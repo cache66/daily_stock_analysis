@@ -38,7 +38,7 @@ function formatPrice(value?: number | null): string {
 }
 
 function getTodayIsoDate(): string {
-  return new Date().toISOString().slice(0, 10);
+  return formatIsoDateLocal(new Date());
 }
 
 function parseIsoDate(value: string): Date {
@@ -120,6 +120,8 @@ const SignalsPage: React.FC = () => {
   const [pageError, setPageError] = useState<ParsedApiError | null>(null);
   const listCacheRef = useRef<Map<string, SignalSnapshotListResponse>>(new Map());
   const historyCacheRef = useRef<Map<string, SignalSnapshotHistoryResponse>>(new Map());
+  const listRequestIdRef = useRef(0);
+  const historyRequestIdRef = useRef(0);
 
   useEffect(() => {
     document.title = '信号快照 - DSA';
@@ -140,6 +142,7 @@ const SignalsPage: React.FC = () => {
     requestedPage?: number;
     requestedCodes?: string[];
   }) => {
+    const requestId = ++listRequestIdRef.current;
     const nextPage = options?.requestedPage ?? currentPage;
     const nextCodes = options?.requestedCodes ?? requestedCodes;
     const params = {
@@ -155,6 +158,7 @@ const SignalsPage: React.FC = () => {
     if (!options?.force) {
       const cached = listCacheRef.current.get(cacheKey);
       if (cached) {
+        historyRequestIdRef.current += 1;
         setListData(cached);
         setPageError(null);
         if (cached.items.length > 0) {
@@ -185,6 +189,10 @@ const SignalsPage: React.FC = () => {
         page: params.page,
         pageSize: params.pageSize,
       });
+      if (requestId !== listRequestIdRef.current) {
+        return;
+      }
+      historyRequestIdRef.current += 1;
       listCacheRef.current.set(cacheKey, response);
       setListData(response);
       setPageError(null);
@@ -201,16 +209,23 @@ const SignalsPage: React.FC = () => {
         setHistoryData(null);
       }
     } catch (error) {
+      if (requestId !== listRequestIdRef.current) {
+        return;
+      }
+      historyRequestIdRef.current += 1;
       setPageError(getParsedApiError(error));
       setListData(null);
       setSelectedItem(null);
       setHistoryData(null);
     } finally {
-      setIsLoadingList(false);
+      if (requestId === listRequestIdRef.current) {
+        setIsLoadingList(false);
+      }
     }
   };
 
   const loadHistory = async (item: SignalSnapshotListItem, force = false) => {
+    const requestId = ++historyRequestIdRef.current;
     const days = Number.parseInt(historyDays, 10) || 180;
     const limit = 100;
     const cacheKey = buildHistoryCacheKey({
@@ -231,14 +246,22 @@ const SignalsPage: React.FC = () => {
     setIsLoadingHistory(true);
     try {
       const response = await signalsApi.getHistory(signalType, item.code, { days, limit });
+      if (requestId !== historyRequestIdRef.current) {
+        return;
+      }
       historyCacheRef.current.set(cacheKey, response);
       setHistoryData(response);
       setPageError(null);
     } catch (error) {
+      if (requestId !== historyRequestIdRef.current) {
+        return;
+      }
       setPageError(getParsedApiError(error));
       setHistoryData(null);
     } finally {
-      setIsLoadingHistory(false);
+      if (requestId === historyRequestIdRef.current) {
+        setIsLoadingHistory(false);
+      }
     }
   };
 
@@ -280,6 +303,7 @@ const SignalsPage: React.FC = () => {
 
   useEffect(() => {
     if (!filteredAndSortedItems.length) {
+      historyRequestIdRef.current += 1;
       setSelectedItem(null);
       setHistoryData(null);
       return;
@@ -298,6 +322,7 @@ const SignalsPage: React.FC = () => {
 
   useEffect(() => {
     if (!selectedItem) {
+      historyRequestIdRef.current += 1;
       setHistoryData(null);
       return;
     }

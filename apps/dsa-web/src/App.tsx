@@ -1,18 +1,19 @@
 import type React from 'react';
-import { useEffect } from 'react';
+import { Suspense, lazy, useEffect } from 'react';
 import { BrowserRouter as Router, Navigate, Route, Routes, useLocation } from 'react-router-dom';
 import HomePage from './pages/HomePage';
-import BacktestPage from './pages/BacktestPage';
-import SettingsPage from './pages/SettingsPage';
 import LoginPage from './pages/LoginPage';
-import NotFoundPage from './pages/NotFoundPage';
-import ChatPage from './pages/ChatPage';
-import PortfolioPage from './pages/PortfolioPage';
-import SignalsPage from './pages/SignalsPage';
-import { ApiErrorAlert, Shell } from './components/common';
+import { ApiErrorAlert, Loading, Shell } from './components/common';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
 import { useAgentChatStore } from './stores/agentChatStore';
 import './App.css';
+
+const ChatPage = lazy(() => import('./pages/ChatPage'));
+const SignalsPage = lazy(() => import('./pages/SignalsPage'));
+const PortfolioPage = lazy(() => import('./pages/PortfolioPage'));
+const BacktestPage = lazy(() => import('./pages/BacktestPage'));
+const SettingsPage = lazy(() => import('./pages/SettingsPage'));
+const NotFoundPage = lazy(() => import('./pages/NotFoundPage'));
 
 const AppContent: React.FC = () => {
   const location = useLocation();
@@ -59,19 +60,27 @@ const AppContent: React.FC = () => {
     return <Navigate to="/" replace />;
   }
 
+  const routeFallback = (
+    <div className="flex min-h-[50vh] items-center justify-center">
+      <Loading label="页面加载中..." className="p-0" />
+    </div>
+  );
+
   return (
-    <Routes>
-      <Route element={<Shell />}>
-        <Route path="/" element={<HomePage />} />
-        <Route path="/chat" element={<ChatPage />} />
-        <Route path="/signals" element={<SignalsPage />} />
-        <Route path="/portfolio" element={<PortfolioPage />} />
-        <Route path="/backtest" element={<BacktestPage />} />
-        <Route path="/settings" element={<SettingsPage />} />
-        <Route path="*" element={<NotFoundPage />} />
-      </Route>
-      <Route path="/login" element={<LoginPage />} />
-    </Routes>
+    <Suspense fallback={routeFallback}>
+      <Routes>
+        <Route element={<Shell />}>
+          <Route path="/" element={<HomePage />} />
+          <Route path="/chat" element={<ChatPage />} />
+          <Route path="/signals" element={<SignalsPage />} />
+          <Route path="/portfolio" element={<PortfolioPage />} />
+          <Route path="/backtest" element={<BacktestPage />} />
+          <Route path="/settings" element={<SettingsPage />} />
+          <Route path="*" element={<NotFoundPage />} />
+        </Route>
+        <Route path="/login" element={<LoginPage />} />
+      </Routes>
+    </Suspense>
   );
 };
 

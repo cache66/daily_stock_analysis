@@ -35,5 +35,60 @@ export default defineConfig({
     // 打包输出到项目根目录的 static 文件夹
     outDir: path.resolve(__dirname, '../../static'),
     emptyOutDir: true,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (!id.includes('node_modules')) {
+            return undefined
+          }
+
+          if (id.includes('recharts') || id.includes('victory-vendor') || id.includes('d3-')) {
+            return 'charts'
+          }
+
+          if (
+            id.includes('react-markdown')
+            || id.includes('remark-gfm')
+            || id.includes('remark-')
+            || id.includes('mdast-')
+            || id.includes('micromark')
+            || id.includes('unified')
+          ) {
+            return 'markdown'
+          }
+
+          if (
+            id.includes('axios')
+            || id.includes('follow-redirects')
+            || id.includes('proxy-from-env')
+          ) {
+            return 'http'
+          }
+
+          if (
+            id.includes('lucide-react')
+            || id.includes('@remixicon/react')
+          ) {
+            return 'icons'
+          }
+
+          if (
+            id.includes('motion')
+            || id.includes('framer-motion')
+            || id.includes('motion-dom')
+            || id.includes('motion-utils')
+            || id.includes('next-themes')
+          ) {
+            return 'motion-ui'
+          }
+
+          if (id.includes('react-router') || id.includes('@remix-run')) {
+            return 'router'
+          }
+
+          return 'vendor'
+        },
+      },
+    },
   },
 })

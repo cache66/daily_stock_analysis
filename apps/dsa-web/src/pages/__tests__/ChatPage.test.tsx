@@ -212,6 +212,27 @@ describe('ChatPage', () => {
     expect(screen.getByRole('button', { name: '历史对话' })).toBeInTheDocument();
   });
 
+  it('shows the new next-day confirmation skills in the strategy selector when available', async () => {
+    mockGetSkills.mockResolvedValue({
+      skills: [
+        { id: 'inside_day_breakout', name: '内包日突破', description: '次日突破确认' },
+        { id: 'nr7_breakout', name: 'NR7窄幅突破', description: '波动压缩突破' },
+        { id: 'reversal_confirmation', name: '次日反转确认', description: '反转K线次日确认' },
+      ],
+      default_skill_id: 'inside_day_breakout',
+    });
+
+    render(
+      <MemoryRouter initialEntries={['/chat']}>
+        <ChatPage />
+      </MemoryRouter>
+    );
+
+    expect(await screen.findByLabelText('内包日突破')).toBeInTheDocument();
+    expect(screen.getByLabelText('NR7窄幅突破')).toBeInTheDocument();
+    expect(screen.getByLabelText('次日反转确认')).toBeInTheDocument();
+  });
+
   it('exports the current session from the header action', async () => {
     mockStoreState.messages = [
       { id: 'user-1', role: 'user', content: '请分析 600519' },

@@ -91,6 +91,14 @@ from api.v1.schemas.portfolio import (
     PortfolioFxRefreshResponse,
     PortfolioRiskResponse,
 )
+from api.v1.schemas.signals import (
+    SignalSnapshotListItem,
+    SignalSnapshotListResponse,
+    SignalSnapshotHistoryItem,
+    SignalSnapshotHistoryResponse,
+    SignalContinuitySummary,
+    SignalDrawdownSummary,
+)
 
 __all__ = [
     # common
@@ -169,4 +177,11 @@ __all__ = [
     "PortfolioImportBrokerListResponse",
     "PortfolioFxRefreshResponse",
     "PortfolioRiskResponse",
+    # signals
+    "SignalSnapshotListItem",
+    "SignalSnapshotListResponse",
+    "SignalSnapshotHistoryItem",
+    "SignalSnapshotHistoryResponse",
+    "SignalContinuitySummary",
+    "SignalDrawdownSummary",
 ]

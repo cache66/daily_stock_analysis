@@ -6,7 +6,7 @@ interface SelectOption {
   label: string;
 }
 
-interface SelectProps {
+interface SelectProps extends Omit<React.SelectHTMLAttributes<HTMLSelectElement>, 'onChange' | 'value'> {
   id?: string;
   value: string;
   onChange: (value: string) => void;
@@ -32,6 +32,7 @@ export const Select: React.FC<SelectProps> = ({
   placeholder = '请选择',
   disabled = false,
   className = '',
+  ...selectProps
 }) => {
   const selectId = useId();
   const resolvedId = id ?? selectId;
@@ -45,6 +46,7 @@ export const Select: React.FC<SelectProps> = ({
           value={value}
           onChange={(e) => onChange(e.target.value)}
           disabled={disabled}
+          {...selectProps}
           className={cn(
             'input-surface input-focus-glow h-11 w-full appearance-none rounded-xl border bg-transparent px-4 py-2.5 pr-10 text-sm text-foreground',
             'transition-all duration-200 focus:outline-none',

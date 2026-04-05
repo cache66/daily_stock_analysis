@@ -209,6 +209,101 @@ class FundamentalSnapshot(Base):
         return f"<FundamentalSnapshot(query_id={self.query_id}, code={self.code})>"
 
 
+class KlineSignalSnapshot(Base):
+    """
+    日线信号快照。
+
+    按 signal_type + signal_date + code 持久化日度命中结果，
+    便于后续扩展更多 K 线条件而不增加平行表。
+    """
+
+    __tablename__ = "kline_signal_snapshot"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    signal_type = Column(String(64), nullable=False, index=True)
+    signal_date = Column(Date, nullable=False, index=True)
+    code = Column(String(10), nullable=False, index=True)
+    name = Column(String(50))
+    criteria_payload = Column(Text, nullable=False, default="{}")
+    metrics_payload = Column(Text, nullable=False, default="{}")
+    cause_payload = Column(Text)
+    history_payload = Column(Text)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "signal_type",
+            "signal_date",
+            "code",
+            name="uix_kline_signal_snapshot_type_date_code",
+        ),
+        Index("ix_kline_signal_snapshot_type_date", "signal_type", "signal_date"),
+        Index("ix_kline_signal_snapshot_code_date", "code", "signal_date"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<KlineSignalSnapshot(signal_type={self.signal_type}, "
+            f"signal_date={self.signal_date}, code={self.code})>"
+        )
+
+
+class KlineSignalDailySummary(Base):
+    """Precomputed daily aggregates for one signal type."""
+
+    __tablename__ = "kline_signal_daily_summary"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    signal_type = Column(String(64), nullable=False, index=True)
+    signal_date = Column(Date, nullable=False, index=True)
+    total_count = Column(Integer, nullable=False, default=0)
+    continuous_count = Column(Integer, nullable=False, default=0)
+    top_codes_json = Column(Text, nullable=False, default="[]")
+    codes_json = Column(Text, nullable=False, default="[]")
+    code_to_name_json = Column(Text, nullable=False, default="{}")
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "signal_type",
+            "signal_date",
+            name="uix_kline_signal_daily_summary_type_date",
+        ),
+        Index("ix_kline_signal_daily_summary_type_date", "signal_type", "signal_date"),
+    )
+
+
+class KlineSignalStreakSnapshot(Base):
+    """Precomputed narrow snapshot rows for range leaderboard queries."""
+
+    __tablename__ = "kline_signal_streak_snapshot"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    signal_type = Column(String(64), nullable=False, index=True)
+    signal_date = Column(Date, nullable=False, index=True)
+    code = Column(String(10), nullable=False, index=True)
+    name = Column(String(50))
+    current_streak_count = Column(Integer, nullable=False, default=1)
+    current_streak_start_date = Column(Date)
+    latest_high = Column(Float)
+    close = Column(Float)
+    industry = Column(String(120))
+    theme_label = Column(String(120))
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "signal_type",
+            "signal_date",
+            "code",
+            name="uix_kline_signal_streak_snapshot_type_date_code",
+        ),
+        Index("ix_kline_signal_streak_snapshot_type_date", "signal_type", "signal_date"),
+        Index("ix_kline_signal_streak_snapshot_type_code_date", "signal_type", "code", "signal_date"),
+    )
+
+
 class AnalysisHistory(Base):
     """
     分析结果历史记录模型
@@ -1124,6 +1219,809 @@ class DatabaseManager:
             except Exception:
                 return None
 
+    def upsert_signal_snapshot(
+        self,
+        *,
+        signal_type: str,
+        signal_date: Any,
+        code: str,
+        name: Optional[str] = None,
+        criteria_payload: Optional[Dict[str, Any]] = None,
+        metrics_payload: Optional[Dict[str, Any]] = None,
+        cause_payload: Optional[Dict[str, Any]] = None,
+        history_payload: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """
+        Insert or update a daily K-line signal snapshot.
+
+        Updates are partial: payload fields only change when a non-None value is
+        provided, which lets callers enrich the same-day snapshot in phases.
+        """
+        normalized_signal_type = str(signal_type or "").strip()
+        normalized_code = str(code or "").strip()
+        normalized_date = self._coerce_date(signal_date)
+        if not normalized_signal_type or not normalized_code or normalized_date is None:
+            return 0
+
+        with self.get_session() as session:
+            try:
+                row = session.execute(
+                    select(KlineSignalSnapshot)
+                    .where(
+                        and_(
+                            KlineSignalSnapshot.signal_type == normalized_signal_type,
+                            KlineSignalSnapshot.signal_date == normalized_date,
+                            KlineSignalSnapshot.code == normalized_code,
+                        )
+                    )
+                    .limit(1)
+                ).scalar_one_or_none()
+
+                now_ts = datetime.now()
+                if row is None:
+                    row = KlineSignalSnapshot(
+                        signal_type=normalized_signal_type,
+                        signal_date=normalized_date,
+                        code=normalized_code,
+                        name=name,
+                        criteria_payload=self._safe_json_dumps(criteria_payload or {}),
+                        metrics_payload=self._safe_json_dumps(metrics_payload or {}),
+                        cause_payload=(
+                            self._safe_json_dumps(cause_payload)
+                            if cause_payload is not None
+                            else None
+                        ),
+                        history_payload=(
+                            self._safe_json_dumps(history_payload)
+                            if history_payload is not None
+                            else None
+                        ),
+                        created_at=now_ts,
+                        updated_at=now_ts,
+                    )
+                    session.add(row)
+                else:
+                    if name is not None:
+                        row.name = name
+                    if criteria_payload is not None:
+                        row.criteria_payload = self._safe_json_dumps(criteria_payload)
+                    if metrics_payload is not None:
+                        row.metrics_payload = self._safe_json_dumps(metrics_payload)
+                    if cause_payload is not None:
+                        row.cause_payload = self._safe_json_dumps(cause_payload)
+                    if history_payload is not None:
+                        row.history_payload = self._safe_json_dumps(history_payload)
+                    row.updated_at = now_ts
+
+                session.flush()
+                self._rebuild_signal_daily_summary(
+                    session,
+                    signal_type=normalized_signal_type,
+                    signal_date=normalized_date,
+                )
+                self._rebuild_signal_streak_snapshots(
+                    session,
+                    signal_type=normalized_signal_type,
+                    code=normalized_code,
+                )
+
+                session.commit()
+                return 1
+            except Exception as e:
+                session.rollback()
+                logger.warning(
+                    "日线信号快照写入失败（fail-open）: signal_type=%s signal_date=%s code=%s err=%s",
+                    normalized_signal_type,
+                    normalized_date,
+                    normalized_code,
+                    e,
+                )
+                return 0
+
+    def get_signal_snapshots(
+        self,
+        signal_type: str,
+        signal_date: Optional[Any] = None,
+        start_date: Optional[Any] = None,
+        end_date: Optional[Any] = None,
+        code: Optional[str] = None,
+        codes: Optional[List[str]] = None,
+        days: Optional[int] = None,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+    ) -> List[KlineSignalSnapshot]:
+        """Query signal snapshots by type, optional exact date, code, and recent window."""
+        normalized_signal_type = str(signal_type or "").strip()
+        if not normalized_signal_type:
+            return []
+
+        conditions = [KlineSignalSnapshot.signal_type == normalized_signal_type]
+        normalized_date = self._coerce_date(signal_date) if signal_date is not None else None
+        normalized_start = self._coerce_date(start_date) if start_date is not None else None
+        normalized_end = self._coerce_date(end_date) if end_date is not None else None
+        if normalized_date is not None:
+            conditions.append(KlineSignalSnapshot.signal_date == normalized_date)
+        elif normalized_start is not None or normalized_end is not None:
+            if normalized_start is not None:
+                conditions.append(KlineSignalSnapshot.signal_date >= normalized_start)
+            if normalized_end is not None:
+                conditions.append(KlineSignalSnapshot.signal_date <= normalized_end)
+        elif days is not None and days > 0:
+            cutoff_date = date.today() - timedelta(days=int(days))
+            conditions.append(KlineSignalSnapshot.signal_date >= cutoff_date)
+
+        normalized_codes = [
+            str(item).strip()
+            for item in (codes or [])
+            if str(item).strip()
+        ]
+        if normalized_codes:
+            conditions.append(KlineSignalSnapshot.code.in_(normalized_codes))
+        elif code:
+            conditions.append(KlineSignalSnapshot.code == str(code).strip())
+
+        with self.get_session() as session:
+            stmt = (
+                select(KlineSignalSnapshot)
+                .where(and_(*conditions))
+                .order_by(
+                    desc(KlineSignalSnapshot.signal_date),
+                    desc(KlineSignalSnapshot.updated_at),
+                )
+            )
+            if offset is not None and offset > 0:
+                stmt = stmt.offset(offset)
+            if limit is not None and limit > 0:
+                stmt = stmt.limit(limit)
+            return list(session.execute(stmt).scalars().all())
+
+    def get_signal_daily_summaries(
+        self,
+        signal_type: str,
+        start_date: Any,
+        end_date: Any,
+    ) -> List[KlineSignalDailySummary]:
+        """Return precomputed daily summaries for one signal type and date range."""
+        normalized_signal_type = str(signal_type or "").strip()
+        normalized_start = self._coerce_date(start_date)
+        normalized_end = self._coerce_date(end_date)
+        if not normalized_signal_type or normalized_start is None or normalized_end is None:
+            return []
+
+        with self.get_session() as session:
+            stmt = (
+                select(KlineSignalDailySummary)
+                .where(
+                    and_(
+                        KlineSignalDailySummary.signal_type == normalized_signal_type,
+                        KlineSignalDailySummary.signal_date >= normalized_start,
+                        KlineSignalDailySummary.signal_date <= normalized_end,
+                    )
+                )
+                .order_by(desc(KlineSignalDailySummary.signal_date))
+            )
+            return list(session.execute(stmt).scalars().all())
+
+    def get_signal_streak_snapshots(
+        self,
+        signal_type: str,
+        start_date: Any,
+        end_date: Any,
+        code: Optional[str] = None,
+        codes: Optional[List[str]] = None,
+    ) -> List[KlineSignalStreakSnapshot]:
+        """Return narrow precomputed streak rows for one range."""
+        normalized_signal_type = str(signal_type or "").strip()
+        normalized_start = self._coerce_date(start_date)
+        normalized_end = self._coerce_date(end_date)
+        if not normalized_signal_type or normalized_start is None or normalized_end is None:
+            return []
+
+        conditions = [
+            KlineSignalStreakSnapshot.signal_type == normalized_signal_type,
+            KlineSignalStreakSnapshot.signal_date >= normalized_start,
+            KlineSignalStreakSnapshot.signal_date <= normalized_end,
+        ]
+        normalized_codes = [
+            str(item).strip()
+            for item in (codes or [])
+            if str(item).strip()
+        ]
+        if normalized_codes:
+            conditions.append(KlineSignalStreakSnapshot.code.in_(normalized_codes))
+        elif code:
+            conditions.append(KlineSignalStreakSnapshot.code == str(code).strip())
+
+        with self.get_session() as session:
+            stmt = (
+                select(KlineSignalStreakSnapshot)
+                .where(and_(*conditions))
+                .order_by(
+                    desc(KlineSignalStreakSnapshot.signal_date),
+                    KlineSignalStreakSnapshot.code,
+                )
+            )
+            return list(session.execute(stmt).scalars().all())
+
+    def get_signal_summary_stats(
+        self,
+        *,
+        signal_type: Optional[str] = None,
+        start_date: Optional[Any] = None,
+        end_date: Optional[Any] = None,
+        code: Optional[str] = None,
+        codes: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Return lightweight stats for snapshots and precomputed summary tables."""
+        normalized_signal_type = str(signal_type or "").strip() or None
+        normalized_start = self._coerce_date(start_date) if start_date is not None else None
+        normalized_end = self._coerce_date(end_date) if end_date is not None else None
+        normalized_code = str(code or "").strip() or None
+        normalized_codes = [
+            str(item).strip()
+            for item in (codes or [])
+            if str(item).strip()
+        ]
+
+        snapshot_conditions = []
+        if normalized_signal_type:
+            snapshot_conditions.append(KlineSignalSnapshot.signal_type == normalized_signal_type)
+        if normalized_start is not None:
+            snapshot_conditions.append(KlineSignalSnapshot.signal_date >= normalized_start)
+        if normalized_end is not None:
+            snapshot_conditions.append(KlineSignalSnapshot.signal_date <= normalized_end)
+        if normalized_codes:
+            snapshot_conditions.append(KlineSignalSnapshot.code.in_(normalized_codes))
+        elif normalized_code:
+            snapshot_conditions.append(KlineSignalSnapshot.code == normalized_code)
+
+        summary_conditions = []
+        if normalized_signal_type:
+            summary_conditions.append(KlineSignalDailySummary.signal_type == normalized_signal_type)
+        if normalized_start is not None:
+            summary_conditions.append(KlineSignalDailySummary.signal_date >= normalized_start)
+        if normalized_end is not None:
+            summary_conditions.append(KlineSignalDailySummary.signal_date <= normalized_end)
+
+        streak_conditions = []
+        if normalized_signal_type:
+            streak_conditions.append(KlineSignalStreakSnapshot.signal_type == normalized_signal_type)
+        if normalized_start is not None:
+            streak_conditions.append(KlineSignalStreakSnapshot.signal_date >= normalized_start)
+        if normalized_end is not None:
+            streak_conditions.append(KlineSignalStreakSnapshot.signal_date <= normalized_end)
+        if normalized_codes:
+            streak_conditions.append(KlineSignalStreakSnapshot.code.in_(normalized_codes))
+        elif normalized_code:
+            streak_conditions.append(KlineSignalStreakSnapshot.code == normalized_code)
+
+        with self.get_session() as session:
+            snapshot_where = and_(*snapshot_conditions) if snapshot_conditions else None
+            summary_where = and_(*summary_conditions) if summary_conditions else None
+            streak_where = and_(*streak_conditions) if streak_conditions else None
+
+            snapshot_query = select(
+                func.count().label("snapshot_count"),
+                func.count(func.distinct(KlineSignalSnapshot.signal_date)).label("snapshot_day_count"),
+                func.count(func.distinct(KlineSignalSnapshot.code)).label("snapshot_code_count"),
+                func.min(KlineSignalSnapshot.signal_date).label("snapshot_min_date"),
+                func.max(KlineSignalSnapshot.signal_date).label("snapshot_max_date"),
+            ).select_from(KlineSignalSnapshot)
+            if snapshot_where is not None:
+                snapshot_query = snapshot_query.where(snapshot_where)
+            snapshot_row = session.execute(snapshot_query).one()
+
+            daily_query = select(
+                func.count().label("daily_summary_count"),
+                func.min(KlineSignalDailySummary.signal_date).label("daily_min_date"),
+                func.max(KlineSignalDailySummary.signal_date).label("daily_max_date"),
+            ).select_from(KlineSignalDailySummary)
+            if summary_where is not None:
+                daily_query = daily_query.where(summary_where)
+            daily_row = session.execute(daily_query).one()
+
+            streak_query = select(
+                func.count().label("streak_snapshot_count"),
+                func.count(func.distinct(KlineSignalStreakSnapshot.code)).label("streak_code_count"),
+                func.min(KlineSignalStreakSnapshot.signal_date).label("streak_min_date"),
+                func.max(KlineSignalStreakSnapshot.signal_date).label("streak_max_date"),
+            ).select_from(KlineSignalStreakSnapshot)
+            if streak_where is not None:
+                streak_query = streak_query.where(streak_where)
+            streak_row = session.execute(streak_query).one()
+
+        return {
+            "snapshot_count": int(snapshot_row.snapshot_count or 0),
+            "snapshot_day_count": int(snapshot_row.snapshot_day_count or 0),
+            "snapshot_code_count": int(snapshot_row.snapshot_code_count or 0),
+            "snapshot_min_date": snapshot_row.snapshot_min_date.isoformat() if snapshot_row.snapshot_min_date else None,
+            "snapshot_max_date": snapshot_row.snapshot_max_date.isoformat() if snapshot_row.snapshot_max_date else None,
+            "daily_summary_count": int(daily_row.daily_summary_count or 0),
+            "daily_min_date": daily_row.daily_min_date.isoformat() if daily_row.daily_min_date else None,
+            "daily_max_date": daily_row.daily_max_date.isoformat() if daily_row.daily_max_date else None,
+            "streak_snapshot_count": int(streak_row.streak_snapshot_count or 0),
+            "streak_code_count": int(streak_row.streak_code_count or 0),
+            "streak_min_date": streak_row.streak_min_date.isoformat() if streak_row.streak_min_date else None,
+            "streak_max_date": streak_row.streak_max_date.isoformat() if streak_row.streak_max_date else None,
+        }
+
+    def rebuild_signal_summary_tables(
+        self,
+        *,
+        signal_type: Optional[str] = None,
+        start_date: Optional[Any] = None,
+        end_date: Optional[Any] = None,
+        code: Optional[str] = None,
+        codes: Optional[List[str]] = None,
+    ) -> Dict[str, int]:
+        """Rebuild precomputed signal summary tables from main snapshots."""
+        normalized_signal_type = str(signal_type or "").strip() or None
+        normalized_start = self._coerce_date(start_date) if start_date is not None else None
+        normalized_end = self._coerce_date(end_date) if end_date is not None else None
+        normalized_code = str(code or "").strip() or None
+        normalized_codes = [
+            str(item).strip()
+            for item in (codes or [])
+            if str(item).strip()
+        ]
+        if normalized_start and normalized_end and normalized_start > normalized_end:
+            raise ValueError("start_date cannot be later than end_date")
+
+        snapshot_conditions = []
+        if normalized_signal_type:
+            snapshot_conditions.append(KlineSignalSnapshot.signal_type == normalized_signal_type)
+        if normalized_start is not None:
+            snapshot_conditions.append(KlineSignalSnapshot.signal_date >= normalized_start)
+        if normalized_end is not None:
+            snapshot_conditions.append(KlineSignalSnapshot.signal_date <= normalized_end)
+        if normalized_codes:
+            snapshot_conditions.append(KlineSignalSnapshot.code.in_(normalized_codes))
+        elif normalized_code:
+            snapshot_conditions.append(KlineSignalSnapshot.code == normalized_code)
+
+        summary_conditions = []
+        if normalized_signal_type:
+            summary_conditions.append(KlineSignalDailySummary.signal_type == normalized_signal_type)
+        if normalized_start is not None:
+            summary_conditions.append(KlineSignalDailySummary.signal_date >= normalized_start)
+        if normalized_end is not None:
+            summary_conditions.append(KlineSignalDailySummary.signal_date <= normalized_end)
+
+        streak_scan_conditions = []
+        if normalized_signal_type:
+            streak_scan_conditions.append(KlineSignalStreakSnapshot.signal_type == normalized_signal_type)
+        if normalized_start is not None:
+            streak_scan_conditions.append(KlineSignalStreakSnapshot.signal_date >= normalized_start)
+        if normalized_end is not None:
+            streak_scan_conditions.append(KlineSignalStreakSnapshot.signal_date <= normalized_end)
+        if normalized_codes:
+            streak_scan_conditions.append(KlineSignalStreakSnapshot.code.in_(normalized_codes))
+        elif normalized_code:
+            streak_scan_conditions.append(KlineSignalStreakSnapshot.code == normalized_code)
+
+        with self.session_scope() as session:
+            snapshot_where = and_(*snapshot_conditions) if snapshot_conditions else None
+            summary_where = and_(*summary_conditions) if summary_conditions else None
+            streak_scan_where = and_(*streak_scan_conditions) if streak_scan_conditions else None
+
+            daily_pairs = session.execute(
+                select(
+                    KlineSignalSnapshot.signal_type,
+                    KlineSignalSnapshot.signal_date,
+                )
+                .where(snapshot_where) if snapshot_where is not None else select(
+                    KlineSignalSnapshot.signal_type,
+                    KlineSignalSnapshot.signal_date,
+                )
+            ).all()
+            existing_daily_pairs = session.execute(
+                select(
+                    KlineSignalDailySummary.signal_type,
+                    KlineSignalDailySummary.signal_date,
+                )
+                .where(summary_where) if summary_where is not None else select(
+                    KlineSignalDailySummary.signal_type,
+                    KlineSignalDailySummary.signal_date,
+                )
+            ).all()
+            affected_daily_pairs = {
+                (str(signal_type_value), signal_date_value)
+                for signal_type_value, signal_date_value in [*daily_pairs, *existing_daily_pairs]
+                if signal_type_value and signal_date_value
+            }
+
+            streak_pairs = session.execute(
+                select(
+                    KlineSignalSnapshot.signal_type,
+                    KlineSignalSnapshot.code,
+                )
+                .where(snapshot_where) if snapshot_where is not None else select(
+                    KlineSignalSnapshot.signal_type,
+                    KlineSignalSnapshot.code,
+                )
+            ).all()
+            existing_streak_pairs = session.execute(
+                select(
+                    KlineSignalStreakSnapshot.signal_type,
+                    KlineSignalStreakSnapshot.code,
+                )
+                .where(streak_scan_where) if streak_scan_where is not None else select(
+                    KlineSignalStreakSnapshot.signal_type,
+                    KlineSignalStreakSnapshot.code,
+                )
+            ).all()
+            affected_streak_pairs = {
+                (str(signal_type_value), str(code_value))
+                for signal_type_value, code_value in [*streak_pairs, *existing_streak_pairs]
+                if signal_type_value and code_value
+            }
+
+            if affected_daily_pairs:
+                daily_delete_conditions = [
+                    and_(
+                        KlineSignalDailySummary.signal_type == signal_type_value,
+                        KlineSignalDailySummary.signal_date == signal_date_value,
+                    )
+                    for signal_type_value, signal_date_value in affected_daily_pairs
+                ]
+                session.execute(delete(KlineSignalDailySummary).where(or_(*daily_delete_conditions)))
+
+            if affected_streak_pairs:
+                streak_delete_conditions = [
+                    and_(
+                        KlineSignalStreakSnapshot.signal_type == signal_type_value,
+                        KlineSignalStreakSnapshot.code == code_value,
+                    )
+                    for signal_type_value, code_value in affected_streak_pairs
+                ]
+                session.execute(delete(KlineSignalStreakSnapshot).where(or_(*streak_delete_conditions)))
+
+            for signal_type_value, signal_date_value in sorted(affected_daily_pairs, key=lambda item: (item[0], item[1])):
+                self._rebuild_signal_daily_summary(
+                    session,
+                    signal_type=signal_type_value,
+                    signal_date=signal_date_value,
+                )
+
+            for signal_type_value, code_value in sorted(affected_streak_pairs, key=lambda item: (item[0], item[1])):
+                self._rebuild_signal_streak_snapshots(
+                    session,
+                    signal_type=signal_type_value,
+                    code=code_value,
+                )
+
+        return {
+            "daily_summary_count": len(affected_daily_pairs),
+            "streak_code_count": len(affected_streak_pairs),
+        }
+
+    def get_signal_snapshot_projection(
+        self,
+        signal_type: str,
+        signal_date: Optional[Any] = None,
+        start_date: Optional[Any] = None,
+        end_date: Optional[Any] = None,
+        code: Optional[str] = None,
+        codes: Optional[List[str]] = None,
+        days: Optional[int] = None,
+        include_history_payload: bool = False,
+        include_metrics_payload: bool = False,
+        include_cause_payload: bool = False,
+        latest_per_code: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Query lightweight snapshot projections for range aggregates."""
+        normalized_signal_type = str(signal_type or "").strip()
+        if not normalized_signal_type:
+            return []
+
+        conditions = [KlineSignalSnapshot.signal_type == normalized_signal_type]
+        normalized_date = self._coerce_date(signal_date) if signal_date is not None else None
+        normalized_start = self._coerce_date(start_date) if start_date is not None else None
+        normalized_end = self._coerce_date(end_date) if end_date is not None else None
+        if normalized_date is not None:
+            conditions.append(KlineSignalSnapshot.signal_date == normalized_date)
+        elif normalized_start is not None or normalized_end is not None:
+            if normalized_start is not None:
+                conditions.append(KlineSignalSnapshot.signal_date >= normalized_start)
+            if normalized_end is not None:
+                conditions.append(KlineSignalSnapshot.signal_date <= normalized_end)
+        elif days is not None and days > 0:
+            cutoff_date = date.today() - timedelta(days=int(days))
+            conditions.append(KlineSignalSnapshot.signal_date >= cutoff_date)
+
+        normalized_codes = [
+            str(item).strip()
+            for item in (codes or [])
+            if str(item).strip()
+        ]
+        if normalized_codes:
+            conditions.append(KlineSignalSnapshot.code.in_(normalized_codes))
+        elif code:
+            conditions.append(KlineSignalSnapshot.code == str(code).strip())
+
+        columns = [
+            KlineSignalSnapshot.code.label("code"),
+            KlineSignalSnapshot.name.label("name"),
+            KlineSignalSnapshot.signal_date.label("signal_date"),
+        ]
+        if include_history_payload:
+            columns.append(KlineSignalSnapshot.history_payload.label("history_payload"))
+        if include_metrics_payload:
+            columns.append(KlineSignalSnapshot.metrics_payload.label("metrics_payload"))
+        if include_cause_payload:
+            columns.append(KlineSignalSnapshot.cause_payload.label("cause_payload"))
+
+        with self.get_session() as session:
+            if latest_per_code:
+                latest_dates = (
+                    select(
+                        KlineSignalSnapshot.code.label("code"),
+                        func.max(KlineSignalSnapshot.signal_date).label("max_signal_date"),
+                    )
+                    .where(and_(*conditions))
+                    .group_by(KlineSignalSnapshot.code)
+                    .subquery()
+                )
+                stmt = (
+                    select(*columns)
+                    .join(
+                        latest_dates,
+                        and_(
+                            KlineSignalSnapshot.code == latest_dates.c.code,
+                            KlineSignalSnapshot.signal_date == latest_dates.c.max_signal_date,
+                        ),
+                    )
+                    .where(and_(*conditions))
+                    .order_by(
+                        desc(KlineSignalSnapshot.signal_date),
+                        KlineSignalSnapshot.code,
+                    )
+                )
+            else:
+                stmt = (
+                    select(*columns)
+                    .where(and_(*conditions))
+                    .order_by(
+                        desc(KlineSignalSnapshot.signal_date),
+                        desc(KlineSignalSnapshot.updated_at),
+                    )
+                )
+            return [dict(row) for row in session.execute(stmt).mappings().all()]
+
+    def count_signal_snapshots(
+        self,
+        signal_type: str,
+        signal_date: Optional[Any] = None,
+        start_date: Optional[Any] = None,
+        end_date: Optional[Any] = None,
+        code: Optional[str] = None,
+        codes: Optional[List[str]] = None,
+        days: Optional[int] = None,
+    ) -> int:
+        """Count signal snapshots using the same filters as get_signal_snapshots."""
+        normalized_signal_type = str(signal_type or "").strip()
+        if not normalized_signal_type:
+            return 0
+
+        conditions = [KlineSignalSnapshot.signal_type == normalized_signal_type]
+        normalized_date = self._coerce_date(signal_date) if signal_date is not None else None
+        normalized_start = self._coerce_date(start_date) if start_date is not None else None
+        normalized_end = self._coerce_date(end_date) if end_date is not None else None
+        if normalized_date is not None:
+            conditions.append(KlineSignalSnapshot.signal_date == normalized_date)
+        elif normalized_start is not None or normalized_end is not None:
+            if normalized_start is not None:
+                conditions.append(KlineSignalSnapshot.signal_date >= normalized_start)
+            if normalized_end is not None:
+                conditions.append(KlineSignalSnapshot.signal_date <= normalized_end)
+        elif days is not None and days > 0:
+            cutoff_date = date.today() - timedelta(days=int(days))
+            conditions.append(KlineSignalSnapshot.signal_date >= cutoff_date)
+
+        normalized_codes = [
+            str(item).strip()
+            for item in (codes or [])
+            if str(item).strip()
+        ]
+        if normalized_codes:
+            conditions.append(KlineSignalSnapshot.code.in_(normalized_codes))
+        elif code:
+            conditions.append(KlineSignalSnapshot.code == str(code).strip())
+
+        with self.get_session() as session:
+            stmt = select(func.count()).select_from(KlineSignalSnapshot).where(and_(*conditions))
+            result = session.execute(stmt).scalar_one()
+            return int(result or 0)
+
+    def _rebuild_signal_daily_summary(
+        self,
+        session: Session,
+        *,
+        signal_type: str,
+        signal_date: date,
+    ) -> None:
+        rows = list(session.execute(
+            select(
+                KlineSignalSnapshot.code,
+                KlineSignalSnapshot.name,
+                KlineSignalSnapshot.history_payload,
+            )
+            .where(
+                and_(
+                    KlineSignalSnapshot.signal_type == signal_type,
+                    KlineSignalSnapshot.signal_date == signal_date,
+                )
+            )
+            .order_by(KlineSignalSnapshot.code)
+        ).all())
+
+        existing = session.execute(
+            select(KlineSignalDailySummary)
+            .where(
+                and_(
+                    KlineSignalDailySummary.signal_type == signal_type,
+                    KlineSignalDailySummary.signal_date == signal_date,
+                )
+            )
+            .limit(1)
+        ).scalar_one_or_none()
+
+        if not rows:
+            if existing is not None:
+                session.delete(existing)
+            return
+
+        codes: List[str] = []
+        code_to_name: Dict[str, Optional[str]] = {}
+        continuous_count = 0
+        for code_value, name_value, history_payload in rows:
+            normalized_code = str(code_value or "").strip()
+            if not normalized_code:
+                continue
+            codes.append(normalized_code)
+            if normalized_code not in code_to_name:
+                code_to_name[normalized_code] = name_value
+            history = self._safe_json_loads(history_payload, {})
+            previous_hits = int(history.get("previous_hit_count", 0) or 0)
+            days_since_previous_hit = history.get("days_since_previous_hit")
+            is_consecutive = (
+                previous_hits > 0
+                and isinstance(days_since_previous_hit, int)
+                and 0 < days_since_previous_hit <= 4
+            )
+            if is_consecutive:
+                continuous_count += 1
+
+        ordered_codes = sorted(set(codes))
+        top_codes = ordered_codes[:5]
+        row = existing or KlineSignalDailySummary(
+            signal_type=signal_type,
+            signal_date=signal_date,
+        )
+        row.total_count = len(ordered_codes)
+        row.continuous_count = continuous_count
+        row.top_codes_json = self._safe_json_dumps(top_codes)
+        row.codes_json = self._safe_json_dumps(ordered_codes)
+        row.code_to_name_json = self._safe_json_dumps(code_to_name)
+        row.updated_at = datetime.now()
+        if existing is None:
+            session.add(row)
+
+    def _rebuild_signal_streak_snapshots(
+        self,
+        session: Session,
+        *,
+        signal_type: str,
+        code: str,
+    ) -> None:
+        rows = list(session.execute(
+            select(
+                KlineSignalSnapshot.signal_date,
+                KlineSignalSnapshot.code,
+                KlineSignalSnapshot.name,
+                KlineSignalSnapshot.metrics_payload,
+                KlineSignalSnapshot.cause_payload,
+            )
+            .where(
+                and_(
+                    KlineSignalSnapshot.signal_type == signal_type,
+                    KlineSignalSnapshot.code == code,
+                )
+            )
+            .order_by(KlineSignalSnapshot.signal_date)
+        ).all())
+
+        existing_rows = list(session.execute(
+            select(KlineSignalStreakSnapshot)
+            .where(
+                and_(
+                    KlineSignalStreakSnapshot.signal_type == signal_type,
+                    KlineSignalStreakSnapshot.code == code,
+                )
+            )
+        ).scalars().all())
+        existing_by_date = {
+            row.signal_date: row
+            for row in existing_rows
+        }
+
+        previous_date: Optional[date] = None
+        current_streak_count = 0
+        current_streak_start_date: Optional[date] = None
+        seen_dates: set[date] = set()
+        for signal_day, code_value, name_value, metrics_payload, cause_payload in rows:
+            if signal_day is None:
+                continue
+            seen_dates.add(signal_day)
+            if previous_date is not None and 0 < (signal_day - previous_date).days <= 4:
+                current_streak_count += 1
+            else:
+                current_streak_count = 1
+                current_streak_start_date = signal_day
+            previous_date = signal_day
+
+            metrics = self._safe_json_loads(metrics_payload, {})
+            cause = self._safe_json_loads(cause_payload, {})
+            streak_row = existing_by_date.get(signal_day) or KlineSignalStreakSnapshot(
+                signal_type=signal_type,
+                signal_date=signal_day,
+                code=str(code_value or "").strip(),
+            )
+            streak_row.name = name_value
+            streak_row.current_streak_count = current_streak_count
+            streak_row.current_streak_start_date = current_streak_start_date
+            streak_row.latest_high = self._to_float(metrics.get("latest_high"))
+            streak_row.close = self._to_float(metrics.get("close"))
+            streak_row.industry = str(cause.get("industry", "") or "").strip() or None
+            streak_row.theme_label = str(cause.get("theme_label", "") or "").strip() or None
+            streak_row.updated_at = datetime.now()
+            if signal_day not in existing_by_date:
+                session.add(streak_row)
+
+        for signal_day, existing_row in existing_by_date.items():
+            if signal_day not in seen_dates:
+                session.delete(existing_row)
+
+    def get_recent_signal_history(
+        self,
+        signal_type: str,
+        code: str,
+        days: int = 180,
+        before_date: Optional[Any] = None,
+        limit: Optional[int] = None,
+    ) -> List[KlineSignalSnapshot]:
+        """Return recent snapshots for one stock before the given signal date."""
+        normalized_signal_type = str(signal_type or "").strip()
+        normalized_code = str(code or "").strip()
+        if not normalized_signal_type or not normalized_code:
+            return []
+
+        days = max(1, int(days))
+        before = self._coerce_date(before_date) if before_date is not None else date.today()
+        if before is None:
+            before = date.today()
+        start_date = before - timedelta(days=days)
+
+        conditions = [
+            KlineSignalSnapshot.signal_type == normalized_signal_type,
+            KlineSignalSnapshot.code == normalized_code,
+            KlineSignalSnapshot.signal_date >= start_date,
+            KlineSignalSnapshot.signal_date < before,
+        ]
+
+        with self.get_session() as session:
+            stmt = (
+                select(KlineSignalSnapshot)
+                .where(and_(*conditions))
+                .order_by(
+                    desc(KlineSignalSnapshot.signal_date),
+                    desc(KlineSignalSnapshot.updated_at),
+                )
+            )
+            if limit is not None and limit > 0:
+                stmt = stmt.limit(limit)
+            return list(session.execute(stmt).scalars().all())
+
     def get_recent_news(self, code: str, days: int = 7, limit: int = 20) -> List[NewsIntel]:
         """
         获取指定股票最近 N 天的新闻情报
@@ -1692,6 +2590,32 @@ class DatabaseManager:
         return None
 
     @staticmethod
+    def _coerce_date(value: Any) -> Optional[date]:
+        """Normalize date-like input into ``date``."""
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+
+        text = str(value).strip()
+        if not text:
+            return None
+
+        try:
+            return date.fromisoformat(text)
+        except ValueError:
+            pass
+
+        for fmt in ("%Y/%m/%d", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S"):
+            try:
+                return datetime.strptime(text, fmt).date()
+            except ValueError:
+                continue
+        return None
+
+    @staticmethod
     def _safe_json_dumps(data: Any) -> str:
         """
         安全序列化为 JSON 字符串
@@ -1700,6 +2624,29 @@ class DatabaseManager:
             return json.dumps(data, ensure_ascii=False, default=str)
         except Exception:
             return json.dumps(str(data), ensure_ascii=False)
+
+    @staticmethod
+    def _safe_json_loads(data: Any, default: Any) -> Any:
+        """Best-effort JSON parsing with a typed default fallback."""
+        if data is None:
+            return default
+        if isinstance(data, (dict, list)):
+            return data
+        try:
+            parsed = json.loads(str(data))
+        except Exception:
+            return default
+        return parsed if isinstance(parsed, type(default)) else default
+
+    @staticmethod
+    def _to_float(value: Any) -> Optional[float]:
+        """Best-effort float coercion for persisted metric values."""
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def _build_raw_result(result: Any) -> Dict[str, Any]:

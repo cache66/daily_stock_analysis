@@ -225,6 +225,46 @@ class SignalSnapshotServiceTestCase(unittest.TestCase):
         self.assertEqual(db.get_signal_streak_snapshots.call_count, 1)
         self.assertEqual(db.get_signal_snapshot_projection.call_count, 0)
 
+    def test_get_snapshot_list_reuses_projection_rows_for_compare_fallback(self) -> None:
+        db = MagicMock()
+        db.count_signal_snapshots.return_value = 1
+        db.get_signal_snapshots.return_value = [
+            SimpleNamespace(
+                code="300001",
+                name="绀轰緥涓€",
+                signal_date=self.service._coerce_date("2026-04-05"),
+                metrics_payload='{"close": 11.8, "latest_high": 12.0, "window_high": 12.0}',
+                cause_payload='{"industry": "鐧介厭", "reason_summary": "鎽樿", "industry_logic": "琛屼笟閫昏緫", "news_logic": "娑堟伅閫昏緫", "technical_logic": "鎶€鏈€昏緫", "theme_label": ""}',
+                history_payload='{"latest_previous_hit_date": "2026-04-04", "previous_hit_count": 1, "days_since_previous_hit": 1}',
+            ),
+        ]
+        db.get_signal_streak_snapshots.return_value = []
+        db.get_signal_snapshot_projection.side_effect = [
+            [],
+            [],
+        ]
+        service = SignalSnapshotService(db)
+
+        result = service.get_snapshot_list(
+            signal_type="hundred_day_high",
+            signal_date_from="2026-04-04",
+            signal_date_to="2026-04-05",
+            code="300001",
+            page=1,
+            page_size=20,
+        )
+
+        self.assertEqual(result["compare_summary"], [])
+        self.assertEqual(result["streak_leaderboard"], [])
+        self.assertEqual(db.get_signal_snapshot_projection.call_count, 2)
+        history_projection_calls = [
+            call for call in db.get_signal_snapshot_projection.call_args_list
+            if call.kwargs.get("include_history_payload")
+            and not call.kwargs.get("include_metrics_payload")
+            and not call.kwargs.get("include_cause_payload")
+        ]
+        self.assertEqual(len(history_projection_calls), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

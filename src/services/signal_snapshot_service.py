@@ -68,6 +68,33 @@ class SignalSnapshotService:
         items = [self._row_to_list_item(row) for row in rows]
         compare_summary: List[Dict[str, Any]] = []
         streak_leaderboard: List[Dict[str, Any]] = []
+        projection_rows_cache: Dict[tuple[bool, bool, bool], List[Any]] = {}
+
+        def get_projection_rows(
+            *,
+            include_history_payload: bool = False,
+            include_metrics_payload: bool = False,
+            include_cause_payload: bool = False,
+        ) -> List[Any]:
+            cache_key = (
+                include_history_payload,
+                include_metrics_payload,
+                include_cause_payload,
+            )
+            if cache_key not in projection_rows_cache:
+                projection_rows_cache[cache_key] = self.db.get_signal_snapshot_projection(
+                    signal_type=signal_type,
+                    signal_date=normalized_date,
+                    start_date=normalized_from,
+                    end_date=normalized_to,
+                    code=code,
+                    codes=codes,
+                    include_history_payload=include_history_payload,
+                    include_metrics_payload=include_metrics_payload,
+                    include_cause_payload=include_cause_payload,
+                )
+            return projection_rows_cache[cache_key]
+
         if normalized_from is not None or normalized_to is not None:
             if not code and not codes:
                 daily_summaries = self.db.get_signal_daily_summaries(
@@ -77,15 +104,7 @@ class SignalSnapshotService:
                 )
                 compare_summary = self._build_compare_summary_from_daily_summaries(daily_summaries)
             else:
-                projection_rows = self.db.get_signal_snapshot_projection(
-                    signal_type=signal_type,
-                    signal_date=normalized_date,
-                    start_date=normalized_from,
-                    end_date=normalized_to,
-                    code=code,
-                    codes=codes,
-                    include_history_payload=True,
-                )
+                projection_rows = get_projection_rows(include_history_payload=True)
                 compare_items = [self._projection_row_to_compare_item(row) for row in projection_rows]
                 compare_summary = self._build_compare_summary(compare_items)
 
@@ -98,25 +117,11 @@ class SignalSnapshotService:
             )
             streak_leaderboard = self._build_streak_leaderboard_from_streak_rows(streak_rows)
             if not compare_summary and total > 0:
-                projection_rows = self.db.get_signal_snapshot_projection(
-                    signal_type=signal_type,
-                    signal_date=normalized_date,
-                    start_date=normalized_from,
-                    end_date=normalized_to,
-                    code=code,
-                    codes=codes,
-                    include_history_payload=True,
-                )
+                projection_rows = get_projection_rows(include_history_payload=True)
                 compare_items = [self._projection_row_to_compare_item(row) for row in projection_rows]
                 compare_summary = self._build_compare_summary(compare_items)
             if not streak_leaderboard and total > 0:
-                projection_rows = self.db.get_signal_snapshot_projection(
-                    signal_type=signal_type,
-                    signal_date=normalized_date,
-                    start_date=normalized_from,
-                    end_date=normalized_to,
-                    code=code,
-                    codes=codes,
+                projection_rows = get_projection_rows(
                     include_metrics_payload=True,
                     include_cause_payload=True,
                 )

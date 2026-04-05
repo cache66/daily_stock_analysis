@@ -16,6 +16,10 @@ export interface GetSignalSnapshotsParams {
   pageSize?: number;
 }
 
+export interface SignalsRequestOptions {
+  signal?: AbortSignal;
+}
+
 export interface GetSignalSnapshotHistoryParams {
   days?: number;
   limit?: number;
@@ -33,8 +37,12 @@ export interface SendSignalSelectionResponse {
 }
 
 export const signalsApi = {
-  getSnapshots: async (params: GetSignalSnapshotsParams): Promise<SignalSnapshotListResponse> => {
+  getSnapshots: async (
+    params: GetSignalSnapshotsParams,
+    options?: SignalsRequestOptions,
+  ): Promise<SignalSnapshotListResponse> => {
     const response = await apiClient.get<Record<string, unknown>>('/api/v1/signals/kline-snapshots', {
+      signal: options?.signal,
       params: {
         signal_type: params.signalType,
         signal_date: params.signalDate,
@@ -53,10 +61,12 @@ export const signalsApi = {
     signalType: string,
     code: string,
     params: GetSignalSnapshotHistoryParams = {},
+    options?: SignalsRequestOptions,
   ): Promise<SignalSnapshotHistoryResponse> => {
     const response = await apiClient.get<Record<string, unknown>>(
       `/api/v1/signals/kline-snapshots/${encodeURIComponent(signalType)}/${encodeURIComponent(code)}`,
       {
+        signal: options?.signal,
         params: {
           days: params.days ?? 180,
           limit: params.limit ?? 100,

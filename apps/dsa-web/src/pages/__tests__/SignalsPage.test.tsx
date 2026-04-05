@@ -273,7 +273,12 @@ describe('SignalsPage', () => {
     expect(await screen.findByText('当前连续命中')).toBeInTheDocument();
 
     await waitFor(() => expect(getSnapshots).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(getHistory).toHaveBeenCalledWith('hundred_day_high', '300006', { days: 180, limit: 100 }));
+    await waitFor(() => expect(getHistory).toHaveBeenCalledWith(
+      'hundred_day_high',
+      '300006',
+      { days: 180, limit: 100 },
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    ));
   });
 
   it('refreshes with a stock code filter and can switch history item', async () => {
@@ -285,23 +290,31 @@ describe('SignalsPage', () => {
     fireEvent.click(screen.getByLabelText('refresh-list'));
 
     await waitFor(() => {
-      expect(getSnapshots).toHaveBeenLastCalledWith({
-        signalType: 'hundred_day_high',
-        signalDate: expect.any(String),
-        signalDateFrom: undefined,
-        signalDateTo: undefined,
-        code: undefined,
-        codes: ['688485'],
-        page: 1,
-        pageSize: 12,
-      });
+      expect(getSnapshots).toHaveBeenLastCalledWith(
+        {
+          signalType: 'hundred_day_high',
+          signalDate: expect.any(String),
+          signalDateFrom: undefined,
+          signalDateTo: undefined,
+          code: undefined,
+          codes: ['688485'],
+          page: 1,
+          pageSize: 12,
+        },
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
     });
 
     getHistory.mockResolvedValue(buildHistoryResponse('688485', '九州一轨'));
     fireEvent.click(screen.getByRole('button', { name: /九州一轨/ }));
 
     await waitFor(() => {
-      expect(getHistory).toHaveBeenCalledWith('hundred_day_high', '688485', { days: 180, limit: 100 });
+      expect(getHistory).toHaveBeenCalledWith(
+        'hundred_day_high',
+        '688485',
+        { days: 180, limit: 100 },
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
     });
   });
 
@@ -324,16 +337,19 @@ describe('SignalsPage', () => {
     fireEvent.click(screen.getByLabelText('select-streak-group-0'));
 
     await waitFor(() => {
-      expect(getSnapshots).toHaveBeenLastCalledWith({
-        signalType: 'hundred_day_high',
-        signalDate: undefined,
-        signalDateFrom: '2026-04-01',
-        signalDateTo: '2026-04-05',
-        code: undefined,
-        codes: ['300006'],
-        page: 1,
-        pageSize: 12,
-      });
+      expect(getSnapshots).toHaveBeenLastCalledWith(
+        {
+          signalType: 'hundred_day_high',
+          signalDate: undefined,
+          signalDateFrom: '2026-04-01',
+          signalDateTo: '2026-04-05',
+          code: undefined,
+          codes: ['300006'],
+          page: 1,
+          pageSize: 12,
+        },
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
     });
 
     expect(await screen.findByTestId('signals-selection-summary')).toHaveTextContent('已选 1 只');

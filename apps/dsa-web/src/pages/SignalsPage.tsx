@@ -1,5 +1,6 @@
 import type React from 'react';
 import { useEffect, useMemo, useRef, useState } from 'react';
+import axios from 'axios';
 import { getParsedApiError } from '../api/error';
 import type { ParsedApiError } from '../api/error';
 import { signalsApi } from '../api/signals';
@@ -85,6 +86,12 @@ function dedupeCodes(items: SignalSnapshotListItem[]): string[] {
   return [...new Set(items.map((item) => item.code).filter(Boolean))];
 }
 
+function isRequestCanceled(error: unknown): boolean {
+  return axios.isCancel(error)
+    || (error instanceof Error && error.name === 'CanceledError')
+    || (typeof error === 'object' && error !== null && 'code' in error && (error as { code?: string }).code === 'ERR_CANCELED');
+}
+
 type SortOption = 'latestHighDesc' | 'previousHitCountDesc' | 'closeDesc' | 'codeAsc';
 type StreakGroupBy = 'none' | 'theme' | 'industry';
 type ActionStatus = {
@@ -122,6 +129,8 @@ const SignalsPage: React.FC = () => {
   const historyCacheRef = useRef<Map<string, SignalSnapshotHistoryResponse>>(new Map());
   const listRequestIdRef = useRef(0);
   const historyRequestIdRef = useRef(0);
+  const listAbortControllerRef = useRef<AbortController | null>(null);
+  const historyAbortControllerRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     document.title = '信号快照 - DSA';
@@ -143,6 +152,9 @@ const SignalsPage: React.FC = () => {
     requestedCodes?: string[];
   }) => {
     const requestId = ++listRequestIdRef.current;
+    listAbortControllerRef.current?.abort();
+    const abortController = new AbortController();
+    listAbortControllerRef.current = abortController;
     const nextPage = options?.requestedPage ?? currentPage;
     const nextCodes = options?.requestedCodes ?? requestedCodes;
     const params = {
@@ -188,7 +200,7 @@ const SignalsPage: React.FC = () => {
         codes: params.codes,
         page: params.page,
         pageSize: params.pageSize,
-      });
+      }, { signal: abortController.signal });
       if (requestId !== listRequestIdRef.current) {
         return;
       }
@@ -209,6 +221,9 @@ const SignalsPage: React.FC = () => {
         setHistoryData(null);
       }
     } catch (error) {
+      if (isRequestCanceled(error)) {
+        return;
+      }
       if (requestId !== listRequestIdRef.current) {
         return;
       }
@@ -219,6 +234,9 @@ const SignalsPage: React.FC = () => {
       setHistoryData(null);
     } finally {
       if (requestId === listRequestIdRef.current) {
+        if (listAbortControllerRef.current === abortController) {
+          listAbortControllerRef.current = null;
+        }
         setIsLoadingList(false);
       }
     }
@@ -226,6 +244,9 @@ const SignalsPage: React.FC = () => {
 
   const loadHistory = async (item: SignalSnapshotListItem, force = false) => {
     const requestId = ++historyRequestIdRef.current;
+    historyAbortControllerRef.current?.abort();
+    const abortController = new AbortController();
+    historyAbortControllerRef.current = abortController;
     const days = Number.parseInt(historyDays, 10) || 180;
     const limit = 100;
     const cacheKey = buildHistoryCacheKey({
@@ -245,7 +266,7 @@ const SignalsPage: React.FC = () => {
 
     setIsLoadingHistory(true);
     try {
-      const response = await signalsApi.getHistory(signalType, item.code, { days, limit });
+      const response = await signalsApi.getHistory(signalType, item.code, { days, limit }, { signal: abortController.signal });
       if (requestId !== historyRequestIdRef.current) {
         return;
       }
@@ -253,6 +274,9 @@ const SignalsPage: React.FC = () => {
       setHistoryData(response);
       setPageError(null);
     } catch (error) {
+      if (isRequestCanceled(error)) {
+        return;
+      }
       if (requestId !== historyRequestIdRef.current) {
         return;
       }
@@ -260,6 +284,9 @@ const SignalsPage: React.FC = () => {
       setHistoryData(null);
     } finally {
       if (requestId === historyRequestIdRef.current) {
+        if (historyAbortControllerRef.current === abortController) {
+          historyAbortControllerRef.current = null;
+        }
         setIsLoadingHistory(false);
       }
     }
@@ -302,8 +329,16 @@ const SignalsPage: React.FC = () => {
   }, [signalDate, signalDateFrom, signalDateTo, dateMode]);
 
   useEffect(() => {
+    return () => {
+      listAbortControllerRef.current?.abort();
+      historyAbortControllerRef.current?.abort();
+    };
+  }, []);
+
+  useEffect(() => {
     if (!filteredAndSortedItems.length) {
       historyRequestIdRef.current += 1;
+      historyAbortControllerRef.current?.abort();
       setSelectedItem(null);
       setHistoryData(null);
       return;
@@ -323,6 +358,7 @@ const SignalsPage: React.FC = () => {
   useEffect(() => {
     if (!selectedItem) {
       historyRequestIdRef.current += 1;
+      historyAbortControllerRef.current?.abort();
       setHistoryData(null);
       return;
     }

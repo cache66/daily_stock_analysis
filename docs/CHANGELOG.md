@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+- 📉 **新增信号汇总趋势查看脚本** — 新增 `scripts/report_signal_summary_perf_trend.py`，可直接读取 `signal_summary_perf_history.jsonl`，输出最近记录的规模/耗时/吞吐摘要，并生成 Markdown 小报表，方便后续观察重建耗时趋势。
+- 📈 **信号汇总观测支持追加时间序列日志** — `scripts/rebuild_signal_summary_tables.py` 新增 `--append-jsonl`，可将每次观测/重建结果按 JSON Lines 追加到长期日志文件，便于后续直接对比 `elapsed_seconds`、`throughput`、`snapshot_count` 等趋势。
+- 📊 **信号汇总重建脚本补齐性能观测模式** — `scripts/rebuild_signal_summary_tables.py` 新增 `--report-only` 与 `--report-json`，可直接输出 `snapshot_count / day_count / code_count / daily_summary_count / streak_snapshot_count / elapsed_seconds / throughput` 等观测指标，便于后续在真实库上持续记录重建基线。
+- 🧱 **新增信号汇总表全量重建脚本** — 新增 `scripts/rebuild_signal_summary_tables.py`，可针对全部或指定 `signal_type / 日期范围 / 股票代码` 重建 `kline_signal_daily_summary` 与 `kline_signal_streak_snapshot` 两张预计算表，适合用于老数据补齐、恢复备份后重刷、或后续规则升级后的汇总重算。
+- 🚄 **`/signals` 服务端补齐预计算汇总表** — 新增 `kline_signal_daily_summary` 与 `kline_signal_streak_snapshot` 两张热点汇总表，`upsert_signal_snapshot(...)` 时会同步刷新日度命中摘要与窄字段 streak 快照；范围查询现在优先走预计算结果来生成 `compare_summary` 和 `streak_leaderboard`，进一步减少长范围下的 payload 反序列化与 Python 侧重复聚合开销。
+- 🚀 **`/signals` 页面补齐导出 / 推送与长范围优化** — `/signals` 现在可直接把当前联动或连续新高结果导出为 `Markdown / JSON`，也可复用现有通知渠道一键推送选中快照；页面同时补上了更明显的“已选 N 只”状态条、分组内选中计数、选中代码 badge，以及长日期范围下的前端缓存、重复请求收敛、对比卡片折叠展示等优化，降低多日复盘时的等待和滚动开销。
+- 🔎 **百日新高快照查询能力补齐到 API + Web** — 新增 `SignalSnapshotService` 与 `/api/v1/signals/kline-snapshots` 查询接口，可按 `signal_type + signal_date` 查看当天命中的 K 线信号快照，并返回 `industry / reason_summary / industry_logic / news_logic / technical_logic / theme_label / latest_previous_hit_date / previous_hit_count` 等结构化字段；同时新增 `/api/v1/signals/kline-snapshots/{signal_type}/{code}`，用于查看某只股票最近一段时间的同口径命中历史，补充连续命中统计以及基于已落库快照的近似回撤摘要。Web 端同步新增 `/signals` 页面与侧边导航入口，支持按日期查看当天快照、按股票查看最近历史、连续新高与近似回撤；后续增强中又补上了日期范围、多日对比、连续新高显式分组、分页，以及多日对比里的 `新增 / 掉队 / streak 排行`，便于后续直接观察“哪些票新进来了、哪些票掉队了、哪些票在持续连创新高”。
+- 📈 **百日新高信号跟踪与归因闭环** — `scripts/select_hundred_day_high_candidates.py` 现已从单纯筛选扩展为“筛选 -> 日度落库 -> 上涨原因归因 -> 历史复现回看”的完整链路：新增通用 `KlineSignalSnapshot` 日线信号快照模型与查询接口，用 `(signal_type, signal_date, code)` 唯一约束保存 `hundred_day_high` 命中结果；脚本默认会回看近 180 天同口径信号的复现次数/最近命中日期/距上次间隔，并结合基本面、新闻、所属板块和主题级海外映射生成 `reason_summary`、`industry_logic`、`news_logic`、`technical_logic`、`cause_tags`、`theme_label` 等摘要字段，同时保持 `csv/txt/md` 导出不变，便于后续继续扩展更多独立 K 线条件入口。后续跟进中又收紧了 `theme_label` 的判定逻辑：优先使用当日强势池行业、主营业务和高置信新闻线索，证据不足时宁可留空，也避免把普通行业票误贴成 AI / 创新药 / 资源涨价等海外主题。
+- 📌 **新增“次日确认策略”批量扫描入口** — 新增 `scripts/scan_next_day_setups.py` 与 `src/services/next_day_setup_service.py`，可在全市场 A 股（自动排除北交所）批量扫描 `inside_day / nr7 / reversal / all` 四种模式；底层复用现有 `KlineSelectorService` 的股票池、并发、分片、现货预过滤与 checkpoint / `--resume` 能力，输出 `next_day_setup_candidates.csv/txt/md`，用于“第一天复盘选信号，第二天盘中做突破确认”的候选池流程。
+- 🤖 **新增 3 个“复盘后次日确认买”内置策略 skill** — `strategies/` 新增 `inside_day_breakout.yaml`、`nr7_breakout.yaml`、`reversal_confirmation.yaml`，分别覆盖内包日突破、NR7 窄幅突破、吞没/早晨之星等反转K线的次日确认模型。三者统一强调“信号日只做复盘，次日突破信号K高点后才确认买点”，避免把单一K线形态直接当作收盘盲买信号；README 与双语说明中的内置策略数量同步从 11 更新为 14。
+- 🚀 **K 线分片并行运行与结果合并** — `scripts/select_kline_candidates.py` 与 `scripts/select_hundred_day_high_candidates.py` 新增 `--shard-count` / `--shard-index`，可将标准化后的 A 股股票池按分片拆给多个独立进程执行；分片运行时会自动为输出目录与 checkpoint 追加 shard 编号，避免互相覆盖，并在输出目录内落一份策略专用 checkpoint。同步新增 `scripts/merge_kline_shard_results.py`，可将多个分片目录重新合并成与当前单次运行一致的 `csv/txt/md` 输出，便于在当前 Windows 环境下保持单进程 `--max-workers 1` 的稳定性，同时通过多进程分片缩短全市场扫描总耗时。
+
+- 📈 **百日新高策略新增独立入口** — 新增 `scripts/select_hundred_day_high_candidates.py`，可单独运行“最新 K 线 `high` 创近 N 日新高”的 A 股筛选，不再与当前“上涨占比 + 涨停 + 百日新高”的组合 K 线策略混用；底层同时为 `KlineSelectorCriteria` 增加了 `require_up_day_ratio` 开关，便于后续扩展更多独立规则入口。
+- 📈 **大盘复盘新增今日涨停股复盘表** — `MarketAnalyzer` 现已在 A 股大盘复盘中追加“今日涨停股复盘表”，按连板数与封板资金展示代表性涨停股，并补充涨停原因、涨停统计与近 250 个交易日历史涨停次数，保持现有 Markdown 报告输出链路不变，可直接复用于 `/market`、`--market-review` 与通知推送。
+
+### 新功能
+
+- 📈 **独立 K 线条件筛选器** — 新增 `src/services/kline_selector_service.py` 与 `scripts/select_kline_candidates.py`，可对全市场 A 股执行独立扫描并自动排除北交所；当前内置规则包括最近 10 个交易日上涨占比大于 70%、最近 10 日至少 1 次涨停、最新 K 线 `high` 创 100 日新高、总市值不超过 500 亿。脚本会输出 A 股样本列表以及候选结果的 `csv/txt/md` 文件，便于后续回看和扩展更多 K 线规则；同时新增保守并发参数 `--max-workers`、现货预过滤参数以及 checkpoint / `--resume` 断点续跑能力，并默认走更精简的 `Akshare` 单链路抓取。基于当前 Windows 环境的真实联网验证，组合筛选脚本现已默认使用 `--max-workers 1` 作为稳定基线；如需提速，更推荐使用分片而不是继续拉高 worker。使用说明见 `docs/KLINE_SELECTOR_GUIDE.md`。
 
 <!-- 新条目格式：- [类型] 描述（类型取值：新功能/改进/修复/文档/测试/chore）-->
 <!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->

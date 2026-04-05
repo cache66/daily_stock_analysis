@@ -187,7 +187,7 @@ class CommandDispatcher:
 
 | /analyze | /a, 分析 | 分析指定股票 | `/analyze 600519` |
 
-| /market | /m, 大盘 | 大盘复盘 | `/market` |
+| /market | /m, 大盘 | 大盘复盘（A 股会附带今日涨停股复盘表） | `/market` |
 
 | /batch | /b, 批量 | 批量分析自选股 | `/batch` |
 

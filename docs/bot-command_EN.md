@@ -156,7 +156,7 @@ class BotCommand(ABC):
 | `/ask` | Single-turn question about a stock or the market | `/ask what is RSI for AAPL` |
 | `/batch` | Batch-analyze your configured watchlist | `/batch` |
 | `/chat` | Multi-turn strategy chat (maintains conversation context) | `/chat` |
-| `/market` | Market review (A-shares / US stocks) | `/market` |
+| `/market` | Market review (A-shares / US stocks); A-share output now includes a daily limit-up review table | `/market` |
 | `/help` | Show help text | `/help` |
 | `/status` | Show system status | `/status` |
 

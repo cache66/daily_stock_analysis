@@ -367,7 +367,7 @@ class BaseFetcher(ABC):
             raw_df = self._fetch_raw_data(stock_code, start_date, end_date)
             
             if raw_df is None or raw_df.empty:
-                raise DataFetchError(f"[{self.name}] 未获取到 {stock_code} 的数据")
+                raise DataFetchError(f"[{self.name}] (empty_result) returned empty daily data")
             
             # Step 2: 标准化列名
             df = self._normalize_data(raw_df, stock_code)
@@ -937,6 +937,14 @@ class DataFetcherManager:
         total_fetchers = len(fetchers)
         request_start = time.time()
 
+        def _record_empty_result(fetcher: BaseFetcher, attempt: int) -> None:
+            error_msg = f"[{fetcher.name}] (empty_result) returned empty daily data"
+            logger.warning(
+                f"[manager empty_result {attempt}/{total_fetchers}] [{fetcher.name}] {stock_code}: "
+                "returned empty daily data"
+            )
+            errors.append(error_msg)
+
         # 快速路径：美股/港股使用专用数据源路由
         #   - 配置长桥凭据后: Longbridge 为首选, YFinance/AkShare 兜底
         #   - 未配置长桥:     YFinance 为首选（美股）, 通用 fetcher 循环（港股）
@@ -980,6 +988,7 @@ class DataFetcherManager:
                                 f"rows={len(df)}, elapsed={elapsed:.2f}s"
                             )
                             return df, fetcher.name
+                        _record_empty_result(fetcher, attempt)
                     except Exception as e:
                         error_type, error_reason = summarize_exception(e)
                         error_msg = f"[{fetcher.name}] ({error_type}) {error_reason}"
@@ -1014,7 +1023,8 @@ class DataFetcherManager:
                         f"rows={len(df)}, elapsed={elapsed:.2f}s"
                     )
                     return df, fetcher.name
-                    
+                _record_empty_result(fetcher, attempt)
+
             except Exception as e:
                 error_type, error_reason = summarize_exception(e)
                 error_msg = f"[{fetcher.name}] ({error_type}) {error_reason}"

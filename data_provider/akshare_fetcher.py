@@ -29,7 +29,7 @@ import random
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Sequence
 
 import pandas as pd
 import requests
@@ -60,6 +60,7 @@ logger = logging.getLogger(__name__)
 
 SINA_REALTIME_ENDPOINT = "hq.sinajs.cn/list"
 TENCENT_REALTIME_ENDPOINT = "qt.gtimg.cn/q"
+DEFAULT_STOCK_HISTORY_SOURCE_PRIORITY: Tuple[str, ...] = ("em", "sina", "tencent")
 
 
 # User-Agent 池，用于随机轮换
@@ -267,7 +268,12 @@ class AkshareFetcher(BaseFetcher):
     name = "AkshareFetcher"
     priority = int(os.getenv("AKSHARE_PRIORITY", "1"))
     
-    def __init__(self, sleep_min: float = 2.0, sleep_max: float = 5.0):
+    def __init__(
+        self,
+        sleep_min: float = 2.0,
+        sleep_max: float = 5.0,
+        stock_history_source_priority: Optional[Sequence[str]] = None,
+    ):
         """
         初始化 AkshareFetcher
         
@@ -277,11 +283,33 @@ class AkshareFetcher(BaseFetcher):
         """
         self.sleep_min = sleep_min
         self.sleep_max = sleep_max
+        self.stock_history_source_priority = self._normalize_stock_history_source_priority(
+            stock_history_source_priority
+        )
         self._last_request_time: Optional[float] = None
         # 东财补丁开启才执行打补丁操作
         if get_config().enable_eastmoney_patch:
             eastmoney_patch()
     
+    @staticmethod
+    def _normalize_stock_history_source_priority(
+        priority: Optional[Sequence[str]],
+    ) -> Tuple[str, ...]:
+        if not priority:
+            return DEFAULT_STOCK_HISTORY_SOURCE_PRIORITY
+
+        normalized: List[str] = []
+        for item in priority:
+            source = str(item or "").strip().lower()
+            if source == "tx":
+                source = "tencent"
+            if source not in ("em", "sina", "tencent"):
+                continue
+            if source not in normalized:
+                normalized.append(source)
+
+        return tuple(normalized) if normalized else DEFAULT_STOCK_HISTORY_SOURCE_PRIORITY
+
     def _set_random_user_agent(self) -> None:
         """
         设置随机 User-Agent
@@ -356,6 +384,18 @@ class AkshareFetcher(BaseFetcher):
         else:
             return self._fetch_stock_data(stock_code, start_date, end_date)
     
+    def _get_stock_history_methods(self) -> List[Tuple[Any, str]]:
+        source_methods = {
+            "em": (self._fetch_stock_data_em, "涓滄柟璐㈠瘜"),
+            "sina": (self._fetch_stock_data_sina, "鏂版氮璐㈢粡"),
+            "tencent": (self._fetch_stock_data_tx, "鑵捐璐㈢粡"),
+        }
+        return [
+            source_methods[source]
+            for source in self.stock_history_source_priority
+            if source in source_methods
+        ]
+
     def _fetch_stock_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
         """
         获取普通 A 股历史数据
@@ -366,7 +406,7 @@ class AkshareFetcher(BaseFetcher):
         3. 最后尝试腾讯财经接口 (ak.stock_zh_a_hist_tx)
         """
         # 尝试列表
-        methods = [
+        methods = self._get_stock_history_methods() or [
             (self._fetch_stock_data_em, "东方财富"),
             (self._fetch_stock_data_sina, "新浪财经"),
             (self._fetch_stock_data_tx, "腾讯财经"),

@@ -1507,15 +1507,17 @@ class SearXNGSearchProvider(BaseSearchProvider):
 
     PUBLIC_INSTANCES_URL = "https://searx.space/data/instances.json"
     PUBLIC_INSTANCES_CACHE_TTL_SECONDS = 3600
-    PUBLIC_INSTANCES_STALE_REFRESH_BACKOFF_SECONDS = 60
+    PUBLIC_INSTANCES_STALE_REFRESH_BACKOFF_SECONDS = 120
     PUBLIC_INSTANCES_POOL_LIMIT = 20
-    PUBLIC_INSTANCES_MAX_ATTEMPTS = 3
-    PUBLIC_INSTANCES_TIMEOUT_SECONDS = 5
+    PUBLIC_INSTANCES_MAX_ATTEMPTS = 2
+    PUBLIC_INSTANCES_TIMEOUT_SECONDS = 3
     SELF_HOSTED_TIMEOUT_SECONDS = 10
+    PUBLIC_INSTANCE_FAILURE_COOLDOWN_SECONDS = 300
 
     _public_instances_cache: Optional[Tuple[float, List[str]]] = None
     _public_instances_stale_retry_after: float = 0.0
     _public_instances_lock = threading.Lock()
+    _public_instance_retry_after: Dict[str, float] = {}
 
     def __init__(self, base_urls: Optional[List[str]] = None, *, use_public_instances: bool = False):
         normalized_base_urls = [url.rstrip("/") for url in (base_urls or []) if url.strip()]
@@ -1535,6 +1537,7 @@ class SearXNGSearchProvider(BaseSearchProvider):
         with cls._public_instances_lock:
             cls._public_instances_cache = None
             cls._public_instances_stale_retry_after = 0.0
+            cls._public_instance_retry_after = {}
 
     @staticmethod
     def _parse_http_error(response) -> str:
@@ -1675,6 +1678,39 @@ class SearXNGSearchProvider(BaseSearchProvider):
                 cls.PUBLIC_INSTANCES_STALE_REFRESH_BACKOFF_SECONDS,
             )
             return []
+
+    @classmethod
+    def _mark_public_instance_failure(cls, base_url: str) -> None:
+        """Temporarily cool down a public instance after a failed request."""
+        normalized = str(base_url or "").rstrip("/")
+        if not normalized:
+            return
+        with cls._public_instances_lock:
+            cls._public_instance_retry_after[normalized] = (
+                time.time() + cls.PUBLIC_INSTANCE_FAILURE_COOLDOWN_SECONDS
+            )
+
+    @classmethod
+    def _filter_ready_public_instances(cls, pool: List[str]) -> List[str]:
+        """Drop public instances still inside the short failure cooldown window."""
+        if not pool:
+            return []
+
+        now = time.time()
+        with cls._public_instances_lock:
+            if cls._public_instance_retry_after:
+                expired = [
+                    url for url, retry_after in cls._public_instance_retry_after.items()
+                    if retry_after <= now
+                ]
+                for url in expired:
+                    cls._public_instance_retry_after.pop(url, None)
+
+            ready = [
+                url for url in pool
+                if cls._public_instance_retry_after.get(url.rstrip("/"), 0.0) <= now
+            ]
+        return ready
 
     def _rotate_candidates(self, pool: List[str], *, max_attempts: int) -> List[str]:
         if not pool or max_attempts <= 0:
@@ -1835,13 +1871,21 @@ class SearXNGSearchProvider(BaseSearchProvider):
             empty_error = "SearXNG 未配置可用实例"
         elif self._use_public_instances:
             public_instances = self._get_public_instances()
+            ready_instances = self._filter_ready_public_instances(public_instances)
             candidates = self._rotate_candidates(
-                public_instances,
-                max_attempts=min(len(public_instances), self.PUBLIC_INSTANCES_MAX_ATTEMPTS),
+                ready_instances,
+                max_attempts=min(len(ready_instances), self.PUBLIC_INSTANCES_MAX_ATTEMPTS),
             )
             retry_enabled = False
             timeout = self.PUBLIC_INSTANCES_TIMEOUT_SECONDS
-            empty_error = "未获取到可用的公共 SearXNG 实例"
+            if public_instances and not ready_instances:
+                empty_error = "公共 SearXNG 实例全部处于冷却中"
+                logger.debug(
+                    "[SearXNG] 公共实例全部处于失败冷却中，暂不发起请求；实例数=%s",
+                    len(public_instances),
+                )
+            else:
+                empty_error = "未获取到可用的公共 SearXNG 实例"
         else:
             candidates = []
             retry_enabled = False
@@ -1880,6 +1924,8 @@ class SearXNGSearchProvider(BaseSearchProvider):
                 )
                 return response
 
+            if self._use_public_instances:
+                self._mark_public_instance_failure(base_url)
             errors.append(f"{base_url}: {response.error_message or '未知错误'}")
             logger.warning("[%s] 实例 %s 搜索失败: %s", self.name, base_url, response.error_message)
 

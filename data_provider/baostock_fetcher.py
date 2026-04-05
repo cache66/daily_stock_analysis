@@ -339,6 +339,10 @@ class BaostockFetcher(BaseFetcher):
                     
                     if data_list:
                         df = pd.DataFrame(data_list, columns=rs.fields)
+                        if 'type' in df.columns:
+                            df = df[df['type'] == '1'].copy()
+                        if 'status' in df.columns:
+                            df = df[df['status'] == '1'].copy()
                         
                         # 转换代码格式（去除 sh. 或 sz. 前缀）
                         df['code'] = df['code'].apply(lambda x: x.split('.')[1] if '.' in x else x)

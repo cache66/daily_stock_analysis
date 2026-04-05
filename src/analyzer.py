@@ -48,6 +48,8 @@ from src.market_context import get_market_role, get_market_guidelines
 
 logger = logging.getLogger(__name__)
 
+EMPTY_LLM_RESPONSE_RETRY_ATTEMPTS = 3
+
 
 class _LiteLLMStreamError(RuntimeError):
     """Internal error wrapper that records whether any text was streamed."""
@@ -1160,76 +1162,135 @@ class GeminiAnalyzer:
         effective_system_prompt = system_prompt or self.TEXT_SYSTEM_PROMPT
         router_model_names = set(get_configured_llm_models(config.llm_model_list))
         for model in models_to_try:
-            try:
-                model_short = model.split("/")[-1] if "/" in model else model
-                call_kwargs: Dict[str, Any] = {
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": effective_system_prompt},
-                        {"role": "user", "content": prompt},
-                    ],
-                    "temperature": temperature,
-                    "max_tokens": max_tokens,
-                }
-                extra = get_thinking_extra_body(model_short)
-                if extra:
-                    call_kwargs["extra_body"] = extra
+            for attempt in range(1, EMPTY_LLM_RESPONSE_RETRY_ATTEMPTS + 1):
+                try:
+                    model_short = model.split("/")[-1] if "/" in model else model
+                    call_kwargs: Dict[str, Any] = {
+                        "model": model,
+                        "messages": [
+                            {"role": "system", "content": effective_system_prompt},
+                            {"role": "user", "content": prompt},
+                        ],
+                        "temperature": temperature,
+                        "max_tokens": max_tokens,
+                    }
+                    extra = get_thinking_extra_body(model_short)
+                    if extra:
+                        call_kwargs["extra_body"] = extra
 
-                if stream:
-                    try:
-                        stream_response = self._dispatch_litellm_completion(
-                            model,
-                            {**call_kwargs, "stream": True},
-                            config=config,
-                            use_channel_router=use_channel_router,
-                            router_model_names=router_model_names,
-                        )
-                        response_text, usage = self._consume_litellm_stream(
-                            stream_response,
-                            model=model,
-                            progress_callback=stream_progress_callback,
-                        )
-                        return response_text, model, usage
-                    except _LiteLLMStreamError as exc:
-                        if exc.partial_received:
+                    if stream:
+                        try:
+                            stream_response = self._dispatch_litellm_completion(
+                                model,
+                                {**call_kwargs, "stream": True},
+                                config=config,
+                                use_channel_router=use_channel_router,
+                                router_model_names=router_model_names,
+                            )
+                            response_text, usage = self._consume_litellm_stream(
+                                stream_response,
+                                model=model,
+                                progress_callback=stream_progress_callback,
+                            )
+                            return response_text, model, usage
+                        except _LiteLLMStreamError as exc:
+                            if exc.partial_received:
+                                logger.warning(
+                                    "[LiteLLM] %s stream failed after partial output, retrying non-stream for same model: %s",
+                                    model,
+                                    exc,
+                                )
+                            else:
+                                logger.warning(
+                                    "[LiteLLM] %s stream unavailable before first chunk, falling back to non-stream: %s",
+                                    model,
+                                    exc,
+                                )
+                            last_error = exc
+                        except Exception as exc:
                             logger.warning(
-                                "[LiteLLM] %s stream failed after partial output, retrying non-stream for same model: %s",
+                                "[LiteLLM] %s stream request failed before first chunk, falling back to non-stream: %s",
                                 model,
                                 exc,
                             )
-                        else:
-                            logger.warning(
-                                "[LiteLLM] %s stream unavailable before first chunk, falling back to non-stream: %s",
-                                model,
-                                exc,
-                            )
-                        last_error = exc
-                    except Exception as exc:
+
+                    response = self._dispatch_litellm_completion(
+                        model,
+                        call_kwargs,
+                        config=config,
+                        use_channel_router=use_channel_router,
+                        router_model_names=router_model_names,
+                    )
+
+                    text_content = self._extract_litellm_response_text(response)
+                    if text_content:
+                        usage = self._normalize_usage(getattr(response, "usage", None))
+                        return text_content, model, usage
+
+                    empty_error = ValueError("LLM returned empty response")
+                    if attempt < EMPTY_LLM_RESPONSE_RETRY_ATTEMPTS:
                         logger.warning(
-                            "[LiteLLM] %s stream request failed before first chunk, falling back to non-stream: %s",
+                            "[LiteLLM] %s returned empty response (attempt %s/%s), retrying same model",
                             model,
-                            exc,
+                            attempt,
+                            EMPTY_LLM_RESPONSE_RETRY_ATTEMPTS,
                         )
+                        time.sleep(min(0.5 * attempt, 1.5))
+                        continue
+                    raise empty_error
 
-                response = self._dispatch_litellm_completion(
-                    model,
-                    call_kwargs,
-                    config=config,
-                    use_channel_router=use_channel_router,
-                    router_model_names=router_model_names,
-                )
-
-                if response and response.choices and response.choices[0].message.content:
-                    usage = self._normalize_usage(getattr(response, "usage", None))
-                    return (response.choices[0].message.content, model, usage)
-                raise ValueError("LLM returned empty response")
-
-            except Exception as e:
-                logger.warning(f"[LiteLLM] {model} failed: {e}")
-                last_error = e
-                continue
+                except Exception as e:
+                    if (
+                        isinstance(e, ValueError)
+                        and "empty response" in str(e).lower()
+                        and attempt < EMPTY_LLM_RESPONSE_RETRY_ATTEMPTS
+                    ):
+                        logger.warning(
+                            "[LiteLLM] %s empty response on attempt %s/%s, retrying",
+                            model,
+                            attempt,
+                            EMPTY_LLM_RESPONSE_RETRY_ATTEMPTS,
+                        )
+                        time.sleep(min(0.5 * attempt, 1.5))
+                        last_error = e
+                        continue
+                    logger.warning(f"[LiteLLM] {model} failed: {e}")
+                    last_error = e
+                    break
 
         raise Exception(f"All LLM models failed (tried {len(models_to_try)} model(s)). Last error: {last_error}")
+
+    @staticmethod
+    def _extract_litellm_response_text(response: Any) -> str:
+        """Extract plain text from heterogeneous LiteLLM/OpenAI response payloads."""
+        if response is None or not getattr(response, "choices", None):
+            return ""
+
+        try:
+            message = response.choices[0].message
+        except Exception:
+            return ""
+
+        content = getattr(message, "content", None)
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            chunks: List[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    text = item.strip()
+                    if text:
+                        chunks.append(text)
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") not in (None, "text", "output_text"):
+                    continue
+                text = item.get("text")
+                if isinstance(text, str) and text.strip():
+                    chunks.append(text.strip())
+            return "\n".join(chunks).strip()
+        return ""
 
     def generate_text(
         self,
@@ -2061,7 +2122,9 @@ class GeminiAnalyzer:
         json_str = json_str.replace('True', 'true').replace('False', 'false')
         
         # fix by json-repair
-        json_str = repair_json(json_str)
+        repaired = repair_json(json_str)
+        if isinstance(repaired, str) and repaired:
+            json_str = repaired
         
         return json_str
     

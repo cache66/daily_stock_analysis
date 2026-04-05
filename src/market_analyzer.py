@@ -22,6 +22,7 @@ from src.config import get_config
 from src.search_service import SearchService
 from src.core.market_profile import get_profile, MarketProfile
 from src.core.market_strategy import get_market_strategy_blueprint
+from src.services.limit_up_review_service import LimitUpReviewService
 from data_provider.base import DataFetcherManager
 
 logger = logging.getLogger(__name__)
@@ -77,6 +78,9 @@ class MarketOverview:
     bottom_sectors: List[Dict] = field(default_factory=list)  # 跌幅前5板块
 
 
+    limit_up_review_rows: List[Dict[str, Any]] = field(default_factory=list)
+
+
 class MarketAnalyzer:
     """
     大盘复盘分析器
@@ -110,6 +114,7 @@ class MarketAnalyzer:
         self.region = region if region in ("cn", "us") else "cn"
         self.profile: MarketProfile = get_profile(self.region)
         self.strategy = get_market_strategy_blueprint(self.region)
+        self.limit_up_review_service = LimitUpReviewService()
 
     def get_market_overview(self) -> MarketOverview:
         """
@@ -135,6 +140,12 @@ class MarketAnalyzer:
         # 4. 获取北向资金（可选）
         # self._get_north_flow(overview)
         
+        if self.region == "cn" and self.profile.has_market_stats:
+            try:
+                overview.limit_up_review_rows = self.limit_up_review_service.get_review_rows(overview.date)
+            except Exception as e:
+                logger.warning(f"[大盘] 获取今日涨停复盘表失败: {e}")
+
         return overview
 
     
@@ -313,6 +324,9 @@ class MarketAnalyzer:
         stats_block = self._build_stats_block(overview)
         indices_block = self._build_indices_block(overview)
         sector_block = self._build_sector_block(overview)
+        limit_up_review_block = self.limit_up_review_service.build_markdown_block(
+            overview.limit_up_review_rows
+        )
 
         # Inject market stats after "### 一、市场总结" section (before next ###)
         if stats_block:
@@ -325,6 +339,9 @@ class MarketAnalyzer:
         # Inject sector rankings after "### 四、热点解读" section
         if sector_block:
             review = self._insert_after_section(review, r'###\s*四、热点解读', sector_block)
+
+        if limit_up_review_block:
+            review = review.rstrip() + "\n\n" + limit_up_review_block + "\n"
 
         return review
 
@@ -651,6 +668,9 @@ Output the report content directly, no extra commentary.
 """
         market_label = "A股" if self.region == "cn" else "美股"
         strategy_summary = self.strategy.to_markdown_block()
+        limit_up_review_block = self.limit_up_review_service.build_markdown_block(
+            overview.limit_up_review_rows
+        )
         report = f"""## {overview.date} 大盘复盘
 
 ### 一、市场总结
@@ -664,6 +684,8 @@ Output the report content directly, no extra commentary.
 市场有风险，投资需谨慎。以上数据仅供参考，不构成投资建议。
 
 {strategy_summary}
+
+{limit_up_review_block}
 
 ---
 *复盘时间: {datetime.now().strftime('%H:%M')}*

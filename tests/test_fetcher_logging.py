@@ -55,6 +55,21 @@ class _FailureFetcher(BaseFetcher):
         return df
 
 
+class _EmptyFetcher(BaseFetcher):
+    name = "EmptyFetcher"
+    priority = 0
+
+    def _fetch_raw_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+        return pd.DataFrame()
+
+    def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
+        return df
+
+
+class _EmptyYfinanceFetcher(_EmptyFetcher):
+    name = "YfinanceFetcher"
+
+
 class TestFetcherLogging(unittest.TestCase):
     def test_base_fetcher_logs_start_and_success(self):
         fetcher = _SuccessFetcher()
@@ -81,6 +96,26 @@ class TestFetcherLogging(unittest.TestCase):
         self.assertIn("[数据源失败 1/2] [FailureFetcher] 601006:", log_text)
         self.assertIn("[数据源切换] 601006: [FailureFetcher] -> [SuccessFetcher]", log_text)
         self.assertIn("[数据源完成] 601006 使用 [SuccessFetcher] 获取成功:", log_text)
+
+    def test_manager_records_empty_results_before_fallback(self):
+        manager = DataFetcherManager(fetchers=[_EmptyFetcher(), _SuccessFetcher()])
+
+        with self.assertLogs("data_provider.base", level="INFO") as captured:
+            df, source = manager.get_daily_data("601006", start_date="2026-01-07", end_date="2026-03-08")
+
+        log_text = "\n".join(captured.output)
+        self.assertFalse(df.empty)
+        self.assertEqual(source, "SuccessFetcher")
+        self.assertIn("[EmptyFetcher] (empty_result) returned empty daily data", log_text)
+        self.assertIn("[数据源切换] 601006: [EmptyFetcher] -> [SuccessFetcher]", log_text)
+
+    def test_manager_us_route_reports_empty_yfinance_result(self):
+        manager = DataFetcherManager(fetchers=[_EmptyYfinanceFetcher()])
+
+        with self.assertRaises(DataFetchError) as raised:
+            manager.get_daily_data("AAPL", start_date="2026-01-07", end_date="2026-03-08")
+
+        self.assertIn("[YfinanceFetcher] (empty_result) returned empty daily data", str(raised.exception))
 
     def test_efinance_logs_eastmoney_endpoint_on_remote_disconnect(self):
         fetcher = EfinanceFetcher()

@@ -303,11 +303,60 @@ class TestAnalyzerGenerateText:
 # market_analyzer uses generate_text(), not private attributes
 # ---------------------------------------------------------------------------
 
+    def test_call_litellm_retries_same_model_on_empty_response(self):
+        analyzer = self._make_analyzer()
+        empty_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=""))],
+            usage=None,
+        )
+        success_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="final text"))],
+            usage=SimpleNamespace(prompt_tokens=11, completion_tokens=7, total_tokens=18),
+        )
+        runtime_cfg = SimpleNamespace(
+            litellm_model="gemini/gemini-2.0-flash",
+            litellm_fallback_models=[],
+            llm_model_list=[],
+        )
+
+        with patch.object(analyzer, "_get_runtime_config", return_value=runtime_cfg), \
+             patch("src.analyzer.get_api_keys_for_model", return_value=[]), \
+             patch("src.analyzer.litellm.completion", side_effect=[empty_response, empty_response, success_response]) as mock_completion:
+            text, model_used, usage = analyzer._call_litellm(
+                "prompt",
+                generation_config={"max_tokens": 256, "temperature": 0.2},
+            )
+
+        assert text == "final text"
+        assert model_used == "gemini/gemini-2.0-flash"
+        assert usage["total_tokens"] == 18
+        assert mock_completion.call_count == 3
+
+    def test_extract_litellm_response_text_supports_chunk_list_content(self):
+        analyzer = self._make_analyzer()
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=[
+                            {"type": "output_text", "text": "first"},
+                            {"type": "output_text", "text": "second"},
+                        ]
+                    )
+                )
+            ]
+        )
+
+        text = analyzer._extract_litellm_response_text(response)
+
+        assert text == "first\nsecond"
+
 class TestMarketAnalyzerBypassFix:
     def _make_market_analyzer_with_mock_generate_text(self, return_value="复盘报告"):
         """Return a MarketAnalyzer whose embedded Analyzer.generate_text is mocked."""
         from src.core.market_profile import CN_PROFILE
         from src.core.market_strategy import get_market_strategy_blueprint
+        from src.services.limit_up_review_service import LimitUpReviewService
 
         with patch("src.analyzer.get_config") as mock_cfg, \
              patch("src.market_analyzer.get_config") as mock_cfg2:
@@ -337,6 +386,7 @@ class TestMarketAnalyzerBypassFix:
             ma.profile = CN_PROFILE
             ma.strategy = get_market_strategy_blueprint("cn")
             ma.region = "cn"
+            ma.limit_up_review_service = LimitUpReviewService()
             return ma
 
     def test_no_access_to_private_model_attribute(self):
@@ -398,12 +448,41 @@ class TestMarketAnalyzerBypassFix:
         assert kwargs["max_tokens"] == 8192
         assert kwargs["temperature"] == 0.7
 
+    def test_generate_market_review_appends_limit_up_review_block(self):
+        """Structured limit-up review rows should be appended to the final market review."""
+        from src.market_analyzer import MarketOverview
+
+        ma = self._make_market_analyzer_with_mock_generate_text(
+            return_value="## 2026-03-30 review\n\n### 一、市场总结\nbody"
+        )
+        overview = MarketOverview(
+            date="2026-03-30",
+            limit_up_review_rows=[
+                {
+                    "code": "600527",
+                    "name": "Sample Co",
+                    "board_count": 2,
+                    "sealed_amount_yi": 0.88,
+                    "limit_up_stats": "2/2",
+                    "reason": "60d high",
+                    "historical_limit_up_count": 9,
+                    "industry": "Textile",
+                }
+            ],
+        )
+
+        result = ma.generate_market_review(overview, [])
+
+        assert "600527" in result
+        assert "Sample Co" in result
+        assert "2/2" in result
+
     def test_no_private_attribute_access_in_market_analyzer_source(self):
         """Static guard: market_analyzer.py must not access private analyzer attrs."""
         import ast
         import pathlib
 
-        src = pathlib.Path("src/market_analyzer.py").read_text()
+        src = pathlib.Path("src/market_analyzer.py").read_text(encoding="utf-8")
         tree = ast.parse(src)
         forbidden = {
             "_model", "_router", "_use_openai", "_use_anthropic",  # historical

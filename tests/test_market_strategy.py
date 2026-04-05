@@ -5,6 +5,7 @@ import unittest
 
 from src.core.market_strategy import get_market_strategy_blueprint
 from src.market_analyzer import MarketAnalyzer, MarketOverview
+from src.services.limit_up_review_service import LimitUpReviewService
 
 
 class TestMarketStrategyBlueprint(unittest.TestCase):
@@ -43,6 +44,28 @@ class TestMarketAnalyzerStrategyPrompt(unittest.TestCase):
 
         self.assertIn("Strategy Plan", prompt)
         self.assertIn("US Market Regime Strategy", prompt)
+
+    def test_cn_limit_up_review_block_renders_markdown_table(self):
+        service = LimitUpReviewService()
+        block = service.build_markdown_block(
+            [
+                {
+                    "code": "603538",
+                    "name": "美诺华",
+                    "board_count": 5,
+                    "sealed_amount_yi": 1.23,
+                    "limit_up_stats": "5/5",
+                    "reason": "近期多次涨停",
+                    "historical_limit_up_count": 13,
+                    "industry": "化学制药",
+                }
+            ]
+        )
+
+        self.assertIn("今日涨停股复盘表", block)
+        self.assertIn("美诺华", block)
+        self.assertIn("近期多次涨停", block)
+        self.assertIn("13", block)
 
 
 if __name__ == "__main__":

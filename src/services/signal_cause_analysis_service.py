@@ -126,10 +126,14 @@ class SignalCauseAnalysisService:
         manager: Optional[DataFetcherManager] = None,
         search_service: Optional[Any] = None,
         analyzer: Optional[Any] = None,
+        enable_news_search: bool = True,
+        enable_reason_card_llm: bool = True,
     ) -> None:
         self.manager = manager or DataFetcherManager()
         self.search_service = search_service if search_service is not None else get_search_service()
         self.analyzer = analyzer if analyzer is not None else get_analyzer()
+        self.enable_news_search = enable_news_search
+        self.enable_reason_card_llm = enable_reason_card_llm
         self._signal_pool_cache: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self._business_profile_cache: Dict[str, Dict[str, Any]] = {}
 
@@ -181,13 +185,15 @@ class SignalCauseAnalysisService:
                 },
             }
 
-        llm_payload = self._generate_reason_card(
-            stock_code=normalized_code,
-            stock_name=normalized_name,
-            signal_type=signal_type,
-            metrics_payload=metrics_payload,
-            evidence=evidence,
-        )
+        llm_payload = None
+        if self._should_attempt_reason_card_llm(evidence):
+            llm_payload = self._generate_reason_card(
+                stock_code=normalized_code,
+                stock_name=normalized_name,
+                signal_type=signal_type,
+                metrics_payload=metrics_payload,
+                evidence=evidence,
+            )
         return self._merge_reason_payload(
             evidence,
             llm_payload,
@@ -218,7 +224,7 @@ class SignalCauseAnalysisService:
             or str(business_profile.get("industry_hint", "") or "").strip()
         )
         boards = self._collect_belong_boards(stock_code) if should_fetch_boards else []
-        news_items = self._collect_news_items(stock_code, stock_name)
+        news_items = self._collect_news_items(stock_code, stock_name) if self.enable_news_search else []
         if isinstance(fundamental_context, dict) and boards and not isinstance(
             fundamental_context.get("belong_boards"),
             list,
@@ -283,6 +289,13 @@ class SignalCauseAnalysisService:
             "evidence_points": evidence_points,
             "fact_vs_inference": fact_vs_inference,
         }
+
+    def _should_attempt_reason_card_llm(self, evidence: Dict[str, Any]) -> bool:
+        """Only spend LLM budget when richer external evidence exists."""
+        if not self.enable_reason_card_llm:
+            return False
+        news_items = evidence.get("news_items")
+        return isinstance(news_items, list) and len(news_items) > 0
 
     def _collect_belong_boards(self, stock_code: str) -> List[Dict[str, Any]]:
         try:

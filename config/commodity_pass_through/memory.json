@@ -1,0 +1,82 @@
+{
+  "key": "memory",
+  "label": "memory",
+  "keywords": [
+    "DRAM",
+    "NAND",
+    "内存",
+    "存储芯片",
+    "闪存",
+    "SSD",
+    "UFS",
+    "eMMC",
+    "memory"
+  ],
+  "roles": {
+    "upstream": ["DRAM", "NAND", "晶圆", "wafer", "存储芯片", "原厂", "Flash"],
+    "midstream": ["存储模组", "模组", "主控", "封测", "SSD", "UFS", "eMMC", "LPDDR"],
+    "downstream": ["服务器", "整机", "笔记本", "手机", "终端", "代工", "组装", "OEM", "ODM"],
+    "distribution": ["分销", "代理", "渠道", "库存", "海力士", "三星", "美光"],
+    "weak_proxy": ["AI服务器", "算力", "数据中心", "消费电子"]
+  },
+  "subthemes": [
+    {
+      "key": "flash_and_memory_design",
+      "label": "flash_and_memory_design",
+      "keywords": ["NOR Flash", "NAND Flash", "Flash", "存储芯片", "利基存储", "SRAM"],
+      "default_role": "upstream"
+    },
+    {
+      "key": "module_and_packaging",
+      "label": "module_and_packaging",
+      "keywords": ["存储模组", "封测", "SSD", "UFS", "eMMC", "LPDDR", "内存条"],
+      "default_role": "midstream"
+    },
+    {
+      "key": "authorized_distribution",
+      "label": "authorized_distribution",
+      "keywords": ["分销", "代理", "渠道", "SK海力士", "海力士", "三星", "美光"],
+      "default_role": "distribution"
+    },
+    {
+      "key": "server_oem_and_assembly",
+      "label": "server_oem_and_assembly",
+      "keywords": ["服务器", "整机", "OEM", "ODM", "代工"],
+      "default_role": "downstream"
+    }
+  ],
+  "examples": [
+    {
+      "code": "603986",
+      "name": "兆易创新",
+      "bucket": "whitelist",
+      "subtheme_key": "flash_and_memory_design",
+      "role": "upstream",
+      "note": "更偏存储芯片设计与利基存储逻辑。"
+    },
+    {
+      "code": "688525",
+      "name": "佰维存储",
+      "bucket": "whitelist",
+      "subtheme_key": "module_and_packaging",
+      "role": "midstream",
+      "note": "更偏存储器研发设计、封测制造与模组链条。"
+    },
+    {
+      "code": "300475",
+      "name": "香农芯创",
+      "bucket": "whitelist",
+      "subtheme_key": "authorized_distribution",
+      "role": "distribution",
+      "note": "渠道分销型样例，可能受益于库存与价差，但不宜等同直接芯片涨价受益。"
+    },
+    {
+      "code": "601138",
+      "name": "工业富联",
+      "bucket": "counterexample",
+      "subtheme_key": "server_oem_and_assembly",
+      "role": "downstream",
+      "note": "更偏服务器、OEM 与整机制造，内存涨价更容易形成成本压力。"
+    }
+  ]
+}

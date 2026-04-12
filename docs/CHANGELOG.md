@@ -8,6 +8,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+- [改进] `schedule` 模式新增可选板块辨识度 TopN 快照调度；开启 `BOARD_RECOGNIZABILITY_SNAPSHOT_ENABLED` 后，会在定时分析后自动刷新 `/signals` 动态板块辨识度 tab 所需快照。
+- [新功能] 新增 `scripts/collect_board_recognizability_rankings.py` 与文档 `docs/BOARD_RECOGNIZABILITY_RANKING.md`，可从已落库的 `hundred_day_high` 等信号快照中提取“各板块辨识度 TopN”结果，导出汇总文件并按板块命名空间再次写入 `kline_signal_snapshot`，便于后续查询和回溯。
+- [新功能] 新增模块主题核心快照脚本 `scripts/collect_board_theme_core_snapshots.py` 与文档 `docs/THEME_CORE_BOARD_SNAPSHOTS.md`，可按日期保存模块成分股与模块内部子主题核心股结果，便于后续周期性更新与回看。
+- [新功能] 新增“按模块分析模块下股票”的能力：`DataFetcherManager` / `AkshareFetcher` 现支持获取概念板块与行业板块成分股，并新增 `scripts/select_board_theme_core_candidates.py` 在模块内部按 `theme_core_mapper` 拆分子主题并筛出核心股。
+- [新功能] 新增 `theme_core_mapper` 主题核心映射能力：按 `大主题 / 真子主题 / 个股角色` 三层拆解股票，并结合龙头分析输出 `subtheme_core_probability`，同时新增批量脚本 `scripts/select_theme_core_candidates.py` 用于按子主题自动筛出核心股。
+- [改进] `commodity_price_pass_through` 新增显式 `combo_reinforcement` 规则：对“涨价映射强 + 强逻辑 + 资金集中”的股票单独打组合强化分，并同步写入候选池导出、专题快照与服务返回结构，避免这类票只停留在隐含叠加加分。
+- [改进] `dragon_head` 候选池扫描新增第二阶段“快速模式”：批量扫描默认优先复用实时行情、板块排行和日线数据，只对更像候选的股票按需补抓主营资料与新闻催化，并新增 `--full-analysis` 用于切回更完整的证据抓取。
+- [改进] 优化 `dragon_head` 候选池的数据抓取链路：`DragonHeadAnalysisService` 单票分析合并重复日线请求，`DataFetcherManager` 为板块排行与所属板块增加进程内 TTL 缓存，批量扫描前预热实时行情与板块排行，减少重复联网请求与重试耗时。
+- [新功能] `/signals` 正式接入 `dragon_head_candidate` 龙头专题快照，新增龙头专题 tab，并展示 `leader_type / leader_probability / recognizability_score / logic_consensus_score / capital_consensus_score / sector_leadership_score / relative_strength_score / liquidity_score / catalyst_score` 等结构化字段。
+- [新功能] 新增 `scripts/select_dragon_head_candidates.py` 与 `scripts/collect_dragon_head_snapshots.py`，支持批量扫描“高辨识度核心龙头候选池”并按日期落库为 `dragon_head_candidate` 专题快照，同时补充 `docs/DRAGON_HEAD_CANDIDATE_SCAN.md` 与 `docs/DRAGON_HEAD_SNAPSHOTS.md` 说明。
+- [新功能] 新增 `DragonHeadAnalysisService` 与 `analyze_dragon_head` Agent 工具，并将 `dragon_head` 从“板块强势股策略”升级为“高辨识度核心龙头策略”，按 `辨识度 > 板块地位 > 相对强度 > 流动性 > 催化 > 其它` 的固定优先级识别 `hybrid / logic / capital / pseudo` 四类龙头。
+- [改进] 商品涨价专题新增“辨识度优先”的业绩票固定排序口径：`辨识度 > 持续增长 > 大成交 > 低估值 > 股息率 > 其它`，其中辨识度按“逻辑共识 + 资金共识”实现，并同步用于专题分析结果、候选池排序、专题快照落库与 `/signals` 展示。
+- [新功能] `/signals` 正式接入商品涨价专题快照，新增光纤/内存/硬盘三类专题 tab，并展示 `subtheme / chain_role / pass_through_direction / earnings_release_probability / directness / matched_example_bucket` 等结构化字段。
+- [新功能] 新增专题快照脚本 `scripts/collect_commodity_beneficiary_snapshots.py` 与文档 `docs/COMMODITY_BENEFICIARY_SNAPSHOTS.md`，可将光纤/内存/硬盘等商品涨价受益候选池按日期落库到 `kline_signal_snapshot`，signal_type 使用 `commodity_beneficiary__{commodity}` 命名空间，并记录历史命中统计。
+- [新功能] 新增外置专题配置目录 `config/commodity_pass_through/` 与批量扫描脚本 `scripts/select_commodity_beneficiaries.py`，支持基于光纤/内存/硬盘/铜专题规则与真实 A 股样例白名单/反例，直接导出“商品涨价受益候选池”的 `csv/txt/md` 结果。
+- [改进] `CommodityPassThroughService` 第三版把光纤/内存/硬盘进一步拆成更细的 `subtheme` 映射表，并新增一批真实 A 股样例白名单与反例（如长飞光纤、兆易创新、佰维存储、同有科技，以及中际旭创、工业富联、海康威视等），用于在策略问答里对精确代码做优先纠偏。
+- [改进] 新增结构化分析工具 `analyze_commodity_pass_through` 与 `CommodityPassThroughService`，内置光纤/内存/硬盘/铜的小型商品映射表和 `upstream / midstream / downstream / distribution / weak_proxy` 角色标签，用于在策略问答中更稳定地区分直接受益、间接受益与成本承压公司。
+- [新功能] 新增 Agent 内置策略 `commodity_price_pass_through` 与专题文档 `docs/COMMODITY_PRICE_PASS_THROUGH.md`，按“商品涨价 -> 产业链位置 -> 利润传导 -> 财报验证 -> 技术确认”的链路识别更可能真正释放业绩的 A 股公司，适用于光纤、内存、硬盘等涨价题材的结构化研判。
+- [改进] `/signals` 顶部主导航下新增二级摘要条，按当前视图直接展示日期范围、总命中、当前筛选数量、平均 YTD / 中位 YTD，以及业绩公告日过滤等关键信息，减少切换信号后的二次确认成本。
+- [改进] `/signals` 顶部新增三种快捷视图切换按钮：`百日新高`、`业绩超预期`、`新高且业绩`，保留原有下拉选择的同时，减少在常用信号之间反复切换的操作成本。
+- [改进] `/signals` 新增 `新高且业绩` 组合视图，可直接查看 `hundred_day_high ∩ earnings_surprise` 的同日交集；组合视图支持历史观察、YTD 排序、YTD 快速筛选以及多日对比摘要。
+- [改进] `/signals` 进一步补齐 YTD 维度：多日对比卡片新增 `平均 YTD / 中位 YTD`，当前页支持 `YTD > 0% / 20% / 50%` 快速筛选，并可在页面内切换 `hundred_day_high / earnings_surprise` 两类信号快照。
+- [改进] `earnings_surprise` 快照新增更贴近公告节奏的 `event_date` 口径：优先取业绩快报公告日，其次取业绩预告公告日，最后才回退到报告期；事件去重与 `/signals` 展示同步基于该口径增强。
+- [改进] `/signals` 页面与信号查询接口现在直接带出年内涨幅：`SignalSnapshotService` 会为列表和历史记录补充 `year_start_date / year_start_close / ytd_return_pct`，前端卡片、历史观察与导出内容可直接查看 `hundred_day_high` 等信号在命中日的年内位置。
+- [改进] 新增 `scripts/report_signal_snapshot_ytd.py` 与专题文档 `docs/SIGNAL_SNAPSHOT_YTD.md`，可直接基于已落库 `kline_signal_snapshot` 统计 `hundred_day_high` 等信号在命中日的年内涨幅，默认不传日期时自动取该信号类型最新快照日，无需重新全市场扫描。
+- [改进] 新增 `scripts/select_earnings_surprise_candidates.py` 与专题文档 `docs/EARNINGS_SURPRISE_TRACKING.md`，可按“正向业绩文本 + 同比增长阈值”的透明规则扫描 A 股业绩超预期代理事件，默认按事件键去重落库为 `signal_type=earnings_surprise`，并可直接复用现有 `scripts/evaluate_signal_snapshot_performance.py` 做 `1/3/5/10` 日后续涨跌汇总。
+- [改进] 新增 `scripts/collect_hundred_day_high_profile_snapshots.py`，可按 `hundred_day_high_profile__{profile}` 这类独立 `signal_type` 批量采集多套 profile 的同日快照，避免 `breakout_balanced / momentum_strict / breakout_loose` 在同一天互相覆盖，便于后续按 `3D/5D/10D` 表现正式比较。
+- [改进] 百日新高脚本新增 `--profile` 预设能力，当前内置 `breakout_balanced`、`momentum_strict`、`breakout_loose` 三套口径；落库快照会同步记录 `profile_name`，后续可直接按 profile 做表现对比。
+- [改进] 新增 `scripts/evaluate_signal_snapshot_performance.py`，可直接基于已落库的 `kline_signal_snapshot` 计算 `1/3/5/10` 日等 forward return、胜率、中位数收益、平均最大冲高与平均最深回撤，帮助持续评估 `hundred_day_high` 等信号策略质量。
+- [改进] `--cause-analysis-only` 现在默认只补同日仍为空的归因结果，并新增 `--force-cause-refresh` 用于在需要时显式重跑已有归因，避免日常补全重复处理已完成股票。
+- [改进] 百日新高归因补全新增快路径：可跳过新闻搜索并禁用 LLM 原因卡，仅用已有结构化证据生成 fallback 摘要；现有定时模式已默认使用该快路径控制每日更新耗时。
+- [改进] 现有 `schedule` 模式可选接入百日新高快照日更：开启 `SIGNAL_SNAPSHOT_HUNDRED_DAY_HIGH_ENABLED` 后，会在每日定时分析后自动刷新 `/signals` 所需快照，并可选继续补全归因。
+- [改进] 百日新高脚本改为“先快照、后归因”的两阶段流程：扫描过程中会先增量落库同日快照，后续可用 `--cause-analysis-only` 仅对已落库结果补全归因，不必再次重扫全市场。
+- [改进] Web 前端新增路由级懒加载，并拆分 `charts`、`markdown`、`router`、`http`、`motion-ui`、`icons` 等构建 chunk，降低首页与 `/signals` 等工作台页面的初始包体压力。
 - 📉 **新增信号汇总趋势查看脚本** — 新增 `scripts/report_signal_summary_perf_trend.py`，可直接读取 `signal_summary_perf_history.jsonl`，输出最近记录的规模/耗时/吞吐摘要，并生成 Markdown 小报表，方便后续观察重建耗时趋势。
 - 📈 **信号汇总观测支持追加时间序列日志** — `scripts/rebuild_signal_summary_tables.py` 新增 `--append-jsonl`，可将每次观测/重建结果按 JSON Lines 追加到长期日志文件，便于后续直接对比 `elapsed_seconds`、`throughput`、`snapshot_count` 等趋势。
 - 📊 **信号汇总重建脚本补齐性能观测模式** — `scripts/rebuild_signal_summary_tables.py` 新增 `--report-only` 与 `--report-json`，可直接输出 `snapshot_count / day_count / code_count / daily_summary_count / streak_snapshot_count / elapsed_seconds / throughput` 等观测指标，便于后续在真实库上持续记录重建基线。

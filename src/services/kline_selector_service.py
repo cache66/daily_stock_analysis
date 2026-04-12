@@ -727,6 +727,7 @@ class KlineSelectorService:
         checkpoint_path: Optional[Path] = None,
         checkpoint_every: int = 100,
         resume: bool = False,
+        on_evaluation: Optional[Callable[[KlineSelectionEvaluation, int, int], None]] = None,
     ) -> KlineSelectorRunResult:
         """Scan the A-share universe and return all selected stocks."""
         criteria = criteria or KlineSelectorCriteria()
@@ -831,6 +832,16 @@ class KlineSelectorService:
                 selected.append(evaluation)
             else:
                 failed.append(evaluation)
+
+            if on_evaluation is not None:
+                try:
+                    on_evaluation(evaluation, completed, total_eligible)
+                except Exception as exc:
+                    logger.warning(
+                        "K-line selector on_evaluation callback failed for %s: %s",
+                        evaluation.stock_code,
+                        exc,
+                    )
 
             if completed == 1 or completed % 100 == 0 or completed == total_eligible:
                 logger.info(

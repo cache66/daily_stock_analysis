@@ -631,6 +631,10 @@ class SystemConfigService:
             "SCHEDULE_ENABLED",
             "SCHEDULE_TIME",
             "SCHEDULE_RUN_IMMEDIATELY",
+            "SIGNAL_SNAPSHOT_HUNDRED_DAY_HIGH_ENABLED",
+            "SIGNAL_SNAPSHOT_HUNDRED_DAY_HIGH_CAUSE_ANALYSIS_ENABLED",
+            "BOARD_THEME_CORE_SNAPSHOT_ENABLED",
+            "BOARD_THEME_CORE_SNAPSHOT_TARGETS_JSON",
         }
         if startup_only_schedule_keys:
             warnings.append(

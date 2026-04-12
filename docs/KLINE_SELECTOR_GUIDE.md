@@ -542,6 +542,10 @@ E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\select_hundred_day
 新增能力：
 
 - 会按 `signal_type=hundred_day_high` 将当日命中的股票落到数据库快照表，唯一键是 `(signal_type, signal_date, code)`，同一天重跑会覆盖更新，不会重复累计
+- 如果你要同时积累多套 profile 的同日样本，不能继续共用 `signal_type=hundred_day_high`，否则不同 profile 会在同一天互相覆盖；推荐改用独立命名空间，例如：
+  - `hundred_day_high_profile__breakout_balanced`
+  - `hundred_day_high_profile__momentum_strict`
+  - `hundred_day_high_profile__breakout_loose`
 - 会查询该股票近 `--history-lookback-days` 天内是否也命中过同口径百日新高，并输出：
   - `previous_hit_count`
   - `latest_previous_hit_date`
@@ -551,11 +555,168 @@ E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\select_hundred_day
   - 先收集基本面、所属板块、近期新闻
   - 再做主题级海外映射（如 AI 算力 / 有色涨价 / 创新药等）
   - 最后用 LLM 压缩成 `reason_summary`、`industry_logic`、`news_logic`、`technical_logic`、`cause_tags`、`theme_label`
+- 现在默认按“两阶段”执行：
+  - 阶段 1：扫描过程中命中即先落快照，`/signals` 可以更早看到当天结果
+  - 阶段 2：扫描完成后再统一补全 `reason_summary / industry_logic / news_logic / technical_logic / theme_label`
 - 如需只跑筛选和历史回看、跳过归因，可加：
 
 ```powershell
 E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\select_hundred_day_high_candidates.py --skip-cause-analysis
 ```
+
+当前百日新高脚本也支持直接切换预设 profile：
+
+```powershell
+E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\select_hundred_day_high_candidates.py --profile breakout_balanced
+E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\select_hundred_day_high_candidates.py --profile momentum_strict
+E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\select_hundred_day_high_candidates.py --profile breakout_loose
+```
+
+如果你想从今天开始持续积累三套 profile 的快照样本，推荐直接用新的批量采集脚本：
+
+```powershell
+E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\collect_hundred_day_high_profile_snapshots.py --limit 500 --max-workers 1
+```
+
+说明：
+
+- 脚本会顺序执行三次筛选，并分别落到独立 `signal_type`
+- 默认 signal_type 前缀是 `hundred_day_high_profile`
+- 实际会生成：
+  - `hundred_day_high_profile__breakout_balanced`
+  - `hundred_day_high_profile__momentum_strict`
+  - `hundred_day_high_profile__breakout_loose`
+- 默认只做快照采集，不跑归因，适合先积累后验样本
+- 后续做表现评估时，直接把 `--signal-type` 切到对应 profile 命名空间即可
+
+三套预设的定位建议：
+
+- `breakout_balanced`：当前默认口径，偏“先抓突破，再看后续表现”
+- `momentum_strict`：更强调强势确认，会启用上涨占比和近期涨停规则，并收紧市值/预过滤
+- `breakout_loose`：更偏宽松突破，用于观察更大样本池里的后续演化
+
+如需在预设基础上微调，CLI 显式参数仍会覆盖 profile 默认值，例如：
+
+```powershell
+E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\select_hundred_day_high_candidates.py --profile momentum_strict --skip-recent-limit-up-rule --max-total-mv-yi 450
+```
+
+当前更推荐按下面这组默认参数理解三套 profile：
+
+- `breakout_balanced`
+  - `lookback_days=8`
+  - `min_up_ratio=0.625`
+  - `new_high_window=100`
+  - `max_total_mv_yi=400`
+  - `min_60d_change_pct_prefilter=12`
+  - `min_turnover_rate_prefilter=0.8`
+  - 默认启用：上涨占比规则、正涨幅预过滤、排除 ST
+- `momentum_strict`
+  - `lookback_days=8`
+  - `min_up_ratio=0.67`
+  - `limit_up_lookback_days=8`
+  - `new_high_window=110`
+  - `max_total_mv_yi=70`
+  - `min_60d_change_pct_prefilter=20`
+  - `min_turnover_rate_prefilter=1.2`
+  - 默认启用：上涨占比规则、正涨幅预过滤、排除 ST；默认关闭：近期涨停规则
+- `breakout_loose`
+  - `lookback_days=12`
+  - `min_up_ratio=0.58`
+  - `new_high_window=80`
+  - `max_total_mv_yi=600`
+  - `min_60d_change_pct_prefilter=8`
+  - `min_turnover_rate_prefilter=0.5`
+  - 默认启用：正涨幅预过滤、排除 ST；默认关闭：上涨占比规则、近期涨停规则
+
+这次我偏好的调参方向是：
+
+- `breakout_balanced` 不再放得太松，避免默认结果里混进太多“刚摸高但趋势并不稳定”的票
+- `momentum_strict` 现在更接近 “strict-lite”：仍然偏强趋势确认，但不再死卡近期涨停；同时更明确偏向小中盘强势票，避免和 `breakout_balanced` 过度重合
+- `breakout_loose` 仍然保留大样本观察价值，但不给到完全裸奔的宽松口径
+
+如果你想把“快照落库”和“归因补全”拆成两次运行，推荐这样用：
+
+```powershell
+# 第一阶段：先落快照，页面可先看
+E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\select_hundred_day_high_candidates.py --snapshot-date 2026-04-04 --skip-cause-analysis
+
+# 第二阶段：后补归因，不再重扫全市场
+E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\select_hundred_day_high_candidates.py --snapshot-date 2026-04-04 --cause-analysis-only
+```
+
+说明：
+
+- `--cause-analysis-only` 默认只补“归因仍为空”的同日快照，已补过归因的股票会自动跳过
+- 如果你想基于最新逻辑把同日已有归因也整体重跑一遍，可再加：
+
+```powershell
+E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\select_hundred_day_high_candidates.py --snapshot-date 2026-04-04 --cause-analysis-only --force-cause-refresh
+```
+
+如需进一步走“快速结构化归因”模式，可继续附加：
+
+```powershell
+E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\select_hundred_day_high_candidates.py --snapshot-date 2026-04-04 --cause-analysis-only --disable-news-search --disable-llm-reason-card
+```
+
+说明：
+
+- `--disable-news-search`：跳过新闻搜索，只用强势池、主营业务、板块、基本面等已有结构化信息
+- `--disable-llm-reason-card`：不再调用 LLM 压缩原因卡，直接输出规则化 fallback 摘要
+- 两者一起用时，归因速度会明显更稳，适合日常定时更新
+
+如需接入现有每日定时分析流程，可在 `.env` 或 Web 系统设置中开启：
+
+```env
+SIGNAL_SNAPSHOT_HUNDRED_DAY_HIGH_ENABLED=true
+SIGNAL_SNAPSHOT_HUNDRED_DAY_HIGH_CAUSE_ANALYSIS_ENABLED=false
+```
+
+说明：
+
+- 打开 `SIGNAL_SNAPSHOT_HUNDRED_DAY_HIGH_ENABLED=true` 后，现有 `python main.py --schedule` 每日分析完成后，会自动刷新百日新高快照
+- 若同时打开 `SIGNAL_SNAPSHOT_HUNDRED_DAY_HIGH_CAUSE_ANALYSIS_ENABLED=true`，会继续在快照阶段之后补全归因；当前定时模式默认走“跳过新闻搜索 + 不调用 LLM 原因卡”的快速结构化归因，以控制日更耗时
+- 若只想保证 `/signals` 每天有数据、优先缩短耗时，建议先只开第一项，把第二项保持 `false`
+
+当你想评估这条信号本身有没有持续有效，而不只是看当天命中列表时，可以直接基于已落库快照跑一个轻量表现报告：
+
+```powershell
+E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\evaluate_signal_snapshot_performance.py --signal-type hundred_day_high --start-date 2026-04-01 --end-date 2026-04-30
+```
+
+常用变体：
+
+```powershell
+# 自定义窗口
+E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\evaluate_signal_snapshot_performance.py --signal-type hundred_day_high --windows 1,2,3,5,10
+
+# 只看单只股票
+E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\evaluate_signal_snapshot_performance.py --signal-type hundred_day_high --code 600519
+ 
+# 鍙湅鏌愪釜 profile 鐨勮〃鐜?
+E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\evaluate_signal_snapshot_performance.py --signal-type hundred_day_high --profile momentum_strict --start-date 2026-04-01 --end-date 2026-04-30
+```
+
+脚本会输出两份文件：
+
+- `data/signal_snapshot_performance_report.json`
+- `data/signal_snapshot_performance_report.md`
+
+默认会按窗口给出：
+
+- `total / completed / insufficient`
+- `win_rate_pct`
+- `avg_stock_return_pct`
+- `median_stock_return_pct`
+- `avg_max_runup_pct`
+- `avg_worst_drawdown_pct`
+
+说明：
+
+- 起点价格优先使用快照当天落库的 `close`
+- 若某条快照在对应窗口下未来交易日不足，会记为 `insufficient_data`
+- 当前口径是“信号发生后继续持有”的纯多头 forward return 观察，更适合先比较策略有效性，不等同于完整交易系统回测
 
 如需只导出文件、不写数据库快照，可加：
 

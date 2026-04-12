@@ -1,0 +1,21 @@
+{
+  "key": "copper",
+  "label": "copper",
+  "keywords": [
+    "铜",
+    "铜价",
+    "电解铜",
+    "铜箔",
+    "铜加工",
+    "copper"
+  ],
+  "roles": {
+    "upstream": ["铜矿", "冶炼", "资源", "矿山", "阴极铜"],
+    "midstream": ["铜箔", "铜加工", "铜杆", "制造"],
+    "downstream": ["线缆", "家电", "电机", "终端"],
+    "distribution": ["贸易", "分销", "渠道", "库存"],
+    "weak_proxy": ["有色", "资源"]
+  },
+  "subthemes": [],
+  "examples": []
+}

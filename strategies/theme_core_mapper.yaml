@@ -1,0 +1,124 @@
+name: theme_core_mapper
+display_name: 主题核心映射
+description: 按大主题、真子主题、个股角色和核心度拆解一只股票，判断它到底是直接受益、景气核心、渠道受益还是下游承压。
+category: framework
+core_rules: [2, 3, 7]
+required_tools:
+  - analyze_theme_core_mapper
+  - analyze_commodity_pass_through
+  - analyze_dragon_head
+  - search_stock_news
+aliases: [主题映射, 子主题核心, 核心映射, theme_core]
+default_priority: 100
+market_regimes: [sector_hot]
+
+instructions: |
+  **主题核心映射策略（Theme Core Mapper）**
+
+  这套策略用于解决一个常见误区：
+  同属一个大方向的股票，不一定属于同一条交易逻辑。
+
+  例如：
+  - 长飞光纤和中际旭创都可归到光通信
+  - 但前者更接近光纤涨价源头受益
+  - 后者更接近 CPO / 光模块景气核心
+
+  所以，这套策略不直接回答“这票涨不涨”，而是先拆清楚：
+  1. 它属于哪个大主题
+  2. 它属于哪个真子主题
+  3. 它在子主题里扮演什么角色
+  4. 它是不是这个子主题里的核心股
+
+  ## 一、先看三层结构
+
+  先调用 `analyze_theme_core_mapper`，优先读取：
+
+  - `theme_key`
+  - `subtheme_key`
+  - `stock_role`
+  - `core_driver_type`
+  - `theme_core_probability`
+  - `subtheme_core_probability`
+  - `is_direct_beneficiary`
+  - `leader_type`
+  - `leader_probability`
+
+  三层结构含义：
+
+  - `theme_key`
+    - 大主题
+    - 例如 `optical_communication`
+  - `subtheme_key`
+    - 真正驱动交易的细分子主题
+    - 例如 `preform_and_materials`、`optical_module_and_cpo`
+  - `stock_role`
+    - 个股在子主题中的角色
+    - 常见包括：
+      - `source_beneficiary`
+      - `manufacturing_beneficiary`
+      - `prosperity_core`
+      - `channel_beneficiary`
+      - `downstream_cost_pressure`
+      - `theme_proxy`
+
+  ## 二、不要把“同大主题”误当成“同逻辑”
+
+  如果两只股票：
+
+  - `theme_key` 相同
+  - 但 `subtheme_key` 不同
+
+  则默认判定它们不属于同一条交易主逻辑。
+
+  尤其要区分：
+
+  - `source_beneficiary`
+    - 更偏源头受益、价格传导
+  - `prosperity_core`
+    - 更偏子主题景气核心、资金主线
+  - `downstream_cost_pressure`
+    - 更偏下游承压，不能误判为受益
+
+  ## 三、核心股不等于直接受益股
+
+  这套策略强调：
+
+  - 一只票可以不是直接涨价受益股
+  - 但依然可能是某个子主题里的核心股
+
+  例如：
+  - `is_direct_beneficiary = false`
+  - 但 `subtheme_core_probability = high`
+
+  这种情况下，结论应写成：
+  “它不是源头受益股，但它是另一个子主题里的核心强股。”
+
+  ## 四、核心度判断顺序
+
+  优先判断：
+  `子主题核心度 > 大主题核心度 > 是否直接受益`
+
+  因为很多真正的强票，先是子主题核心，后来才被市场扩散理解为整个大主题的代表股。
+
+  ## 五、输出要求
+
+  最终回答至少要写清：
+
+  1. 这只票的大主题是什么
+  2. 真子主题是什么
+  3. 个股角色是什么
+  4. 它是不是这个子主题里的核心股
+  5. 它是不是直接受益股
+  6. 如果不是直接受益股，它强在什么地方
+
+  输出时优先使用这种句式：
+
+  - “它属于同一个大主题，但不是同一条交易逻辑。”
+  - “它不是直接受益股，而是子主题景气核心。”
+  - “它更像源头受益，而不是泛题材映射。”
+
+  ## 六、禁区
+
+  - 禁止因为大板块名称相同，就默认视为同一逻辑
+  - 禁止把“景气核心”误写成“直接涨价受益”
+  - 禁止把“直接受益”与“资金最强”混为一谈

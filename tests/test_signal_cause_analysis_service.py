@@ -67,10 +67,14 @@ class _FailingSearchService:
 
 
 class _FakeAnalyzer:
+    def __init__(self):
+        self.calls = 0
+
     def is_available(self) -> bool:
         return True
 
     def generate_text(self, prompt: str, max_tokens: int = 700, temperature: float = 0.2):
+        self.calls += 1
         return """
         ```json
         {
@@ -108,10 +112,11 @@ class _BareManager:
 
 class SignalCauseAnalysisServiceTestCase(unittest.TestCase):
     def test_analyze_signal_maps_theme_and_normalizes_llm_card(self):
+        analyzer = _FakeAnalyzer()
         service = SignalCauseAnalysisService(
             manager=_FakeManager(),
             search_service=_FakeSearchService(),
-            analyzer=_FakeAnalyzer(),
+            analyzer=analyzer,
         )
         service._fetch_signal_pool_profile = MagicMock(return_value={})
         service._fetch_business_profile = MagicMock(return_value={})
@@ -133,6 +138,7 @@ class SignalCauseAnalysisServiceTestCase(unittest.TestCase):
         self.assertTrue(payload["industry_logic"])
         self.assertTrue(payload["news_logic"])
         self.assertTrue(payload["technical_logic"])
+        self.assertEqual(analyzer.calls, 1)
 
     def test_analyze_signal_falls_back_when_news_or_llm_unavailable(self):
         service = SignalCauseAnalysisService(
@@ -194,6 +200,58 @@ class SignalCauseAnalysisServiceTestCase(unittest.TestCase):
         self.assertIn("化学制药", payload["industry_logic"])
         self.assertIn("当前未检索到足够稳定的公开消息催化", payload["news_logic"])
         self.assertIn("20 日新高", payload["technical_logic"])
+
+    def test_analyze_signal_can_skip_news_search_for_fast_structured_fallback(self):
+        analyzer = _FakeAnalyzer()
+        service = SignalCauseAnalysisService(
+            manager=_BareManager(),
+            search_service=_FailingSearchService(),
+            analyzer=analyzer,
+            enable_news_search=False,
+            enable_reason_card_llm=False,
+        )
+        service._fetch_signal_pool_profile = MagicMock(
+            return_value={"industry": "化学制药", "entry_reason": "60日新高"}
+        )
+        service._fetch_business_profile = MagicMock(
+            return_value={"main_business": "医药制造。", "industry_hint": "医药制造"}
+        )
+
+        payload = service.analyze_signal(
+            "300006",
+            "莱美药业",
+            signal_type="hundred_day_high",
+            metrics_payload={"signal_date": "2026-04-04", "latest_high": 6.52, "new_high_window": 20},
+        )
+
+        self.assertEqual(payload["analysis_status"], "fallback")
+        self.assertEqual(payload["news_items"], [])
+        self.assertEqual(analyzer.calls, 0)
+        self.assertTrue(payload["reason_summary"])
+
+    def test_analyze_signal_skips_llm_when_no_news_evidence_exists(self):
+        analyzer = _FakeAnalyzer()
+        service = SignalCauseAnalysisService(
+            manager=_BareManager(),
+            search_service=_FailingSearchService(),
+            analyzer=analyzer,
+        )
+        service._fetch_signal_pool_profile = MagicMock(
+            return_value={"industry": "化学制药", "entry_reason": "60日新高"}
+        )
+        service._fetch_business_profile = MagicMock(
+            return_value={"main_business": "医药制造。", "industry_hint": "医药制造"}
+        )
+
+        payload = service.analyze_signal(
+            "300006",
+            "莱美药业",
+            signal_type="hundred_day_high",
+            metrics_payload={"signal_date": "2026-04-04", "latest_high": 6.52, "new_high_window": 20},
+        )
+
+        self.assertEqual(payload["analysis_status"], "fallback")
+        self.assertEqual(analyzer.calls, 0)
 
     def test_map_overseas_theme_avoids_false_positive_from_business_field_names(self):
         service = SignalCauseAnalysisService(

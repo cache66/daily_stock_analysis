@@ -87,6 +87,14 @@ class MainScheduleModeTestCase(unittest.TestCase):
             "schedule_enabled": False,
             "schedule_time": "18:00",
             "schedule_run_immediately": True,
+            "signal_snapshot_hundred_day_high_enabled": False,
+            "signal_snapshot_hundred_day_high_cause_analysis_enabled": False,
+            "board_recognizability_snapshot_enabled": False,
+            "board_recognizability_snapshot_source_signal_type": "hundred_day_high",
+            "board_recognizability_snapshot_top_n": 3,
+            "board_theme_core_snapshot_enabled": False,
+            "board_theme_core_snapshot_targets_json": "",
+            "trading_day_check_enabled": True,
             "run_immediately": True,
         }
         defaults.update(overrides)
@@ -171,6 +179,182 @@ class MainScheduleModeTestCase(unittest.TestCase):
             {"schedule_time": "18:00", "resolved_schedule_time": "09:30"},
         )
         run_full_analysis.assert_called_once_with(runtime_config, args, None)
+
+    def test_schedule_mode_runs_signal_snapshot_update_when_enabled(self) -> None:
+        args = self._make_args(schedule=True)
+        config = self._make_config(
+            schedule_enabled=True,
+            signal_snapshot_hundred_day_high_enabled=True,
+        )
+
+        def fake_run_with_schedule(
+            task,
+            schedule_time,
+            run_immediately,
+            background_tasks=None,
+            schedule_time_provider=None,
+        ):
+            task()
+
+        with patch("main.parse_arguments", return_value=args), \
+             patch("main.get_config", return_value=config), \
+             patch("main._reload_runtime_config", return_value=config), \
+             patch("main._build_schedule_time_provider", return_value=lambda: "18:00"), \
+             patch("main.setup_logging"), \
+             patch("main.run_full_analysis") as run_full_analysis, \
+             patch("main._run_optional_signal_snapshot_tasks") as snapshot_task, \
+             patch("src.scheduler.run_with_schedule", side_effect=fake_run_with_schedule):
+            exit_code = main.main()
+
+        self.assertEqual(exit_code, 0)
+        run_full_analysis.assert_called_once_with(config, args, None)
+        snapshot_task.assert_called_once_with(config)
+
+    def test_schedule_mode_runs_board_theme_core_snapshot_update_when_enabled(self) -> None:
+        args = self._make_args(schedule=True)
+        config = self._make_config(
+            schedule_enabled=True,
+            board_theme_core_snapshot_enabled=True,
+            board_theme_core_snapshot_targets_json='[{"board_name":"CPO","board_type":"concept","commodity_hint":"optical_fiber"}]',
+        )
+
+        def fake_run_with_schedule(
+            task,
+            schedule_time,
+            run_immediately,
+            background_tasks=None,
+            schedule_time_provider=None,
+        ):
+            task()
+
+        with patch("main.parse_arguments", return_value=args), \
+             patch("main.get_config", return_value=config), \
+             patch("main._reload_runtime_config", return_value=config), \
+             patch("main._build_schedule_time_provider", return_value=lambda: "18:00"), \
+             patch("main.setup_logging"), \
+             patch("main.run_full_analysis") as run_full_analysis, \
+             patch("main._run_optional_signal_snapshot_tasks") as snapshot_task, \
+             patch("main._run_optional_board_theme_core_snapshot_tasks") as board_snapshot_task, \
+             patch("src.scheduler.run_with_schedule", side_effect=fake_run_with_schedule):
+            exit_code = main.main()
+
+        self.assertEqual(exit_code, 0)
+        run_full_analysis.assert_called_once_with(config, args, None)
+        snapshot_task.assert_called_once_with(config)
+        board_snapshot_task.assert_called_once_with(config)
+
+    def test_schedule_mode_runs_board_recognizability_snapshot_update_when_enabled(self) -> None:
+        args = self._make_args(schedule=True)
+        config = self._make_config(
+            schedule_enabled=True,
+            board_recognizability_snapshot_enabled=True,
+            board_recognizability_snapshot_source_signal_type="hundred_day_high",
+            board_recognizability_snapshot_top_n=3,
+        )
+
+        def fake_run_with_schedule(
+            task,
+            schedule_time,
+            run_immediately,
+            background_tasks=None,
+            schedule_time_provider=None,
+        ):
+            task()
+
+        with patch("main.parse_arguments", return_value=args), \
+             patch("main.get_config", return_value=config), \
+             patch("main._reload_runtime_config", return_value=config), \
+             patch("main._build_schedule_time_provider", return_value=lambda: "18:00"), \
+             patch("main.setup_logging"), \
+             patch("main.run_full_analysis") as run_full_analysis, \
+             patch("main._run_optional_signal_snapshot_tasks") as snapshot_task, \
+             patch("main._run_optional_board_recognizability_snapshot_tasks") as board_recognizability_task, \
+             patch("main._run_optional_board_theme_core_snapshot_tasks") as board_snapshot_task, \
+             patch("src.scheduler.run_with_schedule", side_effect=fake_run_with_schedule):
+            exit_code = main.main()
+
+        self.assertEqual(exit_code, 0)
+        run_full_analysis.assert_called_once_with(config, args, None)
+        snapshot_task.assert_called_once_with(config)
+        board_recognizability_task.assert_called_once_with(config)
+        board_snapshot_task.assert_called_once_with(config)
+
+    def test_run_optional_signal_snapshot_tasks_uses_fast_snapshot_stage_by_default(self) -> None:
+        config = self._make_config(
+            signal_snapshot_hundred_day_high_enabled=True,
+            signal_snapshot_hundred_day_high_cause_analysis_enabled=False,
+            trading_day_check_enabled=True,
+        )
+
+        with patch("src.core.trading_calendar.get_market_now", return_value=datetime(2026, 4, 6, 18, 0, 0)), \
+             patch("src.core.trading_calendar.is_market_open", return_value=True), \
+             patch("main.subprocess.run") as run_mock:
+            main._run_optional_signal_snapshot_tasks(config)
+
+        command = run_mock.call_args.kwargs["args"] if "args" in run_mock.call_args.kwargs else run_mock.call_args.args[0]
+        self.assertIn("--skip-cause-analysis", command)
+
+    def test_run_optional_signal_snapshot_tasks_can_enable_cause_backfill(self) -> None:
+        config = self._make_config(
+            signal_snapshot_hundred_day_high_enabled=True,
+            signal_snapshot_hundred_day_high_cause_analysis_enabled=True,
+            trading_day_check_enabled=True,
+        )
+
+        with patch("src.core.trading_calendar.get_market_now", return_value=datetime(2026, 4, 6, 18, 0, 0)), \
+             patch("src.core.trading_calendar.is_market_open", return_value=True), \
+             patch("main.subprocess.run") as run_mock:
+            main._run_optional_signal_snapshot_tasks(config)
+
+        command = run_mock.call_args.kwargs["args"] if "args" in run_mock.call_args.kwargs else run_mock.call_args.args[0]
+        self.assertNotIn("--skip-cause-analysis", command)
+        self.assertIn("--disable-news-search", command)
+        self.assertIn("--disable-llm-reason-card", command)
+
+    def test_run_optional_board_theme_core_snapshot_tasks_runs_for_each_target(self) -> None:
+        config = self._make_config(
+            board_theme_core_snapshot_enabled=True,
+            board_theme_core_snapshot_targets_json=(
+                '[{"board_name":"CPO","board_type":"concept","commodity_hint":"optical_fiber"},'
+                '{"board_name":"通信设备","board_type":"industry"}]'
+            ),
+            trading_day_check_enabled=True,
+        )
+
+        with patch("src.core.trading_calendar.get_market_now", return_value=datetime(2026, 4, 6, 18, 0, 0)), \
+             patch("src.core.trading_calendar.is_market_open", return_value=True), \
+             patch("main.subprocess.run") as run_mock:
+            main._run_optional_board_theme_core_snapshot_tasks(config)
+
+        self.assertEqual(run_mock.call_count, 2)
+        first_command = run_mock.call_args_list[0].kwargs.get("args") or run_mock.call_args_list[0].args[0]
+        second_command = run_mock.call_args_list[1].kwargs.get("args") or run_mock.call_args_list[1].args[0]
+        self.assertIn("collect_board_theme_core_snapshots.py", " ".join(first_command))
+        self.assertIn("--board-name", first_command)
+        self.assertIn("CPO", first_command)
+        self.assertIn("--commodity-hint", first_command)
+        self.assertIn("optical_fiber", first_command)
+        self.assertIn("通信设备", second_command)
+
+    def test_run_optional_board_recognizability_snapshot_tasks_builds_command(self) -> None:
+        config = self._make_config(
+            board_recognizability_snapshot_enabled=True,
+            board_recognizability_snapshot_source_signal_type="hundred_day_high",
+            board_recognizability_snapshot_top_n=5,
+            trading_day_check_enabled=True,
+        )
+
+        with patch("src.core.trading_calendar.get_market_now", return_value=datetime(2026, 4, 6, 18, 0, 0)), \
+             patch("src.core.trading_calendar.is_market_open", return_value=True), \
+             patch("main.subprocess.run") as run_mock:
+            main._run_optional_board_recognizability_snapshot_tasks(config)
+
+        command = run_mock.call_args.kwargs["args"] if "args" in run_mock.call_args.kwargs else run_mock.call_args.args[0]
+        self.assertIn("collect_board_recognizability_rankings.py", " ".join(command))
+        self.assertIn("--source-signal-type", command)
+        self.assertIn("hundred_day_high", command)
+        self.assertIn("--top-n", command)
+        self.assertIn("5", command)
 
     def test_reload_runtime_config_preserves_process_env_overrides(self) -> None:
         self.env_path.write_text(

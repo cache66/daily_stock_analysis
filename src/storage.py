@@ -259,6 +259,8 @@ class KlineSignalDailySummary(Base):
     signal_date = Column(Date, nullable=False, index=True)
     total_count = Column(Integer, nullable=False, default=0)
     continuous_count = Column(Integer, nullable=False, default=0)
+    avg_ytd_return_pct = Column(Float)
+    median_ytd_return_pct = Column(Float)
     top_codes_json = Column(Text, nullable=False, default="[]")
     codes_json = Column(Text, nullable=False, default="[]")
     code_to_name_json = Column(Text, nullable=False, default="{}")
@@ -786,6 +788,7 @@ class DatabaseManager:
         
         # 创建所有表
         Base.metadata.create_all(self._engine)
+        self._ensure_schema_compatibility()
 
         self._initialized = True
         logger.info(f"数据库初始化完成: {db_url}")
@@ -825,6 +828,41 @@ class DatabaseManager:
                 logger.debug("数据库引擎已清理")
         except Exception as e:
             logger.warning(f"清理数据库引擎时出错: {e}")
+
+    def _ensure_schema_compatibility(self) -> None:
+        """Best-effort additive schema upgrades for SQLite file DBs."""
+        if not self._is_sqlite_engine:
+            return
+        self._ensure_sqlite_column(
+            table_name="kline_signal_daily_summary",
+            column_name="avg_ytd_return_pct",
+            column_sql="FLOAT",
+        )
+        self._ensure_sqlite_column(
+            table_name="kline_signal_daily_summary",
+            column_name="median_ytd_return_pct",
+            column_sql="FLOAT",
+        )
+
+    def _ensure_sqlite_column(self, *, table_name: str, column_name: str, column_sql: str) -> None:
+        if not self._is_sqlite_engine:
+            return
+        try:
+            with self._engine.begin() as connection:
+                rows = connection.exec_driver_sql(f"PRAGMA table_info({table_name})").fetchall()
+                existing_columns = {str(row[1]) for row in rows}
+                if column_name in existing_columns:
+                    return
+                connection.exec_driver_sql(
+                    f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}"
+                )
+        except Exception as exc:
+            logger.debug(
+                "SQLite schema compatibility patch skipped: table=%s column=%s err=%s",
+                table_name,
+                column_name,
+                exc,
+            )
 
     def _install_sqlite_pragma_handler(self) -> None:
         """为 SQLite 连接安装竞争保护参数。"""
@@ -1833,6 +1871,51 @@ class DatabaseManager:
             result = session.execute(stmt).scalar_one()
             return int(result or 0)
 
+    def list_signal_snapshot_signal_types(
+        self,
+        *,
+        signal_date: Optional[Any] = None,
+        start_date: Optional[Any] = None,
+        end_date: Optional[Any] = None,
+        code: Optional[str] = None,
+        codes: Optional[List[str]] = None,
+        prefix: Optional[str] = None,
+    ) -> List[str]:
+        """List distinct signal types under the same filters used by snapshot queries."""
+        conditions = []
+        normalized_date = self._coerce_date(signal_date) if signal_date is not None else None
+        normalized_start = self._coerce_date(start_date) if start_date is not None else None
+        normalized_end = self._coerce_date(end_date) if end_date is not None else None
+        normalized_prefix = str(prefix or "").strip()
+
+        if normalized_date is not None:
+            conditions.append(KlineSignalSnapshot.signal_date == normalized_date)
+        elif normalized_start is not None or normalized_end is not None:
+            if normalized_start is not None:
+                conditions.append(KlineSignalSnapshot.signal_date >= normalized_start)
+            if normalized_end is not None:
+                conditions.append(KlineSignalSnapshot.signal_date <= normalized_end)
+
+        normalized_codes = [
+            str(item).strip()
+            for item in (codes or [])
+            if str(item).strip()
+        ]
+        if normalized_codes:
+            conditions.append(KlineSignalSnapshot.code.in_(normalized_codes))
+        elif code:
+            conditions.append(KlineSignalSnapshot.code == str(code).strip())
+
+        if normalized_prefix:
+            conditions.append(KlineSignalSnapshot.signal_type.like(f"{normalized_prefix}%"))
+
+        with self.get_session() as session:
+            stmt = select(KlineSignalSnapshot.signal_type).distinct()
+            if conditions:
+                stmt = stmt.where(and_(*conditions))
+            stmt = stmt.order_by(KlineSignalSnapshot.signal_type)
+            return [str(row[0]) for row in session.execute(stmt).all() if str(row[0] or "").strip()]
+
     def _rebuild_signal_daily_summary(
         self,
         session: Session,
@@ -1844,6 +1927,7 @@ class DatabaseManager:
             select(
                 KlineSignalSnapshot.code,
                 KlineSignalSnapshot.name,
+                KlineSignalSnapshot.metrics_payload,
                 KlineSignalSnapshot.history_payload,
             )
             .where(
@@ -1874,13 +1958,18 @@ class DatabaseManager:
         codes: List[str] = []
         code_to_name: Dict[str, Optional[str]] = {}
         continuous_count = 0
-        for code_value, name_value, history_payload in rows:
+        ytd_returns: List[float] = []
+        for code_value, name_value, metrics_payload, history_payload in rows:
             normalized_code = str(code_value or "").strip()
             if not normalized_code:
                 continue
             codes.append(normalized_code)
             if normalized_code not in code_to_name:
                 code_to_name[normalized_code] = name_value
+            metrics = self._safe_json_loads(metrics_payload, {})
+            ytd_return_pct = self._to_float(metrics.get("ytd_return_pct"))
+            if ytd_return_pct is not None:
+                ytd_returns.append(ytd_return_pct)
             history = self._safe_json_loads(history_payload, {})
             previous_hits = int(history.get("previous_hit_count", 0) or 0)
             days_since_previous_hit = history.get("days_since_previous_hit")
@@ -1900,6 +1989,16 @@ class DatabaseManager:
         )
         row.total_count = len(ordered_codes)
         row.continuous_count = continuous_count
+        row.avg_ytd_return_pct = round(sum(ytd_returns) / len(ytd_returns), 2) if ytd_returns else None
+        if ytd_returns:
+            ordered_ytd = sorted(ytd_returns)
+            mid = len(ordered_ytd) // 2
+            if len(ordered_ytd) % 2 == 1:
+                row.median_ytd_return_pct = round(ordered_ytd[mid], 2)
+            else:
+                row.median_ytd_return_pct = round((ordered_ytd[mid - 1] + ordered_ytd[mid]) / 2, 2)
+        else:
+            row.median_ytd_return_pct = None
         row.top_codes_json = self._safe_json_dumps(top_codes)
         row.codes_json = self._safe_json_dumps(ordered_codes)
         row.code_to_name_json = self._safe_json_dumps(code_to_name)

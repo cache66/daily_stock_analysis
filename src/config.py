@@ -661,6 +661,13 @@ class Config:
     schedule_enabled: bool = False            # 是否启用定时任务
     schedule_time: str = "18:00"              # 每日推送时间（HH:MM 格式）
     schedule_run_immediately: bool = True     # 启动时是否立即执行一次
+    signal_snapshot_hundred_day_high_enabled: bool = False  # 是否在定时任务中更新百日新高快照
+    signal_snapshot_hundred_day_high_cause_analysis_enabled: bool = False  # 是否在定时任务中补全百日新高归因
+    board_recognizability_snapshot_enabled: bool = False  # 是否在定时任务中更新板块辨识度快照
+    board_recognizability_snapshot_source_signal_type: str = "hundred_day_high"  # 板块辨识度快照来源信号类型
+    board_recognizability_snapshot_top_n: int = 3  # 每个板块保留前 N 名
+    board_theme_core_snapshot_enabled: bool = False  # 是否在定时任务中更新模块主题核心快照
+    board_theme_core_snapshot_targets_json: str = ""  # JSON array of board snapshot targets
     run_immediately: bool = True              # 启动时是否立即执行一次（非定时模式）
     market_review_enabled: bool = True        # 是否启用大盘复盘
     # 大盘复盘市场区域：cn(A股)、us(美股)、both(两者)，us 适合仅关注美股的用户
@@ -1315,6 +1322,49 @@ class Config:
             ).lower() == 'true',
             schedule_time=(schedule_time_value or '18:00').strip() or '18:00',
             schedule_run_immediately=schedule_run_immediately,
+            signal_snapshot_hundred_day_high_enabled=cls._resolve_env_value(
+                'SIGNAL_SNAPSHOT_HUNDRED_DAY_HIGH_ENABLED',
+                default='false',
+                prefer_env_file=True,
+            ).lower() == 'true',
+            signal_snapshot_hundred_day_high_cause_analysis_enabled=cls._resolve_env_value(
+                'SIGNAL_SNAPSHOT_HUNDRED_DAY_HIGH_CAUSE_ANALYSIS_ENABLED',
+                default='false',
+                prefer_env_file=True,
+            ).lower() == 'true',
+            board_recognizability_snapshot_enabled=cls._resolve_env_value(
+                'BOARD_RECOGNIZABILITY_SNAPSHOT_ENABLED',
+                default='false',
+                prefer_env_file=True,
+            ).lower() == 'true',
+            board_recognizability_snapshot_source_signal_type=(
+                cls._resolve_env_value(
+                    'BOARD_RECOGNIZABILITY_SNAPSHOT_SOURCE_SIGNAL_TYPE',
+                    default='hundred_day_high',
+                    prefer_env_file=True,
+                ) or 'hundred_day_high'
+            ).strip() or 'hundred_day_high',
+            board_recognizability_snapshot_top_n=parse_env_int(
+                cls._resolve_env_value(
+                    'BOARD_RECOGNIZABILITY_SNAPSHOT_TOP_N',
+                    default='3',
+                    prefer_env_file=True,
+                ),
+                3,
+                field_name='BOARD_RECOGNIZABILITY_SNAPSHOT_TOP_N',
+                minimum=1,
+                maximum=20,
+            ),
+            board_theme_core_snapshot_enabled=cls._resolve_env_value(
+                'BOARD_THEME_CORE_SNAPSHOT_ENABLED',
+                default='false',
+                prefer_env_file=True,
+            ).lower() == 'true',
+            board_theme_core_snapshot_targets_json=cls._resolve_env_value(
+                'BOARD_THEME_CORE_SNAPSHOT_TARGETS_JSON',
+                default='',
+                prefer_env_file=True,
+            ) or '',
             run_immediately=legacy_run_immediately,
             market_review_enabled=os.getenv('MARKET_REVIEW_ENABLED', 'true').lower() == 'true',
             market_review_region=cls._parse_market_review_region(

@@ -107,7 +107,7 @@ class SignalSnapshotStorageTestCase(unittest.TestCase):
             code="600001",
             name="绀轰緥涓€",
             criteria_payload={"criteria": {"new_high_window": 100}},
-            metrics_payload={"close": 10.1, "latest_high": 10.5},
+            metrics_payload={"close": 10.1, "latest_high": 10.5, "ytd_return_pct": 20.0},
             cause_payload={"industry": "鐧介厭", "theme_label": "娑堣垂"},
             history_payload={"previous_hit_count": 0, "days_since_previous_hit": None},
         )
@@ -117,7 +117,7 @@ class SignalSnapshotStorageTestCase(unittest.TestCase):
             code="600001",
             name="绀轰緥涓€",
             criteria_payload={"criteria": {"new_high_window": 100}},
-            metrics_payload={"close": 10.4, "latest_high": 10.8},
+            metrics_payload={"close": 10.4, "latest_high": 10.8, "ytd_return_pct": 21.0},
             cause_payload={"industry": "鐧介厭", "theme_label": "娑堣垂"},
             history_payload={"previous_hit_count": 1, "days_since_previous_hit": 1},
         )
@@ -127,7 +127,7 @@ class SignalSnapshotStorageTestCase(unittest.TestCase):
             code="600002",
             name="绀轰緥浜?",
             criteria_payload={"criteria": {"new_high_window": 100}},
-            metrics_payload={"close": 20.4, "latest_high": 20.8},
+            metrics_payload={"close": 20.4, "latest_high": 20.8, "ytd_return_pct": 40.0},
             cause_payload={"industry": "鍖栧伐", "theme_label": ""},
             history_payload={"previous_hit_count": 0, "days_since_previous_hit": None},
         )
@@ -141,6 +141,8 @@ class SignalSnapshotStorageTestCase(unittest.TestCase):
         self.assertEqual(daily_summaries[0].signal_date.isoformat(), "2026-04-05")
         self.assertEqual(daily_summaries[0].total_count, 2)
         self.assertEqual(daily_summaries[0].continuous_count, 1)
+        self.assertEqual(daily_summaries[0].avg_ytd_return_pct, 30.5)
+        self.assertEqual(daily_summaries[0].median_ytd_return_pct, 30.5)
         self.assertIn("600001", json.loads(daily_summaries[0].codes_json))
 
         streak_rows = self.db.get_signal_streak_snapshots(

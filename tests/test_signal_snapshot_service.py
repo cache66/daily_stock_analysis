@@ -9,7 +9,7 @@ from unittest.mock import MagicMock
 
 from src.config import Config
 from src.services.signal_snapshot_service import SignalSnapshotService
-from src.storage import DatabaseManager
+from src.storage import DatabaseManager, StockDaily
 
 
 class SignalSnapshotServiceTestCase(unittest.TestCase):
@@ -65,8 +65,22 @@ class SignalSnapshotServiceTestCase(unittest.TestCase):
             },
         )
 
+    def _seed_daily_bar(self, *, code: str, bar_date: str, close: float) -> None:
+        with self.db.session_scope() as session:
+            session.add(
+                StockDaily(
+                    code=code,
+                    date=self.service._coerce_date(bar_date),
+                    high=close,
+                    low=close,
+                    close=close,
+                )
+            )
+
     def test_get_snapshot_list_returns_structured_fields(self) -> None:
         self._seed_snapshot(signal_date="2026-04-04", latest_high=1818.0, close=1800.0)
+        self._seed_daily_bar(code="600519", bar_date="2026-01-02", close=1500.0)
+        self._seed_daily_bar(code="600519", bar_date="2026-04-04", close=1800.0)
 
         result = self.service.get_snapshot_list(
             signal_type="hundred_day_high",
@@ -84,12 +98,89 @@ class SignalSnapshotServiceTestCase(unittest.TestCase):
         self.assertEqual(item["theme_label"], "消费涨价 / 食品饮料")
         self.assertEqual(item["latest_high"], 1818.0)
         self.assertEqual(item["close"], 1800.0)
+        self.assertEqual(item["year_start_date"], "2026-01-02")
+        self.assertEqual(item["year_start_close"], 1500.0)
+        self.assertAlmostEqual(item["ytd_return_pct"], 20.0)
+
+    def test_get_snapshot_list_supports_composite_new_high_with_earnings(self) -> None:
+        self.db.upsert_signal_snapshot(
+            signal_type="hundred_day_high",
+            signal_date="2026-04-05",
+            code="600488",
+            name="娲ヨ嵂鑽笟",
+            criteria_payload={"criteria": {"new_high_window": 100}},
+            metrics_payload={"close": 7.67, "latest_high": 7.8, "window_high": 7.8, "history_source": "test"},
+            cause_payload={"industry": "鍖栧鍒惰嵂", "reason_summary": "鏂伴珮寤剁画", "theme_label": "鍒涙柊鑽? / 鍖荤枟鏈嶅姟"},
+            history_payload={"previous_hit_count": 0, "days_since_previous_hit": None},
+        )
+        self.db.upsert_signal_snapshot(
+            signal_type="earnings_surprise",
+            signal_date="2026-04-05",
+            code="600488",
+            name="娲ヨ嵂鑽笟",
+            criteria_payload={"signal_type": "earnings_surprise"},
+            metrics_payload={
+                "close": 7.67,
+                "event_date": "2026-04-04",
+                "forecast_summary": "涓氱哗棰勫",
+                "signal_score": 2,
+            },
+            cause_payload={"reason_summary": "涓氱哗鍚戝ソ"},
+            history_payload={"previous_hit_count": 0, "days_since_previous_hit": None},
+        )
+        self._seed_daily_bar(code="600488", bar_date="2026-01-02", close=4.14)
+
+        result = self.service.get_snapshot_list(
+            signal_type="hundred_day_high_with_earnings",
+            signal_date="2026-04-05",
+        )
+
+        self.assertEqual(result["total"], 1)
+        item = result["items"][0]
+        self.assertEqual(item["code"], "600488")
+        self.assertEqual(item["event_date"], "2026-04-04")
+        self.assertAlmostEqual(item["ytd_return_pct"], 85.27, places=2)
+
+    def test_get_signal_history_supports_composite_new_high_with_earnings(self) -> None:
+        for signal_day in ("2026-04-04", "2026-04-05"):
+            self.db.upsert_signal_snapshot(
+                signal_type="hundred_day_high",
+                signal_date=signal_day,
+                code="600488",
+                name="娲ヨ嵂鑽笟",
+                criteria_payload={"criteria": {"new_high_window": 100}},
+                metrics_payload={"close": 7.67, "latest_high": 7.8, "window_high": 7.8},
+                cause_payload={"industry": "鍖栧鍒惰嵂", "reason_summary": "鏂伴珮"},
+                history_payload={"previous_hit_count": 0, "days_since_previous_hit": None},
+            )
+            self.db.upsert_signal_snapshot(
+                signal_type="earnings_surprise",
+                signal_date=signal_day,
+                code="600488",
+                name="娲ヨ嵂鑽笟",
+                criteria_payload={"signal_type": "earnings_surprise"},
+                metrics_payload={"close": 7.67, "event_date": "2026-04-04"},
+                cause_payload={"reason_summary": "涓氱哗鍚戝ソ"},
+                history_payload={"previous_hit_count": 0, "days_since_previous_hit": None},
+            )
+        self._seed_daily_bar(code="600488", bar_date="2026-01-02", close=4.14)
+
+        result = self.service.get_signal_history(
+            signal_type="hundred_day_high_with_earnings",
+            code="600488",
+            days=30,
+        )
+
+        self.assertEqual(result["total"], 2)
+        self.assertEqual(result["continuity"]["current_streak_count"], 2)
+        self.assertEqual(result["items"][0]["event_date"], "2026-04-04")
 
     def test_get_signal_history_builds_continuity_and_drawdown(self) -> None:
         self._seed_snapshot(signal_date="2026-04-04", latest_high=1818.0, close=1780.0)
         self._seed_snapshot(signal_date="2026-04-03", latest_high=1790.0, close=1770.0)
         self._seed_snapshot(signal_date="2026-04-02", latest_high=1760.0, close=1755.0)
         self._seed_snapshot(signal_date="2026-03-28", latest_high=1825.0, close=1800.0)
+        self._seed_daily_bar(code="600519", bar_date="2026-01-02", close=1500.0)
 
         result = self.service.get_signal_history(
             signal_type="hundred_day_high",
@@ -108,6 +199,7 @@ class SignalSnapshotServiceTestCase(unittest.TestCase):
         self.assertEqual(result["drawdown"]["max_signal_high_date"], "2026-03-28")
         self.assertAlmostEqual(result["drawdown"]["distance_from_max_signal_high_pct"], -2.47, places=2)
         self.assertAlmostEqual(result["drawdown"]["distance_from_latest_signal_high_pct"], -2.09, places=2)
+        self.assertAlmostEqual(result["items"][0]["ytd_return_pct"], 18.67, places=2)
 
     def test_get_snapshot_list_supports_date_range_pagination_and_compare_summary(self) -> None:
         self._seed_snapshot(signal_date="2026-04-05", code="300001", latest_high=12.0, close=11.8)
@@ -115,6 +207,9 @@ class SignalSnapshotServiceTestCase(unittest.TestCase):
         self._seed_snapshot(signal_date="2026-04-04", code="300003", latest_high=14.0, close=13.5)
         self._seed_snapshot(signal_date="2026-04-04", code="300001", latest_high=11.5, close=11.2)
         self._seed_snapshot(signal_date="2026-04-03", code="300001", latest_high=11.0, close=10.8)
+        self._seed_daily_bar(code="300001", bar_date="2026-01-02", close=9.5)
+        self._seed_daily_bar(code="300002", bar_date="2026-01-02", close=10.1)
+        self._seed_daily_bar(code="300003", bar_date="2026-01-02", close=11.2)
 
         result = self.service.get_snapshot_list(
             signal_type="hundred_day_high",
@@ -134,6 +229,8 @@ class SignalSnapshotServiceTestCase(unittest.TestCase):
         self.assertEqual(result["compare_summary"][0]["total_count"], 2)
         self.assertEqual(result["compare_summary"][0]["added_count"], 1)
         self.assertEqual(result["compare_summary"][0]["dropped_count"], 1)
+        self.assertIsNotNone(result["compare_summary"][0]["avg_ytd_return_pct"])
+        self.assertIsNotNone(result["compare_summary"][0]["median_ytd_return_pct"])
         self.assertEqual(result["compare_summary"][0]["added_codes"], ["300002"])
         self.assertEqual(result["compare_summary"][0]["dropped_codes"], ["300003"])
         self.assertEqual(result["compare_summary"][0]["added_items"][0]["code"], "300002")
@@ -141,6 +238,184 @@ class SignalSnapshotServiceTestCase(unittest.TestCase):
         self.assertEqual(result["streak_leaderboard"][0]["code"], "300001")
         self.assertEqual(result["streak_leaderboard"][0]["industry"], "白酒")
         self.assertEqual(result["streak_leaderboard"][0]["current_streak_count"], 2)
+
+    def test_get_snapshot_list_returns_commodity_snapshot_fields(self) -> None:
+        self.db.upsert_signal_snapshot(
+            signal_type="commodity_beneficiary__optical_fiber",
+            signal_date="2026-04-10",
+            code="601869",
+            name="长飞光纤",
+            criteria_payload={"criteria": {"commodity_key": "optical_fiber"}},
+            metrics_payload={
+                "commodity_key": "optical_fiber",
+                "subtheme_key": "preform_and_materials",
+                "chain_role": "upstream",
+                "pass_through_direction": "positive",
+                "earnings_validation_status": "positive",
+                "earnings_release_probability": "high",
+                "directness": "direct_beneficiary",
+                "matched_example_bucket": "whitelist",
+                "matched_example_name": "长飞光纤",
+                "close": 32.5,
+            },
+            cause_payload={
+                "industry": "preform_and_materials",
+                "reason_summary": "光纤专题候选",
+                "industry_logic": "上游材料更接近直接受益",
+                "news_logic": "",
+                "technical_logic": "",
+                "theme_label": "optical_fiber",
+            },
+            history_payload={"previous_hit_count": 0, "days_since_previous_hit": None},
+        )
+
+        result = self.service.get_snapshot_list(
+            signal_type="commodity_beneficiary__optical_fiber",
+            signal_date="2026-04-10",
+        )
+
+        self.assertEqual(result["total"], 1)
+        item = result["items"][0]
+        self.assertEqual(item["subtheme_key"], "preform_and_materials")
+        self.assertEqual(item["chain_role"], "upstream")
+        self.assertEqual(item["earnings_release_probability"], "high")
+        self.assertEqual(item["matched_example_bucket"], "whitelist")
+
+    def test_get_snapshot_list_returns_dragon_head_snapshot_fields(self) -> None:
+        self.db.upsert_signal_snapshot(
+            signal_type="dragon_head_candidate",
+            signal_date="2026-04-10",
+            code="600001",
+            name="混合龙头",
+            criteria_payload={"criteria": {"strategy": "dragon_head"}},
+            metrics_payload={
+                "leader_probability": "high",
+                "leader_type": "hybrid_leader",
+                "recognizability_score": 3,
+                "logic_consensus_score": 3,
+                "capital_consensus_score": 2,
+                "sector_leadership_score": 3,
+                "relative_strength_score": 2,
+                "liquidity_score": 2,
+                "catalyst_score": 2,
+            },
+            cause_payload={"industry": "hybrid_leader", "reason_summary": "龙头专题候选", "theme_label": "dragon_head"},
+            history_payload={"previous_hit_count": 0, "days_since_previous_hit": None},
+        )
+
+        result = self.service.get_snapshot_list(
+            signal_type="dragon_head_candidate",
+            signal_date="2026-04-10",
+        )
+
+        self.assertEqual(result["total"], 1)
+        item = result["items"][0]
+        self.assertEqual(item["leader_type"], "hybrid_leader")
+        self.assertEqual(item["leader_probability"], "high")
+        self.assertEqual(item["recognizability_score"], 3)
+        self.assertEqual(item["sector_leadership_score"], 3)
+
+    def test_get_snapshot_list_returns_dragon_head_fields(self) -> None:
+        self.db.upsert_signal_snapshot(
+            signal_type="dragon_head_candidate",
+            signal_date="2026-04-10",
+            code="600001",
+            name="混合龙头",
+            criteria_payload={"criteria": {"strategy": "dragon_head"}},
+            metrics_payload={
+                "leader_probability": "high",
+                "leader_type": "hybrid_leader",
+                "recognizability_score": 3,
+                "logic_consensus_score": 3,
+                "capital_consensus_score": 2,
+                "sector_leadership_score": 3,
+                "relative_strength_score": 2,
+                "liquidity_score": 2,
+                "catalyst_score": 2,
+            },
+            cause_payload={"industry": "hybrid_leader", "reason_summary": "龙头专题候选", "theme_label": "dragon_head"},
+            history_payload={"previous_hit_count": 0, "days_since_previous_hit": None},
+        )
+
+        result = self.service.get_snapshot_list(
+            signal_type="dragon_head_candidate",
+            signal_date="2026-04-10",
+        )
+
+        self.assertEqual(result["total"], 1)
+        item = result["items"][0]
+        self.assertEqual(item["leader_type"], "hybrid_leader")
+        self.assertEqual(item["leader_probability"], "high")
+        self.assertEqual(item["recognizability_score"], 3)
+        self.assertEqual(item["sector_leadership_score"], 3)
+
+    def test_get_snapshot_counts_discovers_board_recognizability_signal_types(self) -> None:
+        self.db.upsert_signal_snapshot(
+            signal_type="board_recognizability__board_semiconductor_1234567890",
+            signal_date="2026-04-10",
+            code="688981",
+            name="中芯国际",
+            criteria_payload={"board_name": "半导体", "criteria": {"top_n": 3}},
+            metrics_payload={
+                "board_name": "半导体",
+                "board_rank": 1,
+                "board_candidate_count": 3,
+                "source_signal_type": "hundred_day_high",
+                "source_signal_date": "2026-04-10",
+                "total_market_cap": 123456789000.0,
+                "total_market_cap_yi": 1234.57,
+                "close": 95.5,
+                "latest_high": 96.8,
+            },
+            cause_payload={"industry": "半导体", "reason_summary": "半导体板块辨识度第 1 名"},
+            history_payload={"previous_hit_count": 2, "days_since_previous_hit": 5},
+        )
+
+        result = self.service.get_snapshot_counts(signal_date="2026-04-10")
+
+        board_item = next(
+            item for item in result["items"]
+            if item["signal_type"] == "board_recognizability__board_semiconductor_1234567890"
+        )
+        self.assertEqual(board_item["total"], 1)
+        self.assertEqual(board_item["group"], "board_recognizability")
+        self.assertEqual(board_item["display_label"], "半导体辨识度")
+
+    def test_get_snapshot_list_returns_board_recognizability_fields(self) -> None:
+        self.db.upsert_signal_snapshot(
+            signal_type="board_recognizability__board_semiconductor_1234567890",
+            signal_date="2026-04-10",
+            code="688981",
+            name="中芯国际",
+            criteria_payload={"board_name": "半导体", "criteria": {"top_n": 3}},
+            metrics_payload={
+                "board_name": "半导体",
+                "board_rank": 1,
+                "board_candidate_count": 3,
+                "source_signal_type": "hundred_day_high",
+                "source_signal_date": "2026-04-10",
+                "total_market_cap": 123456789000.0,
+                "total_market_cap_yi": 1234.57,
+                "close": 95.5,
+                "latest_high": 96.8,
+            },
+            cause_payload={"industry": "半导体", "reason_summary": "半导体板块辨识度第 1 名"},
+            history_payload={"previous_hit_count": 2, "days_since_previous_hit": 5},
+        )
+
+        result = self.service.get_snapshot_list(
+            signal_type="board_recognizability__board_semiconductor_1234567890",
+            signal_date="2026-04-10",
+        )
+
+        self.assertEqual(result["total"], 1)
+        item = result["items"][0]
+        self.assertEqual(item["board_name"], "半导体")
+        self.assertEqual(item["board_rank"], 1)
+        self.assertEqual(item["board_candidate_count"], 3)
+        self.assertEqual(item["source_signal_type"], "hundred_day_high")
+        self.assertEqual(item["source_signal_date"], "2026-04-10")
+        self.assertAlmostEqual(item["total_market_cap_yi"], 1234.57, places=2)
 
     def test_get_snapshot_list_uses_precomputed_summaries_for_range_aggregates(self) -> None:
         db = MagicMock()
@@ -260,7 +535,6 @@ class SignalSnapshotServiceTestCase(unittest.TestCase):
         history_projection_calls = [
             call for call in db.get_signal_snapshot_projection.call_args_list
             if call.kwargs.get("include_history_payload")
-            and not call.kwargs.get("include_metrics_payload")
             and not call.kwargs.get("include_cause_payload")
         ]
         self.assertEqual(len(history_projection_calls), 1)

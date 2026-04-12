@@ -1,0 +1,81 @@
+{
+  "key": "hard_disk",
+  "label": "hard_disk",
+  "keywords": [
+    "硬盘",
+    "HDD",
+    "机械硬盘",
+    "企业级存储",
+    "磁头",
+    "盘片",
+    "磁记录",
+    "storage controller"
+  ],
+  "roles": {
+    "upstream": ["盘片", "磁头", "磁材", "电机", "关键部件", "材料"],
+    "midstream": ["硬盘", "企业级存储", "控制器", "存储设备", "存储系统"],
+    "downstream": ["整机", "服务器组装", "系统集成", "终端", "OEM", "ODM", "安防", "视频监控"],
+    "distribution": ["分销", "代理", "渠道", "库存", "价差"],
+    "weak_proxy": ["数据中心", "云服务", "系统集成"]
+  },
+  "subthemes": [
+    {
+      "key": "enterprise_storage_system",
+      "label": "enterprise_storage_system",
+      "keywords": ["企业级存储", "存储系统", "分布式存储", "全闪", "存储设备"],
+      "default_role": "midstream"
+    },
+    {
+      "key": "hdd_channel_distribution",
+      "label": "hdd_channel_distribution",
+      "keywords": ["硬盘分销", "渠道", "代理", "库存", "价差"],
+      "default_role": "distribution"
+    },
+    {
+      "key": "surveillance_storage_demand",
+      "label": "surveillance_storage_demand",
+      "keywords": ["安防", "视频监控", "录像机", "NVR", "DVR"],
+      "default_role": "downstream"
+    },
+    {
+      "key": "server_oem_and_integrator",
+      "label": "server_oem_and_integrator",
+      "keywords": ["服务器", "系统集成", "整机", "OEM", "ODM"],
+      "default_role": "downstream"
+    }
+  ],
+  "examples": [
+    {
+      "code": "300302",
+      "name": "同有科技",
+      "bucket": "whitelist",
+      "subtheme_key": "enterprise_storage_system",
+      "role": "midstream",
+      "note": "更偏企业级存储系统与存储设备链条，属于硬盘与企业存储景气的间接映射。"
+    },
+    {
+      "code": "300857",
+      "name": "协创数据",
+      "bucket": "whitelist",
+      "subtheme_key": "hdd_channel_distribution",
+      "role": "distribution",
+      "note": "更偏存储产品与渠道侧样例，非纯 HDD 源头。"
+    },
+    {
+      "code": "002415",
+      "name": "海康威视",
+      "bucket": "counterexample",
+      "subtheme_key": "surveillance_storage_demand",
+      "role": "downstream",
+      "note": "安防视频存储需求侧，硬盘涨价更容易体现为成本端压力。"
+    },
+    {
+      "code": "601138",
+      "name": "工业富联",
+      "bucket": "counterexample",
+      "subtheme_key": "server_oem_and_integrator",
+      "role": "downstream",
+      "note": "服务器与整机集成链条，不应被当成硬盘涨价直接受益股。"
+    }
+  ]
+}

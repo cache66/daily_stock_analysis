@@ -30,6 +30,10 @@ from .fundamental_adapter import AkshareFundamentalAdapter
 # 配置日志
 logger = logging.getLogger(__name__)
 
+DEFAULT_BELONG_BOARDS_CACHE_TTL_SECONDS = 24 * 60 * 60
+DEFAULT_SECTOR_RANKINGS_CACHE_TTL_SECONDS = 120
+DEFAULT_BOARD_CONSTITUENTS_CACHE_TTL_SECONDS = 30 * 60
+
 
 # === 标准化列名定义 ===
 STANDARD_COLUMNS = ['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg']
@@ -495,6 +499,15 @@ class DataFetcherManager:
         self._fetcher_call_locks_lock = RLock()
         self._stock_name_cache: Dict[str, str] = {}
         self._stock_name_cache_lock = RLock()
+        self._belong_boards_cache: Dict[str, Dict[str, Any]] = {}
+        self._belong_boards_cache_lock = RLock()
+        self._belong_boards_cache_ttl_seconds = DEFAULT_BELONG_BOARDS_CACHE_TTL_SECONDS
+        self._sector_rankings_cache: Dict[int, Dict[str, Any]] = {}
+        self._sector_rankings_cache_lock = RLock()
+        self._sector_rankings_cache_ttl_seconds = DEFAULT_SECTOR_RANKINGS_CACHE_TTL_SECONDS
+        self._board_constituents_cache: Dict[str, Dict[str, Any]] = {}
+        self._board_constituents_cache_lock = RLock()
+        self._board_constituents_cache_ttl_seconds = DEFAULT_BOARD_CONSTITUENTS_CACHE_TTL_SECONDS
         
         if fetchers:
             # 按优先级排序
@@ -523,6 +536,24 @@ class DataFetcherManager:
             self._stock_name_cache = {}
         if not hasattr(self, "_stock_name_cache_lock") or self._stock_name_cache_lock is None:
             self._stock_name_cache_lock = RLock()
+        if not hasattr(self, "_belong_boards_cache") or self._belong_boards_cache is None:
+            self._belong_boards_cache = {}
+        if not hasattr(self, "_belong_boards_cache_lock") or self._belong_boards_cache_lock is None:
+            self._belong_boards_cache_lock = RLock()
+        if not hasattr(self, "_belong_boards_cache_ttl_seconds") or self._belong_boards_cache_ttl_seconds is None:
+            self._belong_boards_cache_ttl_seconds = DEFAULT_BELONG_BOARDS_CACHE_TTL_SECONDS
+        if not hasattr(self, "_sector_rankings_cache") or self._sector_rankings_cache is None:
+            self._sector_rankings_cache = {}
+        if not hasattr(self, "_sector_rankings_cache_lock") or self._sector_rankings_cache_lock is None:
+            self._sector_rankings_cache_lock = RLock()
+        if not hasattr(self, "_sector_rankings_cache_ttl_seconds") or self._sector_rankings_cache_ttl_seconds is None:
+            self._sector_rankings_cache_ttl_seconds = DEFAULT_SECTOR_RANKINGS_CACHE_TTL_SECONDS
+        if not hasattr(self, "_board_constituents_cache") or self._board_constituents_cache is None:
+            self._board_constituents_cache = {}
+        if not hasattr(self, "_board_constituents_cache_lock") or self._board_constituents_cache_lock is None:
+            self._board_constituents_cache_lock = RLock()
+        if not hasattr(self, "_board_constituents_cache_ttl_seconds") or self._board_constituents_cache_ttl_seconds is None:
+            self._board_constituents_cache_ttl_seconds = DEFAULT_BOARD_CONSTITUENTS_CACHE_TTL_SECONDS
 
     def _get_fetchers_snapshot(self) -> List[BaseFetcher]:
         self._ensure_concurrency_guards()
@@ -557,6 +588,107 @@ class DataFetcherManager:
         with self._stock_name_cache_lock:
             self._stock_name_cache[stock_code] = name
         return name
+
+    def _get_cached_belong_boards(self, stock_code: str) -> Optional[List[Dict[str, Any]]]:
+        self._ensure_concurrency_guards()
+        ttl_seconds = max(0, int(getattr(self, "_belong_boards_cache_ttl_seconds", 0)))
+        if ttl_seconds <= 0:
+            return None
+        now_ts = time.time()
+        with self._belong_boards_cache_lock:
+            item = self._belong_boards_cache.get(stock_code)
+            if not item:
+                return None
+            if now_ts - float(item.get("ts", 0)) > ttl_seconds:
+                self._belong_boards_cache.pop(stock_code, None)
+                return None
+            boards = item.get("boards") or []
+            return [dict(board) for board in boards if isinstance(board, dict)]
+
+    def _cache_belong_boards(self, stock_code: str, boards: List[Dict[str, Any]]) -> None:
+        self._ensure_concurrency_guards()
+        ttl_seconds = max(0, int(getattr(self, "_belong_boards_cache_ttl_seconds", 0)))
+        if ttl_seconds <= 0 or not boards:
+            return
+        with self._belong_boards_cache_lock:
+            self._belong_boards_cache[stock_code] = {
+                "ts": time.time(),
+                "boards": [dict(board) for board in boards if isinstance(board, dict)],
+            }
+
+    def _get_cached_sector_rankings(
+        self,
+        n: int,
+    ) -> Optional[Tuple[List[Dict], List[Dict], List[Dict[str, Any]], str]]:
+        self._ensure_concurrency_guards()
+        ttl_seconds = max(0, int(getattr(self, "_sector_rankings_cache_ttl_seconds", 0)))
+        if ttl_seconds <= 0:
+            return None
+        now_ts = time.time()
+        with self._sector_rankings_cache_lock:
+            item = self._sector_rankings_cache.get(int(n))
+            if not item:
+                return None
+            if now_ts - float(item.get("ts", 0)) > ttl_seconds:
+                self._sector_rankings_cache.pop(int(n), None)
+                return None
+            top = [dict(row) for row in (item.get("top") or []) if isinstance(row, dict)]
+            bottom = [dict(row) for row in (item.get("bottom") or []) if isinstance(row, dict)]
+            source_chain = [
+                dict(row) for row in (item.get("source_chain") or []) if isinstance(row, dict)
+            ]
+            return top, bottom, source_chain, str(item.get("last_error") or "")
+
+    def _cache_sector_rankings(
+        self,
+        n: int,
+        *,
+        top: List[Dict],
+        bottom: List[Dict],
+        source_chain: List[Dict[str, Any]],
+        last_error: str,
+    ) -> None:
+        self._ensure_concurrency_guards()
+        ttl_seconds = max(0, int(getattr(self, "_sector_rankings_cache_ttl_seconds", 0)))
+        if ttl_seconds <= 0 or (not top and not bottom):
+            return
+        with self._sector_rankings_cache_lock:
+            self._sector_rankings_cache[int(n)] = {
+                "ts": time.time(),
+                "top": [dict(row) for row in top if isinstance(row, dict)],
+                "bottom": [dict(row) for row in bottom if isinstance(row, dict)],
+                "source_chain": [dict(row) for row in source_chain if isinstance(row, dict)],
+                "last_error": str(last_error or ""),
+            }
+
+    def _get_cached_board_constituents(self, cache_key: str) -> Optional[pd.DataFrame]:
+        self._ensure_concurrency_guards()
+        ttl_seconds = max(0, int(getattr(self, "_board_constituents_cache_ttl_seconds", 0)))
+        if ttl_seconds <= 0:
+            return None
+        now_ts = time.time()
+        with self._board_constituents_cache_lock:
+            item = self._board_constituents_cache.get(cache_key)
+            if not item:
+                return None
+            if now_ts - float(item.get("ts", 0)) > ttl_seconds:
+                self._board_constituents_cache.pop(cache_key, None)
+                return None
+            df = item.get("df")
+            if isinstance(df, pd.DataFrame):
+                return df.copy()
+            return None
+
+    def _cache_board_constituents(self, cache_key: str, df: pd.DataFrame) -> None:
+        self._ensure_concurrency_guards()
+        ttl_seconds = max(0, int(getattr(self, "_board_constituents_cache_ttl_seconds", 0)))
+        if ttl_seconds <= 0 or df is None or df.empty:
+            return
+        with self._board_constituents_cache_lock:
+            self._board_constituents_cache[cache_key] = {
+                "ts": time.time(),
+                "df": df.copy(),
+            }
 
     def _get_tickflow_fetcher(self):
         """Lazily create a TickFlow fetcher for market-review-only calls."""
@@ -1521,6 +1653,9 @@ class DataFetcherManager:
         stock_code = normalize_stock_code(stock_code)
         if _market_tag(stock_code) != "cn":
             return []
+        cached_boards = self._get_cached_belong_boards(stock_code)
+        if cached_boards is not None:
+            return cached_boards
         for fetcher in self._fetchers:
             if not hasattr(fetcher, "get_belong_board"):
                 continue
@@ -1528,12 +1663,122 @@ class DataFetcherManager:
                 raw_data = fetcher.get_belong_board(stock_code)
                 boards = self._normalize_belong_boards(raw_data)
                 if boards:
+                    self._cache_belong_boards(stock_code, boards)
                     logger.info(f"[{fetcher.name}] 获取所属板块成功: {stock_code}, count={len(boards)}")
                     return boards
             except Exception as e:
                 logger.debug(f"[{fetcher.name}] 获取所属板块失败: {e}")
                 continue
         return []
+
+    @staticmethod
+    def _normalize_board_constituents(
+        raw_data: Any,
+        *,
+        board_name: str,
+        board_type: str,
+    ) -> pd.DataFrame:
+        if raw_data is None:
+            return pd.DataFrame(columns=["code", "name", "board_name", "board_type"])
+        if not isinstance(raw_data, pd.DataFrame):
+            try:
+                raw_data = pd.DataFrame(raw_data)
+            except Exception:
+                return pd.DataFrame(columns=["code", "name", "board_name", "board_type"])
+        if raw_data.empty:
+            return pd.DataFrame(columns=["code", "name", "board_name", "board_type"])
+
+        code_col = None
+        for candidate in ("代码", "股票代码", "证券代码", "成分代码", "code"):
+            if candidate in raw_data.columns:
+                code_col = candidate
+                break
+        name_col = None
+        for candidate in ("名称", "股票名称", "证券简称", "成分名称", "name"):
+            if candidate in raw_data.columns:
+                name_col = candidate
+                break
+        if code_col is None or name_col is None:
+            return pd.DataFrame(columns=["code", "name", "board_name", "board_type"])
+
+        records: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for _, row in raw_data.iterrows():
+            code = normalize_stock_code(str(row.get(code_col, "") or "").strip())
+            name = str(row.get(name_col, "") or "").strip()
+            upper_name = name.upper()
+            if (
+                not (isinstance(code, str) and code.isdigit() and len(code) == 6)
+                or is_bse_code(code)
+                or code.startswith("900")
+                or any(keyword in upper_name for keyword in ("ETF", "LOF", "基金", "指数", "联接"))
+            ):
+                continue
+            if code in seen:
+                continue
+            seen.add(code)
+            records.append(
+                {
+                    "code": code,
+                    "name": name,
+                    "board_name": board_name,
+                    "board_type": board_type,
+                }
+            )
+        return pd.DataFrame(records, columns=["code", "name", "board_name", "board_type"])
+
+    def get_board_constituents(
+        self,
+        board_name: str,
+        *,
+        board_type: str = "auto",
+    ) -> pd.DataFrame:
+        """Get normalized A-share constituents for a concept/industry board."""
+        normalized_name = str(board_name or "").strip()
+        normalized_type = str(board_type or "auto").strip().lower() or "auto"
+        if not normalized_name:
+            return pd.DataFrame(columns=["code", "name", "board_name", "board_type"])
+
+        cache_key = f"{normalized_type}:{normalized_name}"
+        cached_df = self._get_cached_board_constituents(cache_key)
+        if cached_df is not None:
+            return cached_df
+
+        for fetcher in self._get_fetchers_snapshot():
+            if not hasattr(fetcher, "get_board_constituents"):
+                continue
+            try:
+                raw_data = self._call_fetcher_method(
+                    fetcher,
+                    "get_board_constituents",
+                    normalized_name,
+                    board_type=normalized_type,
+                )
+                normalized_df = self._normalize_board_constituents(
+                    raw_data,
+                    board_name=normalized_name,
+                    board_type=normalized_type,
+                )
+                if normalized_df is not None and not normalized_df.empty:
+                    self._cache_board_constituents(cache_key, normalized_df)
+                    logger.info(
+                        "[%s] 获取板块成分股成功: %s (%s), count=%s",
+                        fetcher.name,
+                        normalized_name,
+                        normalized_type,
+                        len(normalized_df),
+                    )
+                    return normalized_df
+            except Exception as exc:
+                logger.debug(
+                    "[%s] 获取板块成分股失败: board=%s, board_type=%s, error=%s",
+                    getattr(fetcher, "name", type(fetcher).__name__),
+                    normalized_name,
+                    normalized_type,
+                    exc,
+                )
+                continue
+        return pd.DataFrame(columns=["code", "name", "board_name", "board_type"])
 
     def prefetch_stock_names(self, stock_codes: List[str], use_bulk: bool = False) -> None:
         """
@@ -2446,6 +2691,9 @@ class DataFetcherManager:
             n: int = 5,
         ) -> Tuple[List[Dict], List[Dict], List[Dict[str, Any]], str]:
             """Get sector rankings with ordered fallback chain metadata."""
+            cached_rankings = self._get_cached_sector_rankings(n)
+            if cached_rankings is not None:
+                return cached_rankings
             source_chain: List[Dict[str, Any]] = []
             last_error = ""
 
@@ -2465,6 +2713,13 @@ class DataFetcherManager:
                                 "result": "ok",
                                 "duration_ms": duration_ms,
                             }
+                        )
+                        self._cache_sector_rankings(
+                            n,
+                            top=data[0],
+                            bottom=data[1],
+                            source_chain=source_chain,
+                            last_error="",
                         )
                         logger.info(f"[{fetcher.name}] 获取板块排行成功")
                         return data[0], data[1], source_chain, ""

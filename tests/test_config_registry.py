@@ -141,5 +141,31 @@ class TestDiscordInteractionPublicKeyField(unittest.TestCase):
         self.assertIn("DISCORD_INTERACTIONS_PUBLIC_KEY", field_keys)
 
 
+class TestSignalSnapshotScheduleFieldsRegistered(unittest.TestCase):
+    _KEYS = (
+        "SIGNAL_SNAPSHOT_HUNDRED_DAY_HIGH_ENABLED",
+        "SIGNAL_SNAPSHOT_HUNDRED_DAY_HIGH_CAUSE_ANALYSIS_ENABLED",
+        "BOARD_THEME_CORE_SNAPSHOT_ENABLED",
+        "BOARD_THEME_CORE_SNAPSHOT_TARGETS_JSON",
+    )
+
+    def test_field_definitions_exist(self):
+        for key in self._KEYS:
+            field = get_field_definition(key)
+            self.assertEqual(field["category"], "system")
+            self.assertNotEqual(field["display_order"], 9000)
+
+    def test_schema_response_includes_signal_snapshot_schedule_fields(self):
+        schema = build_schema_response()
+        system_cat = next(
+            (c for c in schema["categories"] if c["category"] == "system"),
+            None,
+        )
+        self.assertIsNotNone(system_cat, "system category missing")
+        field_keys = {f["key"] for f in system_cat["fields"]}
+        for key in self._KEYS:
+            self.assertIn(key, field_keys)
+
+
 if __name__ == "__main__":
     unittest.main()

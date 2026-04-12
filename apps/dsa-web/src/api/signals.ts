@@ -1,6 +1,7 @@
 import apiClient from './index';
 import { toCamelCase } from './utils';
 import type {
+  SignalSnapshotCountsResponse,
   SignalSnapshotHistoryResponse,
   SignalSnapshotListResponse,
 } from '../types/signals';
@@ -23,6 +24,15 @@ export interface SignalsRequestOptions {
 export interface GetSignalSnapshotHistoryParams {
   days?: number;
   limit?: number;
+}
+
+export interface GetSignalSnapshotCountsParams {
+  signalDate?: string;
+  signalDateFrom?: string;
+  signalDateTo?: string;
+  code?: string;
+  codes?: string[];
+  signalTypes?: string[];
 }
 
 export interface SendSignalSelectionParams {
@@ -74,6 +84,24 @@ export const signalsApi = {
       },
     );
     return toCamelCase<SignalSnapshotHistoryResponse>(response.data);
+  },
+
+  getSnapshotCounts: async (
+    params: GetSignalSnapshotCountsParams,
+    options?: SignalsRequestOptions,
+  ): Promise<SignalSnapshotCountsResponse> => {
+    const response = await apiClient.get<Record<string, unknown>>('/api/v1/signals/kline-snapshot-counts', {
+      signal: options?.signal,
+      params: {
+        signal_date: params.signalDate,
+        signal_date_from: params.signalDateFrom,
+        signal_date_to: params.signalDateTo,
+        code: params.code || undefined,
+        codes: params.codes && params.codes.length > 0 ? params.codes.join(',') : undefined,
+        signal_types: params.signalTypes && params.signalTypes.length > 0 ? params.signalTypes.join(',') : undefined,
+      },
+    });
+    return toCamelCase<SignalSnapshotCountsResponse>(response.data);
   },
 
   sendSelection: async (

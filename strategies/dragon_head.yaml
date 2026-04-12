@@ -1,44 +1,116 @@
-# Dragon Head Strategy / 龙头策略
-# Identifies sector leaders during sector rotation cycles.
-
 name: dragon_head
 display_name: 龙头策略
-description: 板块轮动中识别龙头股。适用于板块启动或行业催化剂出现时。
+description: 在逻辑共识与资金共识交汇处识别高辨识度核心龙头，适用于板块轮动、题材发酵和主线强化阶段。
 category: trend
 core_rules: [2, 7]
 required_tools:
-  - get_realtime_quote
-  - get_sector_rankings
+  - analyze_dragon_head
   - search_stock_news
-aliases: [龙头, 龙头战法]
+aliases: [龙头, 龙头战法, 核心龙头]
 default_priority: 90
 market_regimes: [sector_hot]
 
 instructions: |
   **龙头策略（Dragon Head Strategy）**
 
-  评估标准：
+  这套策略不再只是“板块强势股识别器”，而是用于识别**高辨识度核心龙头**。
 
-  1. **板块领涨地位**：
-     - 使用 `get_sector_rankings` 检查该股所在板块是否为近期涨幅前列。
-     - 确认该股是否在板块启动周期中率先上涨或涨停。
+  核心原则：
 
-  2. **换手率与动能**（关联理念7：强势趋势股放宽）：
-     - 使用 `get_realtime_quote` 检查换手率。龙头股换手率通常 > 5%。
-     - 量比 > 1.5 说明有活跃的交易兴趣。
+  - 龙头不只是涨得快，而是共识最强
+  - 共识来自两类：`逻辑共识 + 资金共识`
+  - 真龙头往往是做投机、做趋势、做成长、做业绩的资金都容易撞上的票
+  - 涨得好是结果，不是原因
 
-  3. **相对强度**：
-     - 对比个股涨跌幅与板块平均值。
-     - 真正的龙头在上涨日应跑赢板块 2% 以上。
+  ## 一、先用结构化工具判断是否为核心龙头
 
-  4. **新闻催化**：
-     - 使用 `search_stock_news` 搜索板块级催化剂（政策、事件、业绩）。
-     - 龙头行情常伴随板块整体催化。
+  先调用 `analyze_dragon_head`，再结合 `search_stock_news` 做补充判断。
 
-  5. **乖离率检查**（关联理念1：严进策略）：
-     - 龙头股可适当放宽乖离率至 7%，但超过 10% 仍需谨慎。
+  `analyze_dragon_head` 会给出：
 
-  评分调整：
-  - 确认为龙头股：sentiment_score +10
-  - 板块正处于主动轮动期：额外 +5
-  - 在 `buy_reason` 中注明"龙头策略"判断结果。
+  - `leader_probability`
+  - `leader_type`
+  - `recognizability_score`
+  - `logic_consensus_score`
+  - `capital_consensus_score`
+  - `sector_leadership_score`
+  - `relative_strength_score`
+  - `liquidity_score`
+  - `catalyst_score`
+  - `factor_breakdown`
+  - `ranking_tuple`
+
+  ## 二、龙头的默认定义
+
+  固定分为四类：
+
+  - `hybrid_leader`
+    - 逻辑共识和资金共识都强
+    - 默认最高优先级
+  - `logic_leader`
+    - 产业逻辑、行业龙头、核心受益属性更强
+  - `capital_leader`
+    - 资金抱团、成交与承接更强，即使基本面不一定最强，也可能成为市场核心
+  - `pseudo_leader`
+    - 看起来强，但辨识度、承接或共识不够，容易是跟风或边缘票
+
+  ## 三、辨识度是第一因子
+
+  龙头票默认按下面的固定优先级判断：
+
+  `辨识度 > 板块地位 > 相对强度 > 流动性 > 催化 > 其它`
+
+  其中：
+
+  - `辨识度` 是第一因子
+  - 辨识度的本质是 `逻辑共识 + 资金共识`
+  - 小成交、边缘票、杂毛票默认降权
+
+  ### 1. 逻辑共识
+
+  重点看：
+
+  - 是否属于板块/题材中最先被想到的核心受益股
+  - 是否具备清晰主营业务与产业链位置
+  - 是否有白名单样例或强逻辑映射
+  - 是否在板块中具备“龙头地位”而非普通跟风
+
+  ### 2. 资金共识
+
+  重点看：
+
+  - 当日成交额
+  - 近 20 日平均成交额
+  - 当日换手率
+  - 近 20 日平均换手率
+  - 是否具备持续承接与高流动性
+
+  流动性和承接，是龙头策略里最大的安全边际。
+
+  ## 四、伪龙头过滤
+
+  出现以下情况时，默认不要把它判成高质量核心龙头：
+
+  - 成交太小，流动性弱
+  - 只是跟风板块上涨，没有独立辨识度
+  - 业务描述模糊，逻辑映射不清晰
+  - 负面催化明显，或强势无法持续
+  - 即使涨幅漂亮，但没有辨识度支撑
+
+  ## 五、输出要求
+
+  最终结论至少要回答：
+
+  1. 它是不是龙头
+  2. 属于哪类龙头：`hybrid / logic / capital / pseudo`
+  3. 辨识度为什么高或不高
+  4. 板块地位是否足够靠前
+  5. 成交与承接是否足够强
+  6. 当前是否值得参与，还是只适合观察
+
+  回答时应优先强调：
+
+  - 龙头核心度
+  - 共识来源
+  - 流动性与承接
+  - 风险：高位追涨、假龙头、跟风票、缩量弱承接

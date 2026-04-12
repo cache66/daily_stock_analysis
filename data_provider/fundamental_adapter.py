@@ -353,6 +353,11 @@ class AkshareFundamentalAdapter:
                 result["earnings"]["forecast_summary"] = _safe_str(
                     _pick_by_keywords(row, ["预告", "业绩变动", "内容", "摘要", "公告"])
                 )[:200]
+                forecast_announcement_date = _normalize_report_date(
+                    _pick_by_keywords(row, _DIVIDEND_KEYWORD_MAP["announce_date"])
+                )
+                if forecast_announcement_date:
+                    result["earnings"]["forecast_announcement_date"] = forecast_announcement_date
                 result["source_chain"].append(f"earnings_forecast:{forecast_source}")
 
         # Earnings quick report
@@ -367,6 +372,11 @@ class AkshareFundamentalAdapter:
                 result["earnings"]["quick_report_summary"] = _safe_str(
                     _pick_by_keywords(row, ["快报", "摘要", "公告", "说明"])
                 )[:200]
+                quick_announcement_date = _normalize_report_date(
+                    _pick_by_keywords(row, _DIVIDEND_KEYWORD_MAP["announce_date"])
+                )
+                if quick_announcement_date:
+                    result["earnings"]["quick_report_announcement_date"] = quick_announcement_date
                 result["source_chain"].append(f"earnings_quick:{quick_source}")
 
         # Dividend details (cash dividend, pre-tax)

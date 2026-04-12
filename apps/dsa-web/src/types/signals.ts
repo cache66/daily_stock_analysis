@@ -2,6 +2,32 @@ export interface SignalSnapshotListItem {
   code: string;
   name?: string | null;
   signalDate?: string | null;
+  eventDate?: string | null;
+  boardName?: string | null;
+  boardRank?: number | null;
+  boardCandidateCount?: number | null;
+  sourceSignalType?: string | null;
+  sourceSignalDate?: string | null;
+  subthemeKey?: string | null;
+  chainRole?: string | null;
+  passThroughDirection?: string | null;
+  earningsValidationStatus?: string | null;
+  earningsReleaseProbability?: string | null;
+  directness?: string | null;
+  matchedExampleBucket?: string | null;
+  matchedExampleName?: string | null;
+  recognizabilityScore?: number | null;
+  sustainedGrowthScore?: number | null;
+  liquidityScore?: number | null;
+  valuationScore?: number | null;
+  dividendScore?: number | null;
+  logicConsensusScore?: number | null;
+  capitalConsensusScore?: number | null;
+  leaderProbability?: string | null;
+  leaderType?: string | null;
+  sectorLeadershipScore?: number | null;
+  relativeStrengthScore?: number | null;
+  catalystScore?: number | null;
   industry?: string | null;
   reasonSummary?: string | null;
   industryLogic?: string | null;
@@ -15,6 +41,11 @@ export interface SignalSnapshotListItem {
   close?: number | null;
   latestHigh?: number | null;
   windowHigh?: number | null;
+  totalMarketCap?: number | null;
+  totalMarketCapYi?: number | null;
+  yearStartDate?: string | null;
+  yearStartClose?: number | null;
+  ytdReturnPct?: number | null;
 }
 
 export interface SignalSnapshotCompareItem {
@@ -28,6 +59,8 @@ export interface SignalSnapshotCompareItem {
   droppedCount: number;
   addedCodes: string[];
   droppedCodes: string[];
+  avgYtdReturnPct?: number | null;
+  medianYtdReturnPct?: number | null;
 }
 
 export interface SignalSnapshotStreakItem {
@@ -91,4 +124,18 @@ export interface SignalSnapshotHistoryResponse {
   continuity: SignalContinuitySummary;
   drawdown: SignalDrawdownSummary;
   items: SignalSnapshotHistoryItem[];
+}
+
+export interface SignalSnapshotCountItem {
+  signalType: string;
+  total: number;
+  displayLabel?: string | null;
+  group?: string | null;
+}
+
+export interface SignalSnapshotCountsResponse {
+  signalDate?: string | null;
+  signalDateFrom?: string | null;
+  signalDateTo?: string | null;
+  items: SignalSnapshotCountItem[];
 }

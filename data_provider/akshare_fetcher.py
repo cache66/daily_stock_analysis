@@ -1845,6 +1845,53 @@ class AkshareFetcher(BaseFetcher):
             logger.error(f"[Akshare] 新浪接口获取板块排行也失败: {e}")
             return None
 
+    def get_board_constituents(self, board_name: str, *, board_type: str = "auto") -> pd.DataFrame:
+        """Get concept/industry board constituents from Akshare."""
+        import akshare as ak
+
+        normalized_name = str(board_name or "").strip()
+        normalized_type = str(board_type or "auto").strip().lower() or "auto"
+        if not normalized_name:
+            return pd.DataFrame()
+
+        candidate_types = [normalized_type]
+        if normalized_type == "auto":
+            candidate_types = ["concept", "industry"]
+
+        last_error: Optional[Exception] = None
+        for current_type in candidate_types:
+            try:
+                self._set_random_user_agent()
+                self._enforce_rate_limit()
+                if current_type == "concept":
+                    logger.info("[API调用] ak.stock_board_concept_cons_em(%s) 获取概念板块成分...", normalized_name)
+                    df = ak.stock_board_concept_cons_em(symbol=normalized_name)
+                elif current_type == "industry":
+                    logger.info("[API调用] ak.stock_board_industry_cons_em(%s) 获取行业板块成分...", normalized_name)
+                    df = ak.stock_board_industry_cons_em(symbol=normalized_name)
+                else:
+                    continue
+                if df is not None and not df.empty:
+                    return df
+            except Exception as exc:
+                last_error = exc
+                logger.debug(
+                    "[Akshare] 获取板块成分股失败: board=%s, board_type=%s, error=%s",
+                    normalized_name,
+                    current_type,
+                    exc,
+                )
+                continue
+
+        if last_error is not None:
+            logger.warning(
+                "[Akshare] 获取板块成分股失败: board=%s, board_type=%s, error=%s",
+                normalized_name,
+                normalized_type,
+                last_error,
+            )
+        return pd.DataFrame()
+
 
 if __name__ == "__main__":
     # 测试代码

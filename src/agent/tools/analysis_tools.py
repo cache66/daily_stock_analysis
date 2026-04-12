@@ -555,9 +555,185 @@ analyze_pattern_tool = ToolDefinition(
 )
 
 
+# ============================================================
+# analyze_commodity_pass_through
+# ============================================================
+
+def _handle_analyze_commodity_pass_through(
+    stock_code: str,
+    stock_name: Optional[str] = None,
+    commodity_hint: Optional[str] = None,
+) -> dict:
+    """Run commodity pass-through analysis for a stock."""
+    from src.services.commodity_pass_through_service import CommodityPassThroughService
+
+    if not (stock_code and str(stock_code).strip()):
+        return {"error": "stock_code is required"}
+
+    service = CommodityPassThroughService()
+    return service.analyze_stock(
+        stock_code,
+        stock_name=stock_name,
+        commodity_hint=commodity_hint,
+    )
+
+
+analyze_commodity_pass_through_tool = ToolDefinition(
+    name="analyze_commodity_pass_through",
+    description="Analyze whether a stock has real exposure to a commodity price increase theme. "
+                "Infers the likely commodity category, chain role (upstream/midstream/downstream/distribution), "
+                "pass-through direction, and earnings-release probability from business profile, board tags, "
+                "fundamentals, and recent news evidence.",
+    parameters=[
+        ToolParameter(
+            name="stock_code",
+            type="string",
+            description="Stock code to analyze, e.g., '601869' or '000066'",
+        ),
+        ToolParameter(
+            name="stock_name",
+            type="string",
+            description="Optional stock name for better news lookup, e.g., '长飞光纤'",
+            required=False,
+            default=None,
+        ),
+        ToolParameter(
+            name="commodity_hint",
+            type="string",
+            description="Optional commodity hint such as 'optical_fiber', 'memory', or 'hard_disk'.",
+            required=False,
+            default=None,
+        ),
+    ],
+    handler=_handle_analyze_commodity_pass_through,
+    category="analysis",
+)
+
+
+# ============================================================
+# analyze_dragon_head
+# ============================================================
+
+def _handle_analyze_dragon_head(
+    stock_code: str,
+    stock_name: Optional[str] = None,
+    market_hint: Optional[str] = None,
+) -> dict:
+    """Run high-recognizability core leader analysis for a stock."""
+    from src.services.dragon_head_analysis_service import DragonHeadAnalysisService
+
+    if not (stock_code and str(stock_code).strip()):
+        return {"error": "stock_code is required"}
+
+    service = DragonHeadAnalysisService()
+    return service.analyze_stock(
+        stock_code,
+        stock_name=stock_name,
+        market_hint=market_hint,
+    )
+
+
+analyze_dragon_head_tool = ToolDefinition(
+    name="analyze_dragon_head",
+    description="Analyze whether a stock qualifies as a high-recognizability core leader. "
+                "Returns leader probability/type plus structured scores for recognizability, "
+                "logic consensus, capital consensus, sector leadership, relative strength, "
+                "liquidity, catalyst strength, and a fixed-priority ranking tuple.",
+    parameters=[
+        ToolParameter(
+            name="stock_code",
+            type="string",
+            description="Stock code to analyze, e.g., '600519' or '300308'",
+        ),
+        ToolParameter(
+            name="stock_name",
+            type="string",
+            description="Optional stock name for better news lookup.",
+            required=False,
+            default=None,
+        ),
+        ToolParameter(
+            name="market_hint",
+            type="string",
+            description="Optional market hint. Defaults to A-share behavior.",
+            required=False,
+            default=None,
+        ),
+    ],
+    handler=_handle_analyze_dragon_head,
+    category="analysis",
+)
+
+
+# ============================================================
+# analyze_theme_core_mapper
+# ============================================================
+
+def _handle_analyze_theme_core_mapper(
+    stock_code: str,
+    stock_name: Optional[str] = None,
+    commodity_hint: Optional[str] = None,
+    market_hint: Optional[str] = None,
+) -> dict:
+    """Map a stock into theme/subtheme/core-role layers."""
+    from src.services.theme_core_mapper_service import ThemeCoreMapperService
+
+    if not (stock_code and str(stock_code).strip()):
+        return {"error": "stock_code is required"}
+
+    service = ThemeCoreMapperService(enable_news_search=False)
+    return service.analyze_stock(
+        stock_code,
+        stock_name=stock_name,
+        commodity_hint=commodity_hint,
+        market_hint=market_hint,
+    )
+
+
+analyze_theme_core_mapper_tool = ToolDefinition(
+    name="analyze_theme_core_mapper",
+    description="Map a stock into three explicit layers: broad theme, true subtheme, and stock role. "
+                "Also combines theme mapping with leader analysis to judge whether the stock is a direct beneficiary, "
+                "a prosperity-core name inside a subtheme, a channel beneficiary, or a downstream cost-pressure name.",
+    parameters=[
+        ToolParameter(
+            name="stock_code",
+            type="string",
+            description="Stock code to analyze, e.g., '601869' or '300308'",
+        ),
+        ToolParameter(
+            name="stock_name",
+            type="string",
+            description="Optional stock name for better lookup.",
+            required=False,
+            default=None,
+        ),
+        ToolParameter(
+            name="commodity_hint",
+            type="string",
+            description="Optional theme hint such as 'optical_fiber', 'memory', or 'hard_disk'.",
+            required=False,
+            default=None,
+        ),
+        ToolParameter(
+            name="market_hint",
+            type="string",
+            description="Optional market hint. Defaults to A-share behavior.",
+            required=False,
+            default=None,
+        ),
+    ],
+    handler=_handle_analyze_theme_core_mapper,
+    category="analysis",
+)
+
+
 ALL_ANALYSIS_TOOLS = [
     analyze_trend_tool,
     calculate_ma_tool,
     get_volume_analysis_tool,
     analyze_pattern_tool,
+    analyze_commodity_pass_through_tool,
+    analyze_dragon_head_tool,
+    analyze_theme_core_mapper_tool,
 ]

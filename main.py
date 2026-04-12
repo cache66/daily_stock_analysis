@@ -42,12 +42,14 @@ if os.getenv("GITHUB_ACTIONS") != "true" and os.getenv("USE_PROXY", "false").low
     os.environ["https_proxy"] = proxy_url
 
 import argparse
+import json
 import logging
 import sys
+import subprocess
 import time
 import uuid
 from datetime import datetime, timezone, timedelta
-from typing import List, Tuple
+from typing import Any, List, Tuple
 
 from data_provider.base import canonical_stock_code
 from src.webui_frontend import prepare_webui_frontend_assets
@@ -703,6 +705,221 @@ def _build_schedule_time_provider(default_schedule_time: str):
     return _provider
 
 
+def _run_optional_signal_snapshot_tasks(config: Config) -> None:
+    """Run optional scheduled signal snapshot refresh tasks."""
+    if not getattr(config, "signal_snapshot_hundred_day_high_enabled", False):
+        return
+
+    if getattr(config, "trading_day_check_enabled", True):
+        from src.core.trading_calendar import get_market_now, is_market_open
+
+        market_today = get_market_now("cn").date()
+        if not is_market_open("cn", market_today):
+            logger.info(
+                "今日 A 股为非交易日，跳过定时百日新高快照更新: %s",
+                market_today.isoformat(),
+            )
+            return
+
+    project_root = Path(__file__).resolve().parent
+    script_path = project_root / "scripts" / "select_hundred_day_high_candidates.py"
+    command = [sys.executable, str(script_path)]
+    if not getattr(config, "signal_snapshot_hundred_day_high_cause_analysis_enabled", False):
+        command.append("--skip-cause-analysis")
+    else:
+        # Scheduled runs prioritise deterministic, low-latency structured attribution.
+        command.extend(["--disable-news-search", "--disable-llm-reason-card"])
+
+    logger.info(
+        "开始执行定时百日新高快照更新: cause_analysis=%s, command=%s",
+        getattr(config, "signal_snapshot_hundred_day_high_cause_analysis_enabled", False),
+        " ".join(command),
+    )
+    try:
+        subprocess.run(
+            command,
+            cwd=str(project_root),
+            check=True,
+        )
+        logger.info("定时百日新高快照更新完成")
+    except subprocess.CalledProcessError as exc:
+        logger.warning("定时百日新高快照更新失败（fail-open）: exit_code=%s", exc.returncode)
+
+
+def _run_optional_board_recognizability_snapshot_tasks(config: Config) -> None:
+    """Run optional scheduled board recognizability ranking refresh tasks."""
+    if not getattr(config, "board_recognizability_snapshot_enabled", False):
+        return
+
+    if getattr(config, "trading_day_check_enabled", True):
+        from src.core.trading_calendar import get_market_now, is_market_open
+
+        market_today = get_market_now("cn").date()
+        if not is_market_open("cn", market_today):
+            logger.info(
+                "浠婃棩 A 鑲′负闈炰氦鏄撴棩锛岃烦杩囧畾鏃舵澘鍧楄辨瘑搴︽帓鍚嶅揩鐓ф洿鏂? %s",
+                market_today.isoformat(),
+            )
+            return
+
+    source_signal_type = (
+        str(getattr(config, "board_recognizability_snapshot_source_signal_type", "") or "").strip()
+        or "hundred_day_high"
+    )
+    try:
+        top_n = max(1, int(getattr(config, "board_recognizability_snapshot_top_n", 3)))
+    except (TypeError, ValueError):
+        top_n = 3
+
+    project_root = Path(__file__).resolve().parent
+    script_path = project_root / "scripts" / "collect_board_recognizability_rankings.py"
+    command = [
+        sys.executable,
+        str(script_path),
+        "--source-signal-type",
+        source_signal_type,
+        "--top-n",
+        str(top_n),
+    ]
+
+    logger.info(
+        "寮€濮嬫墽琛屽畾鏃舵澘鍧楄辨瘑搴︽帓鍚嶅揩鐓ф洿鏂? source_signal_type=%s, top_n=%s, command=%s",
+        source_signal_type,
+        top_n,
+        " ".join(command),
+    )
+    try:
+        subprocess.run(
+            command,
+            cwd=str(project_root),
+            check=True,
+        )
+        logger.info(
+            "瀹氭椂鏉垮潡杈ㄨ瘑搴︽帓鍚嶅揩鐓ф洿鏂板畬鎴? source_signal_type=%s, top_n=%s",
+            source_signal_type,
+            top_n,
+        )
+    except subprocess.CalledProcessError as exc:
+        logger.warning(
+            "瀹氭椂鏉垮潡杈ㄨ瘑搴︽帓鍚嶅揩鐓ф洿鏂板け璐ワ紙fail-open锛? source_signal_type=%s, exit_code=%s",
+            source_signal_type,
+            exc.returncode,
+        )
+
+
+def _parse_board_theme_core_snapshot_targets(raw_value: str) -> List[Dict[str, Any]]:
+    text = str(raw_value or "").strip()
+    if not text:
+        return []
+    try:
+        payload = json.loads(text)
+    except Exception as exc:
+        logger.warning("BOARD_THEME_CORE_SNAPSHOT_TARGETS_JSON 解析失败，已跳过: %s", exc)
+        return []
+    if not isinstance(payload, list):
+        logger.warning("BOARD_THEME_CORE_SNAPSHOT_TARGETS_JSON 必须是 JSON 数组，已跳过")
+        return []
+
+    targets: List[Dict[str, Any]] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        board_name = str(item.get("board_name") or "").strip()
+        if not board_name:
+            continue
+        board_type = str(item.get("board_type") or "auto").strip().lower() or "auto"
+        if board_type not in {"auto", "concept", "industry"}:
+            board_type = "auto"
+        commodity_hint = str(item.get("commodity_hint") or "").strip() or None
+        try:
+            top_per_subtheme = max(1, int(item.get("top_per_subtheme", 1)))
+        except (TypeError, ValueError):
+            top_per_subtheme = 1
+        minimum_subtheme_core_probability = str(
+            item.get("minimum_subtheme_core_probability") or "medium"
+        ).strip().lower() or "medium"
+        if minimum_subtheme_core_probability not in {"low", "medium", "high"}:
+            minimum_subtheme_core_probability = "medium"
+        targets.append(
+            {
+                "board_name": board_name,
+                "board_type": board_type,
+                "commodity_hint": commodity_hint,
+                "top_per_subtheme": top_per_subtheme,
+                "minimum_subtheme_core_probability": minimum_subtheme_core_probability,
+            }
+        )
+    return targets
+
+
+def _run_optional_board_theme_core_snapshot_tasks(config: Config) -> None:
+    """Run optional scheduled board/theme-core snapshot refresh tasks."""
+    if not getattr(config, "board_theme_core_snapshot_enabled", False):
+        return
+
+    targets = _parse_board_theme_core_snapshot_targets(
+        getattr(config, "board_theme_core_snapshot_targets_json", "")
+    )
+    if not targets:
+        logger.info("模块主题核心快照已启用，但未配置有效目标，跳过更新")
+        return
+
+    if getattr(config, "trading_day_check_enabled", True):
+        from src.core.trading_calendar import get_market_now, is_market_open
+
+        market_today = get_market_now("cn").date()
+        if not is_market_open("cn", market_today):
+            logger.info(
+                "今日 A 股为非交易日，跳过定时模块主题核心快照更新: %s",
+                market_today.isoformat(),
+            )
+            return
+
+    project_root = Path(__file__).resolve().parent
+    script_path = project_root / "scripts" / "collect_board_theme_core_snapshots.py"
+    for target in targets:
+        command = [
+            sys.executable,
+            str(script_path),
+            "--board-name",
+            str(target["board_name"]),
+            "--board-type",
+            str(target["board_type"]),
+            "--top-per-subtheme",
+            str(target["top_per_subtheme"]),
+            "--minimum-subtheme-core-probability",
+            str(target["minimum_subtheme_core_probability"]),
+        ]
+        if target.get("commodity_hint"):
+            command.extend(["--commodity-hint", str(target["commodity_hint"])])
+
+        logger.info(
+            "开始执行定时模块主题核心快照更新: board=%s(%s), commodity_hint=%s, command=%s",
+            target["board_name"],
+            target["board_type"],
+            target.get("commodity_hint") or "",
+            " ".join(command),
+        )
+        try:
+            subprocess.run(
+                command,
+                cwd=str(project_root),
+                check=True,
+            )
+            logger.info(
+                "定时模块主题核心快照更新完成: board=%s(%s)",
+                target["board_name"],
+                target["board_type"],
+            )
+        except subprocess.CalledProcessError as exc:
+            logger.warning(
+                "定时模块主题核心快照更新失败（fail-open）: board=%s(%s), exit_code=%s",
+                target["board_name"],
+                target["board_type"],
+                exc.returncode,
+            )
+
+
 def main() -> int:
     """
     主入口函数
@@ -899,6 +1116,9 @@ def main() -> int:
             def scheduled_task():
                 runtime_config = _reload_runtime_config()
                 run_full_analysis(runtime_config, args, scheduled_stock_codes)
+                _run_optional_signal_snapshot_tasks(runtime_config)
+                _run_optional_board_recognizability_snapshot_tasks(runtime_config)
+                _run_optional_board_theme_core_snapshot_tasks(runtime_config)
 
             background_tasks = []
             if getattr(config, 'agent_event_monitor_enabled', False):

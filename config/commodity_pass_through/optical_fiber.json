@@ -1,0 +1,81 @@
+{
+  "key": "optical_fiber",
+  "label": "optical_fiber",
+  "keywords": [
+    "光纤",
+    "光缆",
+    "预制棒",
+    "光通信",
+    "光模块",
+    "CPO",
+    "optical fiber",
+    "fiber"
+  ],
+  "roles": {
+    "upstream": ["预制棒", "石英套管", "光棒", "原材料"],
+    "midstream": ["光纤光缆", "光缆", "棒纤缆", "制造"],
+    "downstream": ["通信工程", "网络建设", "系统集成", "运营商"],
+    "distribution": ["分销", "代理", "经销", "渠道", "库存"],
+    "weak_proxy": ["光模块", "CPO", "数据中心", "算力", "通信服务"]
+  },
+  "subthemes": [
+    {
+      "key": "preform_and_materials",
+      "label": "preform_and_materials",
+      "keywords": ["预制棒", "石英套管", "光棒"],
+      "default_role": "upstream"
+    },
+    {
+      "key": "fiber_and_cable",
+      "label": "fiber_and_cable",
+      "keywords": ["光纤光缆", "光缆", "棒纤缆"],
+      "default_role": "midstream"
+    },
+    {
+      "key": "optical_module_and_cpo",
+      "label": "optical_module_and_cpo",
+      "keywords": ["光模块", "CPO", "相干", "光器件"],
+      "default_role": "weak_proxy"
+    },
+    {
+      "key": "telecom_equipment_and_network",
+      "label": "telecom_equipment_and_network",
+      "keywords": ["通信设备", "系统集成", "网络建设", "运营商"],
+      "default_role": "downstream"
+    }
+  ],
+  "examples": [
+    {
+      "code": "601869",
+      "name": "长飞光纤",
+      "bucket": "whitelist",
+      "subtheme_key": "preform_and_materials",
+      "role": "upstream",
+      "note": "光纤预制棒与光纤光缆主线样例，更接近涨价源头。"
+    },
+    {
+      "code": "600487",
+      "name": "亨通光电",
+      "bucket": "whitelist",
+      "subtheme_key": "fiber_and_cable",
+      "role": "midstream",
+      "note": "光纤光缆制造链条样例。"
+    },
+    {
+      "code": "300308",
+      "name": "中际旭创",
+      "bucket": "counterexample",
+      "subtheme_key": "optical_module_and_cpo",
+      "role": "weak_proxy",
+      "note": "更偏光模块与 CPO，并非原始光纤涨价的直接受益逻辑。"
+    },
+    {
+      "code": "000063",
+      "name": "中兴通讯",
+      "bucket": "counterexample",
+      "subtheme_key": "telecom_equipment_and_network",
+      "role": "downstream",
+      "note": "更偏通信设备与网络建设，下游属性更强。"
+    }
+  ]
+}

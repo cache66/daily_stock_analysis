@@ -379,6 +379,55 @@ class TestBuiltinSkills(unittest.TestCase):
         # Verify all strategy names from YAML are loaded
         self.assertEqual(names, expected)
 
+    def test_commodity_price_pass_through_strategy_has_expected_metadata(self):
+        """The commodity price pass-through strategy should be loadable and well-formed."""
+        from src.agent.skills.base import SkillManager
+
+        manager = SkillManager()
+        manager.load_builtin_strategies()
+
+        skill = manager.get("commodity_price_pass_through")
+        self.assertIsNotNone(skill)
+        assert skill is not None
+
+        self.assertEqual(skill.display_name, "商品涨价传导")
+        self.assertEqual(skill.category, "framework")
+        self.assertIn("analyze_commodity_pass_through", skill.required_tools)
+        self.assertIn("get_stock_info", skill.required_tools)
+        self.assertIn("search_comprehensive_intel", skill.required_tools)
+        self.assertIn("涨价传导", skill.aliases)
+
+    def test_dragon_head_strategy_uses_structured_analysis_tool(self):
+        """Dragon head should now rely on structured leader analysis."""
+        from src.agent.skills.base import SkillManager
+
+        manager = SkillManager()
+        manager.load_builtin_strategies()
+
+        skill = manager.get("dragon_head")
+        self.assertIsNotNone(skill)
+        assert skill is not None
+
+        self.assertEqual(skill.display_name, "龙头策略")
+        self.assertIn("analyze_dragon_head", skill.required_tools)
+        self.assertIn("search_stock_news", skill.required_tools)
+
+    def test_theme_core_mapper_strategy_has_expected_metadata(self):
+        """Theme core mapper should be loadable and rely on structured mapping tools."""
+        from src.agent.skills.base import SkillManager
+
+        manager = SkillManager()
+        manager.load_builtin_strategies()
+
+        skill = manager.get("theme_core_mapper")
+        self.assertIsNotNone(skill)
+        assert skill is not None
+
+        self.assertEqual(skill.display_name, "主题核心映射")
+        self.assertIn("analyze_theme_core_mapper", skill.required_tools)
+        self.assertIn("analyze_commodity_pass_through", skill.required_tools)
+        self.assertIn("analyze_dragon_head", skill.required_tools)
+
 
 # ============================================================
 # Built-in tools import test
@@ -398,6 +447,10 @@ class TestBuiltinToolDefinitions(unittest.TestCase):
     def test_import_analysis_tools(self):
         from src.agent.tools.analysis_tools import ALL_ANALYSIS_TOOLS
         self.assertGreater(len(ALL_ANALYSIS_TOOLS), 0, "ALL_ANALYSIS_TOOLS must not be empty")
+        names = {td.name for td in ALL_ANALYSIS_TOOLS}
+        self.assertIn("analyze_commodity_pass_through", names)
+        self.assertIn("analyze_dragon_head", names)
+        self.assertIn("analyze_theme_core_mapper", names)
         for td in ALL_ANALYSIS_TOOLS:
             self.assertIsInstance(td, ToolDefinition)
             self.assertEqual(td.category, "analysis")

@@ -149,6 +149,38 @@ class StockRepository:
             ).scalar_one_or_none()
             return row
 
+    def get_latest_daily_on_or_before(self, *, code: str, target_date: date) -> Optional[StockDaily]:
+        """Return the latest daily bar on or before target_date."""
+        with self.db.get_session() as session:
+            row = session.execute(
+                select(StockDaily)
+                .where(and_(StockDaily.code == code, StockDaily.date <= target_date))
+                .order_by(desc(StockDaily.date))
+                .limit(1)
+            ).scalar_one_or_none()
+            return row
+
+    def get_first_daily_of_year(
+        self,
+        *,
+        code: str,
+        year: int,
+        end_date: Optional[date] = None,
+    ) -> Optional[StockDaily]:
+        """Return the first daily bar within the given calendar year."""
+        year_start = date(int(year), 1, 1)
+        conditions = [StockDaily.code == code, StockDaily.date >= year_start]
+        if end_date is not None:
+            conditions.append(StockDaily.date <= end_date)
+        with self.db.get_session() as session:
+            row = session.execute(
+                select(StockDaily)
+                .where(and_(*conditions))
+                .order_by(StockDaily.date)
+                .limit(1)
+            ).scalar_one_or_none()
+            return row
+
     def get_forward_bars(self, *, code: str, analysis_date: date, eval_window_days: int) -> List[StockDaily]:
         """Return forward daily bars after analysis_date, up to eval_window_days."""
         with self.db.get_session() as session:

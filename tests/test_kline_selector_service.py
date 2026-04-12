@@ -271,6 +271,34 @@ class TestKlineSelectorService(unittest.TestCase):
         self.assertEqual(run_result.evaluated_count, 1)
         self.assertEqual(manager.history_calls, [("600007", criteria.history_days_required)])
 
+    def test_scan_market_invokes_on_evaluation_callback(self):
+        history = build_history(with_limit_up=True)
+        manager = FakeManager(history_by_code={"600070": history, "600071": history})
+        service = KlineSelectorService(
+            manager=manager,
+            universe_provider=lambda: pd.DataFrame(
+                {
+                    "code": ["600070", "600071"],
+                    "name": ["callback_a", "callback_b"],
+                    "total_mv": [40e9, 41e9],
+                }
+            ),
+        )
+        callback_events = []
+
+        run_result = service.scan_market(
+            criteria=KlineSelectorCriteria(),
+            on_evaluation=lambda evaluation, completed, total: callback_events.append(
+                (evaluation.stock_code, evaluation.passed, completed, total)
+            ),
+        )
+
+        self.assertEqual(run_result.evaluated_count, 2)
+        self.assertEqual(len(callback_events), 2)
+        self.assertEqual({event[0] for event in callback_events}, {"600070", "600071"})
+        self.assertTrue(all(event[1] for event in callback_events))
+        self.assertTrue(all(event[3] == 2 for event in callback_events))
+
     def test_apply_universe_shard_slices_codes_deterministically(self):
         universe = pd.DataFrame(
             {

@@ -121,6 +121,42 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
         self.assertFalse(config.schedule_run_immediately)
         self.assertTrue(config.run_immediately)
 
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_signal_snapshot_schedule_flags_load_from_env(
+        self,
+        _mock_parse_yaml,
+        _mock_setup_env,
+    ) -> None:
+        env = {
+            "SIGNAL_SNAPSHOT_HUNDRED_DAY_HIGH_ENABLED": "true",
+            "SIGNAL_SNAPSHOT_HUNDRED_DAY_HIGH_CAUSE_ANALYSIS_ENABLED": "true",
+        }
+
+        with patch.dict(os.environ, env, clear=True):
+            config = Config._load_from_env()
+
+        self.assertTrue(config.signal_snapshot_hundred_day_high_enabled)
+        self.assertTrue(config.signal_snapshot_hundred_day_high_cause_analysis_enabled)
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_board_theme_core_snapshot_flags_load_from_env(
+        self,
+        _mock_parse_yaml,
+        _mock_setup_env,
+    ) -> None:
+        env = {
+            "BOARD_THEME_CORE_SNAPSHOT_ENABLED": "true",
+            "BOARD_THEME_CORE_SNAPSHOT_TARGETS_JSON": '[{"board_name":"CPO","board_type":"concept","commodity_hint":"optical_fiber"}]',
+        }
+
+        with patch.dict(os.environ, env, clear=True):
+            config = Config._load_from_env()
+
+        self.assertTrue(config.board_theme_core_snapshot_enabled)
+        self.assertIn("CPO", config.board_theme_core_snapshot_targets_json)
+
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])
     def test_blank_schedule_time_falls_back_to_default(
         self,

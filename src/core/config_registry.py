@@ -10,6 +10,8 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any, Dict, List, Optional
 
+from src.config import AGENT_MAX_STEPS_DEFAULT
+
 SCHEMA_VERSION = "2026-03-29"
 
 _CATEGORY_DEFINITIONS: List[Dict[str, Any]] = [
@@ -83,7 +85,7 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     # ------------------------------------------------------------------
     "LITELLM_MODEL": {
         "title": "Primary Model",
-        "description": "Primary model in provider/model format (e.g. gemini/gemini-3-flash-preview, openai/deepseek-chat, anthropic/claude-3-5-sonnet-20241022). If empty, it is auto-inferred from available API keys or channel declarations.",
+        "description": "Primary model in provider/model format (e.g. gemini/gemini-3-flash-preview, deepseek/deepseek-v4-flash, anthropic/claude-3-5-sonnet-20241022). If empty, it is auto-inferred from available API keys or channel declarations.",
         "category": "ai_model",
         "data_type": "string",
         "ui_control": "text",
@@ -187,7 +189,7 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     # ------------------------------------------------------------------
     "DEEPSEEK_API_KEY": {
         "title": "DeepSeek API Key",
-        "description": "Official DeepSeek API key (from https://platform.deepseek.com). Auto-infers openai/deepseek-chat when set alone. Also works in multi-channel mode.",
+        "description": "Official DeepSeek API key (from https://platform.deepseek.com). For compatibility, a key set alone still auto-infers deepseek/deepseek-chat and logs a deprecation warning; new configs should migrate to deepseek/deepseek-v4-flash. Also works in multi-channel mode.",
         "category": "ai_model",
         "data_type": "string",
         "ui_control": "password",
@@ -1689,14 +1691,14 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     },
     "AGENT_MAX_STEPS": {
         "title": "Agent Max Steps",
-        "description": "Maximum reasoning-step ceiling for Agent mode. In orchestrator mode, each sub-agent keeps min(its default, this limit) so lower-default specialists are not inflated.",
+        "description": f"Maximum reasoning-step limit for Agent mode. At the default ({AGENT_MAX_STEPS_DEFAULT}), each sub-agent keeps its own preset. When raised above {AGENT_MAX_STEPS_DEFAULT}, all sub-agents adopt this value. When lowered below a sub-agent's preset, that sub-agent is capped at this value.",
         "category": "agent",
         "data_type": "integer",
         "ui_control": "number",
         "is_sensitive": False,
         "is_required": False,
         "is_editable": True,
-        "default_value": "10",
+        "default_value": str(AGENT_MAX_STEPS_DEFAULT),
         "options": [],
         "validation": {"min": 1, "max": 50},
         "display_order": 20,

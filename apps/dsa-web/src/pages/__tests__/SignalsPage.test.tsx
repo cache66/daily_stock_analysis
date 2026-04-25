@@ -267,6 +267,41 @@ function buildDragonHeadResponse() {
   };
 }
 
+function buildTrendLeaderUnifiedResponse() {
+  return {
+    signalType: 'trend_leader_unified',
+    signalDate: '2026-04-19',
+    signalDateFrom: null,
+    signalDateTo: null,
+    total: 1,
+    page: 1,
+    pageSize: 12,
+    compareSummary: [],
+    streakLeaderboard: [],
+    items: [
+      {
+        code: '600001',
+        name: '强势龙头',
+        signalDate: '2026-04-19',
+        primaryProfile: 'breakout',
+        breakoutScore: 82,
+        pullbackScore: 41,
+        hybridScore: 86,
+        overallScore: 86,
+        trendLabel: 'near_new_high',
+        leaderType: 'hybrid_leader',
+        leaderProbability: 'high',
+        previousHitCount: 0,
+        daysSincePreviousHit: null,
+        isConsecutiveSignal: false,
+        close: 12.3,
+        latestHigh: 12.8,
+        windowHigh: 12.8,
+      },
+    ],
+  };
+}
+
 function buildBoardRecognizabilityResponse() {
   return {
     signalType: 'board_recognizability__board_semiconductor_1234567890',
@@ -309,6 +344,114 @@ function buildBoardRecognizabilityResponse() {
       },
     ],
   };
+}
+
+function buildMonthlySlowRiseProfileResponse(profileName = 'balanced') {
+  const profileConfig = {
+    strict: {
+      label: '月线慢牛·严格',
+      code: '600519',
+      name: '贵州茅台',
+      positiveRatio: 0.83,
+      higherLowRatio: 0.75,
+      totalReturnPct: 32.4,
+      maxSingleGainPct: 7.2,
+      worstDrawdownPct: -4.8,
+      maShort: 1688.5,
+      maLong: 1598.2,
+      latestMonth: '2026-03',
+      ytdReturnPct: 15.3,
+      reasonSummary: '月线更平滑，回撤更浅。',
+    },
+    balanced: {
+      label: '月线慢牛·均衡',
+      code: '600519',
+      name: '贵州茅台',
+      positiveRatio: 0.75,
+      higherLowRatio: 0.67,
+      totalReturnPct: 38.5,
+      maxSingleGainPct: 9.8,
+      worstDrawdownPct: -6.2,
+      maShort: 1678.5,
+      maLong: 1588.2,
+      latestMonth: '2026-03',
+      ytdReturnPct: 16.88,
+      reasonSummary: '月线连续抬高，涨幅温和。',
+    },
+    loose: {
+      label: '月线慢牛·宽松',
+      code: '000858',
+      name: '五粮液',
+      positiveRatio: 0.67,
+      higherLowRatio: 0.58,
+      totalReturnPct: 46.2,
+      maxSingleGainPct: 12.8,
+      worstDrawdownPct: -8.9,
+      maShort: 1450.2,
+      maLong: 1398.6,
+      latestMonth: '2026-03',
+      ytdReturnPct: 18.25,
+      reasonSummary: '允许波动略大，但仍保持月线抬升。',
+    },
+  } as const;
+
+  const config = profileConfig[profileName as keyof typeof profileConfig] ?? profileConfig.balanced;
+  return {
+    signalType: `monthly_slow_rise_profile__${profileName}`,
+    signalDate: '2026-04-10',
+    signalDateFrom: null,
+    signalDateTo: null,
+    total: 1,
+    page: 1,
+    pageSize: 12,
+    compareSummary: [],
+    streakLeaderboard: [],
+    items: [
+      {
+        code: config.code,
+        name: config.name,
+        signalDate: '2026-04-10',
+        industry: '白酒',
+        profileName,
+        profileLabel: config.label,
+        monthlyPositiveRatio: config.positiveRatio,
+        monthlyHigherLowRatio: config.higherLowRatio,
+        monthlyTotalReturnPct: config.totalReturnPct,
+        monthlyMaxSingleGainPct: config.maxSingleGainPct,
+        monthlyWorstDrawdownPct: config.worstDrawdownPct,
+        monthlyMaShort: config.maShort,
+        monthlyMaLong: config.maLong,
+        monthlyLatestMonth: config.latestMonth,
+        reasonSummary: config.reasonSummary,
+        industryLogic: '高端白酒景气稳定。',
+        newsLogic: '需求预期平稳。',
+        technicalLogic: 'MA6 持续站上 MA12。',
+        themeLabel: '消费白马',
+        latestPreviousHitDate: '2026-03-10',
+        previousHitCount: 2,
+        daysSincePreviousHit: 31,
+        isConsecutiveSignal: false,
+        close: 1800,
+        latestHigh: 1818,
+        windowHigh: 1818,
+        yearStartDate: '2026-01-02',
+        yearStartClose: 1540,
+        ytdReturnPct: config.ytdReturnPct,
+      },
+    ],
+  };
+}
+
+function buildMonthlySlowRiseResponse() {
+  return buildMonthlySlowRiseProfileResponse('balanced');
+}
+
+function buildMonthlySlowRiseStrictResponse() {
+  return buildMonthlySlowRiseProfileResponse('strict');
+}
+
+function buildMonthlySlowRiseLooseResponse() {
+  return buildMonthlySlowRiseProfileResponse('loose');
 }
 
 function buildRangeResponse() {
@@ -488,6 +631,45 @@ function buildHistoryResponse(code = '300006', name = '莱美药业') {
   };
 }
 
+function buildMonthlySlowRiseHistoryResponse() {
+  return {
+    signalType: 'monthly_slow_rise_profile__balanced',
+    code: '600519',
+    days: 180,
+    total: 2,
+    continuity: {
+      isCurrentStreak: false,
+      currentStreakCount: 1,
+      currentStreakStartDate: '2026-04-10',
+      currentStreakEndDate: '2026-04-10',
+      longestStreakCount: 2,
+      longestStreakStartDate: '2026-03-10',
+      longestStreakEndDate: '2026-04-10',
+    },
+    drawdown: {
+      anchorClose: 1800,
+      maxSignalHigh: 1818,
+      maxSignalHighDate: '2026-04-10',
+      distanceFromMaxSignalHighPct: -0.99,
+      latestSignalHigh: 1818,
+      latestSignalDate: '2026-04-10',
+      distanceFromLatestSignalHighPct: -0.99,
+    },
+    items: [
+      {
+        ...buildMonthlySlowRiseResponse().items[0],
+      },
+      {
+        ...buildMonthlySlowRiseResponse().items[0],
+        signalDate: '2026-03-10',
+        monthlyLatestMonth: '2026-02',
+        monthlyPositiveRatio: 0.67,
+        monthlyHigherLowRatio: 0.58,
+      },
+    ],
+  };
+}
+
 describe('SignalsPage', () => {
 beforeEach(() => {
   vi.clearAllMocks();
@@ -499,8 +681,10 @@ beforeEach(() => {
     signalDateFrom: null,
     signalDateTo: null,
     items: [
+      { signalType: 'trend_leader_unified', total: 1, displayLabel: '强趋势龙头总榜', group: 'strategy' },
       { signalType: 'hundred_day_high', total: 2 },
       { signalType: 'earnings_surprise', total: 1 },
+      { signalType: 'monthly_slow_rise', total: 1, displayLabel: '月线慢牛', group: 'strategy' },
       { signalType: 'hundred_day_high_with_earnings', total: 1 },
       { signalType: 'dragon_head_candidate', total: 1 },
       { signalType: 'commodity_beneficiary__optical_fiber', total: 1 },
@@ -511,6 +695,24 @@ beforeEach(() => {
         total: 1,
         displayLabel: '半导体辨识度',
         group: 'board_recognizability',
+      },
+      {
+        signalType: 'monthly_slow_rise_profile__strict',
+        total: 1,
+        displayLabel: '月线慢牛·严格',
+        group: 'monthly_slow_rise',
+      },
+      {
+        signalType: 'monthly_slow_rise_profile__balanced',
+        total: 1,
+        displayLabel: '月线慢牛·均衡',
+        group: 'monthly_slow_rise',
+      },
+      {
+        signalType: 'monthly_slow_rise_profile__loose',
+        total: 1,
+        displayLabel: '月线慢牛·宽松',
+        group: 'monthly_slow_rise',
       },
     ],
   });
@@ -647,20 +849,24 @@ beforeEach(() => {
     expect(await screen.findByText(/事件日期 2026-04-04/)).toBeInTheDocument();
   });
 
-  it('renders quick signal type tabs for the three main views', async () => {
+  it('renders quick signal type tabs for the four main strategy views', async () => {
     render(<SignalsPage />);
     expect(await screen.findByLabelText('signal-type-tab-hundred_day_high')).toBeInTheDocument();
     expect(screen.getByLabelText('signal-type-tab-earnings_surprise')).toBeInTheDocument();
-    expect(screen.getByLabelText('signal-type-tab-hundred_day_high_with_earnings')).toBeInTheDocument();
+    expect(screen.getByLabelText('signal-type-tab-trend_leader_unified')).toBeInTheDocument();
+    expect(screen.getByLabelText('signal-type-tab-monthly_slow_rise')).toBeInTheDocument();
     expect(await screen.findByLabelText('signal-type-total-count-hundred_day_high')).toHaveTextContent('总 2');
 
-    getSnapshots.mockResolvedValue(buildCombinedResponse());
-    fireEvent.click(screen.getByLabelText('signal-type-tab-hundred_day_high_with_earnings'));
+    getSnapshots.mockResolvedValue({
+      ...buildMonthlySlowRiseResponse(),
+      signalType: 'monthly_slow_rise',
+    });
+    fireEvent.click(screen.getByLabelText('signal-type-tab-monthly_slow_rise'));
 
     await waitFor(() => {
-      expect(getSnapshots).toHaveBeenLastCalledWith(
-        {
-          signalType: 'hundred_day_high_with_earnings',
+      expect(getSnapshots).toHaveBeenCalledWith(
+        expect.objectContaining({
+          signalType: 'monthly_slow_rise',
           signalDate: expect.any(String),
           signalDateFrom: undefined,
           signalDateTo: undefined,
@@ -668,7 +874,7 @@ beforeEach(() => {
           codes: undefined,
           page: 1,
           pageSize: 12,
-        },
+        }),
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
       );
     });
@@ -756,6 +962,46 @@ beforeEach(() => {
     expect((await screen.findAllByText(/Leader Type/i)).length).toBeGreaterThan(0);
   });
 
+  it('supports switching to a trend leader unified signal tab', async () => {
+    getSnapshots
+      .mockResolvedValueOnce(buildSingleResponse())
+      .mockResolvedValue(buildTrendLeaderUnifiedResponse());
+    getHistory.mockResolvedValue({
+      ...buildHistoryResponse('600001', '强势龙头'),
+      signalType: 'trend_leader_unified',
+      items: [
+        {
+          ...buildTrendLeaderUnifiedResponse().items[0],
+        },
+      ],
+    });
+
+    render(<SignalsPage />);
+    expect(await screen.findByLabelText('signal-type-tab-trend_leader_unified')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText('signal-type-tab-trend_leader_unified'));
+
+    await waitFor(() => {
+      expect(getSnapshots).toHaveBeenLastCalledWith(
+        {
+          signalType: 'trend_leader_unified',
+          signalDate: expect.any(String),
+          signalDateFrom: undefined,
+          signalDateTo: undefined,
+          code: undefined,
+          codes: undefined,
+          page: 1,
+          pageSize: 12,
+        },
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
+    });
+
+    expect(await screen.findByRole('heading', { name: '强趋势龙头总榜' })).toBeInTheDocument();
+    expect((await screen.findAllByText('breakout')).length).toBeGreaterThan(0);
+    expect((await screen.findAllByText('86.00')).length).toBeGreaterThan(0);
+  });
+
   it('supports switching to a board recognizability signal tab', async () => {
     getSnapshots
       .mockResolvedValueOnce(buildSingleResponse())
@@ -796,6 +1042,73 @@ beforeEach(() => {
     expect((await screen.findAllByText(/半导体/)).length).toBeGreaterThan(0);
   });
 
+  it('renders one-click compare view for monthly slow rise profiles', async () => {
+    getSnapshots.mockImplementation(async (params: { signalType: string; pageSize?: number }) => {
+      if (params.signalType === 'monthly_slow_rise_profile__strict') {
+        return buildMonthlySlowRiseStrictResponse();
+      }
+      if (params.signalType === 'monthly_slow_rise_profile__balanced') {
+        return buildMonthlySlowRiseResponse();
+      }
+      if (params.signalType === 'monthly_slow_rise_profile__loose') {
+        return buildMonthlySlowRiseLooseResponse();
+      }
+      return buildSingleResponse();
+    });
+    getHistory.mockResolvedValue(buildMonthlySlowRiseHistoryResponse());
+
+    render(<SignalsPage />);
+    expect(await screen.findByLabelText('signal-type-tab-monthly_slow_rise_profile__balanced')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText('signal-type-tab-monthly_slow_rise_profile__balanced'));
+
+    await waitFor(() => {
+      expect(getSnapshots).toHaveBeenCalledWith(
+        {
+          signalType: 'monthly_slow_rise_profile__balanced',
+          signalDate: expect.any(String),
+          signalDateFrom: undefined,
+          signalDateTo: undefined,
+          code: undefined,
+          codes: undefined,
+          page: 1,
+          pageSize: 12,
+        },
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
+    });
+
+    expect(await screen.findByText('月线慢牛·均衡快照')).toBeInTheDocument();
+    expect((await screen.findAllByText('月线慢牛·均衡')).length).toBeGreaterThan(0);
+    expect(await screen.findByText(/收涨 75\.00% \| 抬低点 67\.00% \| 区间 38\.50%/)).toBeInTheDocument();
+    expect(await screen.findByText(/Worst Drawdown/i)).toBeInTheDocument();
+    expect(await screen.findByTestId('monthly-slow-rise-compare')).toBeInTheDocument();
+    expect(await screen.findByText('月线慢牛一键对比')).toBeInTheDocument();
+    expect(await screen.findByText(/双档以上重合 1/)).toBeInTheDocument();
+    expect((await screen.findAllByText('月线慢牛·严格')).length).toBeGreaterThan(0);
+    expect((await screen.findAllByText('月线慢牛·宽松')).length).toBeGreaterThan(0);
+
+    fireEvent.click(screen.getByLabelText('monthly-compare-focus-monthly_slow_rise_profile__strict'));
+
+    await waitFor(() => {
+      expect(getSnapshots).toHaveBeenCalledWith(
+        {
+          signalType: 'monthly_slow_rise_profile__strict',
+          signalDate: expect.any(String),
+          signalDateFrom: undefined,
+          signalDateTo: undefined,
+          code: undefined,
+          codes: undefined,
+          page: 1,
+          pageSize: 12,
+        },
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
+    });
+
+    expect(await screen.findByText('月线慢牛·严格快照')).toBeInTheDocument();
+  });
+
   it('supports range mode compare toggle and group selection', async () => {
     getSnapshots
       .mockResolvedValueOnce(buildSingleResponse())
@@ -831,6 +1144,16 @@ beforeEach(() => {
     });
 
     expect(await screen.findByTestId('signals-selection-summary')).toHaveTextContent('已选 1 只');
+    expect(screen.getByTestId('signals-selection-summary')).toHaveTextContent('行业组 化学制药');
+    expect(screen.getByLabelText('select-streak-group-0')).toHaveTextContent('取消本组');
+
+    fireEvent.click(screen.getByLabelText('select-streak-group-0'));
+
+    await waitFor(() => {
+      expect(screen.getByLabelText('select-streak-group-0')).toHaveTextContent('选择本组');
+    });
+
+    expect(screen.getByTestId('signals-selection-summary')).not.toHaveTextContent('行业组 化学制药');
   });
 
   it('can copy markdown and push selected results', async () => {

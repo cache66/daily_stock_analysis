@@ -19,6 +19,7 @@ import logging
 import re
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any
 
 import pandas as pd
@@ -182,6 +183,165 @@ class TushareFetcher(BaseFetcher):
         logger.debug("Tushare API client configured for direct HTTP calls")
         return client
 
+    def _get_reference_cache_dir(self) -> Path:
+        """Return the shared local cache directory for low-frequency reference data."""
+        config = get_config()
+        history_cache_dir = Path(getattr(config, "history_disk_cache_dir", "./data/cache/history"))
+        reference_dir = history_cache_dir.resolve().parent / "reference"
+        reference_dir.mkdir(parents=True, exist_ok=True)
+        return reference_dir
+
+    def _get_stock_basic_cache_path(self) -> Path:
+        return self._get_reference_cache_dir() / "tushare_stock_basic_list.csv"
+
+    def _get_trade_calendar_cache_path(self) -> Path:
+        return self._get_reference_cache_dir() / "tushare_trade_cal_sse.csv"
+
+    @staticmethod
+    def _is_cache_fresh(cache_path: Path, *, max_age_hours: float) -> bool:
+        if not cache_path.exists():
+            return False
+        age_seconds = max(0.0, time.time() - cache_path.stat().st_mtime)
+        return age_seconds <= max(1.0, float(max_age_hours)) * 3600.0
+
+    def _read_stock_basic_cache(self) -> Optional[pd.DataFrame]:
+        cache_path = self._get_stock_basic_cache_path()
+        if not cache_path.exists():
+            return None
+        try:
+            df = pd.read_csv(cache_path, dtype=str)
+        except Exception as e:
+            logger.warning("Tushare 股票列表缓存读取失败: %s", e)
+            return None
+
+        if df is None or df.empty:
+            return None
+
+        work = df.copy()
+        if "code" not in work.columns and "ts_code" in work.columns:
+            work["code"] = work["ts_code"].astype(str).str.split(".").str[0]
+
+        required_columns = ["code", "name", "industry", "area", "market"]
+        missing = [column for column in required_columns if column not in work.columns]
+        if missing:
+            logger.warning("Tushare 股票列表缓存缺少字段: %s", ",".join(missing))
+            return None
+        return work
+
+    def _write_stock_basic_cache(self, df: pd.DataFrame) -> None:
+        cache_path = self._get_stock_basic_cache_path()
+        try:
+            df.to_csv(cache_path, index=False, encoding="utf-8-sig")
+        except Exception as e:
+            logger.warning("Tushare 股票列表缓存写入失败: %s", e)
+
+    def _read_trade_calendar_cache(self) -> Optional[pd.DataFrame]:
+        cache_path = self._get_trade_calendar_cache_path()
+        if not cache_path.exists():
+            return None
+        try:
+            df = pd.read_csv(cache_path, dtype=str)
+        except Exception as e:
+            logger.warning("Tushare trade calendar cache read failed: %s", e)
+            return None
+
+        if df is None or df.empty:
+            return None
+
+        work = df.copy()
+        if "exchange" not in work.columns:
+            work["exchange"] = "SSE"
+
+        required_columns = ["exchange", "cal_date", "is_open"]
+        missing = [column for column in required_columns if column not in work.columns]
+        if missing:
+            logger.warning("Tushare trade calendar cache missing columns: %s", ",".join(missing))
+            return None
+
+        work["exchange"] = work["exchange"].astype(str).str.strip().replace("", "SSE")
+        work["cal_date"] = work["cal_date"].astype(str).str.strip()
+        work["is_open"] = pd.to_numeric(work["is_open"], errors="coerce").fillna(0).astype(int)
+        work = work[required_columns].drop_duplicates(subset=["exchange", "cal_date"], keep="last")
+        work = work.sort_values("cal_date", ascending=True).reset_index(drop=True)
+        return work
+
+    def _write_trade_calendar_cache(self, df: pd.DataFrame) -> None:
+        cache_path = self._get_trade_calendar_cache_path()
+        try:
+            work = df.copy()
+            if "exchange" not in work.columns:
+                work["exchange"] = "SSE"
+            work = work[["exchange", "cal_date", "is_open"]].drop_duplicates(
+                subset=["exchange", "cal_date"],
+                keep="last",
+            )
+            work = work.sort_values("cal_date", ascending=True).reset_index(drop=True)
+            work.to_csv(cache_path, index=False, encoding="utf-8-sig")
+        except Exception as e:
+            logger.warning("Tushare trade calendar cache write failed: %s", e)
+
+    def _resolve_trade_dates_from_cache(
+        self,
+        cached_df: Optional[pd.DataFrame],
+        *,
+        start_date: str,
+        end_date: str,
+    ) -> List[str]:
+        if cached_df is None or cached_df.empty:
+            return []
+
+        work = cached_df[
+            (cached_df["exchange"].astype(str).str.upper() == "SSE")
+            & (cached_df["cal_date"] >= start_date)
+            & (cached_df["cal_date"] <= end_date)
+        ].copy()
+        if work.empty:
+            return []
+
+        if work["cal_date"].min() > start_date or work["cal_date"].max() < end_date:
+            return []
+
+        return sorted(
+            work[work["is_open"] == 1]["cal_date"].astype(str).tolist(),
+            reverse=True,
+        )
+
+    @staticmethod
+    def _build_weekday_trade_calendar_frame(start_date: str, end_date: str) -> pd.DataFrame:
+        """Build a simple Mon-Fri fallback calendar when Tushare trade_cal is unavailable."""
+        try:
+            dates = pd.date_range(start=start_date, end=end_date, freq="D")
+        except Exception:
+            return pd.DataFrame(columns=["exchange", "cal_date", "is_open"])
+        return pd.DataFrame(
+            {
+                "exchange": ["SSE"] * len(dates),
+                "cal_date": [ts.strftime("%Y%m%d") for ts in dates],
+                "is_open": [1 if ts.weekday() < 5 else 0 for ts in dates],
+            }
+        )
+
+    @classmethod
+    def _build_weekday_trade_dates(cls, start_date: str, end_date: str) -> List[str]:
+        fallback_df = cls._build_weekday_trade_calendar_frame(start_date, end_date)
+        if fallback_df.empty:
+            return []
+        return sorted(
+            fallback_df[fallback_df["is_open"] == 1]["cal_date"].astype(str).tolist(),
+            reverse=True,
+        )
+
+    def _prime_stock_name_cache(self, df: Optional[pd.DataFrame]) -> None:
+        if df is None or df.empty:
+            return
+        if not hasattr(self, "_stock_name_cache"):
+            self._stock_name_cache = {}
+        for _, row in df.iterrows():
+            code = str(row.get("code") or "").strip()
+            name = str(row.get("name") or "").strip()
+            if code and name:
+                self._stock_name_cache[code] = name
+
     def _determine_priority(self) -> int:
         """
         根据 Token 配置和 API 初始化状态确定优先级
@@ -269,28 +429,79 @@ class TushareFetcher(BaseFetcher):
 
     def _get_trade_dates(self, end_date: Optional[str] = None) -> List[str]:
         """按自然日刷新交易日历缓存，避免服务跨日后继续复用旧日历。"""
-        if self._api is None:
-            return []
-
         china_now = self._get_china_now()
         requested_end_date = end_date or china_now.strftime("%Y%m%d")
+        start_date = (china_now - timedelta(days=20)).strftime("%Y%m%d")
+        cache_path = self._get_trade_calendar_cache_path()
 
         if self.date_list is not None and self._date_list_end == requested_end_date:
             return self.date_list
 
-        start_date = (china_now - timedelta(days=20)).strftime("%Y%m%d")
-        df_cal = self._call_api_with_rate_limit(
-            "trade_cal",
-            exchange="SSE",
+        cached_calendar = self._read_trade_calendar_cache()
+        cached_trade_dates = self._resolve_trade_dates_from_cache(
+            cached_calendar,
             start_date=start_date,
             end_date=requested_end_date,
         )
+        if cached_trade_dates and self._is_cache_fresh(cache_path, max_age_hours=36):
+            self.date_list = cached_trade_dates
+            self._date_list_end = requested_end_date
+            logger.info("Tushare 交易日历命中本地缓存: %s", cache_path)
+            return self.date_list
+
+        if self._api is None:
+            if cached_trade_dates:
+                self.date_list = cached_trade_dates
+                self._date_list_end = requested_end_date
+                logger.warning("Tushare API 未初始化，回退使用本地交易日历缓存: %s", cache_path)
+                return self.date_list
+            fallback_calendar = self._build_weekday_trade_calendar_frame(start_date, requested_end_date)
+            if not fallback_calendar.empty:
+                self._write_trade_calendar_cache(fallback_calendar)
+            self.date_list = self._build_weekday_trade_dates(start_date, requested_end_date)
+            self._date_list_end = requested_end_date
+            logger.warning("Tushare API 未初始化，回退使用工作日近似交易日历")
+            return self.date_list
+
+        try:
+            df_cal = self._call_api_with_rate_limit(
+                "trade_cal",
+                exchange="SSE",
+                start_date=start_date,
+                end_date=requested_end_date,
+            )
+        except Exception as e:
+            if cached_trade_dates:
+                self.date_list = cached_trade_dates
+                self._date_list_end = requested_end_date
+                logger.warning("Tushare trade_cal 获取失败，回退使用本地交易日历缓存: %s", e)
+                return self.date_list
+            fallback_calendar = self._build_weekday_trade_calendar_frame(start_date, requested_end_date)
+            if not fallback_calendar.empty:
+                self._write_trade_calendar_cache(fallback_calendar)
+            self.date_list = self._build_weekday_trade_dates(start_date, requested_end_date)
+            self._date_list_end = requested_end_date
+            logger.warning("Tushare trade_cal 获取失败，回退使用工作日近似交易日历: %s", e)
+            return self.date_list
 
         if df_cal is None or df_cal.empty or "cal_date" not in df_cal.columns:
-            logger.warning("[Tushare] trade_cal 返回为空，无法更新交易日历缓存")
-            self.date_list = []
+            if cached_trade_dates:
+                self.date_list = cached_trade_dates
+                self._date_list_end = requested_end_date
+                logger.warning("[Tushare] trade_cal 返回为空，回退使用本地交易日历缓存")
+                return self.date_list
+            logger.warning("[Tushare] trade_cal 返回为空，回退使用工作日近似交易日历")
+            fallback_calendar = self._build_weekday_trade_calendar_frame(start_date, requested_end_date)
+            if not fallback_calendar.empty:
+                self._write_trade_calendar_cache(fallback_calendar)
+            self.date_list = self._build_weekday_trade_dates(start_date, requested_end_date)
             self._date_list_end = requested_end_date
             return self.date_list
+
+        df_cal = df_cal.copy()
+        if "exchange" not in df_cal.columns:
+            df_cal["exchange"] = "SSE"
+        self._write_trade_calendar_cache(df_cal[["exchange", "cal_date", "is_open"]])
 
         trade_dates = sorted(
             df_cal[df_cal["is_open"] == 1]["cal_date"].astype(str).tolist(),
@@ -392,11 +603,11 @@ class TushareFetcher(BaseFetcher):
             return f"{code}.BJ"
         
         # Regular stocks
-        # Shanghai: 600xxx, 601xxx, 603xxx, 688xxx (STAR Market)
-        # Shenzhen: 000xxx, 002xxx, 300xxx (ChiNext)
-        if code.startswith(('600', '601', '603', '688')):
+        # SH: 6xxxxx/9xxxxx (A/B share)
+        # SZ: 0xxxxx/1xxxxx/2xxxxx/3xxxxx (主板/中小板/创业板/新主板段)
+        if len(code) == 6 and code[0] in ('6', '9'):
             return f"{code}.SH"
-        elif code.startswith(('000', '002', '300')):
+        elif len(code) == 6 and code[0] in ('0', '1', '2', '3'):
             return f"{code}.SZ"
         else:
             logger.warning(f"无法确定股票 {code} 的市场，默认使用深市")
@@ -576,6 +787,12 @@ class TushareFetcher(BaseFetcher):
         # 检查缓存
         if hasattr(self, '_stock_name_cache') and stock_code in self._stock_name_cache:
             return self._stock_name_cache[stock_code]
+
+        cached_stock_list = self._read_stock_basic_cache()
+        if cached_stock_list is not None:
+            self._prime_stock_name_cache(cached_stock_list)
+            if hasattr(self, "_stock_name_cache") and stock_code in self._stock_name_cache:
+                return self._stock_name_cache[stock_code]
         
         # 初始化缓存
         if not hasattr(self, '_stock_name_cache'):
@@ -629,10 +846,21 @@ class TushareFetcher(BaseFetcher):
         Returns:
             包含 code, name, industry, area, market 列的 DataFrame，失败返回 None
         """
+        cache_path = self._get_stock_basic_cache_path()
+        cached_df = self._read_stock_basic_cache()
+        if cached_df is not None and self._is_cache_fresh(cache_path, max_age_hours=24 * 7):
+            self._prime_stock_name_cache(cached_df)
+            logger.info("Tushare 股票列表命中本地缓存: %s", cache_path)
+            return cached_df[["code", "name", "industry", "area", "market"]].copy()
+
         if self._api is None:
+            if cached_df is not None:
+                self._prime_stock_name_cache(cached_df)
+                logger.warning("Tushare API 未初始化，回退使用本地股票列表缓存: %s", cache_path)
+                return cached_df[["code", "name", "industry", "area", "market"]].copy()
             logger.warning("Tushare API 未初始化，无法获取股票列表")
             return None
-        
+
         try:
             self._check_rate_limit()
 
@@ -653,10 +881,16 @@ class TushareFetcher(BaseFetcher):
             for _, row in df.iterrows():
                 self._stock_name_cache[row['code']] = row['name']
 
+            self._write_stock_basic_cache(df[["ts_code", "code", "name", "industry", "area", "market"]])
+
             logger.info(f"Tushare 获取股票列表成功: {len(df)} 条")
             return df[['code', 'name', 'industry', 'area', 'market']]
 
         except Exception as e:
+            if cached_df is not None:
+                self._prime_stock_name_cache(cached_df)
+                logger.warning("Tushare 获取股票列表失败，回退使用本地缓存: %s", e)
+                return cached_df[["code", "name", "industry", "area", "market"]].copy()
             logger.warning(f"Tushare 获取股票列表失败: {e}")
 
         return None
@@ -903,8 +1137,10 @@ class TushareFetcher(BaseFetcher):
                     df.columns = [col.lower() for col in df.columns]
 
                     # 获取股票基础信息（包含代码和名称）
-                    df_basic = self._call_api_with_rate_limit("stock_basic", fields='ts_code,name')
-                    df = pd.merge(df, df_basic, on='ts_code', how='left')
+                    df["code"] = df["ts_code"].astype(str).str.split(".").str[0]
+                    df_basic = self.get_stock_list()
+                    if df_basic is not None and not df_basic.empty:
+                        df = pd.merge(df, df_basic[["code", "name"]], on="code", how="left")
                     # 将 daily的 amount 列的值乘以 1000 来和其他数据源保持一致
                     if 'amount' in df.columns:
                         df['amount'] = df['amount'] * 1000

@@ -160,5 +160,10 @@ class BoardRecognizabilitySnapshotFlowTestCase(unittest.TestCase):
         self.assertEqual(second_df.iloc[0]["latest_previous_hit_date"], "2026-04-09")
 
         signal_type = build_signal_type("半导体", prefix=DEFAULT_SIGNAL_TYPE_PREFIX)
-        rows = self.db.get_signal_snapshots(signal_type=signal_type, code="688001", days=10)
+        rows = self.db.get_signal_snapshots(
+            signal_type=signal_type,
+            code="688001",
+            start_date=date(2026, 4, 9),
+            end_date=date(2026, 4, 10),
+        )
         self.assertEqual(len(rows), 2)

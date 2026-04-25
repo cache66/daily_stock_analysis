@@ -705,6 +705,29 @@ def _build_schedule_time_provider(default_schedule_time: str):
     return _provider
 
 
+def _run_scheduled_subprocess(command: List[str], *, cwd: str) -> None:
+    """Run a scheduled helper script and clean up the child on interrupt."""
+    process = subprocess.Popen(command, cwd=cwd)
+    try:
+        return_code = process.wait()
+    except KeyboardInterrupt:
+        logger.warning("scheduled subprocess interrupted, terminating child: %s", " ".join(command))
+        try:
+            process.terminate()
+        except Exception:
+            logger.debug("failed to terminate scheduled child cleanly", exc_info=True)
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            logger.warning("scheduled child did not exit after terminate, force killing: %s", " ".join(command))
+            process.kill()
+            process.wait(timeout=5)
+        raise
+
+    if return_code != 0:
+        raise subprocess.CalledProcessError(return_code, command)
+
+
 def _run_optional_signal_snapshot_tasks(config: Config) -> None:
     """Run optional scheduled signal snapshot refresh tasks."""
     if not getattr(config, "signal_snapshot_hundred_day_high_enabled", False):
@@ -727,8 +750,10 @@ def _run_optional_signal_snapshot_tasks(config: Config) -> None:
     if not getattr(config, "signal_snapshot_hundred_day_high_cause_analysis_enabled", False):
         command.append("--skip-cause-analysis")
     else:
-        # Scheduled runs prioritise deterministic, low-latency structured attribution.
-        command.extend(["--disable-news-search", "--disable-llm-reason-card"])
+        # Dual-stage mode for daily stability:
+        # stage-1 full scan remains deterministic; stage-2 enriches selected hits
+        # with fresh news + main-business evidence while still skipping LLM cards.
+        command.append("--disable-llm-reason-card")
 
     logger.info(
         "开始执行定时百日新高快照更新: cause_analysis=%s, command=%s",
@@ -736,11 +761,7 @@ def _run_optional_signal_snapshot_tasks(config: Config) -> None:
         " ".join(command),
     )
     try:
-        subprocess.run(
-            command,
-            cwd=str(project_root),
-            check=True,
-        )
+        _run_scheduled_subprocess(command, cwd=str(project_root))
         logger.info("定时百日新高快照更新完成")
     except subprocess.CalledProcessError as exc:
         logger.warning("定时百日新高快照更新失败（fail-open）: exit_code=%s", exc.returncode)
@@ -789,11 +810,7 @@ def _run_optional_board_recognizability_snapshot_tasks(config: Config) -> None:
         " ".join(command),
     )
     try:
-        subprocess.run(
-            command,
-            cwd=str(project_root),
-            check=True,
-        )
+        _run_scheduled_subprocess(command, cwd=str(project_root))
         logger.info(
             "瀹氭椂鏉垮潡杈ㄨ瘑搴︽帓鍚嶅揩鐓ф洿鏂板畬鎴? source_signal_type=%s, top_n=%s",
             source_signal_type,
@@ -901,11 +918,7 @@ def _run_optional_board_theme_core_snapshot_tasks(config: Config) -> None:
             " ".join(command),
         )
         try:
-            subprocess.run(
-                command,
-                cwd=str(project_root),
-                check=True,
-            )
+            _run_scheduled_subprocess(command, cwd=str(project_root))
             logger.info(
                 "定时模块主题核心快照更新完成: board=%s(%s)",
                 target["board_name"],
@@ -918,6 +931,98 @@ def _run_optional_board_theme_core_snapshot_tasks(config: Config) -> None:
                 target["board_type"],
                 exc.returncode,
             )
+
+
+def _run_optional_trend_leader_unified_snapshot_tasks(config: Config) -> None:
+    """Run optional scheduled trend-leader unified snapshot refresh task."""
+    if not getattr(config, "trend_leader_unified_snapshot_enabled", False):
+        return
+
+    if getattr(config, "trading_day_check_enabled", True):
+        from src.core.trading_calendar import get_market_now, is_market_open
+
+        market_today = get_market_now("cn").date()
+        if not is_market_open("cn", market_today):
+            logger.info(
+                "浠婃棩 A 鑲′负闈炰氦鏄撴棩锛岃烦杩囧畾鏃跺己瓒嬪娍榫欏ご缁熶竴蹇収鏇存柊: %s",
+                market_today.isoformat(),
+            )
+            return
+
+    project_root = Path(__file__).resolve().parent
+    script_path = project_root / "scripts" / "run_trend_leader_daily_bundle.py"
+    command = [sys.executable, str(script_path)]
+
+    try:
+        limit = int(getattr(config, "trend_leader_unified_snapshot_limit", 0) or 0)
+    except (TypeError, ValueError):
+        limit = 0
+    if limit > 0:
+        command.extend(["--limit", str(limit)])
+
+    logger.info(
+        "寮€濮嬫墽琛屽畾鏃跺己瓒嬪娍榫欏ご缁熶竴蹇収鏇存柊: limit=%s, command=%s",
+        limit if limit > 0 else "all",
+        " ".join(command),
+    )
+    try:
+        _run_scheduled_subprocess(command, cwd=str(project_root))
+        logger.info(
+            "瀹氭椂寮鸿秼鍔块緳澶寸粺涓€蹇収鏇存柊瀹屾垚: limit=%s",
+            limit if limit > 0 else "all",
+        )
+    except subprocess.CalledProcessError as exc:
+        logger.warning(
+            "瀹氭椂寮鸿秼鍔块緳澶寸粺涓€蹇収鏇存柊澶辫触锛坒ail-open锛? limit=%s, exit_code=%s",
+            limit if limit > 0 else "all",
+            exc.returncode,
+        )
+
+
+def _run_optional_earnings_observation_snapshot_tasks(config: Config) -> None:
+    """Run optional scheduled earnings-observation snapshot refresh task."""
+    if not getattr(config, "earnings_observation_snapshot_enabled", False):
+        return
+
+    if getattr(config, "trading_day_check_enabled", True):
+        from src.core.trading_calendar import get_market_now, is_market_open
+
+        market_today = get_market_now("cn").date()
+        if not is_market_open("cn", market_today):
+            logger.info(
+                "today is not an A-share trading day, skip scheduled earnings observation refresh: %s",
+                market_today.isoformat(),
+            )
+            return
+
+    project_root = Path(__file__).resolve().parent
+    script_path = project_root / "scripts" / "collect_earnings_observation_snapshots.py"
+    command = [sys.executable, str(script_path)]
+
+    try:
+        max_observation_days = int(getattr(config, "earnings_observation_max_observation_days", 0) or 0)
+    except (TypeError, ValueError):
+        max_observation_days = 0
+    if max_observation_days > 0:
+        command.extend(["--max-observation-days", str(max_observation_days)])
+
+    logger.info(
+        "start scheduled earnings observation refresh: max_observation_days=%s, command=%s",
+        max_observation_days if max_observation_days > 0 else "default",
+        " ".join(command),
+    )
+    try:
+        _run_scheduled_subprocess(command, cwd=str(project_root))
+        logger.info(
+            "scheduled earnings observation refresh finished: max_observation_days=%s",
+            max_observation_days if max_observation_days > 0 else "default",
+        )
+    except subprocess.CalledProcessError as exc:
+        logger.warning(
+            "scheduled earnings observation refresh failed (fail-open): max_observation_days=%s exit_code=%s",
+            max_observation_days if max_observation_days > 0 else "default",
+            exc.returncode,
+        )
 
 
 def main() -> int:
@@ -1120,6 +1225,8 @@ def main() -> int:
                 _run_optional_signal_snapshot_tasks(runtime_config)
                 _run_optional_board_recognizability_snapshot_tasks(runtime_config)
                 _run_optional_board_theme_core_snapshot_tasks(runtime_config)
+                _run_optional_trend_leader_unified_snapshot_tasks(runtime_config)
+                _run_optional_earnings_observation_snapshot_tasks(runtime_config)
 
             background_tasks = []
             if getattr(config, 'agent_event_monitor_enabled', False):

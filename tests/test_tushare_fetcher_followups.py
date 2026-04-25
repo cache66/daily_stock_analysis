@@ -113,6 +113,9 @@ class TestTushareFetcherFollowUps(unittest.TestCase):
         self.assertEqual(fetcher._convert_stock_code("SZ000001"), "000001.SZ")
         self.assertEqual(fetcher._convert_stock_code("SH600519"), "600519.SH")
         self.assertEqual(fetcher._convert_stock_code("600519.SS"), "600519.SH")
+        self.assertEqual(fetcher._convert_stock_code("001389"), "001389.SZ")
+        self.assertEqual(fetcher._convert_stock_code("301396"), "301396.SZ")
+        self.assertEqual(fetcher._convert_stock_code("605099"), "605099.SH")
 
     @patch.dict(sys.modules, {"tushare": MagicMock()})
     def test_legacy_realtime_quote_keeps_sz_hint_as_stock_symbol(self) -> None:

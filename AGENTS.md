@@ -18,6 +18,7 @@
 - 默认稳定性优先于“顺手优化”；非当前任务直接需要的重构、抽象和基础设施迁移一律克制。
 - 新增配置项时，必须同步更新 `.env.example` 和相关文档。
 - 涉及用户可见能力、CLI/API 行为、部署方式、通知方式、报告结构变化时，必须同步更新相关文档与 `docs/CHANGELOG.md`。
+- 涉及本地策略资产的改动（含 `scripts/select_*.py`、`scripts/collect_*.py`、`strategies/*.yaml`、`src/services/signal_snapshot_service.py` 及相关策略专题文档）时，必须同步更新 `docs/LOCAL_STRATEGY_CATALOG.md`、`docs/AI_MODIFICATION_LOG.md` 与 `docs/CHANGELOG.md`。
 - `docs/CHANGELOG.md` 的 `[Unreleased]` 段使用**扁平格式**：每条独立一行，格式为 `- [类型] 描述`，类型取值：`新功能`/`改进`/`修复`/`文档`/`测试`/`chore`；**禁止在 `[Unreleased]` 内新增 `### 类目标题`**，以减少并发 PR 的 merge 冲突。发版时由 maintainer 汇总整理成带标题的正式格式。
 - `README.md` 用于入门、运行、部署、核心能力总览；更细的模块行为、页面交互、专题配置与排障说明，优先更新对应 `docs/*.md` 或专题文档。
 - 若未更新 `README.md`，需在交付说明或 PR 描述中写明原因，以及本次信息实际落到的文档位置。
@@ -117,8 +118,9 @@ gh run view <run_id> --log-failed
 4. 先判断是否命中高风险区域：配置语义、API / Schema、数据源 fallback、报告结构、认证、调度、发布流程、桌面端启动链路。
 5. 只做和当前任务直接相关的最小改动，不顺手夹带无关重构。
 6. 如果发现文档、脚本、工作流描述不一致，优先信任实际代码与工作流，再决定是否顺手修正文档。
-7. 改完后按下面的验证矩阵执行检查。
-8. 最终交付默认要说明：
+7. 若命中本地策略资产改动，按 `docs/LOCAL_STRATEGY_CATALOG.md` 顶部“维护约定”逐项补齐记录，再执行验证。
+8. 改完后按下面的验证矩阵执行检查。
+9. 最终交付默认要说明：
    - 改了什么
    - 为什么这么改
    - 验证情况
@@ -240,6 +242,7 @@ gh run view <run_id> --log-failed
   - `风险点`
   - `回滚方式`
 - 如果是 `docs` 任务，可直接写：`Docs only, tests not run`，但仍需说明是否核对了命令和文件名。
+- 涉及本地策略资产的任务，交付说明需明确本次留痕落点：`docs/LOCAL_STRATEGY_CATALOG.md`、`docs/AI_MODIFICATION_LOG.md`、`docs/CHANGELOG.md`。
 - 自动 tag 默认不触发，只有 commit title 包含 `#patch`、`#minor`、`#major` 才会触发版本号更新。
 - 手动打 tag 必须使用 annotated tag。
 - 用户可见变更优先通过 PR 合入，并补齐 label 与验证说明。

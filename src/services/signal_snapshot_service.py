@@ -22,6 +22,7 @@ class SignalSnapshotService:
     """Read/query service for K-line signal snapshots."""
 
     BOARD_RECOGNIZABILITY_SIGNAL_PREFIX = "board_recognizability__"
+    MONTHLY_SLOW_RISE_SIGNAL_PREFIX = "monthly_slow_rise_profile__"
     COMPOSITE_SIGNAL_TYPES: Dict[str, Dict[str, str]] = {
         "hundred_day_high_with_earnings": {
             "primary": "hundred_day_high",
@@ -29,8 +30,12 @@ class SignalSnapshotService:
         },
     }
     DEFAULT_SIGNAL_TYPES: List[str] = [
+        "trend_leader_unified",
         "hundred_day_high",
         "earnings_surprise",
+        "monthly_slow_rise",
+        "earnings_observation_registry",
+        "earnings_observation_active",
         "hundred_day_high_with_earnings",
         "dragon_head_candidate",
         "commodity_beneficiary__optical_fiber",
@@ -253,6 +258,16 @@ class SignalSnapshotService:
                     code=code,
                     codes=codes,
                     prefix=self.BOARD_RECOGNIZABILITY_SIGNAL_PREFIX,
+                )
+            )
+            requested_types.extend(
+                self.db.list_signal_snapshot_signal_types(
+                    signal_date=normalized_date,
+                    start_date=normalized_from,
+                    end_date=normalized_to,
+                    code=code,
+                    codes=codes,
+                    prefix=self.MONTHLY_SLOW_RISE_SIGNAL_PREFIX,
                 )
             )
         items: List[Dict[str, Any]] = []
@@ -547,6 +562,14 @@ class SignalSnapshotService:
         )
 
     @staticmethod
+    def _is_monthly_slow_rise_signal_type(signal_type: str) -> bool:
+        normalized = str(signal_type or "").strip()
+        return (
+            normalized == "monthly_slow_rise"
+            or normalized.startswith(SignalSnapshotService.MONTHLY_SLOW_RISE_SIGNAL_PREFIX)
+        )
+
+    @staticmethod
     def _to_float(value: Any) -> Optional[float]:
         if value is None:
             return None
@@ -564,6 +587,48 @@ class SignalSnapshotService:
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _to_optional_bool(value: Any) -> Optional[bool]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value).strip().lower()
+        if not text:
+            return None
+        if text in {"true", "1", "yes", "y", "on"}:
+            return True
+        if text in {"false", "0", "no", "n", "off"}:
+            return False
+        return None
+
+    @staticmethod
+    def _build_trend_leader_signal_tags(metrics: Dict[str, Any]) -> List[str]:
+        tags: List[str] = []
+        near_new_high = SignalSnapshotService._to_optional_bool(metrics.get("near_new_high"))
+        breakout = SignalSnapshotService._to_optional_bool(metrics.get("is_breakout_candidate"))
+        pullback = SignalSnapshotService._to_optional_bool(metrics.get("is_pullback_candidate"))
+        selection_mode = str(metrics.get("selection_mode", "") or "").strip().lower()
+
+        if near_new_high:
+            tags.append("百日新高")
+        if breakout:
+            tags.append("突破形态")
+        if pullback:
+            tags.append("回踩形态")
+        if selection_mode == "strict":
+            tags.append("严格命中")
+        elif selection_mode == "fallback":
+            tags.append("兜底观察")
+
+        deduped: List[str] = []
+        for tag in tags:
+            if tag and tag not in deduped:
+                deduped.append(tag)
+        return deduped
+
     def _get_history_manager(self):
         if self._history_manager is None:
             self._history_manager = KlineSelectorService.build_fast_a_share_manager()
@@ -580,6 +645,12 @@ class SignalSnapshotService:
         cache: Optional[Dict[tuple[str, str], Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         if not code or signal_date is None:
+            return {
+                "year_start_date": None,
+                "year_start_close": None,
+                "ytd_return_pct": None,
+            }
+        if str(code).strip().upper() == "TL_SUMMARY":
             return {
                 "year_start_date": None,
                 "year_start_close": None,
@@ -702,6 +773,22 @@ class SignalSnapshotService:
             "pass_through_direction": str(metrics.get("pass_through_direction", "") or "").strip() or None,
             "earnings_validation_status": str(metrics.get("earnings_validation_status", "") or "").strip() or None,
             "earnings_release_probability": str(metrics.get("earnings_release_probability", "") or "").strip() or None,
+            "earnings_quality_signal": bool(metrics.get("earnings_quality_signal")) if metrics.get("earnings_quality_signal") is not None else None,
+            "earnings_strategy_score": self._to_float(metrics.get("earnings_strategy_score")),
+            "earnings_strategy_label": str(metrics.get("earnings_strategy_label", "") or "").strip() or None,
+            "earnings_strategy_gate_status": str(metrics.get("earnings_strategy_gate_status", "") or "").strip() or None,
+            "earnings_growth_continuity_score": self._to_float(metrics.get("earnings_growth_continuity_score")),
+            "earnings_profit_quality_score": self._to_float(metrics.get("earnings_profit_quality_score")),
+            "earnings_profitability_score": self._to_float(metrics.get("earnings_profitability_score")),
+            "earnings_disclosure_signal_score": self._to_float(metrics.get("earnings_disclosure_signal_score")),
+            "earnings_cycle_score": self._to_float(metrics.get("earnings_cycle_score")),
+            "earnings_event_freshness_score": self._to_float(metrics.get("earnings_event_freshness_score")),
+            "earnings_risk_penalty": self._to_float(metrics.get("earnings_risk_penalty")),
+            "earnings_quality_verdict": str(metrics.get("earnings_quality_verdict", "") or "").strip() or None,
+            "earnings_quality_score": self._to_float(metrics.get("earnings_quality_score")),
+            "earnings_quality_cycle_phase": str(metrics.get("earnings_quality_cycle_phase", "") or "").strip() or None,
+            "earnings_quality_quarterly_trend": str(metrics.get("earnings_quality_quarterly_trend", "") or "").strip() or None,
+            "earnings_quality_dual_positive_streak": self._to_int(metrics.get("earnings_quality_dual_positive_streak")),
             "directness": str(metrics.get("directness", "") or "").strip() or None,
             "matched_example_bucket": str(metrics.get("matched_example_bucket", "") or "").strip() or None,
             "matched_example_name": str(metrics.get("matched_example_name", "") or "").strip() or None,
@@ -712,11 +799,58 @@ class SignalSnapshotService:
             "dividend_score": self._to_float(metrics.get("dividend_score")),
             "logic_consensus_score": self._to_float(metrics.get("logic_consensus_score")),
             "capital_consensus_score": self._to_float(metrics.get("capital_consensus_score")),
+            "cache_source": str(metrics.get("cache_source", "") or "").strip() or None,
+            "bundle_refreshed_at": str(metrics.get("bundle_refreshed_at", "") or "").strip() or None,
+            "capital_profile_refreshed_at": str(metrics.get("capital_profile_refreshed_at", "") or "").strip() or None,
+            "capital_profile_cache_hit": (
+                bool(metrics.get("capital_profile_cache_hit"))
+                if metrics.get("capital_profile_cache_hit") is not None
+                else None
+            ),
             "leader_probability": str(metrics.get("leader_probability", "") or "").strip() or None,
             "leader_type": str(metrics.get("leader_type", "") or "").strip() or None,
+            "selection_mode": str(metrics.get("selection_mode", "") or "").strip() or None,
+            "is_breakout_candidate": self._to_optional_bool(metrics.get("is_breakout_candidate")),
+            "is_pullback_candidate": self._to_optional_bool(metrics.get("is_pullback_candidate")),
+            "near_new_high": self._to_optional_bool(metrics.get("near_new_high")),
+            "signal_tags": self._build_trend_leader_signal_tags(metrics),
+            "primary_profile": str(metrics.get("primary_profile", "") or "").strip() or None,
+            "breakout_score": self._to_float(metrics.get("breakout_score")),
+            "pullback_score": self._to_float(metrics.get("pullback_score")),
+            "hybrid_score": self._to_float(metrics.get("hybrid_score")),
+            "overall_score": self._to_float(metrics.get("overall_score")),
+            "trend_label": str(metrics.get("trend_label", "") or "").strip() or None,
+            "risk_flags": [
+                str(item).strip()
+                for item in (metrics.get("risk_flags") if isinstance(metrics.get("risk_flags"), list) else [])
+                if str(item).strip()
+            ],
+            "strategy_summary": (
+                str(metrics.get("strategy_summary", "") or "").strip()
+                or str(cause.get("reason_summary", "") or "").strip()
+                or None
+            ),
+            "profile_name": (
+                str(metrics.get("profile_name", "") or "").strip()
+                or str(criteria.get("profile_name", "") or "").strip()
+                or None
+            ),
+            "profile_label": (
+                str(metrics.get("profile_label", "") or "").strip()
+                or str(criteria.get("profile_label", "") or "").strip()
+                or None
+            ),
             "sector_leadership_score": self._to_float(metrics.get("sector_leadership_score")),
             "relative_strength_score": self._to_float(metrics.get("relative_strength_score")),
             "catalyst_score": self._to_float(metrics.get("catalyst_score")),
+            "monthly_positive_ratio": self._to_float(metrics.get("monthly_positive_ratio")),
+            "monthly_higher_low_ratio": self._to_float(metrics.get("monthly_higher_low_ratio")),
+            "monthly_total_return_pct": self._to_float(metrics.get("monthly_total_return_pct")),
+            "monthly_max_single_gain_pct": self._to_float(metrics.get("monthly_max_single_gain_pct")),
+            "monthly_worst_drawdown_pct": self._to_float(metrics.get("monthly_worst_drawdown_pct")),
+            "monthly_ma_short": self._to_float(metrics.get("monthly_ma_short")),
+            "monthly_ma_long": self._to_float(metrics.get("monthly_ma_long")),
+            "monthly_latest_month": str(metrics.get("monthly_latest_month", "") or "").strip() or None,
             "industry": str(cause.get("industry", "") or "").strip(),
             "reason_summary": str(cause.get("reason_summary", "") or "").strip(),
             "industry_logic": str(cause.get("industry_logic", "") or "").strip(),
@@ -765,7 +899,43 @@ class SignalSnapshotService:
         code: Optional[str],
         codes: Optional[List[str]],
     ) -> Dict[str, Any]:
-        if not self._is_board_recognizability_signal_type(signal_type):
+        if signal_type == "trend_leader_unified":
+            return {
+                "group": "strategy",
+                "display_label": "强趋势龙头总榜",
+            }
+        if signal_type == "hundred_day_high":
+            return {
+                "group": "strategy",
+                "display_label": "百日新高",
+            }
+        if signal_type == "earnings_surprise":
+            return {
+                "group": "strategy",
+                "display_label": "业绩超预期",
+            }
+        if signal_type == "monthly_slow_rise":
+            return {
+                "group": "strategy",
+                "display_label": "月线慢牛",
+            }
+        if signal_type == "hundred_day_high_with_earnings":
+            return {
+                "group": "strategy",
+                "display_label": "新高且业绩",
+            }
+        if signal_type == "earnings_observation_registry":
+            return {
+                "group": "strategy",
+                "display_label": "业绩观察池",
+            }
+        if signal_type == "earnings_observation_active":
+            return {
+                "group": "strategy",
+                "display_label": "业绩观察活跃",
+            }
+
+        if not self._is_board_recognizability_signal_type(signal_type) and not self._is_monthly_slow_rise_signal_type(signal_type):
             return {}
 
         rows = self.db.get_signal_snapshots(
@@ -778,12 +948,26 @@ class SignalSnapshotService:
             limit=1,
         )
         if not rows:
-            return {"group": "board_recognizability"}
+            return {
+                "group": "board_recognizability" if self._is_board_recognizability_signal_type(signal_type) else "monthly_slow_rise"
+            }
 
         row = rows[0]
         metrics = self._to_dict(getattr(row, "metrics_payload", None))
         criteria = self._to_dict(getattr(row, "criteria_payload", None))
         cause = self._to_dict(getattr(row, "cause_payload", None))
+        if self._is_monthly_slow_rise_signal_type(signal_type):
+            profile_label = (
+                str(metrics.get("profile_label", "") or "").strip()
+                or str(criteria.get("profile_label", "") or "").strip()
+                or str(metrics.get("profile_name", "") or "").strip()
+                or str(criteria.get("profile_name", "") or "").strip()
+            )
+            metadata: Dict[str, Any] = {"group": "monthly_slow_rise"}
+            if profile_label:
+                metadata["display_label"] = profile_label
+            return metadata
+
         board_name = (
             str(metrics.get("board_name", "") or "").strip()
             or str(criteria.get("board_name", "") or "").strip()

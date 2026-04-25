@@ -1616,13 +1616,85 @@ class GeminiAnalyzer:
             if isinstance(earnings_data, dict)
             else {}
         )
-        if isinstance(financial_report, dict) or isinstance(dividend_metrics, dict):
+        earnings_quality_block = (
+            fundamental_context.get("earnings_quality", {})
+            if isinstance(fundamental_context, dict)
+            else {}
+        )
+        earnings_quality_data = (
+            earnings_quality_block.get("data", {})
+            if isinstance(earnings_quality_block, dict)
+            else {}
+        )
+        if (
+            isinstance(financial_report, dict)
+            or isinstance(dividend_metrics, dict)
+            or isinstance(earnings_quality_data, dict)
+        ):
             financial_report = financial_report if isinstance(financial_report, dict) else {}
             dividend_metrics = dividend_metrics if isinstance(dividend_metrics, dict) else {}
+            earnings_quality_data = earnings_quality_data if isinstance(earnings_quality_data, dict) else {}
             ttm_yield = dividend_metrics.get("ttm_dividend_yield_pct", "N/A")
             ttm_cash = dividend_metrics.get("ttm_cash_dividend_per_share", "N/A")
             ttm_count = dividend_metrics.get("ttm_event_count", "N/A")
             report_date = financial_report.get("report_date", "N/A")
+            earnings_quality_verdict = earnings_quality_data.get("verdict", "N/A")
+            earnings_quality_score = earnings_quality_data.get("score_total", "N/A")
+            earnings_quality_risks = earnings_quality_data.get("risk_flags", [])
+            earnings_quality_metrics = earnings_quality_data.get("metrics", {})
+            if not isinstance(earnings_quality_metrics, dict):
+                earnings_quality_metrics = {}
+            cycle_analysis = earnings_quality_data.get("cycle_analysis", {})
+            if not isinstance(cycle_analysis, dict):
+                cycle_analysis = {}
+            cycle_drivers = cycle_analysis.get("drivers", {})
+            if not isinstance(cycle_drivers, dict):
+                cycle_drivers = {}
+            cycle_signals = cycle_analysis.get("signals", [])
+            if not isinstance(cycle_signals, list):
+                cycle_signals = []
+            quarterly_evidence = earnings_quality_data.get("quarterly_evidence", {})
+            if isinstance(quarterly_evidence, dict):
+                quarterly_trend = quarterly_evidence.get("latest_trend", "N/A")
+                dual_positive_streak = quarterly_evidence.get("dual_positive_streak", "N/A")
+                observed_quarters = quarterly_evidence.get("observed_report_dates", [])
+                if isinstance(observed_quarters, list) and observed_quarters:
+                    observed_quarters_text = ", ".join(str(item) for item in observed_quarters[:4])
+                else:
+                    observed_quarters_text = "N/A"
+            else:
+                quarterly_trend = "N/A"
+                dual_positive_streak = "N/A"
+                observed_quarters_text = "N/A"
+            cycle_phase = cycle_analysis.get("phase", earnings_quality_metrics.get("cycle_phase", "N/A"))
+            cycle_confidence = cycle_analysis.get(
+                "confidence",
+                earnings_quality_metrics.get("cycle_confidence", "N/A"),
+            )
+            revenue_ttm_yoy = cycle_drivers.get(
+                "revenue_ttm_yoy",
+                earnings_quality_metrics.get("revenue_ttm_yoy", "N/A"),
+            )
+            net_profit_ttm_yoy = cycle_drivers.get(
+                "net_profit_ttm_yoy",
+                earnings_quality_metrics.get("net_profit_ttm_yoy", "N/A"),
+            )
+            latest_single_quarter_revenue_yoy = cycle_drivers.get(
+                "latest_single_quarter_revenue_yoy",
+                earnings_quality_metrics.get("latest_single_quarter_revenue_yoy", "N/A"),
+            )
+            latest_single_quarter_net_profit_yoy = cycle_drivers.get(
+                "latest_single_quarter_net_profit_yoy",
+                earnings_quality_metrics.get("latest_single_quarter_net_profit_yoy", "N/A"),
+            )
+            if cycle_signals:
+                cycle_signals_text = "; ".join(str(item) for item in cycle_signals[:4])
+            else:
+                cycle_signals_text = "N/A"
+            if isinstance(earnings_quality_risks, list) and earnings_quality_risks:
+                earnings_quality_risks_text = "; ".join(str(item) for item in earnings_quality_risks[:3])
+            else:
+                earnings_quality_risks_text = "N/A"
             prompt += f"""
 ### 财报与分红（价值投资口径）
 | 指标 | 数值 | 说明 |
@@ -1640,6 +1712,31 @@ class GeminiAnalyzer:
 """
 
         # 添加筹码分布数据
+        if (
+            isinstance(earnings_quality_data, dict)
+            and (
+                str(earnings_quality_data.get("verdict", "")).strip().lower() not in {"", "unavailable"}
+                or earnings_quality_data.get("metrics")
+                or earnings_quality_data.get("positive_signals")
+                or earnings_quality_data.get("risk_flags")
+            )
+        ):
+            prompt += f"""
+#### Earnings Quality Snapshot
+- Verdict: {earnings_quality_verdict}
+- Score: {earnings_quality_score}
+- Quarterly Trend: {quarterly_trend}
+- Dual Growth Streak: {dual_positive_streak}
+- Observed Quarters: {observed_quarters_text}
+- Cycle Phase: {cycle_phase}
+- Cycle Confidence: {cycle_confidence}
+- Revenue TTM YoY: {revenue_ttm_yoy}
+- Profit TTM YoY: {net_profit_ttm_yoy}
+- Latest Single-Quarter Revenue YoY: {latest_single_quarter_revenue_yoy}
+- Latest Single-Quarter Profit YoY: {latest_single_quarter_net_profit_yoy}
+- Cycle Signals: {cycle_signals_text}
+- Risks: {earnings_quality_risks_text}
+"""
         if 'chip' in context:
             chip = context['chip']
             profit_ratio = chip.get('profit_ratio', 0)

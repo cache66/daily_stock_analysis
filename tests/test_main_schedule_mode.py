@@ -94,6 +94,10 @@ class MainScheduleModeTestCase(unittest.TestCase):
             "board_recognizability_snapshot_top_n": 3,
             "board_theme_core_snapshot_enabled": False,
             "board_theme_core_snapshot_targets_json": "",
+            "trend_leader_unified_snapshot_enabled": False,
+            "trend_leader_unified_snapshot_limit": 0,
+            "earnings_observation_snapshot_enabled": False,
+            "earnings_observation_max_observation_days": 240,
             "trading_day_check_enabled": True,
             "run_immediately": True,
         }
@@ -279,6 +283,82 @@ class MainScheduleModeTestCase(unittest.TestCase):
         board_recognizability_task.assert_called_once_with(config)
         board_snapshot_task.assert_called_once_with(config)
 
+    def test_schedule_mode_runs_trend_leader_snapshot_update_when_enabled(self) -> None:
+        args = self._make_args(schedule=True)
+        config = self._make_config(
+            schedule_enabled=True,
+            trend_leader_unified_snapshot_enabled=True,
+            trend_leader_unified_snapshot_limit=80,
+        )
+
+        def fake_run_with_schedule(
+            task,
+            schedule_time,
+            run_immediately,
+            background_tasks=None,
+            schedule_time_provider=None,
+        ):
+            task()
+
+        with patch("main.parse_arguments", return_value=args), \
+             patch("main.get_config", return_value=config), \
+             patch("main._reload_runtime_config", return_value=config), \
+             patch("main._build_schedule_time_provider", return_value=lambda: "18:00"), \
+             patch("main.setup_logging"), \
+             patch("main.run_full_analysis") as run_full_analysis, \
+             patch("main._run_optional_signal_snapshot_tasks") as snapshot_task, \
+             patch("main._run_optional_board_recognizability_snapshot_tasks") as board_recognizability_task, \
+             patch("main._run_optional_board_theme_core_snapshot_tasks") as board_snapshot_task, \
+             patch("main._run_optional_trend_leader_unified_snapshot_tasks") as trend_task, \
+             patch("src.scheduler.run_with_schedule", side_effect=fake_run_with_schedule):
+            exit_code = main.main()
+
+        self.assertEqual(exit_code, 0)
+        run_full_analysis.assert_called_once_with(config, args, None)
+        snapshot_task.assert_called_once_with(config)
+        board_recognizability_task.assert_called_once_with(config)
+        board_snapshot_task.assert_called_once_with(config)
+        trend_task.assert_called_once_with(config)
+
+    def test_schedule_mode_runs_earnings_observation_snapshot_update_when_enabled(self) -> None:
+        args = self._make_args(schedule=True)
+        config = self._make_config(
+            schedule_enabled=True,
+            earnings_observation_snapshot_enabled=True,
+            earnings_observation_max_observation_days=210,
+        )
+
+        def fake_run_with_schedule(
+            task,
+            schedule_time,
+            run_immediately,
+            background_tasks=None,
+            schedule_time_provider=None,
+        ):
+            task()
+
+        with patch("main.parse_arguments", return_value=args), \
+             patch("main.get_config", return_value=config), \
+             patch("main._reload_runtime_config", return_value=config), \
+             patch("main._build_schedule_time_provider", return_value=lambda: "18:00"), \
+             patch("main.setup_logging"), \
+             patch("main.run_full_analysis") as run_full_analysis, \
+             patch("main._run_optional_signal_snapshot_tasks") as snapshot_task, \
+             patch("main._run_optional_board_recognizability_snapshot_tasks") as board_recognizability_task, \
+             patch("main._run_optional_board_theme_core_snapshot_tasks") as board_snapshot_task, \
+             patch("main._run_optional_trend_leader_unified_snapshot_tasks") as trend_task, \
+             patch("main._run_optional_earnings_observation_snapshot_tasks") as earnings_observation_task, \
+             patch("src.scheduler.run_with_schedule", side_effect=fake_run_with_schedule):
+            exit_code = main.main()
+
+        self.assertEqual(exit_code, 0)
+        run_full_analysis.assert_called_once_with(config, args, None)
+        snapshot_task.assert_called_once_with(config)
+        board_recognizability_task.assert_called_once_with(config)
+        board_snapshot_task.assert_called_once_with(config)
+        trend_task.assert_called_once_with(config)
+        earnings_observation_task.assert_called_once_with(config)
+
     def test_run_optional_signal_snapshot_tasks_uses_fast_snapshot_stage_by_default(self) -> None:
         config = self._make_config(
             signal_snapshot_hundred_day_high_enabled=True,
@@ -288,13 +368,13 @@ class MainScheduleModeTestCase(unittest.TestCase):
 
         with patch("src.core.trading_calendar.get_market_now", return_value=datetime(2026, 4, 6, 18, 0, 0)), \
              patch("src.core.trading_calendar.is_market_open", return_value=True), \
-             patch("main.subprocess.run") as run_mock:
+             patch("main._run_scheduled_subprocess") as run_mock:
             main._run_optional_signal_snapshot_tasks(config)
 
-        command = run_mock.call_args.kwargs["args"] if "args" in run_mock.call_args.kwargs else run_mock.call_args.args[0]
+        command = run_mock.call_args.kwargs["command"] if "command" in run_mock.call_args.kwargs else run_mock.call_args.args[0]
         self.assertIn("--skip-cause-analysis", command)
 
-    def test_run_optional_signal_snapshot_tasks_can_enable_cause_backfill(self) -> None:
+    def test_run_optional_signal_snapshot_tasks_runs_dual_stage_cause_backfill(self) -> None:
         config = self._make_config(
             signal_snapshot_hundred_day_high_enabled=True,
             signal_snapshot_hundred_day_high_cause_analysis_enabled=True,
@@ -303,13 +383,49 @@ class MainScheduleModeTestCase(unittest.TestCase):
 
         with patch("src.core.trading_calendar.get_market_now", return_value=datetime(2026, 4, 6, 18, 0, 0)), \
              patch("src.core.trading_calendar.is_market_open", return_value=True), \
-             patch("main.subprocess.run") as run_mock:
+             patch("main._run_scheduled_subprocess") as run_mock:
             main._run_optional_signal_snapshot_tasks(config)
 
-        command = run_mock.call_args.kwargs["args"] if "args" in run_mock.call_args.kwargs else run_mock.call_args.args[0]
+        command = run_mock.call_args.kwargs["command"] if "command" in run_mock.call_args.kwargs else run_mock.call_args.args[0]
         self.assertNotIn("--skip-cause-analysis", command)
-        self.assertIn("--disable-news-search", command)
+        self.assertNotIn("--disable-news-search", command)
         self.assertIn("--disable-llm-reason-card", command)
+
+    def test_run_scheduled_subprocess_kills_child_on_keyboard_interrupt(self) -> None:
+        class _FakeProcess:
+            def __init__(self) -> None:
+                self.returncode = None
+                self.terminate_called = False
+                self.kill_called = False
+                self.wait_calls = 0
+
+            def wait(self, timeout=None):
+                self.wait_calls += 1
+                if self.wait_calls == 1:
+                    raise KeyboardInterrupt()
+                if self.terminate_called:
+                    self.returncode = -15
+                    return self.returncode
+                raise main.subprocess.TimeoutExpired(cmd="python child.py", timeout=timeout)
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.terminate_called = True
+
+            def kill(self):
+                self.kill_called = True
+                self.returncode = -9
+
+        fake_process = _FakeProcess()
+
+        with patch("main.subprocess.Popen", return_value=fake_process):
+            with self.assertRaises(KeyboardInterrupt):
+                main._run_scheduled_subprocess(["python", "child.py"], cwd=self.temp_dir.name)
+
+        self.assertTrue(fake_process.terminate_called)
+        self.assertFalse(fake_process.kill_called)
 
     def test_run_optional_board_theme_core_snapshot_tasks_runs_for_each_target(self) -> None:
         config = self._make_config(
@@ -323,12 +439,12 @@ class MainScheduleModeTestCase(unittest.TestCase):
 
         with patch("src.core.trading_calendar.get_market_now", return_value=datetime(2026, 4, 6, 18, 0, 0)), \
              patch("src.core.trading_calendar.is_market_open", return_value=True), \
-             patch("main.subprocess.run") as run_mock:
+             patch("main._run_scheduled_subprocess") as run_mock:
             main._run_optional_board_theme_core_snapshot_tasks(config)
 
         self.assertEqual(run_mock.call_count, 2)
-        first_command = run_mock.call_args_list[0].kwargs.get("args") or run_mock.call_args_list[0].args[0]
-        second_command = run_mock.call_args_list[1].kwargs.get("args") or run_mock.call_args_list[1].args[0]
+        first_command = run_mock.call_args_list[0].kwargs.get("command") or run_mock.call_args_list[0].args[0]
+        second_command = run_mock.call_args_list[1].kwargs.get("command") or run_mock.call_args_list[1].args[0]
         self.assertIn("collect_board_theme_core_snapshots.py", " ".join(first_command))
         self.assertIn("--board-name", first_command)
         self.assertIn("CPO", first_command)
@@ -346,15 +462,49 @@ class MainScheduleModeTestCase(unittest.TestCase):
 
         with patch("src.core.trading_calendar.get_market_now", return_value=datetime(2026, 4, 6, 18, 0, 0)), \
              patch("src.core.trading_calendar.is_market_open", return_value=True), \
-             patch("main.subprocess.run") as run_mock:
+             patch("main._run_scheduled_subprocess") as run_mock:
             main._run_optional_board_recognizability_snapshot_tasks(config)
 
-        command = run_mock.call_args.kwargs["args"] if "args" in run_mock.call_args.kwargs else run_mock.call_args.args[0]
+        command = run_mock.call_args.kwargs["command"] if "command" in run_mock.call_args.kwargs else run_mock.call_args.args[0]
         self.assertIn("collect_board_recognizability_rankings.py", " ".join(command))
         self.assertIn("--source-signal-type", command)
         self.assertIn("hundred_day_high", command)
         self.assertIn("--top-n", command)
         self.assertIn("5", command)
+
+    def test_run_optional_trend_leader_unified_snapshot_tasks_builds_command(self) -> None:
+        config = self._make_config(
+            trend_leader_unified_snapshot_enabled=True,
+            trend_leader_unified_snapshot_limit=80,
+            trading_day_check_enabled=True,
+        )
+
+        with patch("src.core.trading_calendar.get_market_now", return_value=datetime(2026, 4, 6, 18, 0, 0)), \
+             patch("src.core.trading_calendar.is_market_open", return_value=True), \
+             patch("main._run_scheduled_subprocess") as run_mock:
+            main._run_optional_trend_leader_unified_snapshot_tasks(config)
+
+        command = run_mock.call_args.kwargs["command"] if "command" in run_mock.call_args.kwargs else run_mock.call_args.args[0]
+        self.assertIn("run_trend_leader_daily_bundle.py", " ".join(command))
+        self.assertIn("--limit", command)
+        self.assertIn("80", command)
+
+    def test_run_optional_earnings_observation_snapshot_tasks_builds_command(self) -> None:
+        config = self._make_config(
+            earnings_observation_snapshot_enabled=True,
+            earnings_observation_max_observation_days=210,
+            trading_day_check_enabled=True,
+        )
+
+        with patch("src.core.trading_calendar.get_market_now", return_value=datetime(2026, 4, 6, 18, 0, 0)), \
+             patch("src.core.trading_calendar.is_market_open", return_value=True), \
+             patch("main._run_scheduled_subprocess") as run_mock:
+            main._run_optional_earnings_observation_snapshot_tasks(config)
+
+        command = run_mock.call_args.kwargs["command"] if "command" in run_mock.call_args.kwargs else run_mock.call_args.args[0]
+        self.assertIn("collect_earnings_observation_snapshots.py", " ".join(command))
+        self.assertIn("--max-observation-days", command)
+        self.assertIn("210", command)
 
     def test_reload_runtime_config_preserves_process_env_overrides(self) -> None:
         self.env_path.write_text(
@@ -450,7 +600,11 @@ class MainScheduleModeTestCase(unittest.TestCase):
         self.assertEqual(call_order, ["reload_env", "reset_instance", "get_config"])
 
     def test_schedule_time_provider_propagates_config_read_failures(self) -> None:
-        with patch(
+        with patch.object(
+            main,
+            "_INITIAL_PROCESS_ENV",
+            {},
+        ), patch(
             "src.core.config_manager.ConfigManager.read_config_map",
             side_effect=RuntimeError("boom"),
         ):

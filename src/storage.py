@@ -209,6 +209,48 @@ class FundamentalSnapshot(Base):
         return f"<FundamentalSnapshot(query_id={self.query_id}, code={self.code})>"
 
 
+class SignalFundamentalSnapshot(Base):
+    """Reusable per-signal fundamental snapshot cache keyed by date and code."""
+
+    __tablename__ = "signal_fundamental_snapshot"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    signal_type = Column(String(64), nullable=False, index=True)
+    snapshot_date = Column(Date, nullable=False, index=True)
+    code = Column(String(10), nullable=False, index=True)
+    name = Column(String(50))
+    bundle_payload = Column(Text, nullable=False, default="{}")
+    quote_payload = Column(Text, nullable=False, default="{}")
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "signal_type",
+            "snapshot_date",
+            "code",
+            name="uix_signal_fundamental_snapshot_type_date_code",
+        ),
+        Index(
+            "ix_signal_fundamental_snapshot_type_date",
+            "signal_type",
+            "snapshot_date",
+        ),
+        Index(
+            "ix_signal_fundamental_snapshot_type_code_date",
+            "signal_type",
+            "code",
+            "snapshot_date",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<SignalFundamentalSnapshot(signal_type={self.signal_type}, "
+            f"snapshot_date={self.snapshot_date}, code={self.code})>"
+        )
+
+
 class KlineSignalSnapshot(Base):
     """
     日线信号快照。
@@ -1257,6 +1299,273 @@ class DatabaseManager:
             except Exception:
                 return None
 
+    def upsert_signal_fundamental_snapshot(
+        self,
+        *,
+        signal_type: str,
+        snapshot_date: Any,
+        code: str,
+        name: Optional[str] = None,
+        bundle_payload: Optional[Dict[str, Any]] = None,
+        quote_payload: Optional[Dict[str, Any]] = None,
+        session: Optional[Session] = None,
+        auto_commit: bool = True,
+    ) -> int:
+        """Insert or update a reusable signal-level fundamental snapshot cache row."""
+        normalized_signal_type = str(signal_type or "").strip()
+        normalized_code = str(code or "").strip()
+        normalized_date = self._coerce_date(snapshot_date)
+        if not normalized_signal_type or not normalized_code or normalized_date is None:
+            return 0
+
+        def _find_in_session(target_session: Session) -> Optional[SignalFundamentalSnapshot]:
+            for candidate in target_session.new:
+                if (
+                    isinstance(candidate, SignalFundamentalSnapshot)
+                    and candidate.signal_type == normalized_signal_type
+                    and candidate.snapshot_date == normalized_date
+                    and candidate.code == normalized_code
+                ):
+                    return candidate
+            for candidate in target_session.identity_map.values():
+                if (
+                    isinstance(candidate, SignalFundamentalSnapshot)
+                    and candidate.signal_type == normalized_signal_type
+                    and candidate.snapshot_date == normalized_date
+                    and candidate.code == normalized_code
+                ):
+                    return candidate
+            return None
+
+        def _execute(target_session: Session) -> int:
+            try:
+                row = _find_in_session(target_session)
+                if row is None:
+                    row = target_session.execute(
+                        select(SignalFundamentalSnapshot)
+                        .where(
+                            and_(
+                                SignalFundamentalSnapshot.signal_type == normalized_signal_type,
+                                SignalFundamentalSnapshot.snapshot_date == normalized_date,
+                                SignalFundamentalSnapshot.code == normalized_code,
+                            )
+                        )
+                        .limit(1)
+                    ).scalar_one_or_none()
+
+                now_ts = datetime.now()
+                if row is None:
+                    row = SignalFundamentalSnapshot(
+                        signal_type=normalized_signal_type,
+                        snapshot_date=normalized_date,
+                        code=normalized_code,
+                        name=name,
+                        bundle_payload=self._safe_json_dumps(bundle_payload or {}),
+                        quote_payload=self._safe_json_dumps(quote_payload or {}),
+                        created_at=now_ts,
+                        updated_at=now_ts,
+                    )
+                    target_session.add(row)
+                else:
+                    if name is not None:
+                        row.name = name
+                    if bundle_payload is not None:
+                        row.bundle_payload = self._safe_json_dumps(bundle_payload)
+                    if quote_payload is not None:
+                        row.quote_payload = self._safe_json_dumps(quote_payload)
+                    row.updated_at = now_ts
+
+                if auto_commit:
+                    target_session.commit()
+                return 1
+            except Exception as e:
+                if auto_commit:
+                    target_session.rollback()
+                logger.warning(
+                    "Failed to upsert signal fundamental snapshot: signal_type=%s snapshot_date=%s code=%s error=%s",
+                    normalized_signal_type,
+                    normalized_date,
+                    normalized_code,
+                    e,
+                )
+                return 0
+
+        if session is not None:
+            return _execute(session)
+
+        with self.get_session() as own_session:
+            return _execute(own_session)
+
+    def get_signal_fundamental_snapshot(
+        self,
+        *,
+        signal_type: str,
+        snapshot_date: Any,
+        code: str,
+        session: Optional[Session] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Load one cached signal-level fundamental snapshot row."""
+        normalized_signal_type = str(signal_type or "").strip()
+        normalized_code = str(code or "").strip()
+        normalized_date = self._coerce_date(snapshot_date)
+        if not normalized_signal_type or not normalized_code or normalized_date is None:
+            return None
+
+        def _execute(target_session: Session) -> Optional[Dict[str, Any]]:
+            try:
+                row = None
+                for candidate in target_session.new:
+                    if (
+                        isinstance(candidate, SignalFundamentalSnapshot)
+                        and candidate.signal_type == normalized_signal_type
+                        and candidate.snapshot_date == normalized_date
+                        and candidate.code == normalized_code
+                    ):
+                        row = candidate
+                        break
+                if row is None:
+                    for candidate in target_session.identity_map.values():
+                        if (
+                            isinstance(candidate, SignalFundamentalSnapshot)
+                            and candidate.signal_type == normalized_signal_type
+                            and candidate.snapshot_date == normalized_date
+                            and candidate.code == normalized_code
+                        ):
+                            row = candidate
+                            break
+                if row is None:
+                    row = target_session.execute(
+                        select(SignalFundamentalSnapshot)
+                        .where(
+                            and_(
+                                SignalFundamentalSnapshot.signal_type == normalized_signal_type,
+                                SignalFundamentalSnapshot.snapshot_date == normalized_date,
+                                SignalFundamentalSnapshot.code == normalized_code,
+                            )
+                        )
+                        .limit(1)
+                    ).scalar_one_or_none()
+            except Exception as e:
+                logger.debug(
+                    "Failed to read signal fundamental snapshot: signal_type=%s snapshot_date=%s code=%s error=%s",
+                    normalized_signal_type,
+                    normalized_date,
+                    normalized_code,
+                    e,
+                )
+                return None
+
+            if row is None:
+                return None
+
+            try:
+                bundle_payload = json.loads(row.bundle_payload or "{}")
+                if not isinstance(bundle_payload, dict):
+                    bundle_payload = {}
+            except Exception:
+                bundle_payload = {}
+            try:
+                quote_payload = json.loads(row.quote_payload or "{}")
+                if not isinstance(quote_payload, dict):
+                    quote_payload = {}
+            except Exception:
+                quote_payload = {}
+
+            return {
+                "signal_type": row.signal_type,
+                "snapshot_date": row.snapshot_date.isoformat() if row.snapshot_date else None,
+                "code": row.code,
+                "name": row.name,
+                "bundle_payload": bundle_payload,
+                "quote_payload": quote_payload,
+            }
+
+        if session is not None:
+            return _execute(session)
+
+        with self.get_session() as own_session:
+            return _execute(own_session)
+
+    def get_latest_signal_fundamental_snapshot(
+        self,
+        *,
+        signal_type: str,
+        code: str,
+        before_snapshot_date: Optional[Any] = None,
+        session: Optional[Session] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Load the latest cached signal-level fundamental snapshot for one code."""
+        normalized_signal_type = str(signal_type or "").strip()
+        normalized_code = str(code or "").strip()
+        if not normalized_signal_type or not normalized_code:
+            return None
+
+        normalized_before_date = (
+            self._coerce_date(before_snapshot_date)
+            if before_snapshot_date is not None
+            else None
+        )
+
+        def _execute(target_session: Session) -> Optional[Dict[str, Any]]:
+            try:
+                stmt = (
+                    select(SignalFundamentalSnapshot)
+                    .where(
+                        and_(
+                            SignalFundamentalSnapshot.signal_type == normalized_signal_type,
+                            SignalFundamentalSnapshot.code == normalized_code,
+                        )
+                    )
+                )
+                if normalized_before_date is not None:
+                    stmt = stmt.where(SignalFundamentalSnapshot.snapshot_date < normalized_before_date)
+                row = target_session.execute(
+                    stmt.order_by(
+                        desc(SignalFundamentalSnapshot.snapshot_date),
+                        desc(SignalFundamentalSnapshot.updated_at),
+                    ).limit(1)
+                ).scalar_one_or_none()
+            except Exception as e:
+                logger.debug(
+                    "Failed to read latest signal fundamental snapshot: signal_type=%s before_date=%s code=%s error=%s",
+                    normalized_signal_type,
+                    normalized_before_date,
+                    normalized_code,
+                    e,
+                )
+                return None
+
+            if row is None:
+                return None
+
+            try:
+                bundle_payload = json.loads(row.bundle_payload or "{}")
+                if not isinstance(bundle_payload, dict):
+                    bundle_payload = {}
+            except Exception:
+                bundle_payload = {}
+            try:
+                quote_payload = json.loads(row.quote_payload or "{}")
+                if not isinstance(quote_payload, dict):
+                    quote_payload = {}
+            except Exception:
+                quote_payload = {}
+
+            return {
+                "signal_type": row.signal_type,
+                "snapshot_date": row.snapshot_date.isoformat() if row.snapshot_date else None,
+                "code": row.code,
+                "name": row.name,
+                "bundle_payload": bundle_payload,
+                "quote_payload": quote_payload,
+            }
+
+        if session is not None:
+            return _execute(session)
+
+        with self.get_session() as own_session:
+            return _execute(own_session)
+
     def upsert_signal_snapshot(
         self,
         *,
@@ -1352,6 +1661,175 @@ class DatabaseManager:
                     normalized_signal_type,
                     normalized_date,
                     normalized_code,
+                    e,
+                )
+                return 0
+
+    def clear_signal_snapshots_for_date(
+        self,
+        *,
+        signal_type: str,
+        signal_date: Any,
+    ) -> int:
+        """Delete all snapshot rows under one signal type on one date and rebuild summaries."""
+        normalized_signal_type = str(signal_type or "").strip()
+        normalized_date = self._coerce_date(signal_date)
+        if not normalized_signal_type or normalized_date is None:
+            return 0
+
+        deleted_rows = 0
+        with self.get_session() as session:
+            try:
+                result = session.execute(
+                    delete(KlineSignalSnapshot).where(
+                        and_(
+                            KlineSignalSnapshot.signal_type == normalized_signal_type,
+                            KlineSignalSnapshot.signal_date == normalized_date,
+                        )
+                    )
+                )
+                deleted_rows = int(result.rowcount or 0)
+                session.commit()
+            except Exception as e:
+                session.rollback()
+                logger.warning(
+                    "failed to clear signal snapshots (fail-open): signal_type=%s signal_date=%s err=%s",
+                    normalized_signal_type,
+                    normalized_date,
+                    e,
+                )
+                return 0
+
+        try:
+            self.rebuild_signal_summary_tables(
+                signal_type=normalized_signal_type,
+                start_date=normalized_date,
+                end_date=normalized_date,
+            )
+        except Exception as e:
+            logger.warning(
+                "failed to rebuild signal summaries after clear (fail-open): signal_type=%s signal_date=%s err=%s",
+                normalized_signal_type,
+                normalized_date,
+                e,
+            )
+
+        return deleted_rows
+
+    def replace_signal_snapshots_for_date(
+        self,
+        *,
+        signal_type: str,
+        signal_date: Any,
+        snapshots: Optional[List[Dict[str, Any]]] = None,
+    ) -> int:
+        """
+        Atomically replace one-day snapshots for one signal type.
+
+        This operation is all-or-nothing: delete old rows, insert new rows and
+        rebuild summaries/streaks in one transaction.
+        """
+        normalized_signal_type = str(signal_type or "").strip()
+        normalized_date = self._coerce_date(signal_date)
+        if not normalized_signal_type or normalized_date is None:
+            return 0
+
+        normalized_snapshots: List[Dict[str, Any]] = []
+        for item in snapshots or []:
+            if not isinstance(item, dict):
+                continue
+            normalized_code = str(item.get("code") or "").strip()
+            if not normalized_code:
+                continue
+            normalized_snapshots.append(
+                {
+                    "code": normalized_code,
+                    "name": str(item.get("name") or "").strip() or None,
+                    "criteria_payload": item.get("criteria_payload"),
+                    "metrics_payload": item.get("metrics_payload"),
+                    "cause_payload": item.get("cause_payload"),
+                    "history_payload": item.get("history_payload"),
+                }
+            )
+
+        with self.get_session() as session:
+            try:
+                existing_code_rows = session.execute(
+                    select(KlineSignalSnapshot.code).where(
+                        and_(
+                            KlineSignalSnapshot.signal_type == normalized_signal_type,
+                            KlineSignalSnapshot.signal_date == normalized_date,
+                        )
+                    )
+                ).all()
+                existing_codes = {
+                    str(code_value).strip()
+                    for (code_value,) in existing_code_rows
+                    if str(code_value or "").strip()
+                }
+
+                session.execute(
+                    delete(KlineSignalSnapshot).where(
+                        and_(
+                            KlineSignalSnapshot.signal_type == normalized_signal_type,
+                            KlineSignalSnapshot.signal_date == normalized_date,
+                        )
+                    )
+                )
+
+                inserted_codes: set[str] = set()
+                now_ts = datetime.now()
+                for row in normalized_snapshots:
+                    code = str(row.get("code") or "").strip()
+                    if not code:
+                        continue
+                    session.add(
+                        KlineSignalSnapshot(
+                            signal_type=normalized_signal_type,
+                            signal_date=normalized_date,
+                            code=code,
+                            name=row.get("name"),
+                            criteria_payload=self._safe_json_dumps(row.get("criteria_payload") or {}),
+                            metrics_payload=self._safe_json_dumps(row.get("metrics_payload") or {}),
+                            cause_payload=(
+                                self._safe_json_dumps(row.get("cause_payload"))
+                                if row.get("cause_payload") is not None
+                                else None
+                            ),
+                            history_payload=(
+                                self._safe_json_dumps(row.get("history_payload"))
+                                if row.get("history_payload") is not None
+                                else None
+                            ),
+                            created_at=now_ts,
+                            updated_at=now_ts,
+                        )
+                    )
+                    inserted_codes.add(code)
+
+                # Force uniqueness checks before rebuilding summary tables.
+                session.flush()
+
+                self._rebuild_signal_daily_summary(
+                    session,
+                    signal_type=normalized_signal_type,
+                    signal_date=normalized_date,
+                )
+                for code in sorted(existing_codes | inserted_codes):
+                    self._rebuild_signal_streak_snapshots(
+                        session,
+                        signal_type=normalized_signal_type,
+                        code=code,
+                    )
+
+                session.commit()
+                return len(normalized_snapshots)
+            except Exception as e:
+                session.rollback()
+                logger.warning(
+                    "failed to replace signal snapshots atomically (fail-open): signal_type=%s signal_date=%s err=%s",
+                    normalized_signal_type,
+                    normalized_date,
                     e,
                 )
                 return 0

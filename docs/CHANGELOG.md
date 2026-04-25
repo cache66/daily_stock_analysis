@@ -8,6 +8,162 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+- [文档] 重写 `docs/LOCAL_STRATEGY_BASELINE.md` 与 `docs/LOCAL_STRATEGY_CATALOG.md`，按“当前默认行为优先”重构本地策略文档结构，明确默认每日策略分层、入口脚本、`signal_type` 与关键参数口径。
+- [文档] 重写 `docs/TREND_LEADER_UNIFIED_STRATEGY.md`、`docs/EARNINGS_SURPRISE_TRACKING.md`、`docs/MONTHLY_SLOW_RISE_SCAN.md`，统一补齐策略条件、门槛、评分/拦截逻辑与 CLI 参数说明，减少历史叙述对当前口径的干扰。
+- [改进] `scripts/evaluate_signal_snapshot_performance.py` 将前瞻可用性判定升级为“交易日口径优先”：优先按 `stock_daily` 市场级交易日计数判断 `insufficient_forward_horizon`，仅在计数不可用时回退自然日判定，减少对本就不可达窗口的无效补数。
+- [改进] `scripts/evaluate_signal_snapshot_performance.py` 新增 `--fill-max-attempts`（默认 `200`）并输出 `fill_stats`，限制批量评估中的补数尝试上限，避免长尾网络补抓拖慢整轮评估。
+- [改进] `scripts/run_signal_performance_bundle.py` 新增并透传 `--fill-max-attempts` 至单信号评估脚本，支持在 bundle 层统一控制补数预算。
+- [测试] 更新 `tests/test_signal_snapshot_performance_report.py` 与 `tests/test_signal_performance_bundle.py`，补充交易日 horizon 跳过补数、补数预算上限生效与命令透传的回归覆盖。
+- [修复] `scripts/evaluate_signal_snapshot_performance.py` 的缺失日线回填链路改为非 Tushare 默认顺序（`Efinance/Akshare/Baostock/Yfinance`），并将回填尝试从“按窗口重复”收敛为“同一 `code+signal_date` 仅一次”；同时在前瞻窗口天然不足时跳过无效补抓，降低补数风暴与长尾超时。
+- [改进] `scripts/evaluate_signal_snapshot_performance.py` 新增 `insufficient_reason` 与 `insufficient_reason_counts` 统计，`monthly_slow_rise` 等信号在 `completed=0` 时可明确区分 `missing_forward_bars` 与 `insufficient_forward_horizon`，不再是黑箱状态。
+- [修复] `data_provider/tushare_fetcher.py`、`data_provider/baostock_fetcher.py`、`data_provider/yfinance_fetcher.py` 扩展 A 股市场前缀识别（`6/9 -> SH`，`0/1/2/3 -> SZ`），覆盖 `001xxx`、`301xxx`、`605xxx` 等代码段，减少“无法确定股票市场，默认使用深市”误告警。
+- [测试] 新增并更新 `tests/test_signal_snapshot_performance_report.py`、`tests/test_fetcher_market_prefix_inference.py`、`tests/test_tushare_fetcher_followups.py`，覆盖回填去重、前瞻窗口判定与市场前缀识别回归。
+- [改进] `scripts/select_monthly_slow_rise_candidates.py` 补充 `weekly_volatility_percentile` 周线波动分位指标，并接入候选导出与排序 tie-break，增强“慢牛 + 周线稳定”排序解释力。
+- [测试] `tests/test_monthly_slow_rise_candidates.py` 补充 `weekly_volatility_percentile` 回归断言，覆盖指标存在性与 `[0,1]` 取值范围。
+- [改进] `scripts/select_earnings_surprise_candidates.py` 新增多季度 `surprise-history` 指标（正向季度数/占比/连续季度与历史评分），并将 `surprise_history` 作为独立因子接入 `earnings_strategy_factor_breakdown`，同步补齐导出字段与排序 tie-break。
+- [测试] `tests/test_earnings_surprise_signal_flow.py` 新增 `test_evaluate_candidate_records_surprise_history_metrics`，覆盖 `earnings_surprise` 的多季度 surprise-history 指标与策略因子接线。
+- [改进] `scripts/select_trend_leader_candidates.py` 与 `scripts/select_hundred_day_high_candidates.py` 完成共享因子补齐：统一复用 `SharedSignalFactorsService` 的 `capital/quality/industry` 构建，并把 `quality_overlay_*`、`earnings_continuity_*`、`industry_strength_*` 扩展到快照 metrics 与导出结果。
+- [改进] `scripts/run_signal_performance_bundle.py` 默认透传 `--fill-missing-daily-data` 给 `scripts/evaluate_signal_snapshot_performance.py`，并支持显式关闭；当 `stock_daily` 缺失时可按需补齐日线后再评估，避免长期 `completed=0`。
+- [改进] `scripts/select_monthly_slow_rise_candidates.py` 将 `robust` 档 `min_positive_month_ratio` 从 `0.67` 下调到 `0.60`，减少“稳健档全空”并保留周线稳定与业绩连续性约束；`data_provider/akshare_fetcher.py` 同步支持 `AKSHARE_STOCK_HISTORY_EM_BACKOFF_SECONDS` 环境变量调节历史 EM backoff。
+- [文档] 明确 `dragon_head_candidate`、`theme_core_mapper`、`commodity_price_pass_through` 与 `select_kline_candidates.py` 的运行角色为专题/研究工具，不属于默认每日核心选股循环。
+- [改进] 完成本轮本地策略 Task 8 复测留痕：补充 `run_signal_performance_bundle` 与 `run_fast_review_bundle` 的实跑命令、输出目录与结果摘要（含当前窗口 `completed=0` 的样本可用性说明）。
+- [文档] 完成 Task 8 最终全量复测收口：新增 `--skip-fill-missing-daily-data` 的 6 信号同窗复测结果（`2026-04-01~2026-04-24`），并补充各信号在 `1/3/5/10` 窗口的 `completed` 计数，作为当前数据源限流条件下的稳定基线证据。
+- [文档] 补充 Task 8 复测口径说明：修正快复盘核心信号计数为 `earnings=2 / hundred_day_high=5 / trend_leader=2`，并新增覆盖性探针结论（`end_date=2026-04-10` 时 `hundred_day_high` 在 `1/3/5/10` 窗口均 `completed=20`），明确 `2026-04-24` 窗口下 `completed=0` 属于前瞻样本不足而非评估链路失效。
+- [改进] `scripts/select_monthly_slow_rise_candidates.py` 导出层显式补齐 `industry_strength_score/confirmed/label/confirmation_hint` 字段（含空结果 CSV 头），并在 markdown 入选表新增行业与行业确认列，便于直接复盘“慢牛结构 + 行业确认”。
+- [改进] `scripts/select_hundred_day_high_candidates.py` 升级为“质量突破”口径，新增 `minervini_template_score/passed`、`breakout_follow_through_score` 与 `industry_strength_*` 字段，并同步导出到百日新高 CSV/Markdown 及快照 `metrics_payload`。
+- [改进] 新增 `src/services/shared_signal_factors_service.py` 作为第一阶段共享层最小方案，统一沉淀 `capital/liquidity`、`quality overlay`、`industry strength` 三类通用因子，并先接入 `scripts/select_earnings_surprise_candidates.py` 与 `scripts/select_monthly_slow_rise_candidates.py`。
+- [修复] `data_provider/akshare_fetcher.py` 为 `monthly_slow_rise` fast manager 的历史 `em` 源增加短期 backoff；当 `Akshare EM` 出现 `RemoteDisconnected` / timeout 等可重试传输失败时，会在窗口期内跳过重复 EM 重试，避免全市场扫描对同一失效源逐票重打。
+- [测试] `tests/test_kline_fast_manager.py` 新增 `test_akshare_history_em_failure_enables_backoff_and_skips_second_em_attempt`，锁定历史 `em` 源失败后启用 backoff、后续请求跳过第二次 EM 尝试的回归行为。
+- [文档] 同步更新 `docs/LOCAL_STRATEGY_CATALOG.md`、`docs/LOCAL_STRATEGY_BASELINE.md` 与 `docs/AI_MODIFICATION_LOG.md`，补充 2026-04-25 `monthly_slow_rise` 剩余上游历史源稳定性修复留痕。
+- [文档] 补充 2026-04-25 `monthly_slow_rise --profile robust` 单实例全市场续跑至完整收敛的实盘证据：`evaluated=4929`、`skipped_by_listed_days=91`、`network_or_fetch_failures=36`、`total_scan_elapsed_sec=184.6601`，并记录多进程 backoff 仍为进程内状态。
+- [文档] 补充 2026-04-25 `monthly_slow_rise --profile robust` 双分片并行续跑至完整收敛的实盘证据：聚合结果与单实例一致，但 shard 级 `history EM source entered backoff` 次数分别为 `2` 和 `4`，进一步确认该 backoff 当前仅在进程内生效。
+- [文档] 补充 2026-04-25 `monthly_slow_rise` 同日对照分析：当前 `robust` 全市场实跑虽稳定收敛但结果为 `0`，主因是 `monthly_lookback=15` 下 `min_positive_month_ratio=0.67` 实际更接近要求 `11/15` 月收阳；同日 `balanced` 仍有 `65` 个候选，而仅将 `robust` 的该阈值放宽到 `0.60` 即恢复 `5` 个候选。
+- [修复] `src/services/kline_selector_service.py` 的 `spot-enriched universe` generic fallback 现会继续合并上市元数据，避免 `Akshare spot` 失败时丢失 `list_date/listed_days`，让 `monthly_slow_rise --profile robust` 的 `min_listed_days=400` 轻前筛在真实 fallback 路径里仍然生效。
+- [测试] 更新 `tests/test_kline_selector_service.py`，补充 `spot-enriched universe` generic fallback 必须保留 `list_date/listed_days` 的回归覆盖。
+- [文档] 同步更新 `docs/LOCAL_STRATEGY_CATALOG.md` 与 `docs/AI_MODIFICATION_LOG.md`，补充 2026-04-25 `monthly_slow_rise --profile robust` 3 分钟真实观测中 `skipped_by_listed_days=91`、`history fetch failed=21` 的实测结论。
+- [改进] `scripts/select_earnings_surprise_candidates.py` 继续强化 `earnings_surprise`：新增事件后 `1D/3D` 价格反应、营收/利润多季连续性、`earnings_financial_series_continuity_score` 与持续质量因子，并在可用时补充行业确认字段，降低“单季超预期但持续性弱”标的的排序权重。
+- [测试] 更新 `tests/test_earnings_surprise_signal_flow.py`，补充业绩线对事件后反应指标与多季连续性输出的回归覆盖。
+- [改进] `scripts/select_monthly_slow_rise_candidates.py` 将 `monthly_slow_rise` 进一步升级为“月线形态 + 周线稳定 + 流动性 + 业绩连续性”的稳健筛选：新增 weekly stability/compression 指标、`avg_daily_amount_20d` 过滤与财报连续性后置筛选。
+- [测试] 更新 `tests/test_monthly_slow_rise_candidates.py`，补充周线稳定度、低流动性剔除与业绩连续性过滤的回归覆盖。
+- [文档] 同步更新 `docs/LOCAL_STRATEGY_CATALOG.md` 与 `docs/AI_MODIFICATION_LOG.md`，补充 2026-04-25 本地策略收口后的核心日常策略口径，以及 `earnings_surprise` / `monthly_slow_rise` 的本轮升级留痕。
+- [改进] `data_provider/base.py` 为 `DataFetcherManager` 增加历史请求日历跨度与派生日线指标开关；`src/services/kline_selector_service.py` 的 `monthly_slow_rise` fast manager 现使用 `1.6x` 自动跨度并跳过缓存命中时未被策略使用的 `ma5/ma10/ma20/volume_ratio` 重建，降低全市场热跑的 `history_fetch` 成本。
+- [测试] 更新 `tests/test_fetcher_logging.py` 与 `tests/test_kline_fast_manager.py`，锁定 manager 级历史跨度、跳过派生日线指标，以及 `monthly_slow_rise` fast manager 的新默认配置。
+- [文档] 同步更新 `docs/LOCAL_STRATEGY_CATALOG.md` 与 `docs/AI_MODIFICATION_LOG.md`，补充 2026-04-24 `monthly_slow_rise --profile robust` 真实全市场复测中 `selected=27` 保持不变、`total_scan_elapsed_sec` 从 `319.501` 收敛到 `230.6251` 的实测结果。
+- [改进] `src/services/kline_selector_service.py` 将 `MaxMarketCapRule` 改为惰性求值：只有前置 history 规则通过后才补 `total_market_cap` 并执行市值判断，减少 `monthly_slow_rise` 在大量失败样本上的重复实时 quote。
+- [测试] 更新 `tests/test_kline_selector_service.py`，锁定“前置规则已失败时不再执行 market-cap resolve”的惰性求值行为。
+- [文档] 同步更新 `docs/LOCAL_STRATEGY_CATALOG.md` 与 `docs/AI_MODIFICATION_LOG.md`，补充惰性市值求值实现及 2026-04-24 全市场实跑耗时改善结果。
+- [改进] `src/services/kline_selector_service.py` 为 `evaluate_stock()` 与 `scan_market()` 增加 `selection` 内部耗时拆分，`monthly_slow_rise_run_summary.json` 现在可查看 `history_fetch / history_prepare / market_cap_resolve / rule_evaluate` 的累计与均值指标。
+- [测试] 更新 `tests/test_kline_selector_service.py`，锁定单票 K 线评估 timing contract 与全市场 selection-phase 聚合行为。
+- [文档] 同步更新 `docs/LOCAL_STRATEGY_CATALOG.md` 与 `docs/AI_MODIFICATION_LOG.md`，补充月线慢牛 `selection` 深层耗时拆分与 2026-04-24 全市场实跑结论。
+- [改进] `scripts/select_monthly_slow_rise_candidates.py` 新增 `phase_metrics` 输出与 `monthly_slow_rise_run_summary.json`，每次实跑都会留下 `universe / selection / capital_enrich / total_scan` 分段耗时，便于后续直接定位慢点。
+- [测试] 更新 `tests/test_monthly_slow_rise_candidates.py`，锁定月线慢牛脚本的 phase timing 输出契约与 summary artifact 导出行为。
+- [文档] 同步更新 `docs/LOCAL_STRATEGY_CATALOG.md` 与 `docs/AI_MODIFICATION_LOG.md`，补充月线慢牛新的性能拆分产物与使用方式。
+- [修复] `src/services/kline_selector_service.py` 的 fast A-share manager 不再在多 worker 全市场扫描里优先走 `sina` 历史接口，改为 `tencent -> em` 并保留 `Tushare` fallback，修复当前 Windows 环境下 `monthly_slow_rise --profile robust` 实盘并发扫描会因 `py_mini_racer` 原生崩溃而中断的问题。
+- [测试] 更新 `tests/test_kline_fast_manager.py`，锁定 fast manager 的新历史优先级，避免后续回退到会触发并发崩溃的 `sina` 优先链路。
+- [文档] 同步更新 `docs/LOCAL_STRATEGY_CATALOG.md` 与 `docs/AI_MODIFICATION_LOG.md`，补充本次 fast manager 崩溃修复原因，以及真实 `monthly_slow_rise --profile robust` 并发实跑耗时从约 `817.61s` 收敛到约 `309.50s` 的实测结果。
+- [改进] `scripts/select_monthly_slow_rise_candidates.py` 将 `monthly_slow_rise` 全市场扫描默认 `--max-workers` 从 `1` 提升到 `4`，减少月线慢牛实盘全量扫描被单线程 history fetch 拖慢的问题。
+- [改进] `data_provider/base.py` 新增“covered stale history cache 优先复用”路径，`src/services/kline_selector_service.py` 的 fast A-share manager 在请求区间已被本地磁盘历史覆盖时，会直接复用 `disk_cache_stale_covered:*`，不再每次都先做尾部刷新。
+- [文档] 同步更新 `docs/LOCAL_STRATEGY_CATALOG.md` 与 `docs/AI_MODIFICATION_LOG.md`，补充 `monthly_slow_rise` 的默认并发基线和 covered stale cache 复用说明。
+- [改进] `scripts/select_monthly_slow_rise_candidates.py` 新增正式 `robust` profile，月线慢牛从 `strict / balanced / loose` 扩展为四档；`robust` 默认使用 `15` 个月观察窗口、`min_change_pct_60d=3`、`min_listed_days=400`，更适合作为“稳健版”月线观察池。
+- [文档] 同步 `docs/MONTHLY_SLOW_RISE_SCAN.md`、`docs/LOCAL_STRATEGY_BASELINE.md`、`docs/LOCAL_STRATEGY_CATALOG.md` 与 `docs/AI_MODIFICATION_LOG.md`，补充月线慢牛 `robust` 档位、`monthly_slow_rise_profile__robust` 命名空间与 `/signals` 对比说明。
+- [改进] `scripts/collect_earnings_observation_snapshots.py` 的趋势复查阶段改走 `KlineSelectorService.build_fast_a_share_manager()`，减少单票历史数据 multi-provider fallback 对每日业绩观察尾部时延的拖累。
+- [新功能] 新增 `scripts/collect_earnings_observation_snapshots.py`，在 schedule 尾部基于现有 `earnings_surprise balanced` 维护 `earnings_observation_registry` 与 `earnings_observation_active` 两类快照，用于长期业绩观察与每日强势名单跟踪。
+- [改进] `main.py`、`src/config.py` 与 `.env.example` 新增业绩观察尾部任务开关和最长观察期配置，`/signals` 默认信号列表同步纳入业绩观察池与活跃名单。
+- [文档] 同步更新 `docs/LOCAL_STRATEGY_CATALOG.md` 与 `docs/AI_MODIFICATION_LOG.md`，补充业绩观察策略的入口、信号命名空间与留痕说明。
+- [改进] `scripts/select_hundred_day_high_candidates.py` 新增 `breakout_balanced_with_earnings` profile，在保留原 `breakout_balanced` 百日新高口径不变的前提下，仅保留通过 `earnings_surprise balanced` 业绩确认的候选，并默认落库到独立 `signal_type=hundred_day_high__earnings_balanced`。
+- [文档] 同步 `docs/KLINE_SELECTOR_GUIDE.md`、`docs/LOCAL_STRATEGY_CATALOG.md` 与 `docs/AI_MODIFICATION_LOG.md`，补充 `breakout_balanced_with_earnings` 的使用方式、落库命名空间与策略留痕。
+- [改进] `scripts/run_fast_review_bundle.py` 将快复盘 `earnings` 默认近期事件范围切到 `latest_report_period`，只优先查看当前财报季新公告；`scripts/select_earnings_surprise_candidates.py` 同时保留 `--recent-event-scope lookback/latest_report_period` 供其他策略继续复用 `120` 天业绩事件目录。
+- [改进] `scripts/select_trend_leader_candidates.py` 将 `trend_leader` 主扫描历史抓取窗口从 `260` 天收敛到 `140` 天，减少每票未实际使用的 K 线抓取成本。
+- [改进] `scripts/run_fast_review_bundle.py` 新增独立 `--hundred-day-max-workers`，并将快复盘默认 `hundred_day_max_workers` 设为 `2`，避免 `hundred_day_high` 继续被全局 `max_workers=1` 限制。
+- [改进] `scripts/run_fast_review_bundle.py` 将快复盘默认 `external_parallelism` 从 `2` 提升到 `3`，让 `earnings`、`hundred_day_high`、`trend_leader` 默认同轮并行启动。
+- [改进] `scripts/run_fast_review_bundle.py` 将快复盘默认 `continuous_max_workers` 从 `1` 提升到 `2`，减少 `continuous_up_ratio / continuous_up_streak` 共享扫描的单线程尾段耗时。
+- [文档] 同步 `config/local_strategy_profile.json`、`docs/LOCAL_STRATEGY_CATALOG.md` 与 `docs/AI_MODIFICATION_LOG.md` 的快复盘默认值口径，补充 2026-04-23 聚合入口性能优化留痕。
+- [改进] `scripts/select_trend_leader_candidates.py` 会把 generic fallback 前筛阶段已补齐的 `pct_change/turnover_rate` 反写到 `spot-enriched universe` reference cache，并按缺失行定向补水；在 `Akshare spot` 持续不可用的同条件复跑里，`quote_requested_rows` 可从 `5198` 下降到 `1562`。
+- [修复] `src/services/kline_selector_service.py` 为 `spot-enriched universe` 的磁盘 reference cache 增加最小行数护栏，跳过写入/读取被污染的 tiny spot 快照，避免 `trend_leader` 在 generic fallback 时误复用 1 行缓存并继续触发全市场 `quote_requested_rows=5198`。
+- [改进] `scripts/select_trend_leader_candidates.py` 在主扫描前新增历史不足样本短路与 `skipped_unscannable_history` 统计，并预热一次 `sector_rankings` 后通过 `scan_context` 透传给 `dragon_head_analysis_service`，减少近期次新股无效主扫与 worker 首批板块排行冷启动。
+- [改进] `data_provider/base.py` 新增轻量 `get_earnings_fundamental_context()` 并接入 `scripts/select_trend_leader_candidates.py` 主扫描，避免 `trend_leader` 每票重复拉取整包 fundamental context；`2026-04-22` 对比热跑中，主扫描 `sec_per_processed` 约从 `0.62s` 降到 `0.53s`。
+- [改进] `scripts/select_trend_leader_candidates.py` 将 `trend_leader` 前筛逐票 quote hydration 接入受控并发，并新增 `quote_worker_count` 日志字段；对 `2026-04-22` 热跑实测里，`prefilter_elapsed_sec` 约从 `495s` 降至 `242s`。
+- [改进] `scripts/select_trend_leader_candidates.py` 将 `trend_leader` 前筛 quote hydration 改为字段级按需补齐，避免因 `change_pct_60d` 缺失而触发整轮全市场实时行情回填。
+- [改进] `scripts/run_fast_review_bundle.py` 在快复盘包含 `earnings` 且使用 `--skip-persist-snapshots` 时新增显式告警，提示该模式会绕过 `signal_fundamental_snapshot` 的 same-day/cross-day cache 复用，并把缓存热跑放大成更慢的冷跑，避免误判 `earnings` 的真实性能。
+- [改进] `src/services/kline_selector_service.py` 为 `spot-enriched universe` 增加轻量重试、进程内缓存回退与上市元数据缓存；`scripts/select_hundred_day_high_candidates.py`、`scripts/select_monthly_slow_rise_candidates.py` 默认接入 `spot-enriched universe + min_listed_days` 轻前筛；`scripts/select_earnings_surprise_candidates.py` 默认改走现货优先 universe，并在 `scan_depth=low` 时先按近期业绩目录缩小 universe 再主扫。
+- [测试] 补充 `tests/test_kline_selector_service.py`、`tests/test_hundred_day_high_signal_flow.py`、`tests/test_monthly_slow_rise_candidates.py`、`tests/test_earnings_surprise_signal_flow.py`，覆盖 spot universe 重试/缓存回退、百日新高与月线慢牛的上市天数短路接线，以及业绩线现货优先 universe 接线。
+- [文档] 补充快复盘性能优化留痕：记录 `listed_days` 短路、现货优先前筛、`continuous_up` 历史长度收敛的实现与 2026-04-22 小样本实跑结果，详见 `docs/AI_MODIFICATION_LOG.md`、`docs/LOCAL_STRATEGY_BASELINE.md`、`docs/LOCAL_STRATEGY_CATALOG.md`。
+- [改进] `src/services/kline_selector_service.py` 新增 `list_date/listed_days` universe 归一化与 `min_listed_days` 轻前筛；`scripts/select_trend_leader_candidates.py` 默认增加 `scan_prefilter_min_listed_days=120` 并记录准备阶段耗时；`scripts/run_fast_review_bundle.py` 将 `continuous_up` 历史长度收敛到 `max(lookback_days, streak_days) + 5`，同时为连续上涨与趋势前筛接入现货优先 universe。
+- [文档] 补充 2026-04-22 全量快复盘实跑留痕：`earnings` 约 `81.38s`、`hundred_day_high` 约 `723.76s`、`trend_leader` 约 `1766.19s`、`continuous_up` 每信号约 `314.91s`；当前主要慢点已转为 K 线全量扫描与趋势链路准备/主扫阶段，相关观察已记录到 `docs/AI_MODIFICATION_LOG.md`。
+- [文档] 同步 `docs/LOCAL_STRATEGY_BASELINE.md` 与当前快复盘真实默认值及验证结论：`hundred_day_profile=breakout_loose`、`trend_max_workers=2`、`external_parallelism=2`，并补充 2026-04-22 小样本实跑结论（当前最慢外部环节仍是 `earnings`）。
+- [改进] `scripts/run_fast_review_bundle.py` 新增 `--trend-max-workers`（默认 2）并将趋势龙头并发与全局 `--max-workers` 解耦；`config/local_strategy_profile.json` 同步补充 `trend_max_workers=2`，避免快复盘默认单线程拖慢趋势扫描。
+- [修复] `scripts/run_fast_review_bundle.py` 为外部子策略命令增加超时保护（`--external-command-idle-timeout-sec` / `--external-command-total-timeout-sec`），在 `earnings` 等脚本无输出卡住时会主动终止并标记跳过，避免整轮快复盘无限挂起；`config/local_strategy_profile.json` 同步补充默认超时参数。
+- [改进] 快复盘入口提速基线更新：`scripts/run_fast_review_bundle.py` 默认 `--external-parallelism` 提升到 `2`，并新增趋势预过滤参数透传（`--trend-scan-prefilter-*`）；`data_provider/akshare_fetcher.py` 为行业排行东财源增加失败熔断（默认 1200 秒）以减少重复失败请求。
+- [改进] `scripts/select_earnings_surprise_candidates.py` 升级“质量优先版”业绩放行：`strict/balanced` 档位下 watch 分数不再仅靠增速/文本确认，默认必须有 `earnings_quality` 正向确认；并新增 `blocked_missing_quality_confirmation` 拦截态与 `mixed>=50` 的温和质量信号兜底，减少“高增速但低质量”误入选。
+- [改进] `apps/dsa-web/src/pages/SignalsPage.tsx` 增强 `earnings_surprise` 的策略结果可视化：候选卡片新增 strategy/gate/verdict/score 徽标，列表默认按 `earnings_strategy_score` 优先排序，并在右侧历史详情新增“业绩策略结果”结构化面板。
+- [修复] `scripts/run_fast_review_bundle.py` 外部子任务执行新增 SQLite `database is locked` 自动重试，降低并行持久化时的瞬时锁冲突失败概率。
+- [改进] `scripts/run_fast_review_bundle.py` 新增 `--hundred-day-profile`（默认 `breakout_loose`）并透传到百日新高脚本，快复盘场景下避免 `hundred_day_high` 长期全空。
+- [改进] `trend_leader_unified` 放宽非硬风险业绩 gate 与 fallback 兜底策略，新增 `tier5_safety_net`，并要求 strict 命中满足 `overall_score > 0`，减少 strict 全空与结果不稳定。
+- [改进] `earnings_surprise` 扫描链路新增 P0/P1 提速优化：`AkshareFundamentalAdapter._call_df_candidates` 增加同进程结果缓存（成功/失败均缓存），`low/medium` 在近期业绩目录已覆盖时按需跳过 `forecast/quick_report` 重抓，`signal_fundamental_snapshot` 支持跨天事件指纹不变复用，并将近期公告目录报告期数量改为随 `event_lookback_days` 动态计算，降低全量扫描重复抓取成本。
+- [修复] 修复 `earnings scan-depth` 接线遗漏：`scripts/run_fast_review_bundle.py` 新增 `--earnings-scan-depth(low/medium/high, default=low)` 并透传给 `select_earnings_surprise_candidates.py --scan-depth`，同时 `scan_market` 运行链路接入 `scan_depth` 与 `required_blocks`，确保低深度按核心基础面块抓取并通过对应回归测试。
+- [改进] `earnings_surprise` 新增三项提速闭环：近期业绩目录支持跨运行磁盘缓存（同快照直接复用、跨天增量刷新）、`scan_depth=high` 改为“核心块先筛 + 临近通过再补全量块”、`max_workers=1` 时基础面快照改为共享事务批量写入，并修复 SQLite 下逐条 `flush` 引发的 `database is locked` 问题。
+- [文档] 新增 `docs/LOCAL_STRATEGY_BASELINE.md` 作为当前默认本地策略基线文档，按策略名称沉淀实现条件、默认参数、信号落点与 AI 续写位置，并在 `docs/LOCAL_STRATEGY_CATALOG.md` 中补充主入口链接。
+- [改进] `trend_leader_unified` 预过滤改为先补齐行情种子再筛选，并在 60d 动量缺失时启用自适应正向门槛与放宽缓冲池，实际 benchmark 同参数提速提升到 59.52%。
+- [改进] `trend_leader_unified` 的 fallback 分层进一步收口：`tier4_last_resort` 现在只在 `tier1~3` 仍无候选时触发，并继续排除 `blocked_*` 与 `pseudo_leader`，保证“每天尽量有候选”同时保留显式风险标记。
+- [改进] 新增 `scripts/benchmark_trend_leader_v1.py`，可在同参数下输出 `baseline vs optimized` 的趋势龙头扫描耗时、候选数、fallback 数与 prefilter 统计，为 V1 提速验收提供可复现实跑证据。
+- [改进] `trend_leader_unified` 三项 V1 优化落地：新增扫描前行情级预过滤（`--scan-prefilter-*`）、分层 fallback 兜底（`fallback_tier`），以及资金流按市值分层阈值打分（small/mid/large cap）。
+- [改进] `scripts/run_fast_review_bundle.py` 新增“无结果策略跳过”机制：当子策略执行失败或候选数为 0 时不再中断整轮，统一标记为 `skipped` 并在 `fast_review_summary.md` 与控制台输出 `skipped_signal` 列表，便于快速定位未执行/无结果策略。
+- [改进] `trend_leader_unified` 在资金流不可用（`failed/not_supported/unknown/empty`）时，不再因 `weak_capital_consensus/weak_capital_flow/weak_capital_continuity` 直接硬拦截；保留风险标记并新增 `capital_flow_unavailable`，避免“数据缺失=策略否决”。
+- [改进] `AkshareFundamentalAdapter.get_capital_flow` 新增板块资金排行 Tushare fallback（`moneyflow_ind_ths`/`moneyflow_ind_dc`）与日级缓存，在 AkShare 板块资金排行缺失时补齐板块资金上下文。
+- [改进] `trend_leader_unified` 新增“同板块业绩暴雷联动提示”：扫描阶段写入 `primary_board_name`，并按板块统计 `blocked_*` 业绩风险，命中候选会附加 `board_earnings_risk_*` 字段、风险标记与摘要提示，避免仅看个股分数忽略板块联动折价。
+- [改进] `scripts/run_fast_review_bundle.py` 新增本地策略配置文件入口 `--strategy-profile-file`（默认 `config/local_strategy_profile.json`），支持集中管理 include/exclude 与关键参数默认值。
+- [改进] `scripts/run_fast_review_bundle.py` 新增 `--continuous-max-workers`，将连续上涨本地扫描并发与外部脚本并发解耦，默认 1 以提升稳定性。
+- [改进] `scripts/run_fast_review_bundle.py` 新增共振去重导出：`fast_review_resonance.csv` 与 `fast_review_resonance.md`，按 `code` 聚合多信号重叠。
+- [新功能] 新增独立脚本 `scripts/run_signal_performance_bundle.py`（多信号绩效评估聚合）与 `scripts/run_industry_turning_point_daily.py`（行业拐点日更聚合）。
+- [改进] 新增 `scripts/run_trend_leader_sharded_pipeline.py` 两段式分片流水线：支持 `download/merge/persist` 分阶段执行，默认将分片下载扫描与合并入库解耦，避免与其他策略同步耦合。
+- [改进] `scripts/run_fast_review_bundle.py` 新增 `--exclude-signals`，可在 `--include-signals` 展开后按信号键剔除当前不需要的策略，降低本地策略编排复杂度。
+- [改进] 趋势龙头链路新增分片参数：`select_trend_leader_candidates.py` 支持 `--shard-count/--shard-index` 多实例分片扫描，并在分片模式下要求 `--skip-db-persist` 防止快照覆盖；`run_fast_review_bundle.py` 与 `run_trend_leader_daily_bundle.py` 已支持分片参数透传。
+- [改进] 趋势龙头链路新增并发参数：`select_trend_leader_candidates.py` 支持 `--max-workers` 并发扫描；`run_fast_review_bundle.py` 与 `run_trend_leader_daily_bundle.py` 均已透传该参数，支持“获取+策略执行”多线程提速并保留 checkpoint/进度日志能力。
+- [改进] `scripts/run_fast_review_bundle.py` 新增 `--external-parallelism` 外部信号并行执行（业绩/百日新高/趋势龙头）与分信号耗时输出（`elapsed_sec`），用于缩短快复盘总耗时并提升慢点定位效率。
+- [改进] 新增 `scripts/run_fast_review_bundle.py` 两段式快复盘入口：聚合 `业绩/百日新高/趋势龙头/连续上涨(上涨占比+连涨天数)` 的当日导出与快照落库，`全扫描+回测` 保持独立命令按需执行，降低日常入口复杂度。
+- [改进] `trend_leader_unified` 新增股票池瘦身能力：`select_trend_leader_candidates.py` 与 `run_trend_leader_daily_bundle.py` 支持 `--exclude-st`、`--exclude-kcb`、`--exclude-cyb` 与 `--universe-codes-file`，可先按外部股票ID名单和板块/ST规则缩小扫描范围，降低全量扫描耗时。
+- [改进] `trend_leader_unified` 全量扫描提速：`select_trend_leader_candidates.py` 复用单票实时行情、财务上下文与日线上下文，减少重复调用 `get_realtime_quote/get_fundamental_context/get_daily_data`，在不改变选股口径的前提下降低全市场扫描耗时。
+- [文档] 收敛本地策略文档治理：`AGENTS.md`、`docs/LOCAL_STRATEGY_CATALOG.md`、`docs/AI_MODIFICATION_LOG.md` 新增统一留痕约定与检查清单，要求本地策略新增与修改同步记录。
+- [改进] `select_trend_leader_candidates.py` 与 `run_trend_leader_daily_bundle.py` 新增 `--progress-every`，支持输出“已处理/总数/百分比/当前代码”的扫描与补抓进度日志，便于观察长任务运行位置。
+- [修复] `evaluate_signal_snapshot_performance.py` 修复样本不足分支缺少 `first_hit` 字段导致的汇总异常，`trend_leader_unified` 一键链路在 `insufficient_data` 场景可稳定产出评估报告。
+- [改进] `trend_leader_unified` 新增“快扫 + 入选后二阶段补抓”流程：全市场扫描阶段默认关闭新闻/主营抓取，仅对入选池执行补抓；新增 `--disable-second-stage-news-search`、`--disable-second-stage-business-profile`、`--enrich-top-n` 参数，并在快照落库补充 `news_items_count`、`has_business_profile`、`enrichment_stage` 等状态字段。
+- [改进] `schedule` 模式下 `hundred_day_high` 的归因补全改为“稳定快扫 + 入选后补抓”：保留阶段 1 全扫稳定性，仅在阶段 2 对入选候选补抓新闻与主营（默认继续关闭 LLM 原因卡）。
+- [改进] `DataFetcherManager` 在 `days` 自动区间请求下新增 best-effort 历史缓存复用：当缓存已覆盖请求结束日且行数足够时，直接复用缓存切片，避免周末/节假日头部补齐触发额外联网重试，降低全市场扫描耗时。
+- [改进] `schedule` 模式下启用 `TREND_LEADER_UNIFIED_SNAPSHOT_ENABLED=true` 时，现已自动执行 `scripts/run_trend_leader_daily_bundle.py`，每日输出“扫描+绩效+汇总”结果文件。
+- [改进] `trend_leader_unified` 新增扫描链路下载优化与断点续跑能力（批量行情预取、`--checkpoint-path/--checkpoint-every/--resume`），并新增 `scripts/run_trend_leader_daily_bundle.py` 一键执行“扫描+评估+日报汇总”入口。
+- [改进] `evaluate_signal_snapshot_performance.py` 新增交易成本口径（滑点/费率/换手惩罚）、成本后收益/胜率/回撤/卡玛指标与分数分桶统计；`trend_leader_unified` 资金打分新增持续性与结构维度（`capital_flow_continuity_score`、`capital_structure_score`）。
+- [改进] `trend_leader_unified` 同日重跑改为单事务原子替换（删旧+写新+重建汇总），异常时整体回滚避免当日空窗；并对 `TL_SUMMARY` 跳过 YTD 行情回填，减少无效行情抓取。
+- [改进] `trend_leader_unified` 新增标签字段与展示：快照透传 `selection_mode`、`is_breakout_candidate`、`is_pullback_candidate`、`near_new_high`，并在 `/signals` 输出可读 `signal_tags`（百日新高/突破形态/回踩形态/严格命中/兜底观察）。
+- [改进] `trend_leader_unified` 扫描在当日 0 命中时会落库 `TL_SUMMARY` 运行摘要快照，便于在 `/signals` 确认“已执行/0命中”。
+- [改进] `KlineSelectorService.build_fast_a_share_manager` 在保留 Akshare 快路径的同时增加可用 Tushare 兜底，降低单一源失败导致的空跑。
+- [改进] `schedule` 模式新增强趋势龙头统一快照日更开关：支持 `TREND_LEADER_UNIFIED_SNAPSHOT_ENABLED` 与 `TREND_LEADER_UNIFIED_SNAPSHOT_LIMIT`，可在每日定时分析后自动执行 `trend_leader_unified` 快照刷新并在 `/signals` 回看。
+- [新功能] 新增 A 股 `trend_leader_unified` 强趋势龙头统一策略：新增 `scripts/select_trend_leader_candidates.py` 与 `src/services/trend_leader_strategy_service.py`，按龙头/趋势/资金/业绩混合口径生成统一候选池快照。
+- [改进] `/signals` 新增 `trend_leader_unified` 接入：后端快照查询、计数元数据、API schema、前端 tab 与列表/详情字段均支持 `primary_profile`、`breakout_score`、`pullback_score`、`hybrid_score`、`overall_score`、`trend_label`、`strategy_summary`。
+- [测试] 新增统一策略单元与链路测试：覆盖 `TrendLeaderStrategyService` 打分/硬筛、快照 payload 透传、`test_signal_snapshot_api.py` 合同校验与 `SignalsPage` 新 tab 渲染。
+- [改进] `earnings_surprise / fundamental_context / capital_profile` 同日复跑链路新增更强的 same-day cache 复用与缓存观测字段：基础面 bundle 默认同日复用、capital profile 按短 TTL 局部刷新，`/signals` 与性能报告同步补充 `cache_source / bundle_refreshed_at / capital_profile_refreshed_at / capital_profile_cache_hit` 等效率指标。
+- [改进] 新增可复用的 `src/services/capital_profile_service.py`，统一输出 `capital_consensus_score / capital_profile_score / capital_flow_score / relative_strength_score / liquidity_score / main_net_inflow / inflow_5d / inflow_10d / capital_profile_summary` 等资金画像字段。
+- [改进] `scripts/select_earnings_surprise_candidates.py` 现在会为通过的 `earnings_surprise` 候选补充资金画像，并把 `capital_consensus_score`、`relative_strength_score`、`capital_profile_score` 作为同分排序的优先参考，同时随快照一并落库，便于后续按快照复盘。
+- [改进] `scripts/select_monthly_slow_rise_candidates.py` 现在会为 `monthly_slow_rise` 候选补充资金画像，把结构趋势与资金承接一起写入快照与导出结果，并在排序时把资金强弱作为月线结构之后的优先比较项。
+- [文档] 新增 `docs/CAPITAL_PROFILE_STRATEGY.md`，把统一资金层 `capital_profile` 的字段、分数、原始快照字段、当前评分口径，以及在 `earnings_surprise`、`monthly_slow_rise` 中的接入方式单独整理成专题文档，并从主策略总纲与本地策略总表补充跳转。
+- [文档] 新增 `docs/MAIN_STRATEGY_BLUEPRINT.md`，把后续策略开发主轴固定为“逻辑 + 资金 + 趋势 + 业绩兑现”，并在 `docs/LOCAL_STRATEGY_CATALOG.md` 顶部补上主策略入口，方便后续所有策略围绕同一判断框架收敛。
+- [改进] `TushareFetcher` 继续补齐 `trade_cal` 本地参考缓存：优先复用 `data/cache/reference/tushare_trade_cal_sse.csv`，接口失败或无权限时回退到旧缓存；若首次即无权限且本地无缓存，则降级用近 20 天工作日近似交易日历，尽量保证低积分 Tushare 环境下的交易日判断和日线策略可继续运行。
+- [改进] `TushareFetcher` 针对低积分场景补上 `stock_basic` 本地缓存：首次成功拉取后会写入 `data/cache/reference/tushare_stock_basic_list.csv`，后续优先复用缓存，接口失败时也可回退到本地缓存，减少 120 积分账号重复消耗在股票列表/名称查询上。
+- [修复] 修复 `scripts/select_earnings_surprise_candidates.py` 在季度尚未结束时推导最近已完成财报期会递归卡死的问题，最近业绩公告目录现在可在 1 月、4 月等时点正常构建。
+- [改进] `earnings_surprise` 新增 `strict / balanced / relaxed` 三档 `--strategy-profile` 预设，并按档位分别落库 `earnings_surprise`、`earnings_surprise_strict`、`earnings_surprise_relaxed`，便于同日横向比较业绩线策略表现。
+- [改进] `earnings_surprise` 扫描会把拉取到的基础面、行情与近期业绩公告覆盖层写入 `signal_fundamental_snapshot`，同日重跑可复用快照并按最新覆盖层补写，减少重复抓取并固定当日判断口径。
+- [文档] 新增 `docs/EARNINGS_SURPRISE_PLAYBOOK.md`，补充 `earnings_surprise` 的实战判读手册，整理通过/拦截状态的解读方式、筛选顺序以及与趋势线、题材线的联动使用建议。
+- [文档] 新增 `docs/EARNINGS_SURPRISE_STRATEGY_BREAKDOWN.md`，把 `earnings_surprise` 的判断字段、加权结构、放行门槛、`gate_status` 与快照字段拆成独立业绩线专章，并在相关文档中补充跳转。
+- [文档] 新增 `docs/LOCAL_STRATEGY_CATALOG.md`，整理本地扫描策略、快照采集脚本、`/signals` 信号类型与 `strategies/` agent 策略总表，便于集中查看当前策略资产。
+- [改进] `earnings_surprise` 升级为“硬门槛 + 多因子加权”的业绩策略，新增 `earnings_strategy_score/label/gate_status` 及增长连续性、利润质量、盈利能力、披露文本、周期、新鲜度、风险扣分等快照字段，并整理 `docs/EARNINGS_SURPRISE_TRACKING.md` 便于查看当前判断口径。
+- [改进] `earnings_surprise` 扫描现在会接入 `earnings_quality` 评分，允许“强季度连续性 / 周期改善 / 现金流质量较好”的业绩信号参与命中与排序，并把 `earnings_quality_verdict/score/cycle_phase` 等字段落入快照与导出结果。
+- [改进] `earnings_quality` 进一步补齐多季度财报序列与连续性判断，新增 `financial_report_series`、`quarterly_continuity_score`、`quarterly_evidence` 等字段，可更严格地区分“连续改善”“持续为正”和“走弱”。
+- [改进] 基本面聚合新增 `fundamental_context.earnings_quality` 业绩质量评分块，并同步暴露到 `get_stock_info`、分析/历史详情 API、信号归因摘要和商品涨价受益服务，便于判断增长、现金流和盈利质量是否真实改善。
+- [改进] `DataFetcherManager` 新增本地日线磁盘缓存，默认复用 `data/cache/history/` 历史数据，并支持 TTL、强制刷新透传与按股票尾部增量补齐，减少多策略扫描时的重复联网抓取压力。
+- [新功能] 新增 `scripts/select_monthly_slow_rise_candidates.py` 与文档 `docs/MONTHLY_SLOW_RISE_SCAN.md`，可先抓日线再聚合月线，按“收涨月份占比、低点抬高占比、MA6/MA12 结构、区间总涨幅、单月最大涨幅、最大回撤”等口径筛选“月线一点点上涨”的 A 股候选。
+- [新功能] 新增 `scripts/collect_monthly_slow_rise_profile_snapshots.py`，支持按 `strict / balanced / loose` 三套 profile 批量采集“月线慢牛”快照并写入 `kline_signal_snapshot`。
+- [改进] `/signals` 新增动态月线慢牛 profile tab，可直接查看 `monthly_positive_ratio`、`monthly_higher_low_ratio`、`monthly_total_return_pct`、`monthly_max_single_gain_pct`、`monthly_worst_drawdown_pct`、`monthly_ma_short / monthly_ma_long` 等字段。
+- [改进] `/signals` 月线慢牛视图新增“严格 / 均衡 / 宽松”一键对比卡片，可同屏查看三档候选池的并集、共识、独有股票与月线指标均值，并从对比卡直接切换到目标 profile。
+- [改进] `/signals` 的 `streak` 分组批量联动补上了更明确的反馈：点击“选择本组”后会显示当前联动的主题组/行业组，并支持再次点击“取消本组”；导出与推送摘要也会带上该分组上下文。
 - [改进] `schedule` 模式新增可选板块辨识度 TopN 快照调度；开启 `BOARD_RECOGNIZABILITY_SNAPSHOT_ENABLED` 后，会在定时分析后自动刷新 `/signals` 动态板块辨识度 tab 所需快照。
 - [新功能] 新增 `scripts/collect_board_recognizability_rankings.py` 与文档 `docs/BOARD_RECOGNIZABILITY_RANKING.md`，可从已落库的 `hundred_day_high` 等信号快照中提取“各板块辨识度 TopN”结果，导出汇总文件并按板块命名空间再次写入 `kline_signal_snapshot`，便于后续查询和回溯。
 - [新功能] 新增模块主题核心快照脚本 `scripts/collect_board_theme_core_snapshots.py` 与文档 `docs/THEME_CORE_BOARD_SNAPSHOTS.md`，可按日期保存模块成分股与模块内部子主题核心股结果，便于后续周期性更新与回看。

@@ -7,8 +7,9 @@ import math
 import sys
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 
@@ -20,6 +21,7 @@ if "json_repair" not in sys.modules:
 from src.services.kline_selector_service import (  # noqa: E402
     KlineSelectorCriteria,
     KlineSelectorPrefilter,
+    KlineRuleResult,
     KlineSelectionEvaluation,
     KlineSelectorService,
 )
@@ -87,6 +89,29 @@ class FakeManager:
 
 
 class TestKlineSelectorService(unittest.TestCase):
+    def tearDown(self) -> None:
+        KlineSelectorService._spot_universe_cache = None
+        KlineSelectorService._listing_metadata_cache = None
+
+    def test_fetch_universe_dataframe_prefers_tushare_before_akshare_spot(self):
+        service = KlineSelectorService()
+        tushare_df = pd.DataFrame({"code": ["000001"], "name": ["pingan"]})
+
+        with patch.object(
+            service,
+            "_fetch_universe_from_tushare",
+            return_value=tushare_df,
+        ) as tushare_mock, patch.object(
+            service,
+            "_fetch_universe_from_akshare_spot",
+            side_effect=RuntimeError("akshare should not be called first"),
+        ) as akshare_mock:
+            universe_df = service._fetch_universe_dataframe()
+
+        self.assertEqual(universe_df["code"].tolist(), ["000001"])
+        self.assertEqual(tushare_mock.call_count, 1)
+        self.assertEqual(akshare_mock.call_count, 0)
+
     def test_get_a_share_universe_filters_bse_and_duplicates(self):
         service = KlineSelectorService(
             universe_provider=lambda: pd.DataFrame(
@@ -118,6 +143,249 @@ class TestKlineSelectorService(unittest.TestCase):
 
         self.assertEqual(universe["code"].tolist(), ["301236", "600519"])
         self.assertEqual(universe["name"].tolist(), ["软通动力", "贵州茅台"])
+
+    def test_get_a_share_universe_preserves_list_date_and_listed_days(self):
+        service = KlineSelectorService(
+            universe_provider=lambda: pd.DataFrame(
+                {
+                    "code": ["600519", "301236"],
+                    "name": ["贵州茅台", "软通动力"],
+                    "list_date": ["20010827", "2022-03-15"],
+                }
+            )
+        )
+
+        universe = service.get_a_share_universe(as_of_date=date(2026, 4, 22))
+
+        self.assertIn("list_date", universe.columns)
+        self.assertIn("listed_days", universe.columns)
+        self.assertEqual(str(universe.loc[0, "list_date"].date()), "2022-03-15")
+        self.assertEqual(int(universe.loc[0, "listed_days"]), 1499)
+        self.assertEqual(str(universe.loc[1, "list_date"].date()), "2001-08-27")
+
+    def test_get_spot_enriched_a_share_universe_retries_once_before_success(self):
+        service = KlineSelectorService()
+        spot_df = pd.DataFrame(
+            {
+                "代码": ["600519"],
+                "名称": ["贵州茅台"],
+                "总市值": [220_000_000_000.0],
+                "最新价": [1800.0],
+                "60日涨跌幅": [25.0],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cache_csv = Path(tmp_dir) / "spot_cache.csv"
+            cache_meta = Path(tmp_dir) / "spot_cache.json"
+            with patch.object(
+                service,
+                "_fetch_universe_from_akshare_spot",
+                side_effect=[RuntimeError("temporary"), spot_df],
+            ) as spot_mock, patch.object(
+                service,
+                "_fetch_listing_dates_dataframe",
+                return_value=pd.DataFrame(),
+            ), patch.object(
+                service,
+                "_get_spot_universe_reference_cache_paths",
+                return_value=(cache_csv, cache_meta),
+                create=True,
+            ):
+                universe = service.get_spot_enriched_a_share_universe(as_of_date=date(2026, 4, 22))
+
+        self.assertEqual(spot_mock.call_count, 2)
+        self.assertEqual(universe["code"].tolist(), ["600519"])
+        self.assertEqual(float(universe.iloc[0]["change_pct_60d"]), 25.0)
+
+    def test_get_spot_enriched_a_share_universe_falls_back_to_cached_spot_snapshot(self):
+        service = KlineSelectorService()
+        spot_df = pd.DataFrame(
+            {
+                "代码": ["600519"],
+                "名称": ["贵州茅台"],
+                "总市值": [220_000_000_000.0],
+                "最新价": [1800.0],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cache_csv = Path(tmp_dir) / "spot_cache.csv"
+            cache_meta = Path(tmp_dir) / "spot_cache.json"
+            with patch.object(
+                service,
+                "_fetch_universe_from_akshare_spot",
+                side_effect=[spot_df, RuntimeError("offline"), RuntimeError("offline")],
+            ), patch.object(
+                service,
+                "_fetch_listing_dates_dataframe",
+                return_value=pd.DataFrame(),
+            ), patch.object(
+                service,
+                "get_a_share_universe",
+                side_effect=AssertionError("generic fallback should not be used when cache exists"),
+            ), patch.object(
+                service,
+                "_get_spot_universe_reference_cache_paths",
+                return_value=(cache_csv, cache_meta),
+                create=True,
+            ):
+                first = service.get_spot_enriched_a_share_universe(as_of_date=date(2026, 4, 22))
+                second = service.get_spot_enriched_a_share_universe(as_of_date=date(2026, 4, 22))
+
+        self.assertEqual(first["code"].tolist(), ["600519"])
+        self.assertEqual(second["code"].tolist(), ["600519"])
+
+    def test_get_spot_enriched_a_share_universe_merges_disk_cached_spot_quotes_on_generic_fallback(self):
+        service = KlineSelectorService()
+        spot_df = pd.DataFrame(
+            {
+                "code": ["600519"],
+                "name": ["maotai"],
+                "total_mv": [220_000_000_000.0],
+                "latest_price": [1800.0],
+                "pct_change": [2.5],
+                "turnover_rate": [1.3],
+            }
+        )
+        generic_universe = pd.DataFrame(
+            {
+                "code": ["600519"],
+                "name": ["maotai"],
+                "list_date": [pd.Timestamp("2001-08-27")],
+                "listed_days": [9000],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cache_csv = Path(tmp_dir) / "spot_cache.csv"
+            cache_meta = Path(tmp_dir) / "spot_cache.json"
+            with patch.object(
+                service,
+                "_fetch_universe_from_akshare_spot",
+                side_effect=[spot_df, RuntimeError("offline"), RuntimeError("offline")],
+            ), patch.object(
+                service,
+                "_fetch_listing_dates_dataframe",
+                return_value=pd.DataFrame(),
+            ), patch.object(
+                service,
+                "get_a_share_universe",
+                return_value=generic_universe.copy(),
+            ), patch.object(
+                service,
+                "_get_spot_universe_reference_cache_paths",
+                return_value=(cache_csv, cache_meta),
+                create=True,
+            ), patch.object(
+                service,
+                "_spot_universe_reference_cache_min_rows",
+                1,
+                create=True,
+            ):
+                first = service.get_spot_enriched_a_share_universe(as_of_date=date(2026, 4, 22))
+                KlineSelectorService._spot_universe_cache = None
+                second = service.get_spot_enriched_a_share_universe(as_of_date=date(2026, 4, 22))
+
+        self.assertEqual(first["code"].tolist(), ["600519"])
+        self.assertEqual(second["code"].tolist(), ["600519"])
+        self.assertEqual(float(second.iloc[0]["latest_price"]), 1800.0)
+        self.assertEqual(float(second.iloc[0]["pct_change"]), 2.5)
+        self.assertEqual(float(second.iloc[0]["turnover_rate"]), 1.3)
+
+    def test_get_spot_enriched_a_share_universe_merges_listing_metadata_on_generic_fallback(self):
+        service = KlineSelectorService()
+        generic_universe = pd.DataFrame(
+            {
+                "code": ["301682"],
+                "name": ["recent_ipo"],
+                "total_mv": [8_000_000_000.0],
+            }
+        )
+        listing_df = pd.DataFrame(
+            {
+                "code": ["301682"],
+                "name": ["recent_ipo"],
+                "list_date": ["2025-05-01"],
+            }
+        )
+
+        with patch.object(
+            service,
+            "_fetch_universe_from_akshare_spot",
+            side_effect=RuntimeError("offline"),
+        ), patch.object(
+            service,
+            "get_a_share_universe",
+            return_value=generic_universe.copy(),
+        ), patch.object(
+            service,
+            "_fetch_listing_dates_dataframe",
+            return_value=listing_df,
+        ), patch.object(
+            service,
+            "_read_spot_universe_reference_cache",
+            return_value=pd.DataFrame(),
+        ):
+            universe = service.get_spot_enriched_a_share_universe(as_of_date=date(2026, 4, 22))
+
+        self.assertEqual(universe["code"].tolist(), ["301682"])
+        self.assertEqual(str(universe.iloc[0]["list_date"].date()), "2025-05-01")
+        self.assertEqual(int(universe.iloc[0]["listed_days"]), 356)
+
+    def test_get_spot_enriched_a_share_universe_ignores_tiny_disk_cached_spot_snapshot(self):
+        service = KlineSelectorService()
+        spot_df = pd.DataFrame(
+            {
+                "code": ["600519"],
+                "name": ["maotai"],
+                "total_mv": [220_000_000_000.0],
+                "latest_price": [1800.0],
+                "pct_change": [2.5],
+                "turnover_rate": [1.3],
+            }
+        )
+        generic_universe = pd.DataFrame(
+            {
+                "code": ["600519"],
+                "name": ["maotai"],
+                "list_date": [pd.Timestamp("2001-08-27")],
+                "listed_days": [9000],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cache_csv = Path(tmp_dir) / "spot_cache.csv"
+            cache_meta = Path(tmp_dir) / "spot_cache.json"
+            with patch.object(
+                service,
+                "_fetch_universe_from_akshare_spot",
+                side_effect=[spot_df, RuntimeError("offline"), RuntimeError("offline")],
+            ), patch.object(
+                service,
+                "_fetch_listing_dates_dataframe",
+                return_value=pd.DataFrame(),
+            ), patch.object(
+                service,
+                "get_a_share_universe",
+                return_value=generic_universe.copy(),
+            ), patch.object(
+                service,
+                "_get_spot_universe_reference_cache_paths",
+                return_value=(cache_csv, cache_meta),
+                create=True,
+            ), patch.object(
+                service,
+                "_spot_universe_reference_cache_min_rows",
+                2,
+                create=True,
+            ):
+                service.get_spot_enriched_a_share_universe(as_of_date=date(2026, 4, 22))
+                KlineSelectorService._spot_universe_cache = None
+                second = service.get_spot_enriched_a_share_universe(as_of_date=date(2026, 4, 22))
+
+        self.assertEqual(second["code"].tolist(), ["600519"])
+        self.assertTrue("latest_price" not in second.columns or pd.isna(second.iloc[0].get("latest_price")))
 
     def test_evaluate_stock_passes_all_rules(self):
         history = build_history(with_limit_up=True)
@@ -187,6 +455,62 @@ class TestKlineSelectorService(unittest.TestCase):
 
         self.assertTrue(evaluation.passed)
         self.assertEqual(set(evaluation.rule_results.keys()), {"max_market_cap", "hundred_day_high"})
+
+    def test_evaluate_stock_records_phase_metrics(self):
+        history = build_history(with_limit_up=True)
+        manager = FakeManager(history_by_code={"600013": history})
+        service = KlineSelectorService(manager=manager)
+
+        class _PassingRule:
+            name = "pass_rule"
+            description = "always pass"
+
+            def evaluate(self, _ctx):
+                return KlineRuleResult(name=self.name, passed=True, message="ok")
+
+        with patch(
+            "src.services.kline_selector_service.time.perf_counter",
+            side_effect=[100.0, 101.0, 105.0, 105.0, 106.0, 106.0, 107.0, 107.0, 109.0, 110.0],
+        ):
+            evaluation = service.evaluate_stock(
+                stock_code="600013",
+                stock_name="timing_case",
+                criteria=KlineSelectorCriteria(),
+                prefetched_total_market_cap=40e9,
+                rules=[_PassingRule()],
+            )
+
+        self.assertTrue(evaluation.passed)
+        self.assertEqual(evaluation.phase_metrics["history_fetch_elapsed_sec"], 4.0)
+        self.assertEqual(evaluation.phase_metrics["history_prepare_elapsed_sec"], 1.0)
+        self.assertEqual(evaluation.phase_metrics["market_cap_resolve_elapsed_sec"], 0.0)
+        self.assertEqual(evaluation.phase_metrics["rule_evaluate_elapsed_sec"], 1.0)
+        self.assertEqual(evaluation.phase_metrics["evaluation_elapsed_sec"], 7.0)
+
+    def test_evaluate_stock_skips_market_cap_resolve_after_other_rules_fail(self):
+        history = build_history(with_limit_up=True)
+        manager = FakeManager(history_by_code={"600016": history})
+        service = KlineSelectorService(manager=manager)
+
+        class _FailingRule:
+            name = "history_only_fail"
+            description = "always fail before market-cap rule"
+
+            def evaluate(self, _ctx):
+                return KlineRuleResult(name=self.name, passed=False, message="history rule failed")
+
+        with patch.object(service, "_resolve_total_market_cap", side_effect=AssertionError("should not resolve market cap")):
+            evaluation = service.evaluate_stock(
+                stock_code="600016",
+                stock_name="lazy_cap_case",
+                criteria=KlineSelectorCriteria(),
+                prefetched_total_market_cap=None,
+                rules=[_FailingRule(), service.build_rules(KlineSelectorCriteria())[0]],
+            )
+
+        self.assertFalse(evaluation.passed)
+        self.assertEqual(evaluation.failure_reason, "history rule failed")
+        self.assertEqual(evaluation.phase_metrics["market_cap_resolve_elapsed_sec"], 0.0)
 
     def test_scan_market_prefilters_large_caps_before_history_fetch(self):
         history = build_history(with_limit_up=True)
@@ -270,6 +594,117 @@ class TestKlineSelectorService(unittest.TestCase):
         self.assertEqual(run_result.skipped_prefilter_count, 1)
         self.assertEqual(run_result.evaluated_count, 1)
         self.assertEqual(manager.history_calls, [("600007", criteria.history_days_required)])
+
+    def test_scan_market_aggregates_evaluation_phase_metrics(self):
+        service = KlineSelectorService(
+            manager=FakeManager(),
+            universe_provider=lambda: pd.DataFrame(
+                {
+                    "code": ["600014", "600015"],
+                    "name": ["phase_a", "phase_b"],
+                    "total_mv": [40e9, 41e9],
+                }
+            ),
+        )
+        evaluation_a = KlineSelectionEvaluation(
+            stock_code="600014",
+            stock_name="phase_a",
+            passed=True,
+            phase_metrics={
+                "history_fetch_elapsed_sec": 4.0,
+                "history_prepare_elapsed_sec": 1.0,
+                "market_cap_resolve_elapsed_sec": 0.5,
+                "rule_evaluate_elapsed_sec": 2.0,
+                "evaluation_elapsed_sec": 7.5,
+            },
+        )
+        evaluation_b = KlineSelectionEvaluation(
+            stock_code="600015",
+            stock_name="phase_b",
+            passed=False,
+            failure_reason="blocked",
+            phase_metrics={
+                "history_fetch_elapsed_sec": 6.0,
+                "history_prepare_elapsed_sec": 2.0,
+                "market_cap_resolve_elapsed_sec": 1.5,
+                "rule_evaluate_elapsed_sec": 3.0,
+                "evaluation_elapsed_sec": 12.5,
+            },
+        )
+
+        with patch.object(service, "evaluate_stock", side_effect=[evaluation_a, evaluation_b]):
+            run_result = service.scan_market(criteria=KlineSelectorCriteria(), max_workers=1)
+
+        self.assertEqual(run_result.phase_metrics["selection_phase_metrics_sample_count"], 2)
+        self.assertEqual(run_result.phase_metrics["selection_history_fetch_elapsed_sec_sum"], 10.0)
+        self.assertEqual(run_result.phase_metrics["selection_history_prepare_elapsed_sec_sum"], 3.0)
+        self.assertEqual(run_result.phase_metrics["selection_market_cap_resolve_elapsed_sec_sum"], 2.0)
+        self.assertEqual(run_result.phase_metrics["selection_rule_evaluate_elapsed_sec_sum"], 5.0)
+        self.assertEqual(run_result.phase_metrics["selection_evaluation_elapsed_sec_sum"], 20.0)
+        self.assertEqual(run_result.phase_metrics["selection_history_fetch_elapsed_sec_avg"], 5.0)
+        self.assertEqual(run_result.phase_metrics["selection_rule_evaluate_elapsed_sec_avg"], 2.5)
+
+    def test_scan_market_short_circuits_listed_days_before_history_fetch(self):
+        history = build_history(with_limit_up=True)
+        manager = FakeManager(history_by_code={"600031": history})
+        criteria = KlineSelectorCriteria()
+        service = KlineSelectorService(
+            manager=manager,
+            universe_provider=lambda: pd.DataFrame(
+                {
+                    "code": ["600030", "600031"],
+                    "name": ["recent_ipo", "seasoned"],
+                    "total_mv": [20e9, 21e9],
+                    "listed_days": [90, 180],
+                }
+            ),
+        )
+
+        run_result = service.scan_market(
+            criteria=criteria,
+            prefilter=KlineSelectorPrefilter(min_listed_days=120),
+        )
+
+        self.assertEqual(run_result.skipped_listed_days_count, 1)
+        self.assertEqual(run_result.skipped_prefilter_count, 0)
+        self.assertEqual(run_result.evaluated_count, 1)
+        self.assertEqual(manager.history_calls, [("600031", criteria.history_days_required)])
+
+    def test_prefilter_skip_reason_distinguishes_listed_days_short_circuit(self):
+        reason = KlineSelectorService._get_prefilter_skip_reason(
+            "recent_ipo",
+            {"listed_days": 45},
+            KlineSelectorPrefilter(min_listed_days=120),
+        )
+
+        self.assertIsNotNone(reason)
+        self.assertIn("listed_days_prefilter", str(reason))
+        self.assertIn("need >= 120", str(reason))
+
+    def test_scan_market_does_not_fetch_listing_metadata_when_listed_days_missing(self):
+        history = build_history(with_limit_up=True)
+        manager = FakeManager(history_by_code={"600032": history})
+        criteria = KlineSelectorCriteria()
+        service = KlineSelectorService(
+            manager=manager,
+            universe_provider=lambda: pd.DataFrame(
+                {
+                    "code": ["600032"],
+                    "name": ["missing_listed_days"],
+                    "total_mv": [20e9],
+                }
+            ),
+        )
+
+        with patch.object(service, "_fetch_listing_dates_dataframe", side_effect=AssertionError("should not fetch")):
+            run_result = service.scan_market(
+                criteria=criteria,
+                prefilter=KlineSelectorPrefilter(min_listed_days=120),
+            )
+
+        self.assertEqual(run_result.skipped_listed_days_count, 0)
+        self.assertEqual(run_result.evaluated_count, 1)
+        self.assertEqual(manager.history_calls, [("600032", criteria.history_days_required)])
 
     def test_scan_market_invokes_on_evaluation_callback(self):
         history = build_history(with_limit_up=True)
@@ -393,6 +828,7 @@ class TestKlineSelectorService(unittest.TestCase):
                 universe=service.get_a_share_universe(),
                 skipped_market_cap_count=0,
                 skipped_prefilter_count=0,
+                skipped_listed_days_count=0,
                 selected=[partial_selected],
                 failed=[],
             )
@@ -435,6 +871,7 @@ class TestKlineSelectorService(unittest.TestCase):
                 universe=service.get_a_share_universe(),
                 skipped_market_cap_count=1,
                 skipped_prefilter_count=1,
+                skipped_listed_days_count=0,
                 selected=[],
                 failed=[],
             )

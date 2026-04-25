@@ -915,3 +915,64 @@ E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests\test_kline
     - `data\signal_summary_perf_trend.md`
 - 验证结果：
   - `pytest tests/test_signal_summary_perf_trend_script.py tests/test_signal_snapshot_storage.py tests/test_signal_snapshot_service.py tests/test_signal_snapshot_api.py` -> `14 passed`
+
+# 2026-04-12（/signals 分组联动反馈补充）
+
+- 类型：前端交互补充 / 导出摘要补强 / 文档同步
+- 目标：把 `/signals` 里 `streak` 分组的“选择本组”从单纯批量勾选，补成更容易看懂和回退的联动操作
+- 涉及文件：
+  - `apps/dsa-web/src/pages/SignalsPage.tsx`
+  - `apps/dsa-web/src/pages/__tests__/SignalsPage.test.tsx`
+  - `docs/KLINE_SELECTOR_GUIDE.md`
+  - `docs/CHANGELOG.md`
+- 本次补充：
+  - 选中主题组 / 行业组后，页面会明确显示当前联动组
+  - 再次点击同一组时，可直接“取消本组”
+  - 导出 / 推送摘要里的 `selectionLabel` 会带上对应组名，减少事后回看时只看到“联动筛选 N 只”却不知道来源分组的歧义
+- 执行命令：
+  - `npm run test -- --run src/pages/__tests__/SignalsPage.test.tsx`
+  - `npm run build`
+- 验证结果：
+  - 页面测试已覆盖“选择本组 -> 显示组名 -> 再点取消本组”的交互闭环
+  - `vitest`：`11 passed`
+  - Web 构建通过
+
+# 2026-04-14（月线慢牛 profile 接入 /signals）
+
+- 类型：新策略补充 / 快照联动接入 / 前后端联调 / 文档同步
+- 目标：把“月线一点点上涨”的候选池从单次脚本筛选，补成可按 `strict / balanced / loose` 多档 profile 反复采集、落库、对比和回看的完整链路
+- 涉及文件：
+  - `scripts/select_monthly_slow_rise_candidates.py`
+  - `scripts/collect_monthly_slow_rise_profile_snapshots.py`
+  - `src/services/kline_selector_service.py`
+  - `src/services/signal_snapshot_service.py`
+  - `api/v1/schemas/signals.py`
+  - `tests/test_monthly_slow_rise_candidates.py`
+  - `tests/test_signal_snapshot_service.py`
+  - `tests/test_signal_snapshot_api.py`
+  - `apps/dsa-web/src/pages/SignalsPage.tsx`
+  - `apps/dsa-web/src/pages/__tests__/SignalsPage.test.tsx`
+  - `apps/dsa-web/src/types/signals.ts`
+  - `docs/MONTHLY_SLOW_RISE_SCAN.md`
+  - `docs/KLINE_SELECTOR_GUIDE.md`
+  - `docs/CHANGELOG.md`
+- 本次补充：
+  - 新增 `monthly_slow_rise` 扫描脚本：先抓日线，再聚合月线，按“收涨月份占比、低点抬高占比、MA6/MA12 结构、区间总涨幅、单月最大涨幅、最大回撤”等口径筛选候选
+  - 新增 profile 批量采集脚本，默认支持 `strict / balanced / loose` 三档 profile 依次跑批并写入 `kline_signal_snapshot`
+  - 在 `KlineSelectorService` 中补充 `aggregate_history_by_period(..., period="monthly")`，避免月线逻辑各脚本重复实现
+  - `SignalSnapshotService` / API schema / Web types 补充月线慢牛字段，支持 `profile_label`、`monthly_positive_ratio`、`monthly_higher_low_ratio`、`monthly_total_return_pct`、`monthly_max_single_gain_pct`、`monthly_worst_drawdown_pct`、`monthly_ma_short / monthly_ma_long`、`monthly_latest_month`
+  - `/signals` 自动识别 `monthly_slow_rise_profile__*` 动态 tab，并在详情区展示月线结构字段
+  - `/signals` 在月线慢牛 profile 下方新增“一键对比”视图，可同屏查看三档候选池的并集、双档以上重合数、各档独有股票和指标均值，并可直接切换到目标 profile
+  - 补充月线慢牛脚本说明文档，便于后续独立复跑和调参
+- 执行命令：
+  - `.\.venv\Scripts\python.exe scripts\select_monthly_slow_rise_candidates.py --help`
+  - `.\.venv\Scripts\python.exe -m unittest tests.test_monthly_slow_rise_candidates tests.test_signal_snapshot_service tests.test_signal_snapshot_api`
+  - `.\.venv\Scripts\python.exe -m py_compile api/v1/schemas/signals.py src/services/kline_selector_service.py src/services/signal_snapshot_service.py scripts/select_monthly_slow_rise_candidates.py scripts/collect_monthly_slow_rise_profile_snapshots.py tests/test_monthly_slow_rise_candidates.py tests/test_signal_snapshot_service.py tests/test_signal_snapshot_api.py`
+  - `npm.cmd run test -- --run src/pages/__tests__/SignalsPage.test.tsx`
+  - `npm.cmd run build`
+- 验证结果：
+  - 月线慢牛脚本 `--help` 可正常输出参数说明
+  - `unittest`：`32 tests` 通过
+  - `py_compile`：通过
+  - `vitest`：`12 passed`
+  - Web 构建通过

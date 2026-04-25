@@ -142,9 +142,11 @@ class YfinanceFetcher(BaseFetcher):
             return f"{base}.BJ"
 
         # A股：根据代码前缀判断市场
-        if code.startswith(('600', '601', '603', '688')):
+        # SH: 6xxxxx/9xxxxx (A/B share)
+        # SZ: 0xxxxx/1xxxxx/2xxxxx/3xxxxx (主板/中小板/创业板/新主板段)
+        if len(code) == 6 and code[0] in ('6', '9'):
             return f"{code}.SS"
-        elif code.startswith(('000', '002', '300')):
+        elif len(code) == 6 and code[0] in ('0', '1', '2', '3'):
             return f"{code}.SZ"
         else:
             logger.warning(f"无法确定股票 {code} 的市场，默认使用深市")

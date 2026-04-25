@@ -59,6 +59,7 @@ def _compact_fundamental_context(fundamental_context: dict) -> dict:
         "valuation",
         "growth",
         "earnings",
+        "earnings_quality",
         "institution",
         "capital_flow",
         "dragon_tiger",
@@ -405,7 +406,7 @@ def _handle_get_stock_info(stock_code: str) -> dict:
 
 get_stock_info_tool = ToolDefinition(
     name="get_stock_info",
-    description="Get stock fundamental information: valuation, growth, earnings, institution flow, "
+    description="Get stock fundamental information: valuation, growth, earnings, earnings quality, institution flow, "
                 "stock sector membership (belong_boards; boards is compatibility alias) and "
                 "sector rankings. Returns a compact fundamental_context to reduce token usage.",
     parameters=[

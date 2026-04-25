@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 ===================================
 AkshareFetcher - 主数据源 (Priority 1)
@@ -61,6 +61,8 @@ logger = logging.getLogger(__name__)
 SINA_REALTIME_ENDPOINT = "hq.sinajs.cn/list"
 TENCENT_REALTIME_ENDPOINT = "qt.gtimg.cn/q"
 DEFAULT_STOCK_HISTORY_SOURCE_PRIORITY: Tuple[str, ...] = ("em", "sina", "tencent")
+DEFAULT_SECTOR_RANK_EM_BACKOFF_SECONDS = int(os.getenv("AKSHARE_SECTOR_RANK_EM_BACKOFF_SECONDS", "1200"))
+DEFAULT_STOCK_HISTORY_EM_BACKOFF_SECONDS = int(os.getenv("AKSHARE_STOCK_HISTORY_EM_BACKOFF_SECONDS", "120"))
 
 
 # User-Agent 池，用于随机轮换
@@ -235,6 +237,13 @@ def _classify_realtime_http_error(exc: Exception) -> Tuple[str, str]:
     return "unknown_request_error", detail
 
 
+def _classify_request_exception(exc: Exception) -> Tuple[str, str]:
+    """
+    Reuse the same stable buckets for history-fetch request failures.
+    """
+    return _classify_realtime_http_error(exc)
+
+
 def _build_realtime_failure_message(
     source_name: str,
     endpoint: str,
@@ -287,6 +296,10 @@ class AkshareFetcher(BaseFetcher):
             stock_history_source_priority
         )
         self._last_request_time: Optional[float] = None
+        self._sector_rank_em_backoff_seconds = max(0, int(DEFAULT_SECTOR_RANK_EM_BACKOFF_SECONDS))
+        self._sector_rank_em_backoff_until_ts: float = 0.0
+        self._stock_history_em_backoff_seconds = max(0, int(DEFAULT_STOCK_HISTORY_EM_BACKOFF_SECONDS))
+        self._stock_history_em_backoff_until_ts: float = 0.0
         # 东财补丁开启才执行打补丁操作
         if get_config().enable_eastmoney_patch:
             eastmoney_patch()
@@ -346,6 +359,40 @@ class AkshareFetcher(BaseFetcher):
         # 执行随机 jitter 休眠
         self.random_sleep(self.sleep_min, self.sleep_max)
         self._last_request_time = time.time()
+
+    def _is_sector_rank_em_backoff_active(self) -> bool:
+        return time.time() < float(self._sector_rank_em_backoff_until_ts)
+
+    def _activate_sector_rank_em_backoff(self, reason: str) -> None:
+        backoff_seconds = max(0, int(self._sector_rank_em_backoff_seconds))
+        if backoff_seconds <= 0:
+            return
+        self._sector_rank_em_backoff_until_ts = time.time() + backoff_seconds
+        logger.warning(
+            "[Akshare] sector-ranking EM source entered backoff: backoff=%ss reason=%s",
+            backoff_seconds,
+            reason,
+        )
+
+    def _clear_sector_rank_em_backoff(self) -> None:
+        self._sector_rank_em_backoff_until_ts = 0.0
+
+    def _is_stock_history_em_backoff_active(self) -> bool:
+        return time.time() < float(self._stock_history_em_backoff_until_ts)
+
+    def _activate_stock_history_em_backoff(self, reason: str) -> None:
+        backoff_seconds = max(0, int(self._stock_history_em_backoff_seconds))
+        if backoff_seconds <= 0:
+            return
+        self._stock_history_em_backoff_until_ts = time.time() + backoff_seconds
+        logger.warning(
+            "[Akshare] history EM source entered backoff: backoff=%ss reason=%s",
+            backoff_seconds,
+            reason,
+        )
+
+    def _clear_stock_history_em_backoff(self) -> None:
+        self._stock_history_em_backoff_until_ts = 0.0
     
     @retry(
         stop=stop_after_attempt(3),  # 最多重试3次
@@ -384,17 +431,91 @@ class AkshareFetcher(BaseFetcher):
         else:
             return self._fetch_stock_data(stock_code, start_date, end_date)
     
-    def _get_stock_history_methods(self) -> List[Tuple[Any, str]]:
+    def _get_stock_history_methods(self) -> List[Tuple[str, Any, str]]:
         source_methods = {
             "em": (self._fetch_stock_data_em, "涓滄柟璐㈠瘜"),
             "sina": (self._fetch_stock_data_sina, "鏂版氮璐㈢粡"),
             "tencent": (self._fetch_stock_data_tx, "鑵捐璐㈢粡"),
         }
         return [
-            source_methods[source]
+            (source, source_methods[source][0], source_methods[source][1])
             for source in self.stock_history_source_priority
             if source in source_methods
         ]
+
+    def _should_retry_stock_history_exception(self, exc: Exception) -> bool:
+        category, _ = _classify_request_exception(exc)
+        return category in {"remote_disconnect", "timeout"}
+
+    def _run_stock_history_call_with_retry(self, source_name: str, stock_code: str, func):
+        max_attempts = 2
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return func()
+            except Exception as exc:
+                if attempt >= max_attempts or not self._should_retry_stock_history_exception(exc):
+                    raise
+                category, detail = _classify_request_exception(exc)
+                logger.warning(
+                    "[Akshare] retrying history source=%s stock=%s category=%s attempt=%s/%s detail=%s",
+                    source_name,
+                    stock_code,
+                    category,
+                    attempt + 1,
+                    max_attempts,
+                    detail,
+                )
+                time.sleep(min(1.0, 0.5 * attempt))
+
+    @staticmethod
+    def _pick_history_column(df: pd.DataFrame, aliases: Sequence[str]) -> Optional[str]:
+        for name in aliases:
+            if name in df.columns:
+                return name
+        return None
+
+    def _normalize_history_result_columns(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        normalized = df.copy()
+        alias_groups = {
+            "date": ("date", "日期", "datetime", "交易日期"),
+            "open": ("open", "开盘", "今开"),
+            "high": ("high", "最高"),
+            "low": ("low", "最低"),
+            "close": ("close", "收盘", "最新价"),
+            "volume": ("volume", "成交量", "vol", "成交股数"),
+            "amount": ("amount", "成交额", "成交金额", "turnover"),
+            "pct_chg": ("pct_chg", "涨跌幅", "change_percent", "涨跌幅(%)"),
+        }
+        rename_map: Dict[str, str] = {}
+        for standard_name, aliases in alias_groups.items():
+            selected = self._pick_history_column(normalized, aliases)
+            if selected and selected != standard_name and standard_name not in normalized.columns:
+                rename_map[selected] = standard_name
+        if rename_map:
+            normalized = normalized.rename(columns=rename_map)
+
+        if "volume" not in normalized.columns:
+            normalized["volume"] = 0.0
+            logger.warning(
+                "[Akshare] history result missing volume column for %s, backfilling zeros. columns=%s",
+                stock_code,
+                list(df.columns),
+            )
+
+        if "amount" not in normalized.columns and {"close", "volume"}.issubset(normalized.columns):
+            close_series = pd.to_numeric(normalized["close"], errors="coerce")
+            volume_series = pd.to_numeric(normalized["volume"], errors="coerce")
+            normalized["amount"] = close_series * volume_series
+
+        if "pct_chg" not in normalized.columns and "close" in normalized.columns:
+            close_series = pd.to_numeric(normalized["close"], errors="coerce")
+            normalized["pct_chg"] = close_series.pct_change() * 100.0
+            normalized["pct_chg"] = normalized["pct_chg"].fillna(0.0)
+
+        return normalized
 
     def _fetch_stock_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
         """
@@ -407,23 +528,35 @@ class AkshareFetcher(BaseFetcher):
         """
         # 尝试列表
         methods = self._get_stock_history_methods() or [
-            (self._fetch_stock_data_em, "东方财富"),
-            (self._fetch_stock_data_sina, "新浪财经"),
-            (self._fetch_stock_data_tx, "腾讯财经"),
+            ("em", self._fetch_stock_data_em, "东方财富"),
+            ("sina", self._fetch_stock_data_sina, "新浪财经"),
+            ("tencent", self._fetch_stock_data_tx, "腾讯财经"),
         ]
 
         last_error = None
 
-        for fetch_method, source_name in methods:
+        for source_key, fetch_method, source_name in methods:
+            if source_key == "em" and self._is_stock_history_em_backoff_active():
+                remaining = max(0.0, self._stock_history_em_backoff_until_ts - time.time())
+                logger.info(
+                    "[Akshare] history EM source in backoff, skipping: stock=%s remaining=%.0fs",
+                    stock_code,
+                    remaining,
+                )
+                continue
             try:
                 logger.info(f"[数据源] 尝试使用 {source_name} 获取 {stock_code}...")
                 df = fetch_method(stock_code, start_date, end_date)
 
                 if df is not None and not df.empty:
+                    if source_key == "em":
+                        self._clear_stock_history_em_backoff()
                     logger.info(f"[数据源] {source_name} 获取成功")
                     return df
             except Exception as e:
                 last_error = e
+                if source_key == "em" and self._should_retry_stock_history_exception(e):
+                    self._activate_stock_history_em_backoff(str(e))
                 logger.warning(f"[数据源] {source_name} 获取失败: {e}")
                 # 继续尝试下一个
 
@@ -447,24 +580,25 @@ class AkshareFetcher(BaseFetcher):
 
         try:
             import time as _time
-            api_start = _time.time()
 
-            df = ak.stock_zh_a_hist(
-                symbol=stock_code,
-                period="daily",
-                start_date=start_date.replace('-', ''),
-                end_date=end_date.replace('-', ''),
-                adjust="qfq"
-            )
+            def _call():
+                api_start = _time.time()
+                df = ak.stock_zh_a_hist(
+                    symbol=stock_code,
+                    period="daily",
+                    start_date=start_date.replace('-', ''),
+                    end_date=end_date.replace('-', ''),
+                    adjust="qfq"
+                )
+                api_elapsed = _time.time() - api_start
 
-            api_elapsed = _time.time() - api_start
-
-            if df is not None and not df.empty:
-                logger.info(f"[API返回] ak.stock_zh_a_hist 成功: {len(df)} 行, 耗时 {api_elapsed:.2f}s")
-                return df
-            else:
-                logger.warning(f"[API返回] ak.stock_zh_a_hist 返回空数据")
+                if df is not None and not df.empty:
+                    logger.info("[API返回] ak.stock_zh_a_hist 成功: %s 行, 耗时 %.2fs", len(df), api_elapsed)
+                    return df
+                logger.warning("[API返回] ak.stock_zh_a_hist 返回空数据")
                 return pd.DataFrame()
+
+            return self._run_stock_history_call_with_retry("em", stock_code, _call)
 
         except Exception as e:
             error_msg = str(e).lower()
@@ -531,32 +665,22 @@ class AkshareFetcher(BaseFetcher):
         self._enforce_rate_limit()
 
         try:
-            df = ak.stock_zh_a_hist_tx(
-                symbol=symbol,
-                start_date=start_date.replace('-', ''),
-                end_date=end_date.replace('-', ''),
-                adjust="qfq"
-            )
+            def _call():
+                df = ak.stock_zh_a_hist_tx(
+                    symbol=symbol,
+                    start_date=start_date.replace('-', ''),
+                    end_date=end_date.replace('-', ''),
+                    adjust="qfq"
+                )
 
-            # 标准化腾讯数据列名
-            # 腾讯返回：date, open, close, high, low, volume, amount
-            if df is not None and not df.empty:
-                rename_map = {
-                    'date': '日期', 'open': '开盘', 'high': '最高',
-                    'low': '最低', 'close': '收盘', 'volume': '成交量',
-                    'amount': '成交额'
-                }
-                df = df.rename(columns=rename_map)
+                if df is not None and not df.empty:
+                    if 'pct_chg' not in df.columns and 'close' in df.columns:
+                        df['pct_chg'] = df['close'].pct_change() * 100
+                        df['pct_chg'] = df['pct_chg'].fillna(0)
+                    return df
+                return pd.DataFrame()
 
-                # 腾讯数据通常包含 '涨跌幅'，如果没有则计算
-                if 'pct_chg' in df.columns:
-                    df = df.rename(columns={'pct_chg': '涨跌幅'})
-                elif '收盘' in df.columns:
-                    df['涨跌幅'] = df['收盘'].pct_change() * 100
-                    df['涨跌幅'] = df['涨跌幅'].fillna(0)
-
-                return df
-            return pd.DataFrame()
+            return self._run_stock_history_call_with_retry("tencent", stock_code, _call)
 
         except Exception as e:
             raise e
@@ -791,32 +915,18 @@ class AkshareFetcher(BaseFetcher):
         需要映射到标准列名：
         date, open, high, low, close, volume, amount, pct_chg
         """
+        df = self._normalize_history_result_columns(df, stock_code)
         df = df.copy()
-        
-        # 列名映射（Akshare 中文列名 -> 标准英文列名）
-        column_mapping = {
-            '日期': 'date',
-            '开盘': 'open',
-            '收盘': 'close',
-            '最高': 'high',
-            '最低': 'low',
-            '成交量': 'volume',
-            '成交额': 'amount',
-            '涨跌幅': 'pct_chg',
-        }
-        
-        # 重命名列
-        df = df.rename(columns=column_mapping)
-        
+
         # 添加股票代码列
         df['code'] = stock_code
-        
-        # 只保留需要的列
+
+        # 只保留需要的列，并补齐缺失列避免后续清洗阶段因 volume 缺失直接失败
         keep_cols = ['code'] + STANDARD_COLUMNS
-        existing_cols = [col for col in keep_cols if col in df.columns]
-        df = df[existing_cols]
-        
-        return df
+        for column in STANDARD_COLUMNS:
+            if column not in df.columns:
+                df[column] = pd.NA
+        return df[keep_cols]
     
     def get_realtime_quote(self, stock_code: str, source: str = "em") -> Optional[UnifiedRealtimeQuote]:
         """
@@ -1813,20 +1923,29 @@ class AkshareFetcher(BaseFetcher):
             ]
             return top_sectors, bottom_sectors
         
-        # 优先东财接口
-        try:
-            self._set_random_user_agent()
-            self._enforce_rate_limit()
+        # 优先东财接口；若短时间内连续失败，则在 backoff 窗口内直接走新浪回退
+        if self._is_sector_rank_em_backoff_active():
+            remaining = max(0.0, self._sector_rank_em_backoff_until_ts - time.time())
+            logger.info(
+                "[Akshare] 东财板块排行处于 backoff，直接走新浪回退: remaining=%.0fs",
+                remaining,
+            )
+        else:
+            try:
+                self._set_random_user_agent()
+                self._enforce_rate_limit()
 
-            logger.info("[API调用] ak.stock_board_industry_name_em() 获取板块排行...")
-            df = ak.stock_board_industry_name_em()
-            if df is not None and not df.empty:
-                change_col = '涨跌幅'
-                name = '板块名称'
-                return _get_rank_top_n(df, change_col, name, n)
-            
-        except Exception as e:
-            logger.warning(f"[Akshare] 东财接口获取行业板块排行失败: {e}，尝试新浪接口")
+                logger.info("[API调用] ak.stock_board_industry_name_em() 获取板块排行...")
+                df = ak.stock_board_industry_name_em()
+                if df is not None and not df.empty:
+                    self._clear_sector_rank_em_backoff()
+                    change_col = '涨跌幅'
+                    name = '板块名称'
+                    return _get_rank_top_n(df, change_col, name, n)
+                logger.warning("[Akshare] 东财接口返回空板块排行，切换新浪回退")
+            except Exception as e:
+                self._activate_sector_rank_em_backoff(str(e))
+                logger.warning(f"[Akshare] 东财接口获取行业板块排行失败: {e}，尝试新浪接口")
 
         # 东财失败后，尝试新浪接口
         try:

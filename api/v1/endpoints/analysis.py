@@ -806,6 +806,7 @@ def _build_analysis_report(
             context_snapshot=context_snapshot,
             financial_report=extracted_fundamental.get("financial_report"),
             dividend_metrics=extracted_fundamental.get("dividend_metrics"),
+            earnings_quality=extracted_fundamental.get("earnings_quality"),
             belong_boards=extracted_boards.get("belong_boards"),
             sector_rankings=extracted_boards.get("sector_rankings"),
         )

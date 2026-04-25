@@ -167,6 +167,10 @@ class DragonHeadAnalysisService:
         stock_name: Optional[str] = None,
         market_hint: Optional[str] = None,
         scan_context: Optional[Dict[str, Any]] = None,
+        quote_data: Optional[Any] = None,
+        daily_context: Optional[Dict[str, Any]] = None,
+        fundamental_context: Optional[Dict[str, Any]] = None,
+        boards: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         normalized_code = normalize_stock_code(stock_code)
         resolved_name = _safe_text(stock_name)
@@ -181,36 +185,52 @@ class DragonHeadAnalysisService:
         if not (normalized_code.isdigit() and len(normalized_code) == 6):
             return self._not_supported_payload(normalized_code, resolved_name, "non A-share stock is not supported")
 
-        try:
-            fundamental_context = self.manager.get_fundamental_context(normalized_code)
-        except Exception as exc:
-            logger.warning("Dragon head fundamentals failed for %s: %s", normalized_code, exc)
-            fundamental_context = self.manager.build_failed_fundamental_context(normalized_code, str(exc))
+        resolved_fundamental_context: Dict[str, Any]
+        if isinstance(fundamental_context, dict):
+            resolved_fundamental_context = dict(fundamental_context)
+        else:
+            try:
+                resolved_fundamental_context = self.manager.get_fundamental_context(normalized_code)
+            except Exception as exc:
+                logger.warning("Dragon head fundamentals failed for %s: %s", normalized_code, exc)
+                resolved_fundamental_context = self.manager.build_failed_fundamental_context(normalized_code, str(exc))
 
-        try:
-            boards = self.manager.get_belong_boards(normalized_code)
-        except Exception as exc:
-            logger.debug("Dragon head boards failed for %s: %s", normalized_code, exc)
-            boards = []
+        resolved_boards: List[Dict[str, Any]]
+        if isinstance(boards, list):
+            resolved_boards = [dict(item) for item in boards if isinstance(item, dict)]
+        else:
+            try:
+                resolved_boards = self.manager.get_belong_boards(normalized_code)
+            except Exception as exc:
+                logger.debug("Dragon head boards failed for %s: %s", normalized_code, exc)
+                resolved_boards = []
 
-        quote_data = self._fetch_realtime_quote(normalized_code)
-        daily_context = self._collect_daily_context(normalized_code)
+        resolved_quote_data = (
+            self._normalize_quote_payload(quote_data)
+            if quote_data is not None
+            else self._fetch_realtime_quote(normalized_code)
+        )
+        resolved_daily_context = (
+            dict(daily_context)
+            if isinstance(daily_context, dict)
+            else self._collect_daily_context(normalized_code)
+        )
         liquidity_context = self._collect_liquidity_context(
             normalized_code,
-            quote_data=quote_data,
-            daily_context=daily_context,
+            quote_data=resolved_quote_data,
+            daily_context=resolved_daily_context,
         )
-        sector_context = self._collect_sector_context(boards=boards, scan_context=scan_context)
+        sector_context = self._collect_sector_context(boards=resolved_boards, scan_context=scan_context)
         relative_strength_context = self._collect_relative_strength_context(
             normalized_code,
-            quote_data=quote_data,
-            daily_context=daily_context,
+            quote_data=resolved_quote_data,
+            daily_context=resolved_daily_context,
         )
         exact_example = self._match_exact_example(normalized_code, resolved_name)
 
         business_profile: Dict[str, Any] = {}
         preliminary_logic_score, preliminary_logic_reasons = self._score_logic_consensus(
-            boards=boards,
+            boards=resolved_boards,
             business_profile=business_profile,
             exact_example=exact_example,
             sector_context=sector_context,
@@ -219,12 +239,12 @@ class DragonHeadAnalysisService:
             preliminary_logic_score=preliminary_logic_score,
             exact_example=exact_example,
             sector_context=sector_context,
-            boards=boards,
+            boards=resolved_boards,
         ):
             business_profile = self._fetch_business_profile(normalized_code)
 
         logic_consensus_score, logic_reasons = self._score_logic_consensus(
-            boards=boards,
+            boards=resolved_boards,
             business_profile=business_profile,
             exact_example=exact_example,
             sector_context=sector_context,
@@ -236,8 +256,8 @@ class DragonHeadAnalysisService:
 
         sector_leadership_score, sector_reasons = self._score_sector_leadership(
             sector_context=sector_context,
-            quote_data=quote_data,
-            boards=boards,
+            quote_data=resolved_quote_data,
+            boards=resolved_boards,
         )
         relative_strength_score, relative_reasons = self._score_relative_strength(relative_strength_context)
         liquidity_score, liquidity_reasons = self._score_liquidity(liquidity_context)
@@ -272,7 +292,7 @@ class DragonHeadAnalysisService:
             relative_strength_score,
             liquidity_score,
             catalyst_score,
-            int(_safe_float(quote_data.get("change_pct")) or 0),
+            int(_safe_float(resolved_quote_data.get("change_pct")) or 0),
         ]
 
         factor_breakdown = {
@@ -378,6 +398,10 @@ class DragonHeadAnalysisService:
         except Exception as exc:
             logger.debug("Dragon head realtime quote failed for %s: %s", stock_code, exc)
             return {}
+        return self._normalize_quote_payload(quote)
+
+    @staticmethod
+    def _normalize_quote_payload(quote: Any) -> Dict[str, Any]:
         if quote is None:
             return {}
         if isinstance(quote, dict):

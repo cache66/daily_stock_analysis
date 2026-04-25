@@ -635,6 +635,8 @@ class SystemConfigService:
             "SIGNAL_SNAPSHOT_HUNDRED_DAY_HIGH_CAUSE_ANALYSIS_ENABLED",
             "BOARD_THEME_CORE_SNAPSHOT_ENABLED",
             "BOARD_THEME_CORE_SNAPSHOT_TARGETS_JSON",
+            "TREND_LEADER_UNIFIED_SNAPSHOT_ENABLED",
+            "TREND_LEADER_UNIFIED_SNAPSHOT_LIMIT",
         }
         if startup_only_schedule_keys:
             warnings.append(

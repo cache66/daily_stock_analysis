@@ -239,6 +239,52 @@ class SignalSnapshotServiceTestCase(unittest.TestCase):
         self.assertEqual(result["streak_leaderboard"][0]["industry"], "白酒")
         self.assertEqual(result["streak_leaderboard"][0]["current_streak_count"], 2)
 
+    def test_get_snapshot_list_returns_earnings_quality_fields(self) -> None:
+        self.db.upsert_signal_snapshot(
+            signal_type="earnings_surprise",
+            signal_date="2026-04-10",
+            code="600010",
+            name="涓氱哗鑳藉姏鑲?",
+            criteria_payload={"criteria": {"signal_type": "earnings_surprise"}},
+            metrics_payload={
+                "close": 23.4,
+                "event_date": "2026-04-08",
+                "signal_score": 5,
+                "earnings_quality_signal": True,
+                "earnings_strategy_score": 68.5,
+                "earnings_strategy_label": "qualified",
+                "earnings_strategy_gate_status": "passed_strategy_score",
+                "earnings_growth_continuity_score": 24,
+                "earnings_profit_quality_score": 18,
+                "earnings_quality_verdict": "good",
+                "earnings_quality_score": 74,
+                "earnings_quality_cycle_phase": "reaccelerating",
+                "earnings_quality_quarterly_trend": "improving",
+                "earnings_quality_dual_positive_streak": 4,
+            },
+            cause_payload={"reason_summary": "涓氱哗璐ㄩ噺鏀瑰杽", "news_logic": "", "technical_logic": "", "theme_label": ""},
+            history_payload={"previous_hit_count": 1, "days_since_previous_hit": 5},
+        )
+
+        result = self.service.get_snapshot_list(
+            signal_type="earnings_surprise",
+            signal_date="2026-04-10",
+        )
+
+        self.assertEqual(result["total"], 1)
+        item = result["items"][0]
+        self.assertTrue(item["earnings_quality_signal"])
+        self.assertEqual(item["earnings_strategy_score"], 68.5)
+        self.assertEqual(item["earnings_strategy_label"], "qualified")
+        self.assertEqual(item["earnings_strategy_gate_status"], "passed_strategy_score")
+        self.assertEqual(item["earnings_growth_continuity_score"], 24.0)
+        self.assertEqual(item["earnings_profit_quality_score"], 18.0)
+        self.assertEqual(item["earnings_quality_verdict"], "good")
+        self.assertEqual(item["earnings_quality_score"], 74.0)
+        self.assertEqual(item["earnings_quality_cycle_phase"], "reaccelerating")
+        self.assertEqual(item["earnings_quality_quarterly_trend"], "improving")
+        self.assertEqual(item["earnings_quality_dual_positive_streak"], 4)
+
     def test_get_snapshot_list_returns_commodity_snapshot_fields(self) -> None:
         self.db.upsert_signal_snapshot(
             signal_type="commodity_beneficiary__optical_fiber",
@@ -380,6 +426,86 @@ class SignalSnapshotServiceTestCase(unittest.TestCase):
         self.assertEqual(board_item["total"], 1)
         self.assertEqual(board_item["group"], "board_recognizability")
         self.assertEqual(board_item["display_label"], "半导体辨识度")
+
+    def test_get_snapshot_counts_discovers_monthly_slow_rise_profiles(self) -> None:
+        self.db.upsert_signal_snapshot(
+            signal_type="monthly_slow_rise_profile__balanced",
+            signal_date="2026-04-10",
+            code="600519",
+            name="贵州茅台",
+            criteria_payload={"profile_name": "balanced", "profile_label": "月线慢牛·均衡", "criteria": {"monthly_lookback": 12}},
+            metrics_payload={
+                "profile_name": "balanced",
+                "profile_label": "月线慢牛·均衡",
+                "monthly_positive_ratio": 0.67,
+                "monthly_higher_low_ratio": 0.58,
+                "monthly_total_return_pct": 22.5,
+                "monthly_max_single_gain_pct": 9.2,
+                "monthly_worst_drawdown_pct": 6.8,
+                "monthly_latest_month": "2026-04",
+                "monthly_ma_short": 1620.0,
+                "monthly_ma_long": 1510.0,
+                "close": 1710.0,
+            },
+            cause_payload={"industry": "月线慢牛·均衡", "reason_summary": "月线缓升候选"},
+            history_payload={"previous_hit_count": 1, "days_since_previous_hit": 28},
+        )
+
+        result = self.service.get_snapshot_counts(signal_date="2026-04-10")
+
+        item = next(
+            row for row in result["items"]
+            if row["signal_type"] == "monthly_slow_rise_profile__balanced"
+        )
+        self.assertEqual(item["total"], 1)
+        self.assertEqual(item["group"], "monthly_slow_rise")
+        self.assertEqual(item["display_label"], "月线慢牛·均衡")
+
+    def test_get_snapshot_list_returns_monthly_slow_rise_fields(self) -> None:
+        self.db.upsert_signal_snapshot(
+            signal_type="monthly_slow_rise_profile__strict",
+            signal_date="2026-04-10",
+            code="600519",
+            name="贵州茅台",
+            criteria_payload={"profile_name": "strict", "profile_label": "月线慢牛·严格", "criteria": {"monthly_lookback": 12}},
+            metrics_payload={
+                "profile_name": "strict",
+                "profile_label": "月线慢牛·严格",
+                "monthly_positive_ratio": 0.75,
+                "monthly_higher_low_ratio": 0.67,
+                "monthly_total_return_pct": 28.4,
+                "monthly_max_single_gain_pct": 10.6,
+                "monthly_worst_drawdown_pct": 7.1,
+                "monthly_latest_month": "2026-04",
+                "monthly_ma_short": 1620.0,
+                "monthly_ma_long": 1510.0,
+                "close": 1710.0,
+                "latest_high": 1710.0,
+                "window_high": 1510.0,
+            },
+            cause_payload={
+                "industry": "月线慢牛·严格",
+                "reason_summary": "月线延续缓升",
+                "industry_logic": "低点持续抬高",
+                "news_logic": "纯技术口径",
+                "technical_logic": "单月涨幅受控",
+                "theme_label": "月线慢牛·严格",
+            },
+            history_payload={"previous_hit_count": 2, "days_since_previous_hit": 56},
+        )
+
+        result = self.service.get_snapshot_list(
+            signal_type="monthly_slow_rise_profile__strict",
+            signal_date="2026-04-10",
+        )
+
+        self.assertEqual(result["total"], 1)
+        item = result["items"][0]
+        self.assertEqual(item["profile_name"], "strict")
+        self.assertEqual(item["profile_label"], "月线慢牛·严格")
+        self.assertAlmostEqual(item["monthly_positive_ratio"], 0.75, places=2)
+        self.assertAlmostEqual(item["monthly_higher_low_ratio"], 0.67, places=2)
+        self.assertEqual(item["monthly_latest_month"], "2026-04")
 
     def test_get_snapshot_list_returns_board_recognizability_fields(self) -> None:
         self.db.upsert_signal_snapshot(

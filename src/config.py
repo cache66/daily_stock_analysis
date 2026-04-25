@@ -669,6 +669,10 @@ class Config:
     board_recognizability_snapshot_top_n: int = 3  # 每个板块保留前 N 名
     board_theme_core_snapshot_enabled: bool = False  # 是否在定时任务中更新模块主题核心快照
     board_theme_core_snapshot_targets_json: str = ""  # JSON array of board snapshot targets
+    trend_leader_unified_snapshot_enabled: bool = False  # 是否在定时任务中刷新强趋势龙头统一快照
+    trend_leader_unified_snapshot_limit: int = 0  # 强趋势龙头扫描数量限制，0 表示全市场
+    earnings_observation_snapshot_enabled: bool = False  # 是否在定时任务中刷新业绩观察快照
+    earnings_observation_max_observation_days: int = 240  # 业绩观察最长跟踪天数
     run_immediately: bool = True              # 启动时是否立即执行一次（非定时模式）
     market_review_enabled: bool = True        # 是否启用大盘复盘
     # 大盘复盘市场区域：cn(A股)、us(美股)、both(两者)，us 适合仅关注美股的用户
@@ -692,6 +696,10 @@ class Config:
     # - efinance/akshare_em: 东财全量接口，数据最全但容易被封
     # - tushare: Tushare Pro，需要2000积分，数据全面（付费用户可优先使用）
     realtime_source_priority: str = "tencent,akshare_sina,efinance,akshare_em"
+    history_disk_cache_enabled: bool = True
+    history_disk_cache_dir: str = "./data/cache/history"
+    history_disk_cache_ttl_seconds: int = 21600
+    history_disk_cache_overlap_days: int = 5
     # 实时行情缓存时间（秒）
     realtime_cache_ttl: int = 600
     # 熔断器冷却时间（秒）
@@ -1371,6 +1379,32 @@ class Config:
                 default='',
                 prefer_env_file=True,
             ) or '',
+            trend_leader_unified_snapshot_enabled=cls._resolve_env_value(
+                'TREND_LEADER_UNIFIED_SNAPSHOT_ENABLED',
+                default='false',
+            ).lower() == 'true',
+            trend_leader_unified_snapshot_limit=parse_env_int(
+                cls._resolve_env_value(
+                    'TREND_LEADER_UNIFIED_SNAPSHOT_LIMIT',
+                    default='0',
+                ),
+                0,
+                field_name='TREND_LEADER_UNIFIED_SNAPSHOT_LIMIT',
+                minimum=0,
+            ),
+            earnings_observation_snapshot_enabled=cls._resolve_env_value(
+                'EARNINGS_OBSERVATION_SNAPSHOT_ENABLED',
+                default='false',
+            ).lower() == 'true',
+            earnings_observation_max_observation_days=parse_env_int(
+                cls._resolve_env_value(
+                    'EARNINGS_OBSERVATION_MAX_OBSERVATION_DAYS',
+                    default='240',
+                ),
+                240,
+                field_name='EARNINGS_OBSERVATION_MAX_OBSERVATION_DAYS',
+                minimum=1,
+            ),
             run_immediately=legacy_run_immediately,
             market_review_enabled=os.getenv('MARKET_REVIEW_ENABLED', 'true').lower() == 'true',
             market_review_region=cls._parse_market_review_region(
@@ -1417,6 +1451,20 @@ class Config:
             # - efinance/akshare_em: 东财全量接口，数据最全但容易被封
             # - tushare: Tushare Pro，需要2000积分，数据全面
             realtime_source_priority=cls._resolve_realtime_source_priority(),
+            history_disk_cache_enabled=parse_env_bool(os.getenv('HISTORY_DISK_CACHE_ENABLED'), True),
+            history_disk_cache_dir=os.getenv('HISTORY_DISK_CACHE_DIR', './data/cache/history'),
+            history_disk_cache_ttl_seconds=parse_env_int(
+                os.getenv('HISTORY_DISK_CACHE_TTL_SECONDS'),
+                21600,
+                field_name='HISTORY_DISK_CACHE_TTL_SECONDS',
+                minimum=0,
+            ),
+            history_disk_cache_overlap_days=parse_env_int(
+                os.getenv('HISTORY_DISK_CACHE_OVERLAP_DAYS'),
+                5,
+                field_name='HISTORY_DISK_CACHE_OVERLAP_DAYS',
+                minimum=0,
+            ),
             realtime_cache_ttl=parse_env_int(os.getenv('REALTIME_CACHE_TTL'), 600, field_name='REALTIME_CACHE_TTL', minimum=0),
             circuit_breaker_cooldown=parse_env_int(os.getenv('CIRCUIT_BREAKER_COOLDOWN'), 300, field_name='CIRCUIT_BREAKER_COOLDOWN', minimum=0),
             enable_fundamental_pipeline=os.getenv('ENABLE_FUNDAMENTAL_PIPELINE', 'true').lower() == 'true',

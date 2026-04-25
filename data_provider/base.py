@@ -14,12 +14,15 @@
 3. 指数退避重试机制
 """
 
+import json
 import logging
+import math
 import random
 import time
 from threading import BoundedSemaphore, RLock, Thread
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Callable, Optional, List, Tuple, Dict, Any
 
 import pandas as pd
@@ -34,10 +37,75 @@ logger = logging.getLogger(__name__)
 DEFAULT_BELONG_BOARDS_CACHE_TTL_SECONDS = 24 * 60 * 60
 DEFAULT_SECTOR_RANKINGS_CACHE_TTL_SECONDS = 120
 DEFAULT_BOARD_CONSTITUENTS_CACHE_TTL_SECONDS = 30 * 60
+DEFAULT_DAILY_DATA_REQUEST_CALENDAR_SPAN_MULTIPLIER = 2.0
+_EARNINGS_QUALITY_POSITIVE_KEYWORDS = (
+    "预增",
+    "增长",
+    "大增",
+    "扭亏",
+    "超预期",
+    "向好",
+    "改善",
+    "回升",
+)
+_EARNINGS_QUALITY_NEGATIVE_KEYWORDS = (
+    "预减",
+    "下滑",
+    "亏损",
+    "首亏",
+    "续亏",
+    "承压",
+    "恶化",
+    "下降",
+)
 
 
 # === 标准化列名定义 ===
 STANDARD_COLUMNS = ['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg']
+DAILY_HISTORY_CACHE_COLUMNS = list(STANDARD_COLUMNS)
+
+
+def _clean_daily_history_data(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize common daily-history columns before indicator calculation."""
+    df = df.copy()
+
+    if 'date' in df.columns:
+        df['date'] = pd.to_datetime(df['date'])
+
+    numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg']
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    df = df.dropna(subset=['close', 'volume'])
+    df = df.sort_values('date', ascending=True).reset_index(drop=True)
+    return df
+
+
+def _calculate_daily_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute the shared set of lightweight indicators for daily-history rows."""
+    df = df.copy()
+
+    df['ma5'] = df['close'].rolling(window=5, min_periods=1).mean()
+    df['ma10'] = df['close'].rolling(window=10, min_periods=1).mean()
+    df['ma20'] = df['close'].rolling(window=20, min_periods=1).mean()
+
+    avg_volume_5 = df['volume'].rolling(window=5, min_periods=1).mean()
+    df['volume_ratio'] = df['volume'] / avg_volume_5.shift(1)
+    df['volume_ratio'] = df['volume_ratio'].fillna(1.0)
+
+    for col in ['ma5', 'ma10', 'ma20', 'volume_ratio']:
+        if col in df.columns:
+            df[col] = df[col].round(2)
+
+    return df
+
+
+def _finalize_daily_history_data(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a clean, indicator-ready daily-history dataframe."""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=DAILY_HISTORY_CACHE_COLUMNS)
+    return _calculate_daily_indicators(_clean_daily_history_data(df))
 
 
 def unwrap_exception(exc: Exception) -> Exception:
@@ -509,6 +577,8 @@ class DataFetcherManager:
         self._board_constituents_cache: Dict[str, Dict[str, Any]] = {}
         self._board_constituents_cache_lock = RLock()
         self._board_constituents_cache_ttl_seconds = DEFAULT_BOARD_CONSTITUENTS_CACHE_TTL_SECONDS
+        self._history_cache_locks: Dict[str, RLock] = {}
+        self._history_cache_locks_lock = RLock()
         
         if fetchers:
             # 按优先级排序
@@ -524,6 +594,12 @@ class DataFetcherManager:
         self._fundamental_cache_lock = RLock()
         self._fundamental_timeout_worker_limit = 8
         self._fundamental_timeout_slots = BoundedSemaphore(self._fundamental_timeout_worker_limit)
+        self._daily_data_fetch_timeout_seconds = 0.0
+        self._daily_data_timeout_worker_limit = 8
+        self._daily_data_timeout_slots = BoundedSemaphore(self._daily_data_timeout_worker_limit)
+        self._daily_data_request_calendar_span_multiplier = DEFAULT_DAILY_DATA_REQUEST_CALENDAR_SPAN_MULTIPLIER
+        self._daily_data_include_derived_indicators = True
+        self._prefer_cached_history_when_covered = False
 
     def _ensure_concurrency_guards(self) -> None:
         """Lazily initialize thread-safety primitives for test scaffolds using __new__."""
@@ -555,6 +631,34 @@ class DataFetcherManager:
             self._board_constituents_cache_lock = RLock()
         if not hasattr(self, "_board_constituents_cache_ttl_seconds") or self._board_constituents_cache_ttl_seconds is None:
             self._board_constituents_cache_ttl_seconds = DEFAULT_BOARD_CONSTITUENTS_CACHE_TTL_SECONDS
+        if not hasattr(self, "_history_cache_locks") or self._history_cache_locks is None:
+            self._history_cache_locks = {}
+        if not hasattr(self, "_history_cache_locks_lock") or self._history_cache_locks_lock is None:
+            self._history_cache_locks_lock = RLock()
+        if not hasattr(self, "_fundamental_timeout_worker_limit") or self._fundamental_timeout_worker_limit is None:
+            self._fundamental_timeout_worker_limit = 8
+        if not hasattr(self, "_fundamental_timeout_slots") or self._fundamental_timeout_slots is None:
+            self._fundamental_timeout_slots = BoundedSemaphore(self._fundamental_timeout_worker_limit)
+        if not hasattr(self, "_daily_data_fetch_timeout_seconds") or self._daily_data_fetch_timeout_seconds is None:
+            self._daily_data_fetch_timeout_seconds = 0.0
+        if not hasattr(self, "_daily_data_timeout_worker_limit") or self._daily_data_timeout_worker_limit is None:
+            self._daily_data_timeout_worker_limit = 8
+        if not hasattr(self, "_daily_data_timeout_slots") or self._daily_data_timeout_slots is None:
+            self._daily_data_timeout_slots = BoundedSemaphore(self._daily_data_timeout_worker_limit)
+        if (
+            not hasattr(self, "_daily_data_request_calendar_span_multiplier")
+            or self._daily_data_request_calendar_span_multiplier is None
+        ):
+            self._daily_data_request_calendar_span_multiplier = (
+                DEFAULT_DAILY_DATA_REQUEST_CALENDAR_SPAN_MULTIPLIER
+            )
+        if (
+            not hasattr(self, "_daily_data_include_derived_indicators")
+            or self._daily_data_include_derived_indicators is None
+        ):
+            self._daily_data_include_derived_indicators = True
+        if not hasattr(self, "_prefer_cached_history_when_covered") or self._prefer_cached_history_when_covered is None:
+            self._prefer_cached_history_when_covered = False
 
     def _get_fetchers_snapshot(self) -> List[BaseFetcher]:
         self._ensure_concurrency_guards()
@@ -576,6 +680,216 @@ class DataFetcherManager:
         method = getattr(fetcher, method_name)
         with self._get_fetcher_call_lock(fetcher):
             return method(*args, **kwargs)
+
+    def _call_fetcher_daily_data(
+        self,
+        fetcher: BaseFetcher,
+        stock_code: str,
+        start_date: Optional[str],
+        end_date: Optional[str],
+        days: int,
+    ):
+        timeout_seconds = max(0.0, float(getattr(self, "_daily_data_fetch_timeout_seconds", 0.0) or 0.0))
+        if timeout_seconds <= 0:
+            return self._call_fetcher_method(
+                fetcher,
+                "get_daily_data",
+                stock_code=stock_code,
+                start_date=start_date,
+                end_date=end_date,
+                days=days,
+            )
+
+        task_name = f"{fetcher.name}.get_daily_data({stock_code})"
+        result, err, _ = self._run_with_timeout_with_slots(
+            lambda: self._call_fetcher_method(
+                fetcher,
+                "get_daily_data",
+                stock_code=stock_code,
+                start_date=start_date,
+                end_date=end_date,
+                days=days,
+            ),
+            timeout_seconds=timeout_seconds,
+            task_name=task_name,
+            slots=self._daily_data_timeout_slots,
+            worker_name_prefix="daily-data",
+        )
+        if err is not None:
+            raise DataFetchError(err)
+        return result
+
+    def _get_history_cache_lock(self, cache_key: str) -> RLock:
+        self._ensure_concurrency_guards()
+        with self._history_cache_locks_lock:
+            lock = self._history_cache_locks.get(cache_key)
+            if lock is None:
+                lock = RLock()
+                self._history_cache_locks[cache_key] = lock
+            return lock
+
+    def _resolve_daily_data_request_range(
+        self,
+        start_date: Optional[str],
+        end_date: Optional[str],
+        days: int,
+    ) -> Tuple[str, str]:
+        resolved_end = end_date or datetime.now().strftime('%Y-%m-%d')
+        if start_date:
+            return start_date, resolved_end
+
+        multiplier = max(
+            1.0,
+            float(
+                getattr(
+                    self,
+                    "_daily_data_request_calendar_span_multiplier",
+                    DEFAULT_DAILY_DATA_REQUEST_CALENDAR_SPAN_MULTIPLIER,
+                )
+                or DEFAULT_DAILY_DATA_REQUEST_CALENDAR_SPAN_MULTIPLIER
+            ),
+        )
+        calendar_days = max(1, int(math.ceil(max(1, int(days)) * multiplier)))
+        start_dt = datetime.strptime(resolved_end, '%Y-%m-%d') - timedelta(days=calendar_days)
+        return start_dt.strftime('%Y-%m-%d'), resolved_end
+
+    @staticmethod
+    def _storage_history_columns(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame(columns=DAILY_HISTORY_CACHE_COLUMNS)
+
+        prepared = df.copy()
+        if 'date' in prepared.columns:
+            prepared['date'] = pd.to_datetime(prepared['date'])
+
+        keep_columns = [col for col in DAILY_HISTORY_CACHE_COLUMNS if col in prepared.columns]
+        prepared = prepared[keep_columns].copy()
+        prepared = prepared.dropna(subset=['close', 'volume'])
+        prepared = prepared.sort_values('date', ascending=True).reset_index(drop=True)
+        return prepared
+
+    def _finalize_history_frame(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame(columns=DAILY_HISTORY_CACHE_COLUMNS)
+
+        if 'date' in df.columns:
+            df = df.copy()
+            df['date'] = pd.to_datetime(df['date'])
+        if not bool(getattr(self, "_daily_data_include_derived_indicators", True)):
+            return _clean_daily_history_data(df)
+        return _finalize_daily_history_data(df)
+
+    @staticmethod
+    def _slice_history_range(df: pd.DataFrame, start_date: str, end_date: str) -> pd.DataFrame:
+        if df is None or df.empty or 'date' not in df.columns:
+            return pd.DataFrame()
+
+        start_ts = pd.Timestamp(start_date)
+        end_ts = pd.Timestamp(end_date)
+        sliced = df.loc[(df['date'] >= start_ts) & (df['date'] <= end_ts)].copy()
+        return sliced.reset_index(drop=True)
+
+    def _merge_history_frames(self, *frames: pd.DataFrame) -> pd.DataFrame:
+        prepared_frames = []
+        for frame in frames:
+            if frame is None or frame.empty:
+                continue
+            prepared = DataFetcherManager._storage_history_columns(frame)
+            if not prepared.empty:
+                prepared_frames.append(prepared)
+
+        if not prepared_frames:
+            return pd.DataFrame(columns=DAILY_HISTORY_CACHE_COLUMNS)
+
+        merged = pd.concat(prepared_frames, ignore_index=True, sort=False)
+        merged['date'] = pd.to_datetime(merged['date'])
+        merged = merged.sort_values('date', ascending=True)
+        merged = merged.drop_duplicates(subset=['date'], keep='last').reset_index(drop=True)
+        return self._finalize_history_frame(merged)
+
+    def _get_history_cache_config(self) -> Dict[str, Any]:
+        from src.config import get_config
+
+        config = get_config()
+        return {
+            "enabled": bool(getattr(config, "history_disk_cache_enabled", True)),
+            "cache_dir": Path(getattr(config, "history_disk_cache_dir", "./data/cache/history")),
+            "ttl_seconds": max(0, int(getattr(config, "history_disk_cache_ttl_seconds", 21600))),
+            "overlap_days": max(0, int(getattr(config, "history_disk_cache_overlap_days", 5))),
+        }
+
+    @staticmethod
+    def _history_cache_key(stock_code: str) -> str:
+        return f"{_market_tag(stock_code)}:{canonical_stock_code(stock_code)}"
+
+    @staticmethod
+    def _history_cache_filename(stock_code: str) -> str:
+        code = canonical_stock_code(stock_code)
+        for src, dest in (("/", "_"), ("\\", "_"), (":", "_"), ("*", "_"), ("?", "_"), ('"', "_"), ("<", "_"), (">", "_"), ("|", "_")):
+            code = code.replace(src, dest)
+        return code
+
+    def _get_history_cache_paths(self, stock_code: str) -> Tuple[Path, Path]:
+        settings = self._get_history_cache_config()
+        cache_root = settings["cache_dir"] / _market_tag(stock_code)
+        filename = self._history_cache_filename(stock_code)
+        return cache_root / f"{filename}.csv", cache_root / f"{filename}.json"
+
+    @staticmethod
+    def _history_cache_is_fresh(metadata: Dict[str, Any], request_end_date: str, ttl_seconds: int) -> bool:
+        try:
+            request_end = datetime.strptime(request_end_date, '%Y-%m-%d').date()
+        except ValueError:
+            return False
+
+        if request_end < datetime.now().date():
+            return True
+        if ttl_seconds <= 0:
+            return False
+
+        updated_at = float(metadata.get("updated_at") or 0)
+        if updated_at <= 0:
+            return False
+        return (time.time() - updated_at) <= ttl_seconds
+
+    def _read_history_cache(self, stock_code: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+        csv_path, metadata_path = self._get_history_cache_paths(stock_code)
+        if not csv_path.exists():
+            return pd.DataFrame(), {}
+
+        try:
+            cached_df = pd.read_csv(csv_path)
+        except Exception as exc:
+            logger.warning("[history cache] failed to read %s: %s", csv_path, exc)
+            return pd.DataFrame(), {}
+
+        metadata: Dict[str, Any] = {}
+        if metadata_path.exists():
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                logger.warning("[history cache] failed to read metadata %s: %s", metadata_path, exc)
+
+        if not metadata:
+            metadata = {"updated_at": csv_path.stat().st_mtime}
+
+        return self._finalize_history_frame(cached_df), metadata
+
+    def _write_history_cache(self, stock_code: str, df: pd.DataFrame, source: str) -> None:
+        csv_path, metadata_path = self._get_history_cache_paths(stock_code)
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+        storage_df = self._storage_history_columns(df)
+        storage_df.to_csv(csv_path, index=False, encoding="utf-8")
+
+        metadata = {
+            "stock_code": canonical_stock_code(stock_code),
+            "market": _market_tag(stock_code),
+            "source": source,
+            "updated_at": time.time(),
+            "rows": int(len(storage_df)),
+        }
+        metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _get_cached_stock_name(self, stock_code: str) -> Optional[str]:
         self._ensure_concurrency_guards()
@@ -1106,13 +1420,12 @@ class DataFetcherManager:
                             f"[数据源尝试 {attempt}/{total_fetchers}] [{fetcher.name}] "
                             f"{market_label} {stock_code} {role}路由..."
                         )
-                        df = self._call_fetcher_method(
+                        df = self._call_fetcher_daily_data(
                             fetcher,
-                            "get_daily_data",
-                            stock_code=stock_code,
-                            start_date=start_date,
-                            end_date=end_date,
-                            days=days,
+                            stock_code,
+                            start_date,
+                            end_date,
+                            days,
                         )
                         if df is not None and not df.empty:
                             elapsed = time.time() - request_start
@@ -1140,13 +1453,12 @@ class DataFetcherManager:
         for attempt, fetcher in enumerate(fetchers, start=1):
             try:
                 logger.info(f"[数据源尝试 {attempt}/{total_fetchers}] [{fetcher.name}] 获取 {stock_code}...")
-                df = self._call_fetcher_method(
+                df = self._call_fetcher_daily_data(
                     fetcher,
-                    "get_daily_data",
-                    stock_code=stock_code,
-                    start_date=start_date,
-                    end_date=end_date,
-                    days=days
+                    stock_code,
+                    start_date,
+                    end_date,
+                    days,
                 )
                 
                 if df is not None and not df.empty:
@@ -1178,6 +1490,147 @@ class DataFetcherManager:
         logger.error(f"[数据源终止] {stock_code} 获取失败: elapsed={elapsed:.2f}s\n{error_summary}")
         raise DataFetchError(error_summary)
     
+    _fetch_daily_data_from_sources = get_daily_data
+
+    def get_daily_data(
+        self,
+        stock_code: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        days: int = 30,
+        force_refresh: bool = False,
+    ) -> Tuple[pd.DataFrame, str]:
+        """Fetch daily history with manager-level disk cache and incremental top-up."""
+        stock_code = normalize_stock_code(stock_code)
+        auto_range_request = start_date is None
+        resolved_start_date, resolved_end_date = self._resolve_daily_data_request_range(
+            start_date=start_date,
+            end_date=end_date,
+            days=days,
+        )
+        cache_settings = self._get_history_cache_config()
+
+        if not cache_settings["enabled"]:
+            return self._fetch_daily_data_from_sources(
+                stock_code,
+                start_date=resolved_start_date,
+                end_date=resolved_end_date,
+                days=days,
+            )
+
+        cache_key = self._history_cache_key(stock_code)
+        with self._get_history_cache_lock(cache_key):
+            cached_df, metadata = self._read_history_cache(stock_code)
+            cached_source = str(metadata.get("source") or "").strip()
+            cache_fresh = self._history_cache_is_fresh(
+                metadata,
+                resolved_end_date,
+                cache_settings["ttl_seconds"],
+            )
+
+            if not force_refresh and not cached_df.empty:
+                cached_start_date = cached_df['date'].min().strftime('%Y-%m-%d')
+                cached_end_date = cached_df['date'].max().strftime('%Y-%m-%d')
+                cache_covers_request = (
+                    cached_start_date <= resolved_start_date <= resolved_end_date <= cached_end_date
+                )
+
+                if cache_covers_request and cache_fresh:
+                    return (
+                        self._slice_history_range(cached_df, resolved_start_date, resolved_end_date),
+                        f"disk_cache:{cached_source}" if cached_source else "disk_cache",
+                    )
+                if cache_covers_request and getattr(self, "_prefer_cached_history_when_covered", False):
+                    return (
+                        self._slice_history_range(cached_df, resolved_start_date, resolved_end_date),
+                        (
+                            f"disk_cache_stale_covered:{cached_source}"
+                            if cached_source else
+                            "disk_cache_stale_covered"
+                        ),
+                    )
+
+                # For days-based requests (no explicit start_date), tolerate a tiny tail lag to avoid
+                # unnecessary retries on weekends/holidays or short-lived endpoint instability.
+                if auto_range_request:
+                    resolved_end_ts = pd.Timestamp(resolved_end_date)
+                    cached_end_ts = pd.Timestamp(cached_end_date)
+                    end_gap_days = int((resolved_end_ts - cached_end_ts).days)
+                    allow_end_lag_days = 3
+                    if end_gap_days <= allow_end_lag_days:
+                        sliced_cached = self._slice_history_range(cached_df, resolved_start_date, resolved_end_date)
+                        required_rows = max(1, int(days))
+                        if len(sliced_cached) >= required_rows:
+                            cache_mode = (
+                                "disk_cache_best_effort"
+                                if end_gap_days <= 0
+                                else "disk_cache_best_effort_stale"
+                            )
+                            return (
+                                sliced_cached,
+                                f"{cache_mode}:{cached_source}" if cached_source else cache_mode,
+                            )
+
+                merged_df = cached_df
+                active_source = cached_source
+
+                if resolved_start_date < cached_start_date:
+                    head_end = (pd.Timestamp(cached_start_date) - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+                    head_df, head_source = self._fetch_daily_data_from_sources(
+                        stock_code,
+                        start_date=resolved_start_date,
+                        end_date=head_end,
+                        days=days,
+                    )
+                    merged_df = self._merge_history_frames(head_df, merged_df)
+                    active_source = head_source or active_source
+
+                should_refresh_tail = (resolved_end_date > cached_end_date) or (not cache_fresh)
+                if should_refresh_tail:
+                    overlap_days = cache_settings["overlap_days"]
+                    tail_start = max(
+                        pd.Timestamp(resolved_start_date),
+                        pd.Timestamp(cached_end_date) - pd.Timedelta(days=overlap_days),
+                    ).strftime('%Y-%m-%d')
+                    try:
+                        tail_df, tail_source = self._fetch_daily_data_from_sources(
+                            stock_code,
+                            start_date=tail_start,
+                            end_date=resolved_end_date,
+                            days=days,
+                        )
+                    except Exception:
+                        if cache_covers_request and resolved_end_date <= cached_end_date:
+                            logger.warning(
+                                "[history cache] stale refresh failed for %s, falling back to cached history",
+                                stock_code,
+                                exc_info=True,
+                            )
+                            return (
+                                self._slice_history_range(cached_df, resolved_start_date, resolved_end_date),
+                                f"disk_cache_stale:{cached_source}" if cached_source else "disk_cache_stale",
+                            )
+                        raise
+
+                    merged_df = self._merge_history_frames(merged_df, tail_df)
+                    active_source = tail_source or active_source
+
+                if not merged_df.empty:
+                    self._write_history_cache(stock_code, merged_df, active_source or cached_source or "unknown")
+                    sliced = self._slice_history_range(merged_df, resolved_start_date, resolved_end_date)
+                    if not sliced.empty:
+                        return sliced, active_source or cached_source or "unknown"
+
+            network_df, network_source = self._fetch_daily_data_from_sources(
+                stock_code,
+                start_date=resolved_start_date,
+                end_date=resolved_end_date,
+                days=days,
+            )
+            finalized_df = self._finalize_history_frame(network_df)
+            self._write_history_cache(stock_code, finalized_df, network_source)
+            return self._slice_history_range(finalized_df, resolved_start_date, resolved_end_date), network_source
+
     @property
     def available_fetchers(self) -> List[str]:
         """返回可用数据源名称列表"""
@@ -1921,6 +2374,53 @@ class DataFetcherManager:
                 continue
         return {}
 
+    def _run_with_timeout_with_slots(
+        self,
+        task: Callable[[], Any],
+        timeout_seconds: float,
+        task_name: str,
+        *,
+        slots: BoundedSemaphore,
+        worker_name_prefix: str,
+    ) -> Tuple[Optional[Any], Optional[str], int]:
+        """Execute a task in a short-lived thread with timeout and bounded workers."""
+        start = time.time()
+        timeout_value = max(0.0, timeout_seconds)
+        if timeout_value <= 0:
+            return None, f"{task_name} timeout", 0
+        result_holder: Dict[str, Any] = {}
+        error_holder: Dict[str, Exception] = {}
+
+        if not slots.acquire(blocking=False):
+            return None, f"{task_name} timeout worker pool exhausted", int(timeout_value * 1000)
+
+        def runner() -> None:
+            try:
+                result_holder["value"] = task()
+            except Exception as exc:
+                error_holder["value"] = exc
+            finally:
+                try:
+                    slots.release()
+                except ValueError:
+                    pass
+
+        worker = Thread(target=runner, daemon=True, name=f"{worker_name_prefix}-{task_name}")
+        try:
+            worker.start()
+        except Exception as exc:
+            try:
+                slots.release()
+            except ValueError:
+                pass
+            return None, str(exc), int((time.time() - start) * 1000)
+        worker.join(timeout=timeout_value)
+        if worker.is_alive():
+            return None, f"{task_name} timeout", int(timeout_value * 1000)
+        if "value" in error_holder:
+            return None, str(error_holder["value"]), int((time.time() - start) * 1000)
+        return result_holder.get("value"), None, int((time.time() - start) * 1000)
+
     def _run_with_timeout(
         self,
         task: Callable[[], Any],
@@ -1933,42 +2433,13 @@ class DataFetcherManager:
         Returns:
             (result, error, duration_ms)
         """
-        start = time.time()
-        timeout_value = max(0.0, timeout_seconds)
-        if timeout_value <= 0:
-            return None, f"{task_name} timeout", 0
-        result_holder: Dict[str, Any] = {}
-        error_holder: Dict[str, Exception] = {}
-
-        if not self._fundamental_timeout_slots.acquire(blocking=False):
-            return None, f"{task_name} timeout worker pool exhausted", int(timeout_value * 1000)
-
-        def runner() -> None:
-            try:
-                result_holder["value"] = task()
-            except Exception as exc:
-                error_holder["value"] = exc
-            finally:
-                try:
-                    self._fundamental_timeout_slots.release()
-                except ValueError:
-                    pass
-
-        worker = Thread(target=runner, daemon=True, name=f"fundamental-{task_name}")
-        try:
-            worker.start()
-        except Exception as exc:
-            try:
-                self._fundamental_timeout_slots.release()
-            except ValueError:
-                pass
-            return None, str(exc), int((time.time() - start) * 1000)
-        worker.join(timeout=timeout_value)
-        if worker.is_alive():
-            return None, f"{task_name} timeout", int(timeout_value * 1000)
-        if "value" in error_holder:
-            return None, str(error_holder["value"]), int((time.time() - start) * 1000)
-        return result_holder.get("value"), None, int((time.time() - start) * 1000)
+        return self._run_with_timeout_with_slots(
+            task,
+            timeout_seconds,
+            task_name,
+            slots=self._fundamental_timeout_slots,
+            worker_name_prefix="fundamental",
+        )
 
     def _run_with_retry(
         self,
@@ -2108,6 +2579,1027 @@ class DataFetcherManager:
             return fallback_status
         return "partial"
 
+    @classmethod
+    def _has_meaningful_earnings_quality_payload(cls, payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        verdict = str(payload.get("verdict", "")).strip().lower()
+        if verdict and verdict != "unavailable":
+            return True
+        # "unavailable" with no score means no earnings-quality evidence;
+        # ignore placeholder metrics from the default payload.
+        if cls._safe_float(payload.get("score_total")) is not None:
+            return True
+        for key in ("positive_signals", "risk_flags"):
+            if cls._has_meaningful_payload(payload.get(key)):
+                return True
+        return False
+
+    @staticmethod
+    def _safe_float(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            if isinstance(value, str):
+                normalized = value.strip().replace(",", "").replace("%", "")
+                if not normalized:
+                    return None
+                return float(normalized)
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _normalize_text_value(value: Any) -> str:
+        if value is None:
+            return ""
+        return " ".join(str(value).split()).strip()
+
+    @classmethod
+    def _normalize_earnings_quality_series(
+        cls,
+        growth_data: Dict[str, Any],
+        earnings_data: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        candidate_series = earnings_data.get("financial_report_series")
+        if not isinstance(candidate_series, list):
+            candidate_series = growth_data.get("quarterly_series")
+        if not isinstance(candidate_series, list):
+            return []
+
+        normalized_series: List[Dict[str, Any]] = []
+        seen_report_dates = set()
+
+        for item in candidate_series:
+            if not isinstance(item, dict):
+                continue
+            report_date = cls._normalize_text_value(item.get("report_date")) or None
+            normalized_item = {
+                "report_date": report_date,
+                "revenue_yoy": cls._safe_float(item.get("revenue_yoy")),
+                "net_profit_yoy": cls._safe_float(item.get("net_profit_yoy")),
+                "roe": cls._safe_float(item.get("roe")),
+                "gross_margin": cls._safe_float(item.get("gross_margin")),
+                "revenue": cls._safe_float(item.get("revenue")),
+                "net_profit_parent": cls._safe_float(item.get("net_profit_parent")),
+                "operating_cash_flow": cls._safe_float(item.get("operating_cash_flow")),
+                "accounts_receivable": cls._safe_float(item.get("accounts_receivable")),
+                "inventory": cls._safe_float(item.get("inventory")),
+                "contract_liabilities": cls._safe_float(item.get("contract_liabilities")),
+                "selling_expense_rate": cls._safe_float(item.get("selling_expense_rate")),
+                "management_expense_rate": cls._safe_float(item.get("management_expense_rate")),
+                "r_and_d_expense_rate": cls._safe_float(item.get("r_and_d_expense_rate")),
+                "net_margin": cls._safe_float(item.get("net_margin")),
+                "operating_margin": cls._safe_float(item.get("operating_margin")),
+            }
+            if not any(value is not None for key, value in normalized_item.items() if key != "report_date"):
+                continue
+            if report_date:
+                if report_date in seen_report_dates:
+                    continue
+                seen_report_dates.add(report_date)
+            normalized_series.append({key: value for key, value in normalized_item.items() if value is not None})
+
+        normalized_series.sort(key=lambda item: item.get("report_date") or "", reverse=True)
+        return normalized_series
+
+    @staticmethod
+    def _parse_report_date(value: Any) -> Optional[datetime]:
+        text = str(value).strip() if value is not None else ""
+        if not text:
+            return None
+        try:
+            parsed = pd.to_datetime(text, errors="coerce")
+        except Exception:
+            return None
+        if pd.isna(parsed):
+            return None
+        try:
+            return parsed.to_pydatetime()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _report_quarter_from_datetime(value: Optional[datetime]) -> Optional[int]:
+        if value is None:
+            return None
+        return ((int(value.month) - 1) // 3) + 1
+
+    @staticmethod
+    def _calc_pct_change(current: Optional[float], previous: Optional[float]) -> Optional[float]:
+        if current is None or previous is None or abs(previous) <= 1e-9:
+            return None
+        return round((current - previous) / abs(previous) * 100.0, 4)
+
+    @classmethod
+    def _infer_numeric_trend(cls, values: List[float], lower_is_better: bool = False) -> str:
+        if len(values) < 2:
+            return "insufficient_history"
+
+        work_values = [(-value if lower_is_better else value) for value in values]
+        has_up = any(work_values[idx] > work_values[idx + 1] for idx in range(len(work_values) - 1))
+        has_down = any(work_values[idx] < work_values[idx + 1] for idx in range(len(work_values) - 1))
+        if has_up and not has_down:
+            return "improving"
+        if has_down and not has_up:
+            return "deteriorating"
+        if not has_up and not has_down:
+            return "flat"
+        return "mixed"
+
+    @classmethod
+    def _build_derived_financial_series(cls, quarterly_series: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not quarterly_series:
+            return []
+
+        ascending_series: List[Dict[str, Any]] = []
+        for item in quarterly_series:
+            if not isinstance(item, dict):
+                continue
+            normalized_item = dict(item)
+            normalized_item["_report_dt"] = cls._parse_report_date(item.get("report_date"))
+            ascending_series.append(normalized_item)
+
+        ascending_series.sort(key=lambda item: item.get("_report_dt") or datetime.min)
+        by_year_quarter: Dict[Tuple[int, int], Dict[str, Any]] = {}
+
+        for item in ascending_series:
+            report_dt = item.get("_report_dt")
+            fiscal_quarter = cls._report_quarter_from_datetime(report_dt)
+            fiscal_year = report_dt.year if report_dt is not None else None
+            item["fiscal_year"] = fiscal_year
+            item["fiscal_quarter"] = fiscal_quarter
+            if fiscal_year is not None and fiscal_quarter is not None:
+                by_year_quarter[(fiscal_year, fiscal_quarter)] = item
+
+            for source_key, derived_key in (
+                ("revenue", "single_quarter_revenue"),
+                ("net_profit_parent", "single_quarter_net_profit_parent"),
+                ("operating_cash_flow", "single_quarter_operating_cash_flow"),
+            ):
+                current_value = cls._safe_float(item.get(source_key))
+                single_value = None
+                if current_value is not None and fiscal_quarter is not None:
+                    if fiscal_quarter == 1:
+                        single_value = current_value
+                    else:
+                        previous_item = by_year_quarter.get((fiscal_year, fiscal_quarter - 1))
+                        previous_value = (
+                            cls._safe_float(previous_item.get(source_key))
+                            if isinstance(previous_item, dict)
+                            else None
+                        )
+                        if previous_value is not None:
+                            single_value = current_value - previous_value
+                if single_value is not None:
+                    item[derived_key] = round(single_value, 4)
+
+            if fiscal_year is not None and fiscal_quarter is not None:
+                previous_year_item = by_year_quarter.get((fiscal_year - 1, fiscal_quarter))
+                for metric_key, yoy_key in (
+                    ("single_quarter_revenue", "single_quarter_revenue_yoy"),
+                    ("single_quarter_net_profit_parent", "single_quarter_net_profit_parent_yoy"),
+                    ("single_quarter_operating_cash_flow", "single_quarter_operating_cash_flow_yoy"),
+                ):
+                    current_value = cls._safe_float(item.get(metric_key))
+                    previous_value = (
+                        cls._safe_float(previous_year_item.get(metric_key))
+                        if isinstance(previous_year_item, dict)
+                        else None
+                    )
+                    yoy_value = cls._calc_pct_change(current_value, previous_value)
+                    if yoy_value is not None:
+                        item[yoy_key] = yoy_value
+
+            revenue = cls._safe_float(item.get("revenue"))
+            accounts_receivable = cls._safe_float(item.get("accounts_receivable"))
+            inventory = cls._safe_float(item.get("inventory"))
+            contract_liabilities = cls._safe_float(item.get("contract_liabilities"))
+            if revenue is not None and abs(revenue) > 1e-9:
+                if accounts_receivable is not None:
+                    item["accounts_receivable_to_revenue"] = round(accounts_receivable / revenue, 4)
+                if inventory is not None:
+                    item["inventory_to_revenue"] = round(inventory / revenue, 4)
+                if contract_liabilities is not None:
+                    item["contract_liabilities_to_revenue"] = round(contract_liabilities / revenue, 4)
+
+            expense_rates = [
+                cls._safe_float(item.get("selling_expense_rate")),
+                cls._safe_float(item.get("management_expense_rate")),
+                cls._safe_float(item.get("r_and_d_expense_rate")),
+            ]
+            expense_rates = [value for value in expense_rates if value is not None]
+            if expense_rates:
+                item["total_core_expense_rate"] = round(sum(expense_rates), 4)
+
+        descending_series = sorted(
+            ascending_series,
+            key=lambda item: item.get("_report_dt") or datetime.min,
+            reverse=True,
+        )
+        cleaned_series: List[Dict[str, Any]] = []
+        for item in descending_series:
+            cleaned_series.append({key: value for key, value in item.items() if key != "_report_dt"})
+        return cleaned_series
+
+    @classmethod
+    def _build_ttm_snapshot(cls, derived_series: List[Dict[str, Any]]) -> Dict[str, Any]:
+        snapshot: Dict[str, Any] = {}
+        for metric_key, prefix in (
+            ("single_quarter_revenue", "revenue"),
+            ("single_quarter_net_profit_parent", "net_profit_parent"),
+            ("single_quarter_operating_cash_flow", "operating_cash_flow"),
+        ):
+            values = [cls._safe_float(item.get(metric_key)) for item in derived_series[:8] if isinstance(item, dict)]
+            latest_ttm = None
+            previous_ttm = None
+            if len(values) >= 4 and all(value is not None for value in values[:4]):
+                latest_ttm = round(sum(float(value) for value in values[:4] if value is not None), 4)
+                snapshot[f"{prefix}_ttm"] = latest_ttm
+            if len(values) >= 8 and all(value is not None for value in values[4:8]):
+                previous_ttm = round(sum(float(value) for value in values[4:8] if value is not None), 4)
+                snapshot[f"{prefix}_ttm_previous"] = previous_ttm
+            yoy_pct = cls._calc_pct_change(latest_ttm, previous_ttm)
+            if yoy_pct is not None:
+                snapshot[f"{prefix}_ttm_yoy"] = yoy_pct
+        return snapshot
+
+    @classmethod
+    def _build_qoq_snapshot(cls, derived_series: List[Dict[str, Any]]) -> Dict[str, Any]:
+        snapshot: Dict[str, Any] = {}
+        latest_item = derived_series[0] if derived_series else {}
+        previous_item = derived_series[1] if len(derived_series) > 1 else {}
+        if not isinstance(latest_item, dict):
+            latest_item = {}
+        if not isinstance(previous_item, dict):
+            previous_item = {}
+
+        for metric_key, prefix in (
+            ("single_quarter_revenue", "revenue"),
+            ("single_quarter_net_profit_parent", "net_profit_parent"),
+            ("single_quarter_operating_cash_flow", "operating_cash_flow"),
+        ):
+            latest_value = cls._safe_float(latest_item.get(metric_key))
+            previous_value = cls._safe_float(previous_item.get(metric_key))
+            if latest_value is not None:
+                snapshot[f"latest_{prefix}"] = latest_value
+            qoq_pct = cls._calc_pct_change(latest_value, previous_value)
+            if qoq_pct is not None:
+                snapshot[f"{prefix}_qoq"] = qoq_pct
+        return snapshot
+
+    @classmethod
+    def _build_single_quarter_growth_snapshot(cls, derived_series: List[Dict[str, Any]]) -> Dict[str, Any]:
+        snapshot: Dict[str, Any] = {}
+        latest_item = derived_series[0] if derived_series else {}
+        if not isinstance(latest_item, dict):
+            latest_item = {}
+
+        for metric_key, prefix in (
+            ("single_quarter_revenue", "revenue"),
+            ("single_quarter_net_profit_parent", "net_profit_parent"),
+            ("single_quarter_operating_cash_flow", "operating_cash_flow"),
+        ):
+            latest_value = cls._safe_float(latest_item.get(metric_key))
+            latest_yoy = cls._safe_float(latest_item.get(f"{metric_key}_yoy"))
+            if latest_value is not None:
+                snapshot[f"latest_{prefix}"] = latest_value
+            if latest_yoy is not None:
+                snapshot[f"latest_{prefix}_yoy"] = latest_yoy
+
+            yoy_trend = cls._infer_series_trend(derived_series, f"{metric_key}_yoy")
+            if yoy_trend != "insufficient_history":
+                snapshot[f"{prefix}_yoy_trend"] = yoy_trend
+        return snapshot
+
+    @classmethod
+    def _infer_series_trend(
+        cls,
+        derived_series: List[Dict[str, Any]],
+        key: str,
+        *,
+        lower_is_better: bool = False,
+        max_points: int = 3,
+    ) -> str:
+        values: List[float] = []
+        for item in derived_series:
+            if not isinstance(item, dict):
+                continue
+            value = cls._safe_float(item.get(key))
+            if value is None:
+                continue
+            values.append(value)
+            if len(values) >= max(2, max_points):
+                break
+        return cls._infer_numeric_trend(values, lower_is_better=lower_is_better)
+
+    @classmethod
+    def _build_margin_and_working_capital_snapshot(cls, derived_series: List[Dict[str, Any]]) -> Dict[str, Any]:
+        latest_item = derived_series[0] if derived_series else {}
+        if not isinstance(latest_item, dict):
+            latest_item = {}
+        return {
+            "latest_accounts_receivable_to_revenue": cls._safe_float(latest_item.get("accounts_receivable_to_revenue")),
+            "latest_inventory_to_revenue": cls._safe_float(latest_item.get("inventory_to_revenue")),
+            "latest_contract_liabilities_to_revenue": cls._safe_float(latest_item.get("contract_liabilities_to_revenue")),
+            "latest_total_core_expense_rate": cls._safe_float(latest_item.get("total_core_expense_rate")),
+            "latest_net_margin": cls._safe_float(latest_item.get("net_margin")),
+            "latest_operating_margin": cls._safe_float(latest_item.get("operating_margin")),
+            "accounts_receivable_to_revenue_trend": cls._infer_series_trend(
+                derived_series, "accounts_receivable_to_revenue", lower_is_better=True
+            ),
+            "inventory_to_revenue_trend": cls._infer_series_trend(
+                derived_series, "inventory_to_revenue", lower_is_better=True
+            ),
+            "total_core_expense_rate_trend": cls._infer_series_trend(
+                derived_series, "total_core_expense_rate", lower_is_better=True
+            ),
+            "net_margin_trend": cls._infer_series_trend(derived_series, "net_margin"),
+            "gross_margin_trend": cls._infer_series_trend(derived_series, "gross_margin"),
+        }
+
+    @classmethod
+    def _count_positive_streak(cls, quarterly_series: List[Dict[str, Any]], key: str) -> int:
+        streak = 0
+        for item in quarterly_series:
+            value = cls._safe_float(item.get(key)) if isinstance(item, dict) else None
+            if value is None or value <= 0:
+                break
+            streak += 1
+        return streak
+
+    @classmethod
+    def _count_dual_positive_streak(cls, quarterly_series: List[Dict[str, Any]]) -> int:
+        streak = 0
+        for item in quarterly_series:
+            if not isinstance(item, dict):
+                break
+            revenue_yoy = cls._safe_float(item.get("revenue_yoy"))
+            net_profit_yoy = cls._safe_float(item.get("net_profit_yoy"))
+            if revenue_yoy is None or net_profit_yoy is None or revenue_yoy <= 0 or net_profit_yoy <= 0:
+                break
+            streak += 1
+        return streak
+
+    @classmethod
+    def _build_quarterly_earnings_evidence(
+        cls,
+        quarterly_series: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        derived_series = cls._build_derived_financial_series(quarterly_series)
+        latest_quarters: List[Dict[str, Any]] = []
+        revenue_values: List[float] = []
+        profit_values: List[float] = []
+
+        for item in derived_series[:4]:
+            if not isinstance(item, dict):
+                continue
+            quarter_snapshot: Dict[str, Any] = {}
+            report_date = cls._normalize_text_value(item.get("report_date")) or None
+            if report_date:
+                quarter_snapshot["report_date"] = report_date
+
+            revenue_yoy = cls._safe_float(item.get("revenue_yoy"))
+            if revenue_yoy is not None:
+                quarter_snapshot["revenue_yoy"] = revenue_yoy
+                revenue_values.append(revenue_yoy)
+
+            net_profit_yoy = cls._safe_float(item.get("net_profit_yoy"))
+            if net_profit_yoy is not None:
+                quarter_snapshot["net_profit_yoy"] = net_profit_yoy
+                profit_values.append(net_profit_yoy)
+
+            if quarter_snapshot:
+                latest_quarters.append(quarter_snapshot)
+
+        observation_count = len(derived_series)
+        revenue_positive_streak = cls._count_positive_streak(derived_series, "revenue_yoy")
+        profit_positive_streak = cls._count_positive_streak(derived_series, "net_profit_yoy")
+        dual_positive_streak = cls._count_dual_positive_streak(derived_series)
+        revenue_positive_quarters = sum(
+            1
+            for item in derived_series
+            if isinstance(item, dict) and (cls._safe_float(item.get("revenue_yoy")) or 0.0) > 0
+        )
+        profit_positive_quarters = sum(
+            1
+            for item in derived_series
+            if isinstance(item, dict) and (cls._safe_float(item.get("net_profit_yoy")) or 0.0) > 0
+        )
+
+        revenue_trend = cls._infer_numeric_trend(revenue_values[:3])
+        profit_trend = cls._infer_numeric_trend(profit_values[:3])
+        if observation_count < 2:
+            latest_trend = "insufficient_history"
+        elif dual_positive_streak >= min(3, observation_count):
+            if "improving" in (revenue_trend, profit_trend):
+                latest_trend = "improving"
+            else:
+                latest_trend = "stable_positive"
+        elif revenue_trend == "deteriorating" and profit_trend == "deteriorating":
+            latest_trend = "deteriorating"
+        elif dual_positive_streak >= 2:
+            latest_trend = "stable_positive"
+        elif "improving" in (revenue_trend, profit_trend):
+            latest_trend = "recovering"
+        elif "deteriorating" in (revenue_trend, profit_trend):
+            latest_trend = "deteriorating"
+        else:
+            latest_trend = "mixed"
+
+        ttm_snapshot = cls._build_ttm_snapshot(derived_series)
+        qoq_snapshot = cls._build_qoq_snapshot(derived_series)
+        single_quarter_growth_snapshot = cls._build_single_quarter_growth_snapshot(derived_series)
+        margin_quality_snapshot = cls._build_margin_and_working_capital_snapshot(derived_series)
+        return {
+            "observation_count": observation_count,
+            "observed_report_dates": [
+                item.get("report_date")
+                for item in derived_series[:4]
+                if isinstance(item, dict) and item.get("report_date")
+            ],
+            "revenue_positive_quarters": revenue_positive_quarters,
+            "profit_positive_quarters": profit_positive_quarters,
+            "revenue_positive_streak": revenue_positive_streak,
+            "profit_positive_streak": profit_positive_streak,
+            "dual_positive_streak": dual_positive_streak,
+            "revenue_trend": revenue_trend,
+            "profit_trend": profit_trend,
+            "latest_trend": latest_trend,
+            "latest_quarters": latest_quarters,
+            "latest_single_quarters": [
+                {
+                    key: item[key]
+                    for key in (
+                        "report_date",
+                        "single_quarter_revenue",
+                        "single_quarter_net_profit_parent",
+                        "single_quarter_operating_cash_flow",
+                        "single_quarter_revenue_yoy",
+                        "single_quarter_net_profit_parent_yoy",
+                        "single_quarter_operating_cash_flow_yoy",
+                    )
+                    if key in item
+                }
+                for item in derived_series[:4]
+                if isinstance(item, dict)
+            ],
+            "ttm_snapshot": ttm_snapshot,
+            "qoq_snapshot": qoq_snapshot,
+            "single_quarter_growth_snapshot": single_quarter_growth_snapshot,
+            "margin_quality_snapshot": margin_quality_snapshot,
+        }
+
+    @classmethod
+    def _build_growth_cycle_analysis(cls, quarterly_evidence: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(quarterly_evidence, dict):
+            return {
+                "phase": "unavailable",
+                "confidence": "low",
+                "score": 0,
+                "signals": [],
+                "drivers": {},
+                "limitations": ["quarterly_evidence_unavailable"],
+            }
+
+        ttm_snapshot = quarterly_evidence.get("ttm_snapshot")
+        if not isinstance(ttm_snapshot, dict):
+            ttm_snapshot = {}
+        single_quarter_snapshot = quarterly_evidence.get("single_quarter_growth_snapshot")
+        if not isinstance(single_quarter_snapshot, dict):
+            single_quarter_snapshot = {}
+        margin_snapshot = quarterly_evidence.get("margin_quality_snapshot")
+        if not isinstance(margin_snapshot, dict):
+            margin_snapshot = {}
+
+        observation_count = int(quarterly_evidence.get("observation_count") or 0)
+        latest_trend = str(quarterly_evidence.get("latest_trend") or "").strip().lower() or None
+        dual_positive_streak = int(quarterly_evidence.get("dual_positive_streak") or 0)
+        revenue_ttm_yoy = cls._safe_float(ttm_snapshot.get("revenue_ttm_yoy"))
+        net_profit_ttm_yoy = cls._safe_float(ttm_snapshot.get("net_profit_parent_ttm_yoy"))
+        operating_cash_flow_ttm_yoy = cls._safe_float(ttm_snapshot.get("operating_cash_flow_ttm_yoy"))
+        latest_single_quarter_revenue_yoy = cls._safe_float(single_quarter_snapshot.get("latest_revenue_yoy"))
+        latest_single_quarter_net_profit_yoy = cls._safe_float(single_quarter_snapshot.get("latest_net_profit_parent_yoy"))
+        latest_single_quarter_operating_cash_flow_yoy = cls._safe_float(
+            single_quarter_snapshot.get("latest_operating_cash_flow_yoy")
+        )
+        gross_margin_trend = str(margin_snapshot.get("gross_margin_trend") or "").strip().lower() or None
+        net_margin_trend = str(margin_snapshot.get("net_margin_trend") or "").strip().lower() or None
+
+        limitations: List[str] = []
+        if observation_count < 2:
+            limitations.append("quarterly_series_history_short_for_cycle_analysis")
+        if revenue_ttm_yoy is None and net_profit_ttm_yoy is None:
+            limitations.append("ttm_growth_unavailable_for_cycle_analysis")
+        if latest_single_quarter_revenue_yoy is None and latest_single_quarter_net_profit_yoy is None:
+            limitations.append("single_quarter_yoy_unavailable_for_cycle_analysis")
+
+        score = 0
+        phase_signals: List[str] = []
+
+        if revenue_ttm_yoy is not None:
+            if revenue_ttm_yoy >= 20:
+                score += 2
+                phase_signals.append("revenue_ttm_yoy_strong")
+            elif revenue_ttm_yoy > 0:
+                score += 1
+                phase_signals.append("revenue_ttm_yoy_positive")
+            else:
+                score -= 2
+                phase_signals.append("revenue_ttm_yoy_non_positive")
+
+        if net_profit_ttm_yoy is not None:
+            if net_profit_ttm_yoy >= 25:
+                score += 3
+                phase_signals.append("profit_ttm_yoy_strong")
+            elif net_profit_ttm_yoy > 0:
+                score += 1
+                phase_signals.append("profit_ttm_yoy_positive")
+            else:
+                score -= 3
+                phase_signals.append("profit_ttm_yoy_non_positive")
+
+        if operating_cash_flow_ttm_yoy is not None:
+            if operating_cash_flow_ttm_yoy >= 15:
+                score += 1
+                phase_signals.append("cashflow_ttm_yoy_positive")
+            elif operating_cash_flow_ttm_yoy < 0:
+                score -= 1
+                phase_signals.append("cashflow_ttm_yoy_non_positive")
+
+        if latest_single_quarter_revenue_yoy is not None:
+            if latest_single_quarter_revenue_yoy >= 15:
+                score += 2
+                phase_signals.append("latest_single_quarter_revenue_yoy_strong")
+            elif latest_single_quarter_revenue_yoy > 0:
+                score += 1
+                phase_signals.append("latest_single_quarter_revenue_yoy_positive")
+            else:
+                score -= 2
+                phase_signals.append("latest_single_quarter_revenue_yoy_non_positive")
+
+        if latest_single_quarter_net_profit_yoy is not None:
+            if latest_single_quarter_net_profit_yoy >= 20:
+                score += 3
+                phase_signals.append("latest_single_quarter_profit_yoy_strong")
+            elif latest_single_quarter_net_profit_yoy > 0:
+                score += 1
+                phase_signals.append("latest_single_quarter_profit_yoy_positive")
+            else:
+                score -= 3
+                phase_signals.append("latest_single_quarter_profit_yoy_non_positive")
+
+        if latest_single_quarter_operating_cash_flow_yoy is not None:
+            if latest_single_quarter_operating_cash_flow_yoy >= 10:
+                score += 1
+                phase_signals.append("latest_single_quarter_cashflow_yoy_positive")
+            elif latest_single_quarter_operating_cash_flow_yoy < 0:
+                score -= 1
+                phase_signals.append("latest_single_quarter_cashflow_yoy_non_positive")
+
+        if latest_trend == "improving":
+            score += 2
+            phase_signals.append("quarterly_growth_trend_improving")
+        elif latest_trend == "stable_positive":
+            score += 1
+            phase_signals.append("quarterly_growth_trend_stable_positive")
+        elif latest_trend == "recovering":
+            score += 1
+            phase_signals.append("quarterly_growth_trend_recovering")
+        elif latest_trend == "deteriorating":
+            score -= 2
+            phase_signals.append("quarterly_growth_trend_deteriorating")
+
+        if dual_positive_streak >= 4:
+            score += 1
+            phase_signals.append("dual_growth_streak_4q")
+        elif dual_positive_streak >= 2:
+            score += 1
+            phase_signals.append("dual_growth_streak_active")
+        elif observation_count >= 2 and dual_positive_streak == 0:
+            score -= 1
+            phase_signals.append("dual_growth_streak_missing")
+
+        if gross_margin_trend == "improving":
+            score += 1
+            phase_signals.append("gross_margin_trend_improving")
+        elif gross_margin_trend == "deteriorating":
+            score -= 1
+            phase_signals.append("gross_margin_trend_deteriorating")
+
+        if net_margin_trend == "improving":
+            score += 1
+            phase_signals.append("net_margin_trend_improving")
+        elif net_margin_trend == "deteriorating":
+            score -= 1
+            phase_signals.append("net_margin_trend_deteriorating")
+
+        if observation_count < 2:
+            phase = "unavailable"
+        elif (
+            score <= -5
+            and latest_trend in {"deteriorating", "mixed", "flat", None}
+            and (
+                (net_profit_ttm_yoy is not None and net_profit_ttm_yoy < 0)
+                or (
+                    latest_single_quarter_net_profit_yoy is not None
+                    and latest_single_quarter_net_profit_yoy < 0
+                )
+            )
+        ):
+            phase = "downcycle"
+        elif (
+            score >= 7
+            and latest_trend == "improving"
+            and (
+                (latest_single_quarter_net_profit_yoy is not None and latest_single_quarter_net_profit_yoy >= 20)
+                or (net_profit_ttm_yoy is not None and net_profit_ttm_yoy >= 25)
+            )
+        ):
+            phase = "reaccelerating"
+        elif (
+            score >= 5
+            and dual_positive_streak >= 3
+            and latest_trend in {"improving", "stable_positive"}
+        ):
+            phase = "expanding"
+        elif (
+            score >= 2
+            and latest_trend in {"recovering", "mixed"}
+            and (
+                (latest_single_quarter_revenue_yoy is not None and latest_single_quarter_revenue_yoy > 0)
+                or (
+                    latest_single_quarter_net_profit_yoy is not None
+                    and latest_single_quarter_net_profit_yoy > 0
+                )
+            )
+        ):
+            phase = "recovering"
+        elif score >= 3 and latest_trend == "stable_positive":
+            phase = "mature"
+        else:
+            phase = "mixed"
+
+        evidence_count = sum(
+            value is not None
+            for value in (
+                revenue_ttm_yoy,
+                net_profit_ttm_yoy,
+                latest_single_quarter_revenue_yoy,
+                latest_single_quarter_net_profit_yoy,
+            )
+        )
+        if observation_count >= 4 and evidence_count >= 2 and abs(score) >= 5:
+            confidence = "high"
+        elif observation_count >= 3 and evidence_count >= 1 and abs(score) >= 2:
+            confidence = "medium"
+        else:
+            confidence = "low"
+
+        if phase not in {"unavailable", "mixed"}:
+            phase_signals.append(f"cycle_phase_{phase}")
+
+        drivers = {
+            "latest_trend": latest_trend,
+            "dual_positive_streak": dual_positive_streak if observation_count > 0 else None,
+            "revenue_ttm_yoy": revenue_ttm_yoy,
+            "net_profit_ttm_yoy": net_profit_ttm_yoy,
+            "operating_cash_flow_ttm_yoy": operating_cash_flow_ttm_yoy,
+            "latest_single_quarter_revenue_yoy": latest_single_quarter_revenue_yoy,
+            "latest_single_quarter_net_profit_yoy": latest_single_quarter_net_profit_yoy,
+            "latest_single_quarter_operating_cash_flow_yoy": latest_single_quarter_operating_cash_flow_yoy,
+            "gross_margin_trend": gross_margin_trend,
+            "net_margin_trend": net_margin_trend,
+        }
+        drivers = {key: value for key, value in drivers.items() if value is not None}
+
+        return {
+            "phase": phase,
+            "confidence": confidence,
+            "score": score,
+            "signals": sorted(set(phase_signals)),
+            "drivers": drivers,
+            "limitations": sorted(set(limitations)),
+        }
+
+    @staticmethod
+    def _pick_earnings_quality_verdict(score_total: Optional[float], has_evidence: bool) -> str:
+        if not has_evidence or score_total is None:
+            return "unavailable"
+        if score_total >= 80:
+            return "strong"
+        if score_total >= 65:
+            return "good"
+        if score_total >= 45:
+            return "mixed"
+        return "weak"
+
+    @classmethod
+    def _build_earnings_quality_payload(
+        cls,
+        growth_payload: Any,
+        earnings_payload: Any,
+    ) -> Dict[str, Any]:
+        growth_data = dict(growth_payload) if isinstance(growth_payload, dict) else {}
+        earnings_data = dict(earnings_payload) if isinstance(earnings_payload, dict) else {}
+        financial_report = earnings_data.get("financial_report")
+        if not isinstance(financial_report, dict):
+            financial_report = {}
+
+        quarterly_series = cls._normalize_earnings_quality_series(growth_data, earnings_data)
+        latest_quarter = quarterly_series[0] if quarterly_series else {}
+
+        revenue_yoy = cls._safe_float(growth_data.get("revenue_yoy"))
+        net_profit_yoy = cls._safe_float(growth_data.get("net_profit_yoy"))
+        roe = cls._safe_float(growth_data.get("roe"))
+        gross_margin = cls._safe_float(growth_data.get("gross_margin"))
+        operating_cash_flow = cls._safe_float(financial_report.get("operating_cash_flow"))
+        net_profit_parent = cls._safe_float(financial_report.get("net_profit_parent"))
+        report_date = financial_report.get("report_date")
+        if revenue_yoy is None:
+            revenue_yoy = cls._safe_float(latest_quarter.get("revenue_yoy"))
+        if net_profit_yoy is None:
+            net_profit_yoy = cls._safe_float(latest_quarter.get("net_profit_yoy"))
+        if roe is None:
+            roe = cls._safe_float(latest_quarter.get("roe"))
+        if gross_margin is None:
+            gross_margin = cls._safe_float(latest_quarter.get("gross_margin"))
+        if operating_cash_flow is None:
+            operating_cash_flow = cls._safe_float(latest_quarter.get("operating_cash_flow"))
+        if net_profit_parent is None:
+            net_profit_parent = cls._safe_float(latest_quarter.get("net_profit_parent"))
+        if not cls._normalize_text_value(report_date):
+            report_date = latest_quarter.get("report_date")
+
+        growth_continuity_score = 0
+        quarterly_continuity_score = 0
+        profit_quality_score = 0
+        profitability_score = 0
+        disclosure_signal_score = 0
+        positive_signals: List[str] = []
+        risk_flags: List[str] = []
+        limitations = [
+            "score_blends_quarterly_series_latest_snapshot_and_disclosure_text",
+        ]
+
+        if revenue_yoy is not None:
+            if revenue_yoy >= 25:
+                growth_continuity_score += 14
+                positive_signals.append("revenue_yoy_strong")
+            elif revenue_yoy >= 10:
+                growth_continuity_score += 10
+                positive_signals.append("revenue_yoy_positive")
+            elif revenue_yoy > 0:
+                growth_continuity_score += 6
+                positive_signals.append("revenue_yoy_slightly_positive")
+            else:
+                risk_flags.append("revenue_yoy_non_positive")
+
+        if net_profit_yoy is not None:
+            if net_profit_yoy >= 40:
+                growth_continuity_score += 16
+                positive_signals.append("net_profit_yoy_very_strong")
+            elif net_profit_yoy >= 20:
+                growth_continuity_score += 12
+                positive_signals.append("net_profit_yoy_strong")
+            elif net_profit_yoy > 0:
+                growth_continuity_score += 7
+                positive_signals.append("net_profit_yoy_positive")
+            else:
+                risk_flags.append("net_profit_yoy_non_positive")
+
+        if revenue_yoy is not None and net_profit_yoy is not None:
+            if revenue_yoy > 0 and net_profit_yoy > revenue_yoy:
+                growth_continuity_score += 3
+                positive_signals.append("profit_growth_outpaces_revenue_growth")
+            elif revenue_yoy > 0 and net_profit_yoy < 0:
+                risk_flags.append("profit_growth_diverges_from_revenue_growth")
+
+        quarterly_evidence = cls._build_quarterly_earnings_evidence(quarterly_series)
+        ttm_snapshot = quarterly_evidence.get("ttm_snapshot") if isinstance(quarterly_evidence, dict) else {}
+        if not isinstance(ttm_snapshot, dict):
+            ttm_snapshot = {}
+        qoq_snapshot = quarterly_evidence.get("qoq_snapshot") if isinstance(quarterly_evidence, dict) else {}
+        if not isinstance(qoq_snapshot, dict):
+            qoq_snapshot = {}
+        margin_quality_snapshot = (
+            quarterly_evidence.get("margin_quality_snapshot") if isinstance(quarterly_evidence, dict) else {}
+        )
+        if not isinstance(margin_quality_snapshot, dict):
+            margin_quality_snapshot = {}
+        single_quarter_growth_snapshot = (
+            quarterly_evidence.get("single_quarter_growth_snapshot") if isinstance(quarterly_evidence, dict) else {}
+        )
+        if not isinstance(single_quarter_growth_snapshot, dict):
+            single_quarter_growth_snapshot = {}
+        quarterly_observation_count = int(quarterly_evidence.get("observation_count") or 0)
+        if quarterly_observation_count <= 0:
+            limitations.append("quarterly_series_unavailable_for_continuity_check")
+        else:
+            if quarterly_observation_count < 3:
+                limitations.append("quarterly_series_history_short")
+
+            dual_positive_streak = int(quarterly_evidence.get("dual_positive_streak") or 0)
+            revenue_positive_streak = int(quarterly_evidence.get("revenue_positive_streak") or 0)
+            profit_positive_streak = int(quarterly_evidence.get("profit_positive_streak") or 0)
+            latest_trend = str(quarterly_evidence.get("latest_trend") or "").strip().lower()
+
+            if dual_positive_streak >= 4:
+                quarterly_continuity_score += 10
+                positive_signals.append("quarterly_dual_growth_streak_4q")
+            elif dual_positive_streak >= 3:
+                quarterly_continuity_score += 7
+                positive_signals.append("quarterly_dual_growth_streak_3q")
+            elif dual_positive_streak >= 2:
+                quarterly_continuity_score += 4
+                positive_signals.append("quarterly_dual_growth_streak_2q")
+            elif quarterly_observation_count >= 2:
+                risk_flags.append("quarterly_dual_growth_streak_missing")
+
+            if revenue_positive_streak >= 4:
+                quarterly_continuity_score += 2
+                positive_signals.append("revenue_yoy_positive_streak_4q")
+            elif quarterly_observation_count >= 2 and revenue_positive_streak == 0:
+                risk_flags.append("recent_revenue_growth_not_consistently_positive")
+
+            if profit_positive_streak >= 4:
+                quarterly_continuity_score += 2
+                positive_signals.append("profit_yoy_positive_streak_4q")
+            elif quarterly_observation_count >= 2 and profit_positive_streak == 0:
+                risk_flags.append("recent_profit_growth_not_consistently_positive")
+
+            if latest_trend == "improving":
+                quarterly_continuity_score += 4
+                positive_signals.append("quarterly_growth_trend_improving")
+            elif latest_trend == "stable_positive":
+                quarterly_continuity_score += 2
+                positive_signals.append("quarterly_growth_trend_stable_positive")
+            elif latest_trend == "recovering":
+                quarterly_continuity_score += 1
+                positive_signals.append("quarterly_growth_trend_recovering")
+            elif latest_trend == "deteriorating":
+                risk_flags.append("quarterly_growth_trend_deteriorating")
+
+        quarterly_continuity_score = max(0, min(15, quarterly_continuity_score))
+        growth_continuity_score += quarterly_continuity_score
+
+        cycle_analysis = cls._build_growth_cycle_analysis(quarterly_evidence)
+        cycle_phase = str(cycle_analysis.get("phase") or "").strip().lower()
+        cycle_limitations = cycle_analysis.get("limitations")
+        if isinstance(cycle_limitations, list):
+            limitations.extend(str(item) for item in cycle_limitations if str(item).strip())
+        if cycle_phase in {"reaccelerating", "expanding", "recovering", "mature"}:
+            positive_signals.append(f"cycle_phase_{cycle_phase}")
+        elif cycle_phase == "downcycle":
+            risk_flags.append("cycle_phase_downcycle")
+
+        cashflow_to_profit_ratio = None
+        if operating_cash_flow is not None and net_profit_parent is not None and abs(net_profit_parent) > 1e-9:
+            cashflow_to_profit_ratio = round(operating_cash_flow / net_profit_parent, 4)
+            if operating_cash_flow > 0 and cashflow_to_profit_ratio >= 1.2:
+                profit_quality_score += 18
+                positive_signals.append("cashflow_covers_profit_well")
+            elif operating_cash_flow > 0 and cashflow_to_profit_ratio >= 0.8:
+                profit_quality_score += 12
+                positive_signals.append("cashflow_matches_profit")
+            elif operating_cash_flow > 0:
+                profit_quality_score += 6
+                risk_flags.append("cashflow_conversion_soft")
+            else:
+                risk_flags.append("operating_cash_flow_non_positive")
+        else:
+            if operating_cash_flow is not None and operating_cash_flow <= 0:
+                risk_flags.append("operating_cash_flow_non_positive")
+            limitations.append("cashflow_to_profit_ratio_unavailable")
+
+        if roe is not None:
+            if roe >= 18:
+                profitability_score += 12
+                positive_signals.append("roe_excellent")
+            elif roe >= 12:
+                profitability_score += 9
+                positive_signals.append("roe_good")
+            elif roe >= 8:
+                profitability_score += 5
+                positive_signals.append("roe_acceptable")
+            else:
+                risk_flags.append("roe_weak")
+
+        if gross_margin is not None:
+            if gross_margin >= 35:
+                profitability_score += 8
+                positive_signals.append("gross_margin_strong")
+            elif gross_margin >= 20:
+                profitability_score += 5
+                positive_signals.append("gross_margin_healthy")
+            elif gross_margin >= 10:
+                profitability_score += 2
+            else:
+                risk_flags.append("gross_margin_thin")
+        else:
+            limitations.append("gross_margin_unavailable")
+
+        disclosure_texts = [
+            cls._normalize_text_value(earnings_data.get("forecast_summary")),
+            cls._normalize_text_value(earnings_data.get("quick_report_summary")),
+        ]
+        disclosure_text = " ".join(text for text in disclosure_texts if text).strip()
+        if disclosure_text:
+            matched_positive = False
+            matched_negative = False
+            for keyword in _EARNINGS_QUALITY_POSITIVE_KEYWORDS:
+                if keyword in disclosure_text:
+                    matched_positive = True
+                    positive_signals.append(f"disclosure_positive:{keyword}")
+                    disclosure_signal_score += 10
+                    break
+            for keyword in _EARNINGS_QUALITY_NEGATIVE_KEYWORDS:
+                if keyword in disclosure_text:
+                    matched_negative = True
+                    risk_flags.append(f"disclosure_negative:{keyword}")
+                    disclosure_signal_score -= 8
+                    break
+            if matched_positive and matched_negative:
+                limitations.append("disclosure_text_contains_mixed_signals")
+        else:
+            limitations.append("earnings_disclosure_text_unavailable")
+
+        disclosure_signal_score = max(0, min(20, disclosure_signal_score))
+        growth_continuity_score = max(0, min(35, growth_continuity_score))
+        profit_quality_score = max(0, min(25, profit_quality_score))
+        profitability_score = max(0, min(20, profitability_score))
+
+        score_total = growth_continuity_score + profit_quality_score + profitability_score + disclosure_signal_score
+        has_evidence = any(
+            value is not None
+            for value in (
+                revenue_yoy,
+                net_profit_yoy,
+                roe,
+                gross_margin,
+                operating_cash_flow,
+                net_profit_parent,
+            )
+        ) or bool(disclosure_text)
+        verdict = cls._pick_earnings_quality_verdict(score_total, has_evidence)
+
+        metrics = {
+            "revenue_yoy": revenue_yoy,
+            "net_profit_yoy": net_profit_yoy,
+            "roe": roe,
+            "gross_margin": gross_margin,
+            "operating_cash_flow": operating_cash_flow,
+            "net_profit_parent": net_profit_parent,
+            "cashflow_to_profit_ratio": cashflow_to_profit_ratio,
+            "report_date": report_date,
+            "quarterly_observation_count": quarterly_observation_count if quarterly_observation_count > 0 else None,
+            "dual_positive_streak": quarterly_evidence.get("dual_positive_streak") if quarterly_observation_count > 0 else None,
+            "latest_quarterly_trend": quarterly_evidence.get("latest_trend") if quarterly_observation_count > 0 else None,
+            "revenue_ttm_yoy": cls._safe_float(ttm_snapshot.get("revenue_ttm_yoy")),
+            "net_profit_ttm_yoy": cls._safe_float(ttm_snapshot.get("net_profit_parent_ttm_yoy")),
+            "operating_cash_flow_ttm_yoy": cls._safe_float(ttm_snapshot.get("operating_cash_flow_ttm_yoy")),
+            "revenue_qoq": cls._safe_float(qoq_snapshot.get("revenue_qoq")),
+            "net_profit_qoq": cls._safe_float(qoq_snapshot.get("net_profit_parent_qoq")),
+            "operating_cash_flow_qoq": cls._safe_float(qoq_snapshot.get("operating_cash_flow_qoq")),
+            "latest_single_quarter_revenue_yoy": cls._safe_float(single_quarter_growth_snapshot.get("latest_revenue_yoy")),
+            "latest_single_quarter_net_profit_yoy": cls._safe_float(
+                single_quarter_growth_snapshot.get("latest_net_profit_parent_yoy")
+            ),
+            "latest_single_quarter_operating_cash_flow_yoy": cls._safe_float(
+                single_quarter_growth_snapshot.get("latest_operating_cash_flow_yoy")
+            ),
+            "gross_margin_trend": margin_quality_snapshot.get("gross_margin_trend"),
+            "net_margin_trend": margin_quality_snapshot.get("net_margin_trend"),
+            "cycle_phase": cycle_analysis.get("phase"),
+            "cycle_confidence": cycle_analysis.get("confidence"),
+            "cycle_score": cycle_analysis.get("score"),
+        }
+        metrics = {key: value for key, value in metrics.items() if value is not None}
+
+        payload = {
+            "score_total": score_total,
+            "verdict": verdict,
+            "growth_continuity_score": growth_continuity_score,
+            "quarterly_continuity_score": quarterly_continuity_score,
+            "profit_quality_score": profit_quality_score,
+            "profitability_score": profitability_score,
+            "disclosure_signal_score": disclosure_signal_score,
+            "metrics": metrics,
+            "quarterly_evidence": quarterly_evidence,
+            "cycle_analysis": cycle_analysis,
+            "positive_signals": sorted(set(positive_signals)),
+            "risk_flags": sorted(set(risk_flags)),
+            "limitations": sorted(set(limitations)),
+        }
+        if not has_evidence:
+            payload["score_total"] = None
+            payload["growth_continuity_score"] = 0
+            payload["quarterly_continuity_score"] = 0
+            payload["profit_quality_score"] = 0
+            payload["profitability_score"] = 0
+            payload["disclosure_signal_score"] = 0
+        return payload
+
     @staticmethod
     def _should_cache_fundamental_context(context: Any) -> bool:
         if not isinstance(context, dict):
@@ -2121,14 +3613,21 @@ class DataFetcherManager:
             "valuation",
             "growth",
             "earnings",
+            "earnings_quality",
             "institution",
             "capital_flow",
             "dragon_tiger",
             "boards",
         ):
             payload = context.get(block, {})
-            if isinstance(payload, dict) and DataFetcherManager._has_meaningful_payload(payload.get("data")):
-                return True
+            if isinstance(payload, dict):
+                data = payload.get("data")
+                if block == "earnings_quality":
+                    if DataFetcherManager._has_meaningful_earnings_quality_payload(data):
+                        return True
+                    continue
+                if DataFetcherManager._has_meaningful_payload(data):
+                    return True
         return False
 
     def _build_market_not_supported(self, market: str, reason: str) -> Dict[str, Any]:
@@ -2146,6 +3645,12 @@ class DataFetcherManager:
                 [reason],
             ),
             "earnings": self._build_fundamental_block(
+                "not_supported",
+                {},
+                [{"provider": "fundamental_pipeline", "result": "not_supported", "duration_ms": 0}],
+                [reason],
+            ),
+            "earnings_quality": self._build_fundamental_block(
                 "not_supported",
                 {},
                 [{"provider": "fundamental_pipeline", "result": "not_supported", "duration_ms": 0}],
@@ -2194,6 +3699,7 @@ class DataFetcherManager:
             "valuation",
             "growth",
             "earnings",
+            "earnings_quality",
             "institution",
             "capital_flow",
             "dragon_tiger",
@@ -2215,6 +3721,129 @@ class DataFetcherManager:
             "source_chain": [{"provider": "fundamental_pipeline", "result": "failed", "duration_ms": 0}],
             "errors": [reason],
             **blocks,
+        }
+
+    def get_earnings_fundamental_context(
+        self,
+        stock_code: str,
+        budget_seconds: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Fetch only the earnings-related fundamental blocks needed by fast scans."""
+        from src.config import get_config
+
+        config = get_config()
+        stock_code = normalize_stock_code(stock_code)
+        market = _market_tag(stock_code)
+        if not config.enable_fundamental_pipeline:
+            return self._build_market_not_supported(
+                market=market,
+                reason="fundamental pipeline disabled",
+            )
+        if market in {"us", "hk"}:
+            return self._build_market_not_supported(
+                market=market,
+                reason="market not supported",
+            )
+        if _is_etf_code(stock_code):
+            return self._build_market_not_supported(
+                market=market,
+                reason="etf not fully supported",
+            )
+
+        stage_timeout = float(
+            budget_seconds if budget_seconds is not None else config.fundamental_stage_timeout_seconds
+        )
+        stage_timeout = max(0.0, stage_timeout)
+        fetch_timeout = max(0.0, float(config.fundamental_fetch_timeout_seconds))
+        bundle_timeout = min(fetch_timeout, stage_timeout)
+
+        if bundle_timeout <= 0:
+            bundle_status = "failed"
+            bundle_payload: Dict[str, Any] = {}
+            bundle_errors = ["fundamental stage timeout"]
+            bundle_ms = 0
+        else:
+            bundle_payload, bundle_err_msg, bundle_ms = self._run_with_retry(
+                lambda: self._fundamental_adapter.get_fundamental_bundle(stock_code),
+                bundle_timeout,
+                "fundamental_bundle",
+            )
+            if not isinstance(bundle_payload, dict):
+                bundle_status = "failed"
+                bundle_payload = {}
+                bundle_errors = ["fundamental_bundle failed"]
+                if bundle_err_msg:
+                    bundle_errors.append(bundle_err_msg)
+            else:
+                bundle_status = str(bundle_payload.get("status", "not_supported"))
+                bundle_errors = [bundle_err_msg] if bundle_err_msg else []
+
+        bundle_chain = self._normalize_source_chain(
+            bundle_payload.get("source_chain", []) if isinstance(bundle_payload, dict) else None,
+            "fundamental_bundle",
+            bundle_status,
+            bundle_ms,
+        )
+        growth_payload = bundle_payload.get("growth", {}) if isinstance(bundle_payload, dict) else {}
+        earnings_payload = bundle_payload.get("earnings", {}) if isinstance(bundle_payload, dict) else {}
+        if not isinstance(growth_payload, dict):
+            growth_payload = {}
+        else:
+            growth_payload = dict(growth_payload)
+        if not isinstance(earnings_payload, dict):
+            earnings_payload = {}
+        else:
+            earnings_payload = dict(earnings_payload)
+
+        adapter_errors = list(bundle_payload.get("errors", [])) if isinstance(bundle_payload, dict) else []
+        adapter_errors.extend(bundle_errors)
+        earnings_quality_payload = self._build_earnings_quality_payload(growth_payload, earnings_payload)
+
+        growth_status = self._infer_block_status(growth_payload, bundle_status)
+        earnings_status = self._infer_block_status(earnings_payload, bundle_status)
+        if self._has_meaningful_earnings_quality_payload(earnings_quality_payload):
+            earnings_quality_status = "ok"
+        elif bundle_status in ("failed", "partial", "not_supported"):
+            earnings_quality_status = bundle_status
+        else:
+            earnings_quality_status = "partial"
+
+        statuses = [growth_status, earnings_status, earnings_quality_status]
+        if any(status == "ok" for status in statuses):
+            overall_status = "ok"
+        elif any(status == "partial" for status in statuses):
+            overall_status = "partial"
+        else:
+            overall_status = bundle_status or "failed"
+
+        return {
+            "market": market,
+            "status": overall_status,
+            "coverage": {
+                "growth": growth_status,
+                "earnings": earnings_status,
+                "earnings_quality": earnings_quality_status,
+            },
+            "source_chain": bundle_chain,
+            "errors": adapter_errors,
+            "growth": self._build_fundamental_block(
+                growth_status,
+                growth_payload,
+                bundle_chain,
+                list(adapter_errors),
+            ),
+            "earnings": self._build_fundamental_block(
+                earnings_status,
+                earnings_payload,
+                bundle_chain,
+                list(adapter_errors),
+            ),
+            "earnings_quality": self._build_fundamental_block(
+                earnings_quality_status,
+                earnings_quality_payload,
+                bundle_chain,
+                list(adapter_errors),
+            ),
         }
 
     def get_fundamental_context(
@@ -2268,6 +3897,7 @@ class DataFetcherManager:
             "valuation": {},
             "growth": {},
             "earnings": {},
+            "earnings_quality": {},
             "institution": {},
             "capital_flow": {},
             "dragon_tiger": {},
@@ -2408,10 +4038,18 @@ class DataFetcherManager:
         growth_errors = list(adapter_errors)
         earnings_errors = list(adapter_errors)
         earnings_errors.extend(earnings_extra_errors)
+        earnings_quality_payload = self._build_earnings_quality_payload(growth_payload, earnings_payload)
+        earnings_quality_errors = list(adapter_errors)
         institution_errors = list(adapter_errors)
 
         growth_status = self._infer_block_status(growth_payload, bundle_status)
         earnings_status = self._infer_block_status(earnings_payload, bundle_status)
+        if self._has_meaningful_earnings_quality_payload(earnings_quality_payload):
+            earnings_quality_status = "ok"
+        elif bundle_status in ("failed", "partial", "not_supported"):
+            earnings_quality_status = bundle_status
+        else:
+            earnings_quality_status = "partial"
         institution_status = self._infer_block_status(institution_payload, bundle_status)
 
         result_ctx["growth"] = self._build_fundamental_block(
@@ -2425,6 +4063,12 @@ class DataFetcherManager:
             earnings_payload,
             bundle_chain,
             earnings_errors,
+        )
+        result_ctx["earnings_quality"] = self._build_fundamental_block(
+            earnings_quality_status,
+            earnings_quality_payload,
+            bundle_chain,
+            earnings_quality_errors,
         )
         result_ctx["institution"] = self._build_fundamental_block(
             institution_status,
@@ -2480,6 +4124,7 @@ class DataFetcherManager:
             "valuation": result_ctx["valuation"].get("status", "not_supported"),
             "growth": result_ctx["growth"].get("status", "not_supported"),
             "earnings": result_ctx["earnings"].get("status", "not_supported"),
+            "earnings_quality": result_ctx["earnings_quality"].get("status", "not_supported"),
             "institution": result_ctx["institution"].get("status", "not_supported"),
             "capital_flow": result_ctx["capital_flow"].get("status", "not_supported"),
             "dragon_tiger": result_ctx["dragon_tiger"].get("status", "not_supported"),
@@ -2490,6 +4135,7 @@ class DataFetcherManager:
             "valuation",
             "growth",
             "earnings",
+            "earnings_quality",
             "institution",
             "capital_flow",
             "dragon_tiger",

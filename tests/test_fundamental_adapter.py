@@ -5,6 +5,7 @@ Tests for fundamental adapter helpers.
 
 import os
 import sys
+import types
 import unittest
 from datetime import datetime, timedelta
 from unittest.mock import patch
@@ -43,6 +44,72 @@ class TestFundamentalAdapter(unittest.TestCase):
         row = _extract_latest_row(df, "600519")
         self.assertIsNotNone(row)
         self.assertEqual(row["值"], 1)
+
+    def test_extract_latest_row_prefers_latest_report_date_for_same_stock(self) -> None:
+        df = pd.DataFrame(
+            {
+                "股票代码": ["600519", "600519", "600519"],
+                "报告期": ["2025-09-30", "2026-03-31", "2025-12-31"],
+                "值": [1, 3, 2],
+            }
+        )
+
+        row = _extract_latest_row(df, "600519")
+        self.assertIsNotNone(row)
+        self.assertEqual(row["报告期"], "2026-03-31")
+        self.assertEqual(row["值"], 3)
+
+    def test_call_df_candidates_caches_successful_response_within_process(self) -> None:
+        adapter = AkshareFundamentalAdapter()
+        calls = {"count": 0}
+
+        def _fake_stock_yjyg_em(*, symbol: str) -> pd.DataFrame:
+            calls["count"] += 1
+            return pd.DataFrame({"股票代码": [symbol], "预告": ["预增"]})
+
+        fake_ak = types.SimpleNamespace(stock_yjyg_em=_fake_stock_yjyg_em)
+        with patch.dict(sys.modules, {"akshare": fake_ak}):
+            first_df, first_source, first_errors = adapter._call_df_candidates(
+                [("stock_yjyg_em", {"symbol": "600519"})]
+            )
+            second_df, second_source, second_errors = adapter._call_df_candidates(
+                [("stock_yjyg_em", {"symbol": "600519"})]
+            )
+
+        self.assertEqual(calls["count"], 1)
+        self.assertEqual(first_source, "stock_yjyg_em")
+        self.assertEqual(second_source, "stock_yjyg_em")
+        self.assertEqual(first_errors, [])
+        self.assertEqual(second_errors, [])
+        self.assertIsInstance(first_df, pd.DataFrame)
+        self.assertIsInstance(second_df, pd.DataFrame)
+        self.assertFalse(first_df.empty)
+        self.assertFalse(second_df.empty)
+
+    def test_call_df_candidates_caches_failure_outcome_within_process(self) -> None:
+        adapter = AkshareFundamentalAdapter()
+        calls = {"count": 0}
+
+        def _fake_stock_yjkb_em(*, symbol: str) -> pd.DataFrame:
+            calls["count"] += 1
+            raise RuntimeError(f"boom:{symbol}")
+
+        fake_ak = types.SimpleNamespace(stock_yjkb_em=_fake_stock_yjkb_em)
+        with patch.dict(sys.modules, {"akshare": fake_ak}):
+            first_df, first_source, first_errors = adapter._call_df_candidates(
+                [("stock_yjkb_em", {"symbol": "600519"})]
+            )
+            second_df, second_source, second_errors = adapter._call_df_candidates(
+                [("stock_yjkb_em", {"symbol": "600519"})]
+            )
+
+        self.assertEqual(calls["count"], 1)
+        self.assertIsNone(first_df)
+        self.assertIsNone(second_df)
+        self.assertIsNone(first_source)
+        self.assertIsNone(second_source)
+        self.assertIn("stock_yjkb_em:RuntimeError", first_errors)
+        self.assertIn("stock_yjkb_em:RuntimeError", second_errors)
 
     def test_dragon_tiger_no_match_with_code_column_is_ok(self) -> None:
         adapter = AkshareFundamentalAdapter()
@@ -129,6 +196,85 @@ class TestFundamentalAdapter(unittest.TestCase):
         self.assertEqual(dividend_payload.get("ttm_event_count"), 1)
         self.assertAlmostEqual(dividend_payload.get("ttm_cash_dividend_per_share"), 0.3, places=6)
 
+    def test_fundamental_bundle_exposes_multi_period_financial_series(self) -> None:
+        adapter = AkshareFundamentalAdapter()
+        fin_df = pd.DataFrame(
+            {
+                "股票代码": ["600519", "600519", "600519"],
+                "报告期": ["2025-09-30", "2026-03-31", "2025-12-31"],
+                "营业总收入": [900.0, 1200.0, 1050.0],
+                "归母净利润": [220.0, 360.0, 300.0],
+                "经营活动产生的现金流量净额": [250.0, 480.0, 410.0],
+                "净资产收益率": [10.5, 18.8, 15.1],
+                "营业收入同比": [8.0, 24.0, 16.0],
+                "净利润同比": [6.0, 35.0, 18.0],
+                "毛利率": [28.0, 34.0, 31.5],
+            }
+        )
+
+        with patch.object(
+            adapter,
+            "_call_df_candidates",
+            side_effect=[
+                (fin_df, "stock_financial_abstract", []),
+                (None, None, []),
+                (None, None, []),
+                (None, None, []),
+                (None, None, []),
+                (None, None, []),
+            ],
+        ):
+            result = adapter.get_fundamental_bundle("600519")
+
+        financial_report = result["earnings"].get("financial_report", {})
+        financial_series = result["earnings"].get("financial_report_series", [])
+        growth_series = result["growth"].get("quarterly_series", [])
+
+        self.assertEqual(financial_report.get("report_date"), "2026-03-31")
+        self.assertEqual(financial_report.get("revenue"), 1200.0)
+        self.assertEqual([item["report_date"] for item in financial_series], ["2026-03-31", "2025-12-31", "2025-09-30"])
+        self.assertEqual(financial_series[0]["net_profit_yoy"], 35.0)
+        self.assertEqual(growth_series[0]["gross_margin"], 34.0)
+        self.assertEqual(growth_series[-1]["revenue_yoy"], 8.0)
+
+    def test_fundamental_bundle_respects_enabled_blocks(self) -> None:
+        adapter = AkshareFundamentalAdapter()
+        fin_df = pd.DataFrame(
+            {
+                "股票代码": ["600519"],
+                "报告期": ["2026-03-31"],
+                "营业总收入": [1200.0],
+                "归母净利润": [360.0],
+                "经营活动产生的现金流量净额": [480.0],
+                "净资产收益率": [18.8],
+                "营业收入同比": [24.0],
+                "净利润同比": [35.0],
+            }
+        )
+        forecast_df = pd.DataFrame({"股票代码": ["600519"], "预告": ["预增"]})
+        quick_df = pd.DataFrame({"股票代码": ["600519"], "快报": ["快报摘要"], "公告日期": ["2026-04-18"]})
+
+        with patch.object(
+            adapter,
+            "_call_df_candidates",
+            side_effect=[
+                (fin_df, "stock_financial_abstract", []),
+                (forecast_df, "stock_yjyg_em", []),
+                (quick_df, "stock_yjkb_em", []),
+            ],
+        ) as call_mock:
+            result = adapter.get_fundamental_bundle(
+                "600519",
+                enabled_blocks=("financial", "forecast", "quick_report"),
+            )
+
+        self.assertEqual(call_mock.call_count, 3)
+        self.assertIn("financial_report", result["earnings"])
+        self.assertIn("forecast_summary", result["earnings"])
+        self.assertIn("quick_report_summary", result["earnings"])
+        self.assertNotIn("dividend", result["earnings"])
+        self.assertEqual(result["institution"], {})
+
     def test_build_dividend_payload_returns_empty_when_code_not_matched(self) -> None:
         now = datetime.now().strftime("%Y-%m-%d")
         df = pd.DataFrame(
@@ -170,6 +316,35 @@ class TestFundamentalAdapter(unittest.TestCase):
         payload = _build_dividend_payload(df, stock_code="600519")
         self.assertEqual(payload.get("ttm_event_count"), 1)
         self.assertAlmostEqual(payload.get("ttm_cash_dividend_per_share"), 0.3, places=6)
+
+    def test_get_capital_flow_fallback_to_tushare_sector_rankings(self) -> None:
+        adapter = AkshareFundamentalAdapter()
+        with patch.object(
+            adapter,
+            "_call_df_candidates",
+            side_effect=[
+                (None, None, ["capital_stock:failed"]),
+                (None, None, ["capital_sector:failed"]),
+            ],
+        ), patch.object(
+            adapter,
+            "_load_tushare_sector_rankings",
+            return_value=(
+                {
+                    "top": [{"name": "绠楀姏", "net_inflow": 12.5}],
+                    "bottom": [{"name": "鐑偣", "net_inflow": -8.0}],
+                },
+                "moneyflow_ind_ths:20260420",
+                [],
+            ),
+        ):
+            result = adapter.get_capital_flow("600519", top_n=5)
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["stock_flow"], {})
+        self.assertEqual(result["sector_rankings"]["top"][0]["name"], "绠楀姏")
+        self.assertEqual(result["sector_rankings"]["bottom"][0]["name"], "鐑偣")
+        self.assertIn("capital_sector:moneyflow_ind_ths:20260420", result["source_chain"])
 
 
 if __name__ == "__main__":

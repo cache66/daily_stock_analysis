@@ -273,11 +273,15 @@ Default schedule: Every weekday at **18:00 (Beijing Time)** automatic execution.
 > - **Field contracts**:
 >   - `fundamental_context.belong_boards` = related board list for the stock (currently populated for A-shares only; `[]` when unavailable);
 >   - `fundamental_context.boards.data` = `sector_rankings` (sector rise/fall leaderboard, structure `{top, bottom}`);
+>   - `fundamental_context.earnings.data.financial_report_series` = normalized recent financial-report series (report dates, revenue/profit YoY, ROE, gross margin, operating cash flow, etc.) for continuity checks;
+>   - `fundamental_context.earnings_quality.data` = structured earnings-quality block (`score_total`, `verdict`, `quarterly_continuity_score`, `quarterly_evidence`, `metrics`, `positive_signals`, `risk_flags`, `limitations`);
 >   - `get_stock_info.belong_boards` = list of sectors the individual stock belongs to;
 >   - `get_stock_info.boards` is a compatibility alias, value is identical to `belong_boards` (removal considered only in major version updates);
 >   - `get_stock_info.sector_rankings` stays consistent with `fundamental_context.boards.data`.
 >   - `AnalysisReport.details.belong_boards` = related board list in structured report details;
 >   - `AnalysisReport.details.sector_rankings` = sector leaderboard in structured report details for board-linkage display.
+>   - `AnalysisReport.details.earnings_quality` = structured earnings-quality result exposed in API/history detail responses.
+> - `earnings_quality` now prefers multi-quarter financial series for continuity checks ("still improving", "consistently positive", "deteriorating"); when the series is missing or too short, the downgrade reason is exposed in `limitations`.
 > - **Sector leaderboard** uses a fixed fallback order: consistent with global priority.
 > - **Timeout control** is a `best-effort` soft timeout: the stage will quickly degrade and continue execution based on the budget, but does not guarantee a hard interrupt of underlying third-party network calls.
 > - `FUNDAMENTAL_STAGE_TIMEOUT_SECONDS=1.5` indicates the target budget for the newly added fundamental stage, not a strict hard SLA.

@@ -55,6 +55,7 @@ class TestFundamentalContext(unittest.TestCase):
         self.assertEqual(ctx["coverage"].get("valuation"), "not_supported")
         self.assertEqual(ctx["coverage"].get("growth"), "not_supported")
         self.assertEqual(ctx["coverage"].get("earnings"), "not_supported")
+        self.assertEqual(ctx["coverage"].get("earnings_quality"), "not_supported")
         self.assertEqual(ctx["coverage"].get("institution"), "not_supported")
         self.assertEqual(ctx["coverage"].get("capital_flow"), "not_supported")
         self.assertEqual(ctx["coverage"].get("dragon_tiger"), "not_supported")
@@ -97,6 +98,7 @@ class TestFundamentalContext(unittest.TestCase):
         self.assertEqual(ctx["coverage"].get("valuation"), "ok")
         self.assertEqual(ctx["coverage"].get("growth"), "not_supported")
         self.assertEqual(ctx["coverage"].get("earnings"), "not_supported")
+        self.assertEqual(ctx["coverage"].get("earnings_quality"), "not_supported")
         self.assertEqual(ctx["coverage"].get("institution"), "not_supported")
         self.assertEqual(ctx["coverage"].get("capital_flow"), "not_supported")
         self.assertEqual(ctx["coverage"].get("dragon_tiger"), "not_supported")
@@ -151,8 +153,327 @@ class TestFundamentalContext(unittest.TestCase):
         self.assertEqual(ctx["market"], "cn")
         self.assertIn("valuation", ctx)
         self.assertIn("growth", ctx)
+        self.assertIn("earnings_quality", ctx)
         self.assertIn("capital_flow", ctx)
         self.assertIn("dragon_tiger", ctx)
+
+    def test_fundamental_context_builds_earnings_quality_block(self) -> None:
+        manager = DataFetcherManager(fetchers=[])
+        cfg = SimpleNamespace(
+            enable_fundamental_pipeline=True,
+            fundamental_cache_ttl_seconds=120,
+            fundamental_stage_timeout_seconds=1.5,
+            fundamental_fetch_timeout_seconds=0.8,
+            fundamental_retry_max=1,
+        )
+        quote = SimpleNamespace(
+            price=20.0,
+            pe_ratio=12.3,
+            pb_ratio=2.1,
+            total_mv=1.0e11,
+            circ_mv=7.0e10,
+            source=SimpleNamespace(value="tencent"),
+        )
+        with patch("src.config.get_config", return_value=cfg), \
+                patch.object(manager, "get_realtime_quote", return_value=quote), \
+                patch("data_provider.fundamental_adapter.AkshareFundamentalAdapter.get_fundamental_bundle", return_value={
+                    "status": "partial",
+                    "growth": {
+                        "revenue_yoy": 18.0,
+                        "net_profit_yoy": 35.0,
+                        "roe": 14.2,
+                        "gross_margin": 32.5,
+                    },
+                    "earnings": {
+                        "financial_report": {
+                            "report_date": "2026-03-31",
+                            "net_profit_parent": 300.0,
+                            "operating_cash_flow": 500.0,
+                        },
+                        "forecast_summary": "预增",
+                    },
+                    "institution": {},
+                    "source_chain": [],
+                    "errors": [],
+                }), \
+                patch.object(manager, "get_capital_flow_context", return_value={"status": "not_supported", "source_chain": []}), \
+                patch.object(manager, "get_dragon_tiger_context", return_value={"status": "not_supported", "source_chain": []}), \
+                patch.object(manager, "get_board_context", return_value={"status": "not_supported", "source_chain": []}):
+            ctx = manager.get_fundamental_context("600519", budget_seconds=1.5)
+
+        earnings_quality = ctx["earnings_quality"]["data"]
+        self.assertEqual(ctx["earnings_quality"]["status"], "ok")
+        self.assertEqual(ctx["coverage"].get("earnings_quality"), "ok")
+        self.assertEqual(earnings_quality["verdict"], "good")
+        self.assertGreaterEqual(earnings_quality["score_total"], 65)
+        self.assertAlmostEqual(
+            earnings_quality["metrics"]["cashflow_to_profit_ratio"],
+            round(500.0 / 300.0, 4),
+            places=6,
+        )
+        self.assertIn("cashflow_covers_profit_well", earnings_quality["positive_signals"])
+
+    def test_fundamental_context_uses_quarterly_series_for_earnings_quality_continuity(self) -> None:
+        manager = DataFetcherManager(fetchers=[])
+        cfg = SimpleNamespace(
+            enable_fundamental_pipeline=True,
+            fundamental_cache_ttl_seconds=120,
+            fundamental_stage_timeout_seconds=1.5,
+            fundamental_fetch_timeout_seconds=0.8,
+            fundamental_retry_max=1,
+        )
+        quote = SimpleNamespace(
+            price=20.0,
+            pe_ratio=12.3,
+            pb_ratio=2.1,
+            total_mv=1.0e11,
+            circ_mv=7.0e10,
+            source=SimpleNamespace(value="tencent"),
+        )
+        quarterly_series = [
+            {
+                "report_date": "2026-03-31",
+                "revenue_yoy": 24.0,
+                "net_profit_yoy": 38.0,
+                "roe": 18.0,
+                "gross_margin": 34.0,
+                "revenue": 1200.0,
+                "net_profit_parent": 360.0,
+                "operating_cash_flow": 480.0,
+            },
+            {
+                "report_date": "2025-12-31",
+                "revenue_yoy": 18.0,
+                "net_profit_yoy": 28.0,
+                "roe": 15.5,
+                "gross_margin": 31.0,
+                "revenue": 1080.0,
+                "net_profit_parent": 300.0,
+                "operating_cash_flow": 400.0,
+            },
+            {
+                "report_date": "2025-09-30",
+                "revenue_yoy": 12.0,
+                "net_profit_yoy": 19.0,
+                "roe": 13.0,
+                "gross_margin": 29.0,
+                "revenue": 980.0,
+                "net_profit_parent": 250.0,
+                "operating_cash_flow": 320.0,
+            },
+            {
+                "report_date": "2025-06-30",
+                "revenue_yoy": 8.0,
+                "net_profit_yoy": 11.0,
+                "roe": 11.0,
+                "gross_margin": 27.0,
+                "revenue": 900.0,
+                "net_profit_parent": 210.0,
+                "operating_cash_flow": 260.0,
+            },
+        ]
+
+        with patch("src.config.get_config", return_value=cfg), \
+                patch.object(manager, "get_realtime_quote", return_value=quote), \
+                patch("data_provider.fundamental_adapter.AkshareFundamentalAdapter.get_fundamental_bundle", return_value={
+                    "status": "partial",
+                    "growth": {
+                        "revenue_yoy": 24.0,
+                        "net_profit_yoy": 38.0,
+                        "roe": 18.0,
+                        "gross_margin": 34.0,
+                        "quarterly_series": [
+                            {
+                                "report_date": item["report_date"],
+                                "revenue_yoy": item["revenue_yoy"],
+                                "net_profit_yoy": item["net_profit_yoy"],
+                                "roe": item["roe"],
+                                "gross_margin": item["gross_margin"],
+                            }
+                            for item in quarterly_series
+                        ],
+                    },
+                    "earnings": {
+                        "financial_report": {
+                            "report_date": "2026-03-31",
+                            "net_profit_parent": 360.0,
+                            "operating_cash_flow": 480.0,
+                        },
+                        "financial_report_series": quarterly_series,
+                        "forecast_summary": "预增",
+                    },
+                    "institution": {},
+                    "source_chain": [],
+                    "errors": [],
+                }), \
+                patch.object(manager, "get_capital_flow_context", return_value={"status": "not_supported", "source_chain": []}), \
+                patch.object(manager, "get_dragon_tiger_context", return_value={"status": "not_supported", "source_chain": []}), \
+                patch.object(manager, "get_board_context", return_value={"status": "not_supported", "source_chain": []}):
+            ctx = manager.get_fundamental_context("600519", budget_seconds=1.5)
+
+        earnings_quality = ctx["earnings_quality"]["data"]
+        quarterly_evidence = earnings_quality["quarterly_evidence"]
+        self.assertEqual(earnings_quality["verdict"], "strong")
+        self.assertGreaterEqual(earnings_quality["quarterly_continuity_score"], 12)
+        self.assertEqual(quarterly_evidence["observation_count"], 4)
+        self.assertEqual(quarterly_evidence["dual_positive_streak"], 4)
+        self.assertEqual(quarterly_evidence["latest_trend"], "improving")
+        self.assertIn("quarterly_dual_growth_streak_4q", earnings_quality["positive_signals"])
+        self.assertNotIn(
+            "quarterly_series_unavailable_for_continuity_check",
+            earnings_quality["limitations"],
+        )
+
+    def test_fundamental_context_builds_reaccelerating_growth_cycle_analysis(self) -> None:
+        manager = DataFetcherManager(fetchers=[])
+        cfg = SimpleNamespace(
+            enable_fundamental_pipeline=True,
+            fundamental_cache_ttl_seconds=120,
+            fundamental_stage_timeout_seconds=1.5,
+            fundamental_fetch_timeout_seconds=0.8,
+            fundamental_retry_max=1,
+        )
+        quote = SimpleNamespace(
+            price=20.0,
+            pe_ratio=12.3,
+            pb_ratio=2.1,
+            total_mv=1.0e11,
+            circ_mv=7.0e10,
+            source=SimpleNamespace(value="tencent"),
+        )
+        quarterly_series = [
+            {"report_date": "2026-03-31", "revenue_yoy": 43.0, "net_profit_yoy": 73.0, "roe": 20.0, "gross_margin": 36.0, "net_margin": 31.0, "revenue": 1650.0, "net_profit_parent": 520.0, "operating_cash_flow": 660.0},
+            {"report_date": "2025-12-31", "revenue_yoy": 41.0, "net_profit_yoy": 52.0, "roe": 18.5, "gross_margin": 35.0, "net_margin": 29.0, "revenue": 4950.0, "net_profit_parent": 1460.0, "operating_cash_flow": 1840.0},
+            {"report_date": "2025-09-30", "revenue_yoy": 35.0, "net_profit_yoy": 45.0, "roe": 17.0, "gross_margin": 34.0, "net_margin": 27.0, "revenue": 3450.0, "net_profit_parent": 980.0, "operating_cash_flow": 1220.0},
+            {"report_date": "2025-06-30", "revenue_yoy": 29.0, "net_profit_yoy": 38.0, "roe": 15.5, "gross_margin": 33.0, "net_margin": 24.0, "revenue": 2200.0, "net_profit_parent": 620.0, "operating_cash_flow": 760.0},
+            {"report_date": "2025-03-31", "revenue_yoy": 18.0, "net_profit_yoy": 24.0, "roe": 14.0, "gross_margin": 32.0, "net_margin": 22.0, "revenue": 1150.0, "net_profit_parent": 300.0, "operating_cash_flow": 360.0},
+            {"report_date": "2024-12-31", "revenue_yoy": 16.0, "net_profit_yoy": 20.0, "roe": 13.0, "gross_margin": 31.0, "net_margin": 20.0, "revenue": 3500.0, "net_profit_parent": 860.0, "operating_cash_flow": 1040.0},
+            {"report_date": "2024-09-30", "revenue_yoy": 14.0, "net_profit_yoy": 18.0, "roe": 12.0, "gross_margin": 30.0, "net_margin": 18.0, "revenue": 2550.0, "net_profit_parent": 610.0, "operating_cash_flow": 760.0},
+            {"report_date": "2024-06-30", "revenue_yoy": 12.0, "net_profit_yoy": 15.0, "roe": 11.0, "gross_margin": 29.0, "net_margin": 17.0, "revenue": 1700.0, "net_profit_parent": 400.0, "operating_cash_flow": 500.0},
+            {"report_date": "2024-03-31", "revenue_yoy": 10.0, "net_profit_yoy": 12.0, "roe": 10.0, "gross_margin": 28.0, "net_margin": 15.0, "revenue": 800.0, "net_profit_parent": 180.0, "operating_cash_flow": 220.0},
+        ]
+
+        with patch("src.config.get_config", return_value=cfg), \
+                patch.object(manager, "get_realtime_quote", return_value=quote), \
+                patch("data_provider.fundamental_adapter.AkshareFundamentalAdapter.get_fundamental_bundle", return_value={
+                    "status": "partial",
+                    "growth": {
+                        "revenue_yoy": 43.0,
+                        "net_profit_yoy": 73.0,
+                        "roe": 20.0,
+                        "gross_margin": 36.0,
+                        "quarterly_series": [
+                            {
+                                "report_date": item["report_date"],
+                                "revenue_yoy": item["revenue_yoy"],
+                                "net_profit_yoy": item["net_profit_yoy"],
+                                "roe": item["roe"],
+                                "gross_margin": item["gross_margin"],
+                            }
+                            for item in quarterly_series
+                        ],
+                    },
+                    "earnings": {
+                        "financial_report": {
+                            "report_date": "2026-03-31",
+                            "net_profit_parent": 520.0,
+                            "operating_cash_flow": 660.0,
+                        },
+                        "financial_report_series": quarterly_series,
+                        "forecast_summary": "预增",
+                    },
+                    "institution": {},
+                    "source_chain": [],
+                    "errors": [],
+                }), \
+                patch.object(manager, "get_capital_flow_context", return_value={"status": "not_supported", "source_chain": []}), \
+                patch.object(manager, "get_dragon_tiger_context", return_value={"status": "not_supported", "source_chain": []}), \
+                patch.object(manager, "get_board_context", return_value={"status": "not_supported", "source_chain": []}):
+            ctx = manager.get_fundamental_context("600519", budget_seconds=1.5)
+
+        cycle_analysis = ctx["earnings_quality"]["data"]["cycle_analysis"]
+        self.assertEqual(cycle_analysis["phase"], "reaccelerating")
+        self.assertEqual(cycle_analysis["confidence"], "high")
+        self.assertGreater(cycle_analysis["drivers"]["revenue_ttm_yoy"], 0)
+        self.assertGreater(cycle_analysis["drivers"]["net_profit_ttm_yoy"], 0)
+        self.assertGreater(cycle_analysis["drivers"]["latest_single_quarter_net_profit_yoy"], 0)
+        self.assertIn("cycle_phase_reaccelerating", cycle_analysis["signals"])
+        self.assertIn("cycle_phase_reaccelerating", ctx["earnings_quality"]["data"]["positive_signals"])
+
+    def test_fundamental_context_marks_downcycle_when_growth_rolls_over(self) -> None:
+        manager = DataFetcherManager(fetchers=[])
+        cfg = SimpleNamespace(
+            enable_fundamental_pipeline=True,
+            fundamental_cache_ttl_seconds=120,
+            fundamental_stage_timeout_seconds=1.5,
+            fundamental_fetch_timeout_seconds=0.8,
+            fundamental_retry_max=1,
+        )
+        quote = SimpleNamespace(
+            price=20.0,
+            pe_ratio=12.3,
+            pb_ratio=2.1,
+            total_mv=1.0e11,
+            circ_mv=7.0e10,
+            source=SimpleNamespace(value="tencent"),
+        )
+        quarterly_series = [
+            {"report_date": "2026-03-31", "revenue_yoy": -12.0, "net_profit_yoy": -33.0, "roe": 6.0, "gross_margin": 19.0, "net_margin": 9.0, "revenue": 880.0, "net_profit_parent": 120.0, "operating_cash_flow": 80.0},
+            {"report_date": "2025-12-31", "revenue_yoy": -22.0, "net_profit_yoy": -46.0, "roe": 7.0, "gross_margin": 20.0, "net_margin": 10.0, "revenue": 4350.0, "net_profit_parent": 750.0, "operating_cash_flow": 620.0},
+            {"report_date": "2025-09-30", "revenue_yoy": -19.0, "net_profit_yoy": -45.0, "roe": 8.0, "gross_margin": 21.0, "net_margin": 11.0, "revenue": 3150.0, "net_profit_parent": 510.0, "operating_cash_flow": 420.0},
+            {"report_date": "2025-06-30", "revenue_yoy": -18.0, "net_profit_yoy": -36.0, "roe": 9.0, "gross_margin": 22.0, "net_margin": 12.0, "revenue": 2050.0, "net_profit_parent": 360.0, "operating_cash_flow": 310.0},
+            {"report_date": "2025-03-31", "revenue_yoy": -17.0, "net_profit_yoy": -31.0, "roe": 10.0, "gross_margin": 23.0, "net_margin": 13.0, "revenue": 1000.0, "net_profit_parent": 180.0, "operating_cash_flow": 140.0},
+            {"report_date": "2024-12-31", "revenue_yoy": 18.0, "net_profit_yoy": 24.0, "roe": 14.0, "gross_margin": 27.0, "net_margin": 18.0, "revenue": 5600.0, "net_profit_parent": 1380.0, "operating_cash_flow": 1700.0},
+            {"report_date": "2024-09-30", "revenue_yoy": 16.0, "net_profit_yoy": 22.0, "roe": 13.0, "gross_margin": 26.0, "net_margin": 17.0, "revenue": 3900.0, "net_profit_parent": 920.0, "operating_cash_flow": 1100.0},
+            {"report_date": "2024-06-30", "revenue_yoy": 14.0, "net_profit_yoy": 18.0, "roe": 12.0, "gross_margin": 25.0, "net_margin": 16.0, "revenue": 2500.0, "net_profit_parent": 560.0, "operating_cash_flow": 650.0},
+            {"report_date": "2024-03-31", "revenue_yoy": 12.0, "net_profit_yoy": 15.0, "roe": 11.0, "gross_margin": 24.0, "net_margin": 15.0, "revenue": 1200.0, "net_profit_parent": 260.0, "operating_cash_flow": 300.0},
+        ]
+
+        with patch("src.config.get_config", return_value=cfg), \
+                patch.object(manager, "get_realtime_quote", return_value=quote), \
+                patch("data_provider.fundamental_adapter.AkshareFundamentalAdapter.get_fundamental_bundle", return_value={
+                    "status": "partial",
+                    "growth": {
+                        "revenue_yoy": -12.0,
+                        "net_profit_yoy": -33.0,
+                        "roe": 6.0,
+                        "gross_margin": 19.0,
+                        "quarterly_series": [
+                            {
+                                "report_date": item["report_date"],
+                                "revenue_yoy": item["revenue_yoy"],
+                                "net_profit_yoy": item["net_profit_yoy"],
+                                "roe": item["roe"],
+                                "gross_margin": item["gross_margin"],
+                            }
+                            for item in quarterly_series
+                        ],
+                    },
+                    "earnings": {
+                        "financial_report": {
+                            "report_date": "2026-03-31",
+                            "net_profit_parent": 120.0,
+                            "operating_cash_flow": 80.0,
+                        },
+                        "financial_report_series": quarterly_series,
+                        "forecast_summary": "预减",
+                    },
+                    "institution": {},
+                    "source_chain": [],
+                    "errors": [],
+                }), \
+                patch.object(manager, "get_capital_flow_context", return_value={"status": "not_supported", "source_chain": []}), \
+                patch.object(manager, "get_dragon_tiger_context", return_value={"status": "not_supported", "source_chain": []}), \
+                patch.object(manager, "get_board_context", return_value={"status": "not_supported", "source_chain": []}):
+            ctx = manager.get_fundamental_context("600519", budget_seconds=1.5)
+
+        earnings_quality = ctx["earnings_quality"]["data"]
+        cycle_analysis = earnings_quality["cycle_analysis"]
+        self.assertEqual(cycle_analysis["phase"], "downcycle")
+        self.assertEqual(cycle_analysis["confidence"], "high")
+        self.assertLess(cycle_analysis["drivers"]["net_profit_ttm_yoy"], 0)
+        self.assertLess(cycle_analysis["drivers"]["latest_single_quarter_net_profit_yoy"], 0)
+        self.assertIn("cycle_phase_downcycle", earnings_quality["risk_flags"])
 
     def test_fundamental_context_derives_ttm_dividend_yield_from_quote_price(self) -> None:
         manager = DataFetcherManager(fetchers=[])

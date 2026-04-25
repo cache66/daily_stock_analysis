@@ -15,7 +15,7 @@ from sqlalchemy.sql import func
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.config import Config
-from src.storage import DatabaseManager, StockDaily
+from src.storage import DatabaseManager, SignalFundamentalSnapshot, StockDaily
 
 class TestStorage(unittest.TestCase):
     
@@ -209,8 +209,65 @@ class TestStorage(unittest.TestCase):
 
             self.assertEqual(total, 1)
         finally:
-            temp_dir.cleanup()
             DatabaseManager.reset_instance()
+            temp_dir.cleanup()
+
+    def test_upsert_signal_fundamental_snapshot_non_autocommit_does_not_flush_each_write(self):
+        DatabaseManager.reset_instance()
+        db = DatabaseManager(db_url="sqlite:///:memory:")
+
+        signal_type = "unit_test_signal"
+        snapshot_date = date(2026, 4, 22)
+        code = "600001"
+
+        with db.session_scope() as session:
+            with patch.object(session, "flush", wraps=session.flush) as flush_mock:
+                inserted = db.upsert_signal_fundamental_snapshot(
+                    signal_type=signal_type,
+                    snapshot_date=snapshot_date,
+                    code=code,
+                    name="sample",
+                    bundle_payload={"growth": {"revenue_yoy": 10.0}},
+                    quote_payload={"step": "first"},
+                    session=session,
+                    auto_commit=False,
+                )
+                updated = db.upsert_signal_fundamental_snapshot(
+                    signal_type=signal_type,
+                    snapshot_date=snapshot_date,
+                    code=code,
+                    name="sample",
+                    quote_payload={"step": "second"},
+                    session=session,
+                    auto_commit=False,
+                )
+
+                self.assertEqual(inserted, 1)
+                self.assertEqual(updated, 1)
+                self.assertEqual(flush_mock.call_count, 0)
+
+                row = db.get_signal_fundamental_snapshot(
+                    signal_type=signal_type,
+                    snapshot_date=snapshot_date,
+                    code=code,
+                    session=session,
+                )
+                self.assertIsNotNone(row)
+                self.assertEqual((row or {}).get("quote_payload", {}).get("step"), "second")
+
+        with db.get_session() as session:
+            total = session.execute(
+                select(func.count()).select_from(SignalFundamentalSnapshot).where(
+                    and_(
+                        SignalFundamentalSnapshot.signal_type == signal_type,
+                        SignalFundamentalSnapshot.snapshot_date == snapshot_date,
+                        SignalFundamentalSnapshot.code == code,
+                    )
+                )
+            ).scalar()
+            self.assertEqual(total, 1)
+
+        DatabaseManager.reset_instance()
 
 if __name__ == '__main__':
     unittest.main()

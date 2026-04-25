@@ -34,6 +34,11 @@ function formatPct(value?: number | null): string {
   return `${value.toFixed(2)}%`;
 }
 
+function formatRatioPct(value?: number | null): string {
+  if (value == null) return '--';
+  return formatPct(value * 100);
+}
+
 function formatPrice(value?: number | null): string {
   if (value == null) return '--';
   return value.toFixed(2);
@@ -127,10 +132,18 @@ type ActionStatus = {
   type: 'success' | 'error';
   message: string;
 } | null;
+type LinkedSelectionContext = {
+  groupBy: Exclude<StreakGroupBy, 'none'>;
+  groupLabel: string;
+} | null;
 
 const COMPARE_SUMMARY_PREVIEW_DAYS = 10;
+const MONTHLY_COMPARE_MAX_ITEMS = 200;
+const MONTHLY_SLOW_RISE_PROFILE_ORDER = ['strict', 'robust', 'balanced', 'loose'] as const;
 const SIGNALS_INPUT_CLASS =
   'input-surface input-focus-glow h-10 rounded-xl border bg-transparent px-3 text-sm transition-all focus:outline-none disabled:cursor-not-allowed disabled:opacity-60';
+
+type MonthlyCompareResponseMap = Record<string, SignalSnapshotListResponse>;
 
 type SignalTypeMeta = {
   title: string;
@@ -145,6 +158,17 @@ type SignalTypeMeta = {
 };
 
 const SIGNAL_TYPE_META: Record<string, SignalTypeMeta> = {
+  trend_leader_unified: {
+    title: '强趋势龙头总榜',
+    description: '查看按统一策略筛选出的 A 股强趋势龙头候选池，包含 breakout / pullback / hybrid 三分制结果和主 profile 标签。',
+    streakLabel: '连续入榜',
+    itemGroupTitle: '连续入榜',
+    nonStreakTitle: '其他入榜',
+    emptyHint: '可以先运行强趋势龙头统一策略脚本，生成 trend_leader_unified 当日快照。',
+    tabAccent: 'from-rose-500/25 via-orange-400/10 to-transparent border-rose-400/40 text-rose-100',
+    countBadgeClass: 'border-rose-400/25 bg-rose-500/10 text-rose-200',
+    activeCountBadgeClass: 'border-white/20 bg-white/10 text-white',
+  },
   hundred_day_high: {
     title: '百日新高快照',
     description: '按日期查看百日新高信号，支持多日对比、连续新高联动筛选，以及当前选中结果的导出和推送。',
@@ -165,6 +189,17 @@ const SIGNAL_TYPE_META: Record<string, SignalTypeMeta> = {
     emptyHint: '可以切换日期，或先运行业绩超预期扫描脚本生成当日快照。',
     tabAccent: 'from-emerald-500/25 via-emerald-400/10 to-transparent border-emerald-400/40 text-emerald-100',
     countBadgeClass: 'border-emerald-400/25 bg-emerald-500/10 text-emerald-200',
+    activeCountBadgeClass: 'border-white/20 bg-white/10 text-white',
+  },
+  monthly_slow_rise: {
+    title: '月线慢牛快照',
+    description: '按日期查看月线慢牛结构候选池，重点关注月线形态、周线稳定性、流动性与业绩连续性。',
+    streakLabel: '连续入池',
+    itemGroupTitle: '连续入池',
+    nonStreakTitle: '其他入池',
+    emptyHint: '可以先运行月线慢牛扫描脚本，生成 monthly_slow_rise 当日快照。',
+    tabAccent: 'from-lime-500/25 via-emerald-400/10 to-transparent border-lime-400/40 text-lime-100',
+    countBadgeClass: 'border-lime-400/25 bg-lime-500/10 text-lime-200',
     activeCountBadgeClass: 'border-white/20 bg-white/10 text-white',
   },
   hundred_day_high_with_earnings: {
@@ -237,9 +272,11 @@ const ALL_SIGNAL_TYPE_META: Record<string, SignalTypeMeta> = {
 };
 
 const BASE_SIGNAL_TYPE_OPTIONS = [
+  { value: 'trend_leader_unified', label: '强趋势龙头总榜' },
   { value: 'dragon_head_candidate', label: '龙头专题' },
   { value: 'hundred_day_high', label: '百日新高' },
   { value: 'earnings_surprise', label: '业绩超预期' },
+  { value: 'monthly_slow_rise', label: '月线慢牛' },
   { value: 'hundred_day_high_with_earnings', label: '新高且业绩' },
   { value: 'commodity_beneficiary__optical_fiber', label: '光纤涨价' },
   { value: 'commodity_beneficiary__memory', label: '内存涨价' },
@@ -250,6 +287,10 @@ function isCommoditySignalType(signalType: string): boolean {
   return signalType.startsWith('commodity_beneficiary__');
 }
 
+function isTrendLeaderUnifiedSignalType(signalType: string): boolean {
+  return signalType === 'trend_leader_unified';
+}
+
 function isDragonHeadSignalType(signalType: string): boolean {
   return signalType === 'dragon_head_candidate';
 }
@@ -258,12 +299,48 @@ function isBoardRecognizabilitySignalType(signalType: string): boolean {
   return signalType.startsWith('board_recognizability__');
 }
 
+function isMonthlySlowRiseSignalType(signalType: string): boolean {
+  return signalType === 'monthly_slow_rise' || signalType.startsWith('monthly_slow_rise_profile__');
+}
+
+function isMonthlySlowRiseProfileSignalType(signalType: string): boolean {
+  return signalType.startsWith('monthly_slow_rise_profile__');
+}
+
+function getMonthlySlowRiseProfileName(signalType: string): string {
+  if (!isMonthlySlowRiseSignalType(signalType)) return '';
+  return signalType.split('__').slice(1).join('__');
+}
+
+function getMonthlySlowRiseProfileOrder(signalType: string): number {
+  const profileName = getMonthlySlowRiseProfileName(signalType);
+  const index = MONTHLY_SLOW_RISE_PROFILE_ORDER.indexOf(profileName as typeof MONTHLY_SLOW_RISE_PROFILE_ORDER[number]);
+  return index >= 0 ? index : Number.MAX_SAFE_INTEGER;
+}
+
 function isFactorDrivenSignalType(signalType: string): boolean {
-  return isCommoditySignalType(signalType) || isDragonHeadSignalType(signalType) || isBoardRecognizabilitySignalType(signalType);
+  return isCommoditySignalType(signalType)
+    || isDragonHeadSignalType(signalType)
+    || isBoardRecognizabilitySignalType(signalType)
+    || isTrendLeaderUnifiedSignalType(signalType);
 }
 
 function showsEventDate(signalType: string): boolean {
   return signalType === 'earnings_surprise' || signalType === 'hundred_day_high_with_earnings';
+}
+
+function isEarningsSignalType(signalType: string): boolean {
+  return signalType === 'earnings_surprise';
+}
+
+function summarizeTopBuckets(counter: Map<string, number>, limit = 2): string {
+  const entries = Array.from(counter.entries())
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+    .slice(0, limit);
+  if (!entries.length) {
+    return '--';
+  }
+  return entries.map(([label, count]) => `${label} x${count}`).join(' / ');
 }
 
 function buildBoardRecognizabilityMeta(label: string): SignalTypeMeta {
@@ -277,6 +354,40 @@ function buildBoardRecognizabilityMeta(label: string): SignalTypeMeta {
     tabAccent: 'from-teal-500/25 via-emerald-400/10 to-transparent border-teal-400/40 text-teal-100',
     countBadgeClass: 'border-teal-400/25 bg-teal-500/10 text-teal-200',
     activeCountBadgeClass: 'border-white/20 bg-white/10 text-white',
+  };
+}
+
+function buildMonthlySlowRiseMeta(label: string): SignalTypeMeta {
+  return {
+    title: `${label}快照`,
+    description: `查看 ${label} 候选池，重点展示月线收涨占比、低点抬升占比、区间涨幅、单月最大涨幅和回撤约束。`,
+    streakLabel: '连续入池',
+    itemGroupTitle: '连续入池',
+    nonStreakTitle: '其他入池',
+    emptyHint: '可以先运行月线慢牛快照脚本或 profile 批量采集脚本，再回来查看不同严格度的结果。',
+    tabAccent: 'from-lime-500/25 via-emerald-400/10 to-transparent border-lime-400/40 text-lime-100',
+    countBadgeClass: 'border-lime-400/25 bg-lime-500/10 text-lime-200',
+    activeCountBadgeClass: 'border-white/20 bg-white/10 text-white',
+  };
+}
+
+function buildEmptySnapshotListResponse(params: {
+  signalType: string;
+  signalDate: string | null;
+  signalDateFrom: string | null;
+  signalDateTo: string | null;
+}): SignalSnapshotListResponse {
+  return {
+    signalType: params.signalType,
+    signalDate: params.signalDate,
+    signalDateFrom: params.signalDateFrom,
+    signalDateTo: params.signalDateTo,
+    total: 0,
+    page: 1,
+    pageSize: 0,
+    compareSummary: [],
+    streakLeaderboard: [],
+    items: [],
   };
 }
 
@@ -298,21 +409,28 @@ const SignalsPage: React.FC = () => {
   const [compareSummaryExpanded, setCompareSummaryExpanded] = useState(false);
   const [currentPage, setCurrentPage] = useState(1);
   const [actionStatus, setActionStatus] = useState<ActionStatus>(null);
+  const [linkedSelectionContext, setLinkedSelectionContext] = useState<LinkedSelectionContext>(null);
   const [isPushingSelection, setIsPushingSelection] = useState(false);
   const pageSize = 12;
   const [listData, setListData] = useState<SignalSnapshotListResponse | null>(null);
   const [countData, setCountData] = useState<SignalSnapshotCountsResponse | null>(null);
   const [selectedItem, setSelectedItem] = useState<SignalSnapshotListItem | null>(null);
   const [historyData, setHistoryData] = useState<SignalSnapshotHistoryResponse | null>(null);
+  const [monthlyCompareData, setMonthlyCompareData] = useState<MonthlyCompareResponseMap | null>(null);
+  const [isLoadingMonthlyCompare, setIsLoadingMonthlyCompare] = useState(false);
+  const [monthlyCompareError, setMonthlyCompareError] = useState<ParsedApiError | null>(null);
   const [isLoadingList, setIsLoadingList] = useState(false);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const [pageError, setPageError] = useState<ParsedApiError | null>(null);
   const listCacheRef = useRef<Map<string, SignalSnapshotListResponse>>(new Map());
   const historyCacheRef = useRef<Map<string, SignalSnapshotHistoryResponse>>(new Map());
+  const monthlyCompareCacheRef = useRef<Map<string, MonthlyCompareResponseMap>>(new Map());
   const listRequestIdRef = useRef(0);
   const historyRequestIdRef = useRef(0);
+  const monthlyCompareRequestIdRef = useRef(0);
   const listAbortControllerRef = useRef<AbortController | null>(null);
   const historyAbortControllerRef = useRef<AbortController | null>(null);
+  const monthlyCompareAbortControllerRef = useRef<AbortController | null>(null);
   const countAbortControllerRef = useRef<AbortController | null>(null);
 
   const boardRecognizabilityOptions = useMemo(
@@ -327,23 +445,41 @@ const SignalsPage: React.FC = () => {
     [countData],
   );
 
+  const monthlySlowRiseOptions = useMemo(
+    () => (countData?.items ?? [])
+      .filter((item) => isMonthlySlowRiseProfileSignalType(item.signalType))
+      .map((item) => ({
+        value: item.signalType,
+        label: item.displayLabel || item.signalType,
+        total: item.total ?? 0,
+      }))
+      .sort((left, right) => getMonthlySlowRiseProfileOrder(left.value) - getMonthlySlowRiseProfileOrder(right.value)
+        || right.total - left.total
+        || left.label.localeCompare(right.label)),
+    [countData],
+  );
+
   const signalTypeMetaMap = useMemo(() => {
     const dynamicMeta = boardRecognizabilityOptions.reduce<Record<string, SignalTypeMeta>>((acc, option) => {
       acc[option.value] = buildBoardRecognizabilityMeta(option.label);
       return acc;
     }, {});
+    for (const option of monthlySlowRiseOptions) {
+      dynamicMeta[option.value] = buildMonthlySlowRiseMeta(option.label);
+    }
     return {
       ...ALL_SIGNAL_TYPE_META,
       ...dynamicMeta,
     };
-  }, [boardRecognizabilityOptions]);
+  }, [boardRecognizabilityOptions, monthlySlowRiseOptions]);
 
   const signalTypeOptions = useMemo(
     () => [
       ...BASE_SIGNAL_TYPE_OPTIONS,
+      ...monthlySlowRiseOptions.map((option) => ({ value: option.value, label: option.label })),
       ...boardRecognizabilityOptions.map((option) => ({ value: option.value, label: option.label })),
     ],
-    [boardRecognizabilityOptions],
+    [boardRecognizabilityOptions, monthlySlowRiseOptions],
   );
 
   const signalMeta = signalTypeMetaMap[signalType] ?? signalTypeMetaMap.hundred_day_high;
@@ -369,6 +505,94 @@ const SignalsPage: React.FC = () => {
     }
     return counts;
   }, [countData]);
+
+  const shouldShowMonthlyCompare = isMonthlySlowRiseSignalType(signalType) && monthlySlowRiseOptions.length >= 2;
+
+  const loadMonthlyCompare = async (force = false) => {
+    if (!shouldShowMonthlyCompare) {
+      monthlyCompareRequestIdRef.current += 1;
+      monthlyCompareAbortControllerRef.current?.abort();
+      setMonthlyCompareData(null);
+      setMonthlyCompareError(null);
+      setIsLoadingMonthlyCompare(false);
+      return;
+    }
+
+    const requestId = ++monthlyCompareRequestIdRef.current;
+    monthlyCompareAbortControllerRef.current?.abort();
+    const abortController = new AbortController();
+    monthlyCompareAbortControllerRef.current = abortController;
+    const signalTypes = monthlySlowRiseOptions.map((option) => option.value);
+    const cacheKey = JSON.stringify({
+      signalTypes,
+      signalDate: dateMode === 'single' ? signalDate : null,
+      signalDateFrom: dateMode === 'range' ? signalDateFrom : null,
+      signalDateTo: dateMode === 'range' ? signalDateTo : null,
+      codes: [...(requestedCodes ?? [])].sort(),
+    });
+
+    if (!force) {
+      const cached = monthlyCompareCacheRef.current.get(cacheKey);
+      if (cached) {
+        setMonthlyCompareData(cached);
+        setMonthlyCompareError(null);
+        setIsLoadingMonthlyCompare(false);
+        return;
+      }
+    }
+
+    setIsLoadingMonthlyCompare(true);
+    try {
+      const responses = await Promise.all(signalTypes.map(async (targetSignalType) => {
+        const total = signalTypeCounts.get(targetSignalType) ?? 0;
+        if (total <= 0) {
+          return [targetSignalType, buildEmptySnapshotListResponse({
+            signalType: targetSignalType,
+            signalDate: dateMode === 'single' ? signalDate : null,
+            signalDateFrom: dateMode === 'range' ? signalDateFrom : null,
+            signalDateTo: dateMode === 'range' ? signalDateTo : null,
+          })] as const;
+        }
+        const response = await signalsApi.getSnapshots(
+          {
+            signalType: targetSignalType,
+            signalDate: dateMode === 'single' ? signalDate : undefined,
+            signalDateFrom: dateMode === 'range' ? signalDateFrom : undefined,
+            signalDateTo: dateMode === 'range' ? signalDateTo : undefined,
+            code: undefined,
+            codes: requestedCodes,
+            page: 1,
+            pageSize: Math.min(total, MONTHLY_COMPARE_MAX_ITEMS),
+          },
+          { signal: abortController.signal },
+        );
+        return [targetSignalType, response] as const;
+      }));
+      if (requestId !== monthlyCompareRequestIdRef.current) {
+        return;
+      }
+      const responseMap = Object.fromEntries(responses);
+      monthlyCompareCacheRef.current.set(cacheKey, responseMap);
+      setMonthlyCompareData(responseMap);
+      setMonthlyCompareError(null);
+    } catch (error) {
+      if (isRequestCanceled(error)) {
+        return;
+      }
+      if (requestId !== monthlyCompareRequestIdRef.current) {
+        return;
+      }
+      setMonthlyCompareData(null);
+      setMonthlyCompareError(getParsedApiError(error));
+    } finally {
+      if (requestId === monthlyCompareRequestIdRef.current) {
+        if (monthlyCompareAbortControllerRef.current === abortController) {
+          monthlyCompareAbortControllerRef.current = null;
+        }
+        setIsLoadingMonthlyCompare(false);
+      }
+    }
+  };
 
   const loadCounts = async () => {
     countAbortControllerRef.current?.abort();
@@ -582,10 +806,35 @@ const SignalsPage: React.FC = () => {
       : eventFiltered;
 
     return [...linkedFiltered].sort((left, right) => {
+      if (isTrendLeaderUnifiedSignalType(signalType) && sortBy === 'latestHighDesc') {
+        return (right.overallScore ?? Number.NEGATIVE_INFINITY) - (left.overallScore ?? Number.NEGATIVE_INFINITY)
+          || (right.hybridScore ?? Number.NEGATIVE_INFINITY) - (left.hybridScore ?? Number.NEGATIVE_INFINITY)
+          || (right.breakoutScore ?? Number.NEGATIVE_INFINITY) - (left.breakoutScore ?? Number.NEGATIVE_INFINITY)
+          || (right.pullbackScore ?? Number.NEGATIVE_INFINITY) - (left.pullbackScore ?? Number.NEGATIVE_INFINITY)
+          || (right.capitalConsensusScore ?? 0) - (left.capitalConsensusScore ?? 0)
+          || (left.code || '').localeCompare(right.code || '');
+      }
       if (isBoardRecognizabilitySignalType(signalType) && sortBy === 'latestHighDesc') {
         return (left.boardRank ?? Number.POSITIVE_INFINITY) - (right.boardRank ?? Number.POSITIVE_INFINITY)
           || (right.previousHitCount ?? 0) - (left.previousHitCount ?? 0)
           || (right.totalMarketCapYi ?? 0) - (left.totalMarketCapYi ?? 0)
+          || (right.latestHigh ?? 0) - (left.latestHigh ?? 0)
+          || (left.code || '').localeCompare(right.code || '');
+      }
+      if (isMonthlySlowRiseSignalType(signalType) && sortBy === 'latestHighDesc') {
+        return (right.monthlyPositiveRatio ?? Number.NEGATIVE_INFINITY) - (left.monthlyPositiveRatio ?? Number.NEGATIVE_INFINITY)
+          || (right.monthlyHigherLowRatio ?? Number.NEGATIVE_INFINITY) - (left.monthlyHigherLowRatio ?? Number.NEGATIVE_INFINITY)
+          || (right.monthlyTotalReturnPct ?? Number.NEGATIVE_INFINITY) - (left.monthlyTotalReturnPct ?? Number.NEGATIVE_INFINITY)
+          || (left.monthlyMaxSingleGainPct ?? Number.POSITIVE_INFINITY) - (right.monthlyMaxSingleGainPct ?? Number.POSITIVE_INFINITY)
+          || (right.monthlyWorstDrawdownPct ?? Number.NEGATIVE_INFINITY) - (left.monthlyWorstDrawdownPct ?? Number.NEGATIVE_INFINITY)
+          || (right.close ?? 0) - (left.close ?? 0)
+          || (left.code || '').localeCompare(right.code || '');
+      }
+      if (isEarningsSignalType(signalType) && sortBy === 'latestHighDesc') {
+        return (right.earningsStrategyScore ?? Number.NEGATIVE_INFINITY) - (left.earningsStrategyScore ?? Number.NEGATIVE_INFINITY)
+          || (right.earningsQualityScore ?? Number.NEGATIVE_INFINITY) - (left.earningsQualityScore ?? Number.NEGATIVE_INFINITY)
+          || (right.earningsEventFreshnessScore ?? Number.NEGATIVE_INFINITY) - (left.earningsEventFreshnessScore ?? Number.NEGATIVE_INFINITY)
+          || (right.eventDate || '').localeCompare(left.eventDate || '')
           || (right.latestHigh ?? 0) - (left.latestHigh ?? 0)
           || (left.code || '').localeCompare(right.code || '');
       }
@@ -638,6 +887,11 @@ const SignalsPage: React.FC = () => {
   }, [signalDate, signalDateFrom, signalDateTo, dateMode, appliedCodeFilter, activeLinkedCodes.join(',')]);
 
   useEffect(() => {
+    void loadMonthlyCompare();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [signalType, signalDate, signalDateFrom, signalDateTo, dateMode, appliedCodeFilter, activeLinkedCodes.join(','), monthlySlowRiseOptions.map((option) => option.value).join('|')]);
+
+  useEffect(() => {
     setCompareSummaryExpanded(false);
   }, [signalDate, signalDateFrom, signalDateTo, dateMode]);
 
@@ -645,6 +899,7 @@ const SignalsPage: React.FC = () => {
     return () => {
       listAbortControllerRef.current?.abort();
       historyAbortControllerRef.current?.abort();
+      monthlyCompareAbortControllerRef.current?.abort();
       countAbortControllerRef.current?.abort();
     };
   }, []);
@@ -742,11 +997,14 @@ const SignalsPage: React.FC = () => {
     }
     return selectedCodes.map((code) => byCode.get(code)).filter(Boolean) as SignalSnapshotListItem[];
   }, [exportableItems, selectedCodes]);
+  const linkedSelectionLabel = linkedSelectionContext
+    ? `${linkedSelectionContext.groupBy === 'theme' ? '主题组' : '行业组'} ${linkedSelectionContext.groupLabel}`
+    : null;
   const dateLabel = dateMode === 'single'
     ? signalDate
     : `${signalDateFrom} ~ ${signalDateTo}`;
   const selectionLabel = activeLinkedCodes.length > 0
-    ? `联动筛选 ${selectedCodes.length} 只股票 / ${exportableItems.length} 条快照`
+    ? `${linkedSelectionLabel ? `${linkedSelectionLabel} / ` : ''}联动筛选 ${selectedCodes.length} 只股票 / ${exportableItems.length} 条快照`
     : showOnlyStreak
       ? `当前页${signalMeta.streakLabel} ${exportableItems.length} 条`
       : `当前页结果 ${exportableItems.length} 条`;
@@ -768,7 +1026,103 @@ const SignalsPage: React.FC = () => {
     () => summarizeYtd(filteredAndSortedItems),
     [filteredAndSortedItems],
   );
+  const monthlyCompareSummary = useMemo(() => {
+    if (!shouldShowMonthlyCompare) {
+      return null;
+    }
+
+    const entries = monthlySlowRiseOptions.map((option) => {
+      const response = monthlyCompareData?.[option.value] ?? buildEmptySnapshotListResponse({
+        signalType: option.value,
+        signalDate: dateMode === 'single' ? signalDate : null,
+        signalDateFrom: dateMode === 'range' ? signalDateFrom : null,
+        signalDateTo: dateMode === 'range' ? signalDateTo : null,
+      });
+      const items = response.items ?? [];
+      const codeSet = new Set(items.map((item) => item.code).filter(Boolean));
+      const avgMetric = (picker: (item: SignalSnapshotListItem) => number | null | undefined) => {
+        const values = items
+          .map((item) => picker(item))
+          .filter((value): value is number => value != null);
+        if (!values.length) return null;
+        return Number((values.reduce((sum, value) => sum + value, 0) / values.length).toFixed(4));
+      };
+      return {
+        ...option,
+        response,
+        items,
+        codeSet,
+        avgPositiveRatio: avgMetric((item) => item.monthlyPositiveRatio),
+        avgHigherLowRatio: avgMetric((item) => item.monthlyHigherLowRatio),
+        avgTotalReturnPct: avgMetric((item) => item.monthlyTotalReturnPct),
+        avgDrawdownPct: avgMetric((item) => item.monthlyWorstDrawdownPct),
+      };
+    });
+
+    const codePresence = new Map<string, number>();
+    for (const entry of entries) {
+      for (const code of entry.codeSet) {
+        codePresence.set(code, (codePresence.get(code) ?? 0) + 1);
+      }
+    }
+
+    const enrichedEntries = entries.map((entry) => ({
+      ...entry,
+      sharedCount: Array.from(entry.codeSet).filter((code) => (codePresence.get(code) ?? 0) >= 2).length,
+      exclusiveCount: Array.from(entry.codeSet).filter((code) => (codePresence.get(code) ?? 0) === 1).length,
+      previewOnly: entry.response.total > entry.items.length,
+      previewItems: entry.items.slice(0, 5),
+    }));
+
+    const activeEntry = enrichedEntries.find((entry) => entry.value === signalType) ?? null;
+    const allProfileCount = enrichedEntries.filter((entry) => entry.total > 0).length;
+    return {
+      entries: enrichedEntries,
+      unionCount: codePresence.size,
+      sharedByAllCount: allProfileCount > 1
+        ? Array.from(codePresence.values()).filter((count) => count === allProfileCount).length
+        : 0,
+      sharedByAtLeastTwoCount: Array.from(codePresence.values()).filter((count) => count >= 2).length,
+      activeEntry,
+      allProfileCount,
+    };
+  }, [dateMode, monthlyCompareData, monthlySlowRiseOptions, shouldShowMonthlyCompare, signalDate, signalDateFrom, signalDateTo, signalType]);
   const activeCompareHead = listData?.compareSummary?.[0] ?? null;
+  const earningsStrategySummary = useMemo(() => {
+    if (!isEarningsSignalType(signalType)) {
+      return null;
+    }
+    const items = filteredAndSortedItems;
+    if (!items.length) {
+      return null;
+    }
+    const avg = (values: Array<number | null | undefined>) => {
+      const validValues = values.filter((value): value is number => value != null);
+      if (!validValues.length) return null;
+      return Number((validValues.reduce((sum, value) => sum + value, 0) / validValues.length).toFixed(2));
+    };
+    const gateCounter = new Map<string, number>();
+    const verdictCounter = new Map<string, number>();
+    let qualitySignalCount = 0;
+    for (const item of items) {
+      if (item.earningsStrategyGateStatus) {
+        gateCounter.set(item.earningsStrategyGateStatus, (gateCounter.get(item.earningsStrategyGateStatus) ?? 0) + 1);
+      }
+      if (item.earningsQualityVerdict) {
+        verdictCounter.set(item.earningsQualityVerdict, (verdictCounter.get(item.earningsQualityVerdict) ?? 0) + 1);
+      }
+      if (item.earningsQualitySignal) {
+        qualitySignalCount += 1;
+      }
+    }
+    return {
+      avgStrategyScore: avg(items.map((item) => item.earningsStrategyScore)),
+      avgQualityScore: avg(items.map((item) => item.earningsQualityScore)),
+      qualitySignalCount,
+      topGateStatuses: summarizeTopBuckets(gateCounter),
+      topVerdicts: summarizeTopBuckets(verdictCounter),
+    };
+  }, [filteredAndSortedItems, signalType]);
   const secondarySummaryItems = useMemo(() => {
     const items: Array<{ label: string; value: string }> = [
       { label: '范围', value: dateLabel },
@@ -787,6 +1141,12 @@ const SignalsPage: React.FC = () => {
     if (activeCompareHead?.avgYtdReturnPct != null) {
       items.push({ label: '对比首日均值', value: formatPct(activeCompareHead.avgYtdReturnPct) });
     }
+    if (monthlyCompareSummary?.unionCount != null) {
+      items.push({ label: '月线总并集', value: String(monthlyCompareSummary.unionCount) });
+    }
+    if (monthlyCompareSummary?.sharedByAllCount) {
+      items.push({ label: '三档共识', value: String(monthlyCompareSummary.sharedByAllCount) });
+    }
     return items;
   }, [
     activeCompareHead?.avgYtdReturnPct,
@@ -795,6 +1155,8 @@ const SignalsPage: React.FC = () => {
     currentYtdSummary.median,
     dateLabel,
     filteredAndSortedItems.length,
+    monthlyCompareSummary?.sharedByAllCount,
+    monthlyCompareSummary?.unionCount,
     recentEventDays,
     signalType,
   ]);
@@ -812,6 +1174,7 @@ const SignalsPage: React.FC = () => {
     setCodeFilter('');
     setAppliedCodeFilter('');
     setActionStatus(null);
+    setLinkedSelectionContext(null);
   };
 
   const handleShiftDate = (deltaDays: number) => {
@@ -830,6 +1193,7 @@ const SignalsPage: React.FC = () => {
     setCurrentPage(1);
     setAppliedCodeFilter(normalizedCodeFilter);
     setActionStatus(null);
+    setLinkedSelectionContext(null);
     if (shouldForceDirectRefresh) {
       void loadList({
         force: true,
@@ -844,6 +1208,7 @@ const SignalsPage: React.FC = () => {
   const handleApplyStreakOnly = () => {
     setShowOnlyStreak(true);
     setActionStatus(null);
+    setLinkedSelectionContext(null);
   };
 
   const handleClearLinkedFilter = () => {
@@ -851,6 +1216,7 @@ const SignalsPage: React.FC = () => {
     setCodeFilter('');
     setAppliedCodeFilter('');
     setActionStatus(null);
+    setLinkedSelectionContext(null);
   };
 
   const handleToggleLinkedCode = (code: string, forceStreakOnly: boolean) => {
@@ -858,6 +1224,7 @@ const SignalsPage: React.FC = () => {
     setAppliedCodeFilter('');
     setCurrentPage(1);
     setActionStatus(null);
+    setLinkedSelectionContext(null);
     if (forceStreakOnly) {
       setShowOnlyStreak(true);
     }
@@ -877,15 +1244,29 @@ const SignalsPage: React.FC = () => {
     setActionStatus(null);
     setShowOnlyStreak(false);
     setActiveLinkedCodes([code]);
+    setLinkedSelectionContext(null);
   };
 
-  const handleSelectGroup = (codes: string[]) => {
+  const handleSelectGroup = (codes: string[], groupLabel: string, groupSelected: boolean) => {
+    if (groupSelected) {
+      handleClearLinkedFilter();
+      return;
+    }
+    const uniqueCodes = [...new Set(codes)];
     setShowOnlyStreak(true);
     setCodeFilter('');
     setAppliedCodeFilter('');
     setCurrentPage(1);
     setActionStatus(null);
-    setActiveLinkedCodes([...new Set(codes)]);
+    setActiveLinkedCodes(uniqueCodes);
+    if (streakGroupBy === 'theme' || streakGroupBy === 'industry') {
+      setLinkedSelectionContext({
+        groupBy: streakGroupBy,
+        groupLabel,
+      });
+    } else {
+      setLinkedSelectionContext(null);
+    }
   };
 
   const handleCopyMarkdown = async () => {
@@ -944,11 +1325,12 @@ const SignalsPage: React.FC = () => {
           description={signalMeta.description}
           actions={(
             <>
-              <div className="grid min-w-[360px] grid-cols-1 gap-2 rounded-[28px] border border-border/60 bg-card/55 p-2 shadow-soft-card sm:grid-cols-3">
+              <div className="grid min-w-[360px] grid-cols-1 gap-2 rounded-[28px] border border-border/60 bg-card/55 p-2 shadow-soft-card sm:grid-cols-4">
                 {[
+                  { value: 'trend_leader_unified', label: '强趋势龙头' },
                   { value: 'hundred_day_high', label: '百日新高' },
                   { value: 'earnings_surprise', label: '业绩超预期' },
-                  { value: 'hundred_day_high_with_earnings', label: '新高且业绩' },
+                  { value: 'monthly_slow_rise', label: '月线慢牛' },
                 ].map((option) => (
                   <button
                     key={option.value}
@@ -1052,6 +1434,60 @@ const SignalsPage: React.FC = () => {
                   </button>
                 ))}
               </div>
+              {monthlySlowRiseOptions.length > 0 ? (
+                <div className="grid min-w-[360px] grid-cols-1 gap-2 rounded-[28px] border border-border/50 bg-card/30 p-2 shadow-soft-card sm:grid-cols-3">
+                  {monthlySlowRiseOptions.map((option) => (
+                    <button
+                      key={option.value}
+                      type="button"
+                      onClick={() => handleSignalTypeChange(option.value)}
+                      aria-label={`signal-type-tab-${option.value}`}
+                      className={`group relative overflow-hidden rounded-2xl border px-4 py-3 text-left transition-all ${
+                        signalType === option.value
+                          ? `bg-gradient-to-br ${signalTypeMetaMap[option.value]?.tabAccent || signalMeta.tabAccent} shadow-lg`
+                          : 'border-transparent bg-transparent text-secondary-text hover:border-border/50 hover:bg-hover hover:text-foreground'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="text-sm font-semibold">{option.label}</div>
+                          <div className="mt-1 text-[11px] opacity-80">
+                            {signalTypeMetaMap[option.value]?.streakLabel || '月线慢牛'}
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          {signalType === option.value ? (
+                            <>
+                              <Badge
+                                variant="history"
+                                className={signalTypeMetaMap[option.value]?.activeCountBadgeClass}
+                                aria-label={`signal-type-filtered-count-${option.value}`}
+                              >
+                                筛 {filteredAndSortedItems.length}
+                              </Badge>
+                              <Badge
+                                variant="history"
+                                className={signalTypeMetaMap[option.value]?.activeCountBadgeClass}
+                                aria-label={`signal-type-total-count-${option.value}`}
+                              >
+                                总 {signalTypeCounts.get(option.value) ?? '--'}
+                              </Badge>
+                            </>
+                          ) : (
+                            <Badge
+                              variant="default"
+                              className={signalTypeMetaMap[option.value]?.countBadgeClass}
+                              aria-label={`signal-type-total-count-${option.value}`}
+                            >
+                              {signalTypeCounts.get(option.value) ?? '--'}
+                            </Badge>
+                          )}
+                        </div>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              ) : null}
               {boardRecognizabilityOptions.length > 0 ? (
                 <div className="grid min-w-[360px] grid-cols-1 gap-2 rounded-[28px] border border-border/50 bg-card/30 p-2 shadow-soft-card sm:grid-cols-3">
                   {boardRecognizabilityOptions.map((option) => (
@@ -1264,6 +1700,136 @@ const SignalsPage: React.FC = () => {
             </div>
           ))}
         </div>
+        {isEarningsSignalType(signalType) && earningsStrategySummary ? (
+          <div className="grid gap-3 rounded-2xl border border-border/60 bg-card/35 p-4 text-sm shadow-soft-card md:grid-cols-2 xl:grid-cols-4">
+            <div className="rounded-xl border border-border/50 bg-card/60 p-3">
+              <p className="text-xs text-muted-text">策略均分</p>
+              <p className="mt-1 text-lg font-semibold text-foreground">
+                {formatPrice(earningsStrategySummary.avgStrategyScore)}
+              </p>
+            </div>
+            <div className="rounded-xl border border-border/50 bg-card/60 p-3">
+              <p className="text-xs text-muted-text">质量均分</p>
+              <p className="mt-1 text-lg font-semibold text-foreground">
+                {formatPrice(earningsStrategySummary.avgQualityScore)}
+              </p>
+            </div>
+            <div className="rounded-xl border border-border/50 bg-card/60 p-3">
+              <p className="text-xs text-muted-text">主 Gate 分布</p>
+              <p className="mt-1 text-xs text-secondary-text">{earningsStrategySummary.topGateStatuses}</p>
+            </div>
+            <div className="rounded-xl border border-border/50 bg-card/60 p-3">
+              <p className="text-xs text-muted-text">主 Verdict 分布</p>
+              <p className="mt-1 text-xs text-secondary-text">{earningsStrategySummary.topVerdicts}</p>
+              <p className="mt-1 text-xs text-muted-text">
+                质量信号 {earningsStrategySummary.qualitySignalCount}/{filteredAndSortedItems.length}
+              </p>
+            </div>
+          </div>
+        ) : null}
+
+        {shouldShowMonthlyCompare ? (
+          <div data-testid="monthly-slow-rise-compare">
+            <Card
+              title="月线慢牛一键对比"
+              subtitle="同一筛选条件下对比严格、均衡、宽松三档候选池，先看差异，再决定切到哪一档深看。"
+            >
+            {monthlyCompareError ? <ApiErrorAlert error={monthlyCompareError} /> : null}
+            {isLoadingMonthlyCompare && !monthlyCompareSummary ? (
+              <div className="grid gap-3 lg:grid-cols-3">
+                <div className="h-36 animate-pulse rounded-2xl bg-card/40" />
+                <div className="h-36 animate-pulse rounded-2xl bg-card/40" />
+                <div className="h-36 animate-pulse rounded-2xl bg-card/40" />
+              </div>
+            ) : monthlyCompareSummary ? (
+              <div className="space-y-4">
+                <div className="flex flex-wrap items-center gap-2 text-xs">
+                  <Badge variant="info">并集 {monthlyCompareSummary.unionCount}</Badge>
+                  <Badge variant="success">三档共识 {monthlyCompareSummary.sharedByAllCount}</Badge>
+                  <Badge variant="history">双档以上重合 {monthlyCompareSummary.sharedByAtLeastTwoCount}</Badge>
+                  {monthlyCompareSummary.activeEntry ? (
+                    <Badge variant="warning">当前查看 {monthlyCompareSummary.activeEntry.label}</Badge>
+                  ) : null}
+                  {isLoadingMonthlyCompare ? <Badge variant="default">对比刷新中</Badge> : null}
+                </div>
+                <div className="grid gap-3 xl:grid-cols-3">
+                  {monthlyCompareSummary.entries.map((entry) => {
+                    const isActiveProfile = signalType === entry.value;
+                    return (
+                      <div
+                        key={entry.value}
+                        className={`rounded-2xl border p-4 ${
+                          isActiveProfile
+                            ? 'border-cyan/40 bg-cyan/10 shadow-lg shadow-cyan/10'
+                            : 'border-border/60 bg-card/35'
+                        }`}
+                      >
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="min-w-0">
+                            <p className="text-sm font-semibold text-foreground">{entry.label}</p>
+                            <p className="mt-1 text-xs text-secondary-text">
+                              命中 {entry.total} | 共享 {entry.sharedCount} | 独有 {entry.exclusiveCount}
+                            </p>
+                          </div>
+                          {isActiveProfile ? <Badge variant="history">当前</Badge> : null}
+                        </div>
+                        <div className="mt-4 grid grid-cols-2 gap-3 text-xs">
+                          <div>
+                            <p className="text-muted-text">平均收涨</p>
+                            <p className="mt-1 font-medium text-foreground">{formatRatioPct(entry.avgPositiveRatio)}</p>
+                          </div>
+                          <div>
+                            <p className="text-muted-text">平均抬低点</p>
+                            <p className="mt-1 font-medium text-foreground">{formatRatioPct(entry.avgHigherLowRatio)}</p>
+                          </div>
+                          <div>
+                            <p className="text-muted-text">平均区间涨幅</p>
+                            <p className="mt-1 font-medium text-foreground">{formatPct(entry.avgTotalReturnPct)}</p>
+                          </div>
+                          <div>
+                            <p className="text-muted-text">平均回撤</p>
+                            <p className="mt-1 font-medium text-foreground">{formatPct(entry.avgDrawdownPct)}</p>
+                          </div>
+                        </div>
+                        <div className="mt-4">
+                          <p className="text-xs text-muted-text">候选预览</p>
+                          <div className="mt-2 flex flex-wrap gap-2">
+                            {entry.previewItems.length > 0 ? entry.previewItems.map((item) => (
+                              <Badge key={`${entry.value}-${item.code}`} variant="default">
+                                {item.name || item.code}
+                              </Badge>
+                            )) : (
+                              <Badge variant="default">暂无候选</Badge>
+                            )}
+                            {entry.previewOnly ? (
+                              <Badge variant="warning">仅预览前 {entry.items.length} 条</Badge>
+                            ) : null}
+                          </div>
+                        </div>
+                        <div className="mt-4">
+                          <Button
+                            variant={isActiveProfile ? 'secondary' : 'ghost'}
+                            size="sm"
+                            onClick={() => handleSignalTypeChange(entry.value)}
+                            aria-label={`monthly-compare-focus-${entry.value}`}
+                          >
+                            {isActiveProfile ? '正在查看' : '查看本档'}
+                          </Button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : (
+              <EmptyState
+                title="暂无月线慢牛对比数据"
+                description="切到任一月线慢牛 profile 后，这里会自动加载严格、均衡、宽松三档对比。"
+              />
+            )}
+            </Card>
+          </div>
+        ) : null}
 
         {pageError ? <ApiErrorAlert error={pageError} /> : null}
 
@@ -1397,7 +1963,9 @@ const SignalsPage: React.FC = () => {
                     </div>
                     <div className="space-y-3">
                       {streakGroups.map((group, groupIndex) => {
-                        const selectedInGroup = group.items.filter((item) => activeLinkedCodes.includes(item.code)).length;
+                        const groupCodes = [...new Set(group.items.map((item) => item.code).filter(Boolean))];
+                        const selectedInGroup = groupCodes.filter((code) => activeLinkedCodes.includes(code)).length;
+                        const isGroupSelected = groupCodes.length > 0 && selectedInGroup === groupCodes.length;
                         return (
                           <div key={`${group.label || 'all'}-${groupIndex}`} className="space-y-2">
                             {group.label ? (
@@ -1405,16 +1973,17 @@ const SignalsPage: React.FC = () => {
                                 <div className="flex min-w-0 flex-wrap items-center gap-2">
                                   <p className="text-xs font-medium text-muted-text">{group.label}</p>
                                   <Badge variant={selectedInGroup > 0 ? 'history' : 'default'}>
-                                    已选 {selectedInGroup}/{group.items.length}
+                                    已选 {selectedInGroup}/{groupCodes.length}
                                   </Badge>
+                                  {isGroupSelected ? <Badge variant="warning">当前联动组</Badge> : null}
                                 </div>
                                 <Button
                                   variant="ghost"
                                   size="sm"
-                                  onClick={() => handleSelectGroup(group.items.map((item) => item.code))}
+                                  onClick={() => handleSelectGroup(groupCodes, group.label, isGroupSelected)}
                                   aria-label={`select-streak-group-${groupIndex}`}
                                 >
-                                  选择本组
+                                  {isGroupSelected ? '取消本组' : '选择本组'}
                                 </Button>
                               </div>
                             ) : null}
@@ -1478,12 +2047,32 @@ const SignalsPage: React.FC = () => {
                                   <Badge variant="info">{item.code}</Badge>
                                   {isBoardRecognizabilitySignalType(signalType) && item.boardRank != null ? <Badge variant="warning">#{item.boardRank}</Badge> : null}
                                   {isBoardRecognizabilitySignalType(signalType) && item.boardCandidateCount != null ? <Badge variant="default">板块候选 {item.boardCandidateCount}</Badge> : null}
+                                  {isMonthlySlowRiseSignalType(signalType) && item.profileLabel ? <Badge variant="warning">{item.profileLabel}</Badge> : null}
+                                  {isMonthlySlowRiseSignalType(signalType) && item.monthlyLatestMonth ? <Badge variant="default">{item.monthlyLatestMonth}</Badge> : null}
                                   {item.themeLabel ? <Badge variant="warning">{item.themeLabel}</Badge> : null}
                                   {isCommoditySignalType(signalType) && item.subthemeKey ? <Badge variant="default">{item.subthemeKey}</Badge> : null}
                                   {isCommoditySignalType(signalType) && item.chainRole ? <Badge variant="history">{item.chainRole}</Badge> : null}
                                   {isCommoditySignalType(signalType) && item.earningsReleaseProbability ? <Badge variant="success">{item.earningsReleaseProbability}</Badge> : null}
                                   {isDragonHeadSignalType(signalType) && item.leaderType ? <Badge variant="warning">{item.leaderType}</Badge> : null}
                                   {isDragonHeadSignalType(signalType) && item.leaderProbability ? <Badge variant="success">{item.leaderProbability}</Badge> : null}
+                                  {isTrendLeaderUnifiedSignalType(signalType) && item.primaryProfile ? <Badge variant="warning">{item.primaryProfile}</Badge> : null}
+                                  {isTrendLeaderUnifiedSignalType(signalType) && item.trendLabel ? <Badge variant="default">{item.trendLabel}</Badge> : null}
+                                  {isTrendLeaderUnifiedSignalType(signalType)
+                                    ? (item.signalTags || []).map((tag, index) => (
+                                        <Badge key={`trend-tag-${item.code}-${item.signalDate}-${index}`} variant="history">
+                                          {tag}
+                                        </Badge>
+                                      ))
+                                    : null}
+                                  {isTrendLeaderUnifiedSignalType(signalType) && item.overallScore != null ? <Badge variant="success">{formatPrice(item.overallScore)}</Badge> : null}
+                                  {isEarningsSignalType(signalType) && item.earningsStrategyLabel ? <Badge variant="warning">{item.earningsStrategyLabel}</Badge> : null}
+                                  {isEarningsSignalType(signalType) && item.earningsStrategyGateStatus ? (
+                                    <Badge variant={item.earningsStrategyGateStatus.startsWith('passed') ? 'success' : 'danger'}>
+                                      {item.earningsStrategyGateStatus}
+                                    </Badge>
+                                  ) : null}
+                                  {isEarningsSignalType(signalType) && item.earningsQualityVerdict ? <Badge variant="default">{item.earningsQualityVerdict}</Badge> : null}
+                                  {isEarningsSignalType(signalType) && item.earningsStrategyScore != null ? <Badge variant="success">{formatPrice(item.earningsStrategyScore)}</Badge> : null}
                                   <Badge variant="success">{signalMeta.streakLabel}</Badge>
                                 </div>
                                 {showsEventDate(signalType) ? (
@@ -1502,9 +2091,21 @@ const SignalsPage: React.FC = () => {
                                   <p className="mt-1 text-xs text-secondary-text">
                                     {item.leaderType || '--'} | {item.leaderProbability || '--'} | recognizability {item.recognizabilityScore ?? '--'}
                                   </p>
+                                ) : isTrendLeaderUnifiedSignalType(signalType) ? (
+                                  <p className="mt-1 text-xs text-secondary-text">
+                                    overall {formatPrice(item.overallScore)} | breakout {formatPrice(item.breakoutScore)} | pullback {formatPrice(item.pullbackScore)}
+                                  </p>
+                                ) : isEarningsSignalType(signalType) ? (
+                                  <p className="mt-1 text-xs text-secondary-text">
+                                    strategy {formatPrice(item.earningsStrategyScore)} | quality {formatPrice(item.earningsQualityScore)} | gate {item.earningsStrategyGateStatus || '--'}
+                                  </p>
                                 ) : isBoardRecognizabilitySignalType(signalType) ? (
                                   <p className="mt-1 text-xs text-secondary-text">
                                     {item.boardName || '--'} | 来源 {item.sourceSignalType || '--'} {item.sourceSignalDate || '--'} | 市值 {item.totalMarketCapYi ?? '--'} 亿
+                                  </p>
+                                ) : isMonthlySlowRiseSignalType(signalType) ? (
+                                  <p className="mt-1 text-xs text-secondary-text">
+                                    收涨 {formatRatioPct(item.monthlyPositiveRatio)} | 抬低点 {formatRatioPct(item.monthlyHigherLowRatio)} | 区间 {formatPct(item.monthlyTotalReturnPct)}
                                   </p>
                                 ) : null}
                               </div>
@@ -1512,6 +2113,12 @@ const SignalsPage: React.FC = () => {
                                 <div>high {formatPrice(item.latestHigh)}</div>
                                 <div>close {formatPrice(item.close)}</div>
                                 <div>YTD {formatPct(item.ytdReturnPct)}</div>
+                                {isTrendLeaderUnifiedSignalType(signalType) ? (
+                                  <div>overall {formatPrice(item.overallScore)}</div>
+                                ) : null}
+                                {isMonthlySlowRiseSignalType(signalType) ? (
+                                  <div>回撤 {formatPct(item.monthlyWorstDrawdownPct)}</div>
+                                ) : null}
                               </div>
                             </div>
                           </button>
@@ -1542,12 +2149,32 @@ const SignalsPage: React.FC = () => {
                                   <Badge variant="info">{item.code}</Badge>
                                   {isBoardRecognizabilitySignalType(signalType) && item.boardRank != null ? <Badge variant="warning">#{item.boardRank}</Badge> : null}
                                   {isBoardRecognizabilitySignalType(signalType) && item.boardCandidateCount != null ? <Badge variant="default">板块候选 {item.boardCandidateCount}</Badge> : null}
+                                  {isMonthlySlowRiseSignalType(signalType) && item.profileLabel ? <Badge variant="warning">{item.profileLabel}</Badge> : null}
+                                  {isMonthlySlowRiseSignalType(signalType) && item.monthlyLatestMonth ? <Badge variant="default">{item.monthlyLatestMonth}</Badge> : null}
                                   {item.themeLabel ? <Badge variant="warning">{item.themeLabel}</Badge> : null}
                                   {isCommoditySignalType(signalType) && item.subthemeKey ? <Badge variant="default">{item.subthemeKey}</Badge> : null}
                                   {isCommoditySignalType(signalType) && item.chainRole ? <Badge variant="history">{item.chainRole}</Badge> : null}
                                   {isCommoditySignalType(signalType) && item.earningsReleaseProbability ? <Badge variant="success">{item.earningsReleaseProbability}</Badge> : null}
                                   {isDragonHeadSignalType(signalType) && item.leaderType ? <Badge variant="warning">{item.leaderType}</Badge> : null}
                                   {isDragonHeadSignalType(signalType) && item.leaderProbability ? <Badge variant="success">{item.leaderProbability}</Badge> : null}
+                                  {isTrendLeaderUnifiedSignalType(signalType) && item.primaryProfile ? <Badge variant="warning">{item.primaryProfile}</Badge> : null}
+                                  {isTrendLeaderUnifiedSignalType(signalType) && item.trendLabel ? <Badge variant="default">{item.trendLabel}</Badge> : null}
+                                  {isTrendLeaderUnifiedSignalType(signalType)
+                                    ? (item.signalTags || []).map((tag, index) => (
+                                        <Badge key={`trend-tag-${item.code}-${item.signalDate}-${index}`} variant="history">
+                                          {tag}
+                                        </Badge>
+                                      ))
+                                    : null}
+                                  {isTrendLeaderUnifiedSignalType(signalType) && item.overallScore != null ? <Badge variant="success">{formatPrice(item.overallScore)}</Badge> : null}
+                                  {isEarningsSignalType(signalType) && item.earningsStrategyLabel ? <Badge variant="warning">{item.earningsStrategyLabel}</Badge> : null}
+                                  {isEarningsSignalType(signalType) && item.earningsStrategyGateStatus ? (
+                                    <Badge variant={item.earningsStrategyGateStatus.startsWith('passed') ? 'success' : 'danger'}>
+                                      {item.earningsStrategyGateStatus}
+                                    </Badge>
+                                  ) : null}
+                                  {isEarningsSignalType(signalType) && item.earningsQualityVerdict ? <Badge variant="default">{item.earningsQualityVerdict}</Badge> : null}
+                                  {isEarningsSignalType(signalType) && item.earningsStrategyScore != null ? <Badge variant="success">{formatPrice(item.earningsStrategyScore)}</Badge> : null}
                                 </div>
                                 {showsEventDate(signalType) ? (
                                   <p className="mt-1 text-xs text-secondary-text">
@@ -1565,9 +2192,21 @@ const SignalsPage: React.FC = () => {
                                   <p className="mt-1 text-xs text-secondary-text">
                                     {item.leaderType || '--'} | {item.leaderProbability || '--'} | recognizability {item.recognizabilityScore ?? '--'}
                                   </p>
+                                ) : isTrendLeaderUnifiedSignalType(signalType) ? (
+                                  <p className="mt-1 text-xs text-secondary-text">
+                                    overall {formatPrice(item.overallScore)} | breakout {formatPrice(item.breakoutScore)} | pullback {formatPrice(item.pullbackScore)}
+                                  </p>
+                                ) : isEarningsSignalType(signalType) ? (
+                                  <p className="mt-1 text-xs text-secondary-text">
+                                    strategy {formatPrice(item.earningsStrategyScore)} | quality {formatPrice(item.earningsQualityScore)} | gate {item.earningsStrategyGateStatus || '--'}
+                                  </p>
                                 ) : isBoardRecognizabilitySignalType(signalType) ? (
                                   <p className="mt-1 text-xs text-secondary-text">
                                     {item.boardName || '--'} | 来源 {item.sourceSignalType || '--'} {item.sourceSignalDate || '--'} | 市值 {item.totalMarketCapYi ?? '--'} 亿
+                                  </p>
+                                ) : isMonthlySlowRiseSignalType(signalType) ? (
+                                  <p className="mt-1 text-xs text-secondary-text">
+                                    收涨 {formatRatioPct(item.monthlyPositiveRatio)} | 抬低点 {formatRatioPct(item.monthlyHigherLowRatio)} | 区间 {formatPct(item.monthlyTotalReturnPct)}
                                   </p>
                                 ) : null}
                               </div>
@@ -1575,6 +2214,12 @@ const SignalsPage: React.FC = () => {
                                 <div>high {formatPrice(item.latestHigh)}</div>
                                 <div>close {formatPrice(item.close)}</div>
                                 <div>YTD {formatPct(item.ytdReturnPct)}</div>
+                                {isTrendLeaderUnifiedSignalType(signalType) ? (
+                                  <div>overall {formatPrice(item.overallScore)}</div>
+                                ) : null}
+                                {isMonthlySlowRiseSignalType(signalType) ? (
+                                  <div>回撤 {formatPct(item.monthlyWorstDrawdownPct)}</div>
+                                ) : null}
                               </div>
                             </div>
                           </button>
@@ -1589,6 +2234,7 @@ const SignalsPage: React.FC = () => {
                     <div className="mr-auto flex flex-wrap items-center gap-2" data-testid="signals-selection-summary">
                       <Badge variant="history">已选 {selectedCodes.length} 只</Badge>
                       <Badge variant="info">{selectionLabel}</Badge>
+                      {linkedSelectionLabel ? <Badge variant="warning">{linkedSelectionLabel}</Badge> : null}
                       {groupedByLabel ? <Badge variant="default">{groupedByLabel}</Badge> : null}
                       {selectedCodeItems.slice(0, 6).map((item) => (
                         <button
@@ -1756,6 +2402,100 @@ const SignalsPage: React.FC = () => {
                         </div>
                       </div>
                     </div>
+                  ) : isTrendLeaderUnifiedSignalType(signalType) ? (
+                    <div className="rounded-2xl border border-border/60 bg-card/40 p-4">
+                      <p className="text-xs text-muted-text">统一策略结构</p>
+                      <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                        <div>
+                          <p className="text-xs font-medium text-muted-text">Primary Profile</p>
+                          <p className="mt-1 text-secondary-text">{currentHistoryItem.primaryProfile || '--'}</p>
+                        </div>
+                        <div>
+                          <p className="text-xs font-medium text-muted-text">Trend Label</p>
+                          <p className="mt-1 text-secondary-text">{currentHistoryItem.trendLabel || '--'}</p>
+                        </div>
+                        <div>
+                          <p className="text-xs font-medium text-muted-text">Selection Mode</p>
+                          <p className="mt-1 text-secondary-text">{currentHistoryItem.selectionMode || '--'}</p>
+                        </div>
+                        <div className="sm:col-span-2">
+                          <p className="text-xs font-medium text-muted-text">Signal Tags</p>
+                          <p className="mt-1 text-secondary-text">
+                            {(currentHistoryItem.signalTags || []).length > 0
+                              ? (currentHistoryItem.signalTags || []).join(' / ')
+                              : '--'}
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-xs font-medium text-muted-text">Overall Score</p>
+                          <p className="mt-1 text-secondary-text">{formatPrice(currentHistoryItem.overallScore)}</p>
+                        </div>
+                        <div>
+                          <p className="text-xs font-medium text-muted-text">Hybrid Score</p>
+                          <p className="mt-1 text-secondary-text">{formatPrice(currentHistoryItem.hybridScore)}</p>
+                        </div>
+                        <div>
+                          <p className="text-xs font-medium text-muted-text">Breakout / Pullback</p>
+                          <p className="mt-1 text-secondary-text">
+                            {formatPrice(currentHistoryItem.breakoutScore)} / {formatPrice(currentHistoryItem.pullbackScore)}
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-xs font-medium text-muted-text">Leader</p>
+                          <p className="mt-1 text-secondary-text">
+                            {currentHistoryItem.leaderType || '--'} / {currentHistoryItem.leaderProbability || '--'}
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                  ) : isEarningsSignalType(signalType) ? (
+                    <div className="rounded-2xl border border-border/60 bg-card/40 p-4">
+                      <p className="text-xs text-muted-text">业绩策略结果</p>
+                      <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                        <div>
+                          <p className="text-xs font-medium text-muted-text">Strategy Label</p>
+                          <p className="mt-1 text-secondary-text">{currentHistoryItem.earningsStrategyLabel || '--'}</p>
+                        </div>
+                        <div>
+                          <p className="text-xs font-medium text-muted-text">Gate Status</p>
+                          <p className="mt-1 text-secondary-text">{currentHistoryItem.earningsStrategyGateStatus || '--'}</p>
+                        </div>
+                        <div>
+                          <p className="text-xs font-medium text-muted-text">Strategy / Quality Score</p>
+                          <p className="mt-1 text-secondary-text">
+                            {formatPrice(currentHistoryItem.earningsStrategyScore)} / {formatPrice(currentHistoryItem.earningsQualityScore)}
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-xs font-medium text-muted-text">Quality Verdict</p>
+                          <p className="mt-1 text-secondary-text">
+                            {currentHistoryItem.earningsQualityVerdict || '--'} / signal {String(Boolean(currentHistoryItem.earningsQualitySignal))}
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-xs font-medium text-muted-text">Event / Signal Date</p>
+                          <p className="mt-1 text-secondary-text">
+                            {currentHistoryItem.eventDate || '--'} / {currentHistoryItem.signalDate || '--'}
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-xs font-medium text-muted-text">Cycle / Trend</p>
+                          <p className="mt-1 text-secondary-text">
+                            {currentHistoryItem.earningsQualityCyclePhase || '--'} / {currentHistoryItem.earningsQualityQuarterlyTrend || '--'}
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-xs font-medium text-muted-text">Freshness / Risk Penalty</p>
+                          <p className="mt-1 text-secondary-text">
+                            {formatPrice(currentHistoryItem.earningsEventFreshnessScore)} / {formatPrice(currentHistoryItem.earningsRiskPenalty)}
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-xs font-medium text-muted-text">Capital Consensus</p>
+                          <p className="mt-1 text-secondary-text">{currentHistoryItem.capitalConsensusScore ?? '--'}</p>
+                        </div>
+                      </div>
+                    </div>
                   ) : isDragonHeadSignalType(signalType) ? (
                     <div className="rounded-2xl border border-border/60 bg-card/40 p-4">
                       <p className="text-xs text-muted-text">龙头结构</p>
@@ -1789,6 +2529,46 @@ const SignalsPage: React.FC = () => {
                         <div>
                           <p className="text-xs font-medium text-muted-text">Catalyst</p>
                           <p className="mt-1 text-secondary-text">{currentHistoryItem.catalystScore ?? '--'}</p>
+                        </div>
+                      </div>
+                    </div>
+                  ) : isMonthlySlowRiseSignalType(signalType) ? (
+                    <div className="rounded-2xl border border-border/60 bg-card/40 p-4">
+                      <p className="text-xs text-muted-text">月线慢牛结构</p>
+                      <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                        <div>
+                          <p className="text-xs font-medium text-muted-text">Profile</p>
+                          <p className="mt-1 text-secondary-text">{currentHistoryItem.profileLabel || currentHistoryItem.profileName || '--'}</p>
+                        </div>
+                        <div>
+                          <p className="text-xs font-medium text-muted-text">Latest Month</p>
+                          <p className="mt-1 text-secondary-text">{currentHistoryItem.monthlyLatestMonth || '--'}</p>
+                        </div>
+                        <div>
+                          <p className="text-xs font-medium text-muted-text">Positive Ratio</p>
+                          <p className="mt-1 text-secondary-text">{formatRatioPct(currentHistoryItem.monthlyPositiveRatio)}</p>
+                        </div>
+                        <div>
+                          <p className="text-xs font-medium text-muted-text">Higher Low Ratio</p>
+                          <p className="mt-1 text-secondary-text">{formatRatioPct(currentHistoryItem.monthlyHigherLowRatio)}</p>
+                        </div>
+                        <div>
+                          <p className="text-xs font-medium text-muted-text">Total Return</p>
+                          <p className="mt-1 text-secondary-text">{formatPct(currentHistoryItem.monthlyTotalReturnPct)}</p>
+                        </div>
+                        <div>
+                          <p className="text-xs font-medium text-muted-text">Max Single Month Gain</p>
+                          <p className="mt-1 text-secondary-text">{formatPct(currentHistoryItem.monthlyMaxSingleGainPct)}</p>
+                        </div>
+                        <div>
+                          <p className="text-xs font-medium text-muted-text">Worst Drawdown</p>
+                          <p className="mt-1 text-secondary-text">{formatPct(currentHistoryItem.monthlyWorstDrawdownPct)}</p>
+                        </div>
+                        <div>
+                          <p className="text-xs font-medium text-muted-text">MA6 / MA12</p>
+                          <p className="mt-1 text-secondary-text">
+                            {formatPrice(currentHistoryItem.monthlyMaShort)} / {formatPrice(currentHistoryItem.monthlyMaLong)}
+                          </p>
                         </div>
                       </div>
                     </div>
@@ -1858,6 +2638,17 @@ const SignalsPage: React.FC = () => {
                           <div className="flex items-center gap-2">
                             {isBoardRecognizabilitySignalType(signalType) && item.boardRank != null ? (
                               <Badge variant="history">#{item.boardRank}</Badge>
+                            ) : null}
+                            {isMonthlySlowRiseSignalType(signalType) && item.profileLabel ? (
+                              <Badge variant="history">{item.profileLabel}</Badge>
+                            ) : null}
+                            {isEarningsSignalType(signalType) && item.earningsStrategyGateStatus ? (
+                              <Badge variant={item.earningsStrategyGateStatus.startsWith('passed') ? 'success' : 'danger'}>
+                                {item.earningsStrategyGateStatus}
+                              </Badge>
+                            ) : null}
+                            {isEarningsSignalType(signalType) && item.earningsStrategyScore != null ? (
+                              <Badge variant="history">{formatPrice(item.earningsStrategyScore)}</Badge>
                             ) : null}
                             {item.themeLabel ? <Badge variant="history">{item.themeLabel}</Badge> : null}
                           </div>

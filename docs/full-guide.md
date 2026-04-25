@@ -312,12 +312,16 @@ daily_stock_analysis/
 >   - `fundamental_context.belong_boards` = 个股关联板块列表（当前仅 A 股写入；无数据时为 `[]`）；
 >   - `fundamental_context.boards.data` = `sector_rankings`（板块涨跌榜，结构 `{top, bottom}`）；
 >   - `fundamental_context.earnings.data.financial_report` = 财报摘要（报告期、营收、归母净利润、经营现金流、ROE）；
+>   - `fundamental_context.earnings.data.financial_report_series` = 近几期标准化财报序列（报告期、营收/利润同比、ROE、毛利率、经营现金流等），供连续性判断复用；
 >   - `fundamental_context.earnings.data.dividend` = 分红指标（仅现金分红税前口径，含 `events`、`ttm_cash_dividend_per_share`、`ttm_dividend_yield_pct`）；
+>   - `fundamental_context.earnings_quality.data` = 业绩质量评分块（`score_total`、`verdict`、`quarterly_continuity_score`、`quarterly_evidence`、`metrics`、`positive_signals`、`risk_flags`、`limitations`）；
 >   - `get_stock_info.belong_boards` = 个股所属板块列表；
 >   - `get_stock_info.boards` 为兼容别名，值与 `belong_boards` 相同（未来仅在大版本考虑移除）；
 >   - `get_stock_info.sector_rankings` 与 `fundamental_context.boards.data` 保持一致。
+>   - `AnalysisReport.details.earnings_quality` = 历史/API 详情里可直接读取的结构化业绩质量结果。
 >   - `AnalysisReport.details.belong_boards` = 结构化报告详情中的关联板块列表；
 >   - `AnalysisReport.details.sector_rankings` = 结构化报告详情中的板块涨跌榜（用于前端板块联动展示）。
+> - `earnings_quality` 现已优先基于多季度财报序列判断“连续改善/连续为正/走弱”，若财报序列缺失或样本过短，会在 `limitations` 中显式标注退化原因。
 > - 板块涨跌榜使用数据源顺序：与全局 priority 一致。
 > - 超时控制为 `best-effort` 软超时：阶段会按预算快速降级继续执行，但不保证硬中断底层三方调用。
 > - `FUNDAMENTAL_STAGE_TIMEOUT_SECONDS=1.5` 表示新增基本面阶段的目标预算，不是严格硬 SLA。

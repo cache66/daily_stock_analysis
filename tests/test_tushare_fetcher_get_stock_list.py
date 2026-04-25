@@ -14,9 +14,13 @@ Run (repo root):
 
 import importlib.util
 import os
+from datetime import datetime
+from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
+from zoneinfo import ZoneInfo
 
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _PROJECT_ROOT not in sys.path:
@@ -58,6 +62,8 @@ class TestTushareFetcherGetStockList(unittest.TestCase):
             fetcher = TushareFetcher()
         fetcher._api = MagicMock()
         fetcher.priority = 2
+        fetcher._test_cache_dir = Path(tempfile.mkdtemp())
+        fetcher._get_reference_cache_dir = lambda: fetcher._test_cache_dir
         return fetcher
 
     def test_get_stock_list_a_share_only(self) -> None:
@@ -97,6 +103,137 @@ class TestTushareFetcherGetStockList(unittest.TestCase):
             df = fetcher.get_stock_list()
 
         self.assertIsNone(df)
+
+    def test_get_stock_list_prefers_fresh_local_cache(self) -> None:
+        fetcher = self._make_fetcher()
+
+        cache_path = fetcher._test_cache_dir / "tushare_stock_basic_list.csv"
+        os.makedirs(fetcher._test_cache_dir, exist_ok=True)
+        pd.DataFrame(
+                {
+                    "ts_code": ["600519.SH", "000001.SZ"],
+                    "code": ["600519", "000001"],
+                    "name": ["贵州茅台", "平安银行"],
+                    "industry": ["白酒", "银行"],
+                    "area": ["贵州", "深圳"],
+                    "market": ["主板", "主板"],
+                }
+        ).to_csv(cache_path, index=False, encoding="utf-8-sig")
+
+        df = fetcher.get_stock_list()
+
+        self.assertIsNotNone(df)
+        assert df is not None
+        self.assertEqual(df["code"].tolist(), ["600519", "000001"])
+        self.assertEqual(fetcher._stock_name_cache.get("600519"), "贵州茅台")
+        fetcher._api.stock_basic.assert_not_called()
+
+    def test_get_stock_list_falls_back_to_stale_cache_when_api_unavailable(self) -> None:
+        fetcher = self._make_fetcher()
+        fetcher._api.stock_basic.side_effect = Exception("quota exceeded")
+
+        cache_path = fetcher._test_cache_dir / "tushare_stock_basic_list.csv"
+        os.makedirs(fetcher._test_cache_dir, exist_ok=True)
+        pd.DataFrame(
+                {
+                    "ts_code": ["600519.SH"],
+                    "code": ["600519"],
+                    "name": ["贵州茅台"],
+                    "industry": ["白酒"],
+                    "area": ["贵州"],
+                    "market": ["主板"],
+                }
+        ).to_csv(cache_path, index=False, encoding="utf-8-sig")
+        stale_ts = os.path.getmtime(cache_path) - 9 * 24 * 3600
+        os.utime(cache_path, (stale_ts, stale_ts))
+
+        with patch.object(fetcher, "_check_rate_limit"):
+            df = fetcher.get_stock_list()
+
+        self.assertIsNotNone(df)
+        assert df is not None
+        self.assertEqual(df.iloc[0]["name"], "贵州茅台")
+        fetcher._api.stock_basic.assert_called_once()
+
+
+class TestTushareFetcherTradeCalendarCache(unittest.TestCase):
+    @staticmethod
+    def _make_fetcher() -> TushareFetcher:
+        with patch.object(TushareFetcher, "_init_api", return_value=None):
+            fetcher = TushareFetcher()
+        fetcher._api = MagicMock()
+        fetcher.priority = 2
+        fetcher._test_cache_dir = Path(tempfile.mkdtemp())
+        fetcher._get_reference_cache_dir = lambda: fetcher._test_cache_dir
+        return fetcher
+
+    @staticmethod
+    def _china_now() -> datetime:
+        return datetime(2026, 4, 19, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    @staticmethod
+    def _trade_calendar_frame() -> pd.DataFrame:
+        dates = pd.date_range("2026-03-30", "2026-04-19", freq="D").strftime("%Y%m%d")
+        return pd.DataFrame(
+            {
+                "exchange": ["SSE"] * len(dates),
+                "cal_date": list(dates),
+                "is_open": ["1"] * len(dates),
+            }
+        )
+
+    def test_get_trade_dates_prefers_fresh_local_cache(self) -> None:
+        fetcher = self._make_fetcher()
+        cache_path = fetcher._test_cache_dir / "tushare_trade_cal_sse.csv"
+        os.makedirs(fetcher._test_cache_dir, exist_ok=True)
+        self._trade_calendar_frame().to_csv(cache_path, index=False, encoding="utf-8-sig")
+
+        with patch.object(fetcher, "_get_china_now", return_value=self._china_now()):
+            trade_dates = fetcher._get_trade_dates("20260419")
+
+        self.assertEqual(trade_dates[0], "20260419")
+        self.assertEqual(trade_dates[-1], "20260330")
+        fetcher._api.trade_cal.assert_not_called()
+
+    def test_get_trade_dates_falls_back_to_stale_cache_when_api_fails(self) -> None:
+        fetcher = self._make_fetcher()
+        cache_path = fetcher._test_cache_dir / "tushare_trade_cal_sse.csv"
+        os.makedirs(fetcher._test_cache_dir, exist_ok=True)
+        self._trade_calendar_frame().to_csv(cache_path, index=False, encoding="utf-8-sig")
+        stale_ts = os.path.getmtime(cache_path) - 3 * 24 * 3600
+        os.utime(cache_path, (stale_ts, stale_ts))
+
+        with patch.object(fetcher, "_get_china_now", return_value=self._china_now()):
+            with patch.object(fetcher, "_call_api_with_rate_limit", side_effect=Exception("quota exceeded")) as api_mock:
+                trade_dates = fetcher._get_trade_dates("20260419")
+
+        self.assertEqual(trade_dates[0], "20260419")
+        self.assertEqual(trade_dates[-1], "20260330")
+        api_mock.assert_called_once_with(
+            "trade_cal",
+            exchange="SSE",
+            start_date="20260330",
+            end_date="20260419",
+        )
+
+    def test_get_trade_dates_falls_back_to_weekdays_when_api_denied_without_cache(self) -> None:
+        fetcher = self._make_fetcher()
+        cache_path = fetcher._test_cache_dir / "tushare_trade_cal_sse.csv"
+
+        with patch.object(fetcher, "_get_china_now", return_value=self._china_now()):
+            with patch.object(fetcher, "_call_api_with_rate_limit", side_effect=Exception("没有接口访问权限")) as api_mock:
+                trade_dates = fetcher._get_trade_dates("20260419")
+
+        self.assertTrue(trade_dates)
+        self.assertEqual(trade_dates[0], "20260417")
+        self.assertEqual(trade_dates[-1], "20260330")
+        self.assertTrue(cache_path.exists())
+        api_mock.assert_called_once_with(
+            "trade_cal",
+            exchange="SSE",
+            start_date="20260330",
+            end_date="20260419",
+        )
 
 
 class TestTushareFetcherFetchRawData(unittest.TestCase):

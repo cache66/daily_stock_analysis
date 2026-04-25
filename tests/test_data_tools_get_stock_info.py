@@ -22,6 +22,7 @@ class _DummyManager:
                 "valuation": "ok",
                 "growth": "not_supported",
                 "earnings": "not_supported",
+                "earnings_quality": "ok",
                 "institution": "not_supported",
                 "capital_flow": "not_supported",
                 "dragon_tiger": "not_supported",
@@ -38,6 +39,7 @@ class _DummyManager:
             },
             "growth": {"status": "not_supported", "data": {}},
             "earnings": {"status": "not_supported", "data": {}},
+            "earnings_quality": {"status": "ok", "data": {"verdict": "good", "score_total": 72}},
             "institution": {"status": "not_supported", "data": {}},
             "capital_flow": {"status": "not_supported", "data": {}},
             "dragon_tiger": {"status": "not_supported", "data": {}},
@@ -85,6 +87,7 @@ class TestGetStockInfoContract(unittest.TestCase):
             result["fundamental_context"]["boards"]["data"],
             result["sector_rankings"],
         )
+        self.assertEqual(result["fundamental_context"]["earnings_quality"]["data"]["verdict"], "good")
 
 
 if __name__ == "__main__":

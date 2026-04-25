@@ -157,6 +157,56 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
         self.assertTrue(config.board_theme_core_snapshot_enabled)
         self.assertIn("CPO", config.board_theme_core_snapshot_targets_json)
 
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_trend_leader_snapshot_flags_load_from_env(
+        self,
+        _mock_parse_yaml,
+        _mock_setup_env,
+    ) -> None:
+        env = {
+            "TREND_LEADER_UNIFIED_SNAPSHOT_ENABLED": "true",
+            "TREND_LEADER_UNIFIED_SNAPSHOT_LIMIT": "120",
+        }
+
+        with patch.object(
+            Config,
+            "_get_env_file_value",
+            side_effect=lambda key: {
+                "TREND_LEADER_UNIFIED_SNAPSHOT_ENABLED": "false",
+                "TREND_LEADER_UNIFIED_SNAPSHOT_LIMIT": "0",
+            }.get(key),
+        ), patch.dict(os.environ, env, clear=True):
+            config = Config._load_from_env()
+
+        self.assertTrue(config.trend_leader_unified_snapshot_enabled)
+        self.assertEqual(config.trend_leader_unified_snapshot_limit, 120)
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_earnings_observation_snapshot_flags_load_from_env(
+        self,
+        _mock_parse_yaml,
+        _mock_setup_env,
+    ) -> None:
+        env = {
+            "EARNINGS_OBSERVATION_SNAPSHOT_ENABLED": "true",
+            "EARNINGS_OBSERVATION_MAX_OBSERVATION_DAYS": "210",
+        }
+
+        with patch.object(
+            Config,
+            "_get_env_file_value",
+            side_effect=lambda key: {
+                "EARNINGS_OBSERVATION_SNAPSHOT_ENABLED": "false",
+                "EARNINGS_OBSERVATION_MAX_OBSERVATION_DAYS": "240",
+            }.get(key),
+        ), patch.dict(os.environ, env, clear=True):
+            config = Config._load_from_env()
+
+        self.assertTrue(config.earnings_observation_snapshot_enabled)
+        self.assertEqual(config.earnings_observation_max_observation_days, 210)
+
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])
     def test_blank_schedule_time_falls_back_to_default(
         self,
@@ -436,6 +486,29 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
         stocks, emails = config.stock_email_groups[0]
         self.assertEqual(stocks, ["600519", "HK01810"])
         self.assertEqual(emails, ["user@example.com"])
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_load_from_env_reads_history_disk_cache_settings(
+        self,
+        _mock_parse_yaml,
+        _mock_setup_env,
+    ) -> None:
+        env = {
+            "STOCK_LIST": "600519",
+            "HISTORY_DISK_CACHE_ENABLED": "false",
+            "HISTORY_DISK_CACHE_DIR": "./tmp/history-cache",
+            "HISTORY_DISK_CACHE_TTL_SECONDS": "123",
+            "HISTORY_DISK_CACHE_OVERLAP_DAYS": "7",
+        }
+
+        with patch.dict(os.environ, env, clear=True):
+            config = Config._load_from_env()
+
+        self.assertFalse(config.history_disk_cache_enabled)
+        self.assertEqual(config.history_disk_cache_dir, "./tmp/history-cache")
+        self.assertEqual(config.history_disk_cache_ttl_seconds, 123)
+        self.assertEqual(config.history_disk_cache_overlap_days, 7)
 
 
 if __name__ == "__main__":

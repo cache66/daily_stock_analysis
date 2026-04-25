@@ -306,7 +306,14 @@ class AnalysisApiContractTestCase(unittest.TestCase):
                                 "financial_report": {"report_date": "2025-12-31", "revenue": 1000},
                                 "dividend": {"ttm_dividend_yield_pct": 2.5},
                             }
-                        }
+                        },
+                        "earnings_quality": {
+                            "data": {
+                                "verdict": "good",
+                                "score_total": 72,
+                                "cycle_analysis": {"phase": "reaccelerating", "confidence": "high"},
+                            }
+                        },
                     }
                 }
             },
@@ -315,6 +322,8 @@ class AnalysisApiContractTestCase(unittest.TestCase):
 
         self.assertEqual(report.details.financial_report["report_date"], "2025-12-31")
         self.assertEqual(report.details.dividend_metrics["ttm_dividend_yield_pct"], 2.5)
+        self.assertEqual(report.details.earnings_quality["verdict"], "good")
+        self.assertEqual(report.details.earnings_quality["cycle_analysis"]["phase"], "reaccelerating")
 
     def test_build_analysis_report_extracts_related_board_fields_from_snapshot(self) -> None:
         if _build_analysis_report is None:
@@ -463,7 +472,8 @@ class AnalysisApiContractTestCase(unittest.TestCase):
                     "financial_report": {"report_date": "2025-12-31"},
                     "dividend": {"ttm_dividend_yield_pct": 2.1},
                 }
-            }
+            },
+            "earnings_quality": {"data": {"verdict": "mixed", "score_total": 55}},
         }
         mock_db.get_latest_fundamental_snapshot.return_value = fallback_payload
 

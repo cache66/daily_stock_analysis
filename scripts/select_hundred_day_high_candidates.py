@@ -12,6 +12,7 @@ history for the same signal type.
 from __future__ import annotations
 
 import argparse
+import copy
 from dataclasses import asdict
 import json
 import logging
@@ -26,6 +27,16 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from data_provider.fundamental_adapter import AkshareFundamentalAdapter
+from scripts.select_earnings_surprise_candidates import (
+    FULL_FUNDAMENTAL_BLOCKS,
+    DEFAULT_STRATEGY_PROFILE as DEFAULT_EARNINGS_STRATEGY_PROFILE,
+    EarningsSurpriseCriteria,
+    SIGNAL_TYPE as EARNINGS_SIGNAL_TYPE,
+    evaluate_earnings_surprise_candidate,
+    get_strategy_profile_preset,
+    load_or_fetch_signal_fundamental_snapshot,
+)
 from src.services.kline_selector_service import (
     KlineSelectionEvaluation,
     KlineSelectorCriteria,
@@ -33,6 +44,7 @@ from src.services.kline_selector_service import (
     KlineSelectorRunResult,
     KlineSelectorService,
 )
+from src.services.shared_signal_factors_service import SharedSignalFactorsService
 from src.services.signal_cause_analysis_service import SignalCauseAnalysisService
 from src.storage import DatabaseManager
 
@@ -42,9 +54,73 @@ logger = logging.getLogger("hundred_day_high_selector")
 SIGNAL_TYPE = "hundred_day_high"
 DEFAULT_HISTORY_LOOKBACK_DAYS = 180
 DEFAULT_PROFILE_NAME = "breakout_balanced"
+EARNINGS_BALANCED_PROFILE_NAME = "breakout_balanced_with_earnings"
+EARNINGS_BALANCED_SIGNAL_TYPE = "hundred_day_high__earnings_balanced"
+EARNINGS_METRIC_KEYS: List[str] = [
+    "revenue_yoy",
+    "net_profit_yoy",
+    "roe",
+    "earnings_strategy_score",
+    "earnings_strategy_label",
+    "earnings_strategy_gate_status",
+    "earnings_quality_signal",
+    "earnings_quality_score",
+    "earnings_quality_verdict",
+    "earnings_quality_cycle_phase",
+    "earnings_quality_quarterly_trend",
+    "earnings_quality_dual_positive_streak",
+    "earnings_reason_summary",
+]
+BREAKOUT_QUALITY_METRIC_KEYS: List[str] = [
+    "breakout_quality_score",
+    "breakout_contraction_ratio",
+    "breakout_volume_ratio",
+    "distance_to_new_high_pct",
+    "minervini_template_score",
+    "minervini_template_passed",
+    "breakout_follow_through_score",
+]
+INDUSTRY_STRENGTH_METRIC_KEYS: List[str] = [
+    "industry_strength_score",
+    "industry_strength_confirmed",
+    "industry_strength_label",
+    "industry_strength_board_names",
+    "industry_strength_confirmation_hint",
+]
+QUALITY_OVERLAY_METRIC_KEYS: List[str] = [
+    "earnings_continuity_available",
+    "earnings_continuity_score",
+    "quality_overlay_available",
+    "quality_overlay_score",
+    "quality_overlay_label",
+    "quality_overlay_source",
+    "earnings_revenue_positive_quarter_streak",
+    "earnings_profit_positive_quarter_streak",
+    "earnings_roe_positive_quarter_streak",
+    "earnings_financial_series_continuity_score",
+    "earnings_financial_series_quarter_count",
+]
 
-PROFILE_PRESETS: Dict[str, Dict[str, Dict[str, Any]]] = {
+PROFILE_PRESETS: Dict[str, Dict[str, Any]] = {
     "breakout_balanced": {
+        "criteria": {
+            "lookback_days": 8,
+            "min_up_ratio": 0.625,
+            "limit_up_lookback_days": 8,
+            "new_high_window": 100,
+            "require_up_day_ratio": True,
+            "require_recent_limit_up": False,
+            "require_new_high": True,
+            "max_total_market_cap": 400.0 * 1e8,
+        },
+        "prefilter": {
+            "min_change_pct_60d": 12.0,
+            "min_turnover_rate": 0.8,
+            "require_positive_change": True,
+            "exclude_st": True,
+        },
+    },
+    EARNINGS_BALANCED_PROFILE_NAME: {
         "criteria": {
             "lookback_days": 8,
             "min_up_ratio": 0.625,
@@ -116,6 +192,181 @@ def resolve_checkpoint_path(checkpoint_path: Path, shard_count: int, shard_index
         return checkpoint_path
     suffix = _shard_suffix(shard_count, shard_index)
     return checkpoint_path.with_name(f"{checkpoint_path.stem}.{suffix}{checkpoint_path.suffix}")
+
+
+def profile_requires_earnings_confirmation(profile_name: str) -> bool:
+    return str(profile_name or "").strip() == EARNINGS_BALANCED_PROFILE_NAME
+
+
+def resolve_runtime_signal_type(*, signal_type: str, profile_name: str) -> str:
+    normalized_signal_type = str(signal_type or SIGNAL_TYPE).strip() or SIGNAL_TYPE
+    if normalized_signal_type != SIGNAL_TYPE:
+        return normalized_signal_type
+    if profile_requires_earnings_confirmation(profile_name):
+        return EARNINGS_BALANCED_SIGNAL_TYPE
+    return SIGNAL_TYPE
+
+
+def _build_balanced_earnings_criteria() -> EarningsSurpriseCriteria:
+    preset = get_strategy_profile_preset(DEFAULT_EARNINGS_STRATEGY_PROFILE)
+    return EarningsSurpriseCriteria(
+        strategy_profile=preset["name"],
+        min_revenue_yoy=preset["min_revenue_yoy"],
+        min_net_profit_yoy=preset["min_net_profit_yoy"],
+        min_roe=preset["min_roe"],
+        require_positive_text=bool(preset["require_positive_text"]),
+        require_growth_thresholds=bool(preset["require_growth_thresholds"]),
+        strategy_direct_pass_score=float(preset["strategy_direct_pass_score"]),
+        strategy_watch_pass_score=float(preset["strategy_watch_pass_score"]),
+        require_quality_confirmation_for_watch=bool(preset.get("require_quality_confirmation_for_watch", True)),
+        max_total_market_cap=None,
+        dedupe_by_event_key=False,
+    )
+
+
+def _extract_earnings_metrics(metrics: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    source = metrics or {}
+    extracted = {key: source.get(key) for key in EARNINGS_METRIC_KEYS if key in source}
+    for key in QUALITY_OVERLAY_METRIC_KEYS:
+        if key in source:
+            extracted[key] = source.get(key)
+    if source.get("reason_summary") is not None:
+        extracted["earnings_reason_summary"] = source.get("reason_summary")
+    return extracted
+
+
+def _normalize_earnings_evaluation_result(result: Any) -> Dict[str, Any]:
+    if isinstance(result, dict):
+        return {
+            "passed": bool(result.get("passed", False)),
+            "failure_reason": str(result.get("failure_reason", "") or ""),
+            "metrics": dict(result.get("metrics") or {}),
+        }
+    return {
+        "passed": bool(getattr(result, "passed", False)),
+        "failure_reason": str(getattr(result, "failure_reason", "") or ""),
+        "metrics": dict(getattr(result, "metrics", {}) or {}),
+    }
+
+
+def _evaluate_selected_candidate_with_balanced_earnings(
+    evaluation: KlineSelectionEvaluation,
+    *,
+    snapshot_date: date,
+    db: DatabaseManager,
+    adapter: Optional[AkshareFundamentalAdapter] = None,
+) -> Dict[str, Any]:
+    resolved_adapter = adapter or AkshareFundamentalAdapter()
+    latest_price = (evaluation.metrics or {}).get("close")
+    payload = load_or_fetch_signal_fundamental_snapshot(
+        db=db,
+        cache_signal_type=EARNINGS_SIGNAL_TYPE,
+        snapshot_date=snapshot_date,
+        stock_code=evaluation.stock_code,
+        stock_name=evaluation.stock_name,
+        total_market_cap=evaluation.total_market_cap,
+        latest_price=latest_price,
+        adapter=resolved_adapter,
+        recent_event_payload=None,
+        scan_depth="high",
+        required_blocks=FULL_FUNDAMENTAL_BLOCKS,
+    )
+    bundle_payload = dict(payload.get("bundle_payload") or {})
+    earnings_evaluation = evaluate_earnings_surprise_candidate(
+        stock_code=evaluation.stock_code,
+        stock_name=payload.get("stock_name") or evaluation.stock_name,
+        bundle_payload=bundle_payload,
+        criteria=_build_balanced_earnings_criteria(),
+        total_market_cap=evaluation.total_market_cap,
+        latest_price=latest_price,
+        snapshot_date=snapshot_date,
+        signal_type=EARNINGS_SIGNAL_TYPE,
+        db=None,
+    )
+    normalized_result = _normalize_earnings_evaluation_result(earnings_evaluation)
+    quality_overlay = SharedSignalFactorsService.build_quality_overlay_factors(bundle_payload)
+    merged_metrics = dict(normalized_result.get("metrics") or {})
+    for key in QUALITY_OVERLAY_METRIC_KEYS:
+        if key in quality_overlay:
+            merged_metrics[key] = quality_overlay.get(key)
+    normalized_result["metrics"] = merged_metrics
+    return normalized_result
+
+
+def filter_selected_results_by_earnings_balanced(
+    run_result: KlineSelectorRunResult,
+    *,
+    snapshot_date: date,
+    db: DatabaseManager,
+    earnings_evaluator: Optional[Any] = None,
+) -> KlineSelectorRunResult:
+    if not run_result.selected:
+        return run_result
+
+    retained: List[KlineSelectionEvaluation] = []
+    rejected: List[KlineSelectionEvaluation] = []
+    resolved_evaluator = earnings_evaluator or (
+        lambda evaluation, *, snapshot_date, db: _evaluate_selected_candidate_with_balanced_earnings(
+            evaluation,
+            snapshot_date=snapshot_date,
+            db=db,
+        )
+    )
+    for evaluation in run_result.selected:
+        try:
+            earnings_result = _normalize_earnings_evaluation_result(
+                resolved_evaluator(evaluation, snapshot_date=snapshot_date, db=db)
+            )
+        except Exception as exc:
+            logger.warning("earnings_filter_failed_evaluation code=%s err=%s", evaluation.stock_code, exc)
+            rejected.append(
+                KlineSelectionEvaluation(
+                    stock_code=evaluation.stock_code,
+                    stock_name=evaluation.stock_name,
+                    passed=False,
+                    history_source=evaluation.history_source,
+                    total_market_cap=evaluation.total_market_cap,
+                    failure_reason="earnings filter evaluation failed",
+                    metrics=dict(evaluation.metrics or {}),
+                    rule_results=copy.deepcopy(evaluation.rule_results),
+                )
+            )
+            continue
+
+        merged_metrics = dict(evaluation.metrics or {})
+        merged_metrics.update(_extract_earnings_metrics(earnings_result.get("metrics")))
+        if earnings_result.get("passed"):
+            evaluation.metrics = merged_metrics
+            retained.append(evaluation)
+            continue
+
+        rejected.append(
+            KlineSelectionEvaluation(
+                stock_code=evaluation.stock_code,
+                stock_name=evaluation.stock_name,
+                passed=False,
+                history_source=evaluation.history_source,
+                total_market_cap=evaluation.total_market_cap,
+                failure_reason=str(earnings_result.get("failure_reason") or "earnings filter rejected"),
+                metrics=merged_metrics,
+                rule_results=copy.deepcopy(evaluation.rule_results),
+            )
+        )
+
+    if not rejected and len(retained) == len(run_result.selected):
+        return run_result
+
+    return KlineSelectorRunResult(
+        criteria=run_result.criteria,
+        universe_size=run_result.universe_size,
+        evaluated_count=run_result.evaluated_count,
+        skipped_market_cap_count=run_result.skipped_market_cap_count,
+        skipped_prefilter_count=run_result.skipped_prefilter_count,
+        skipped_listed_days_count=getattr(run_result, "skipped_listed_days_count", 0),
+        universe_codes=list(run_result.universe_codes),
+        selected=retained,
+        failed=list(run_result.failed) + rejected,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -308,6 +559,17 @@ def parse_args() -> argparse.Namespace:
         help="禁用现货预过滤。",
     )
     parser.add_argument(
+        "--min-listed-days-prefilter",
+        type=int,
+        default=None,
+        help="现货预过滤：最低上市天数，默认与当前历史要求对齐。",
+    )
+    parser.add_argument(
+        "--disable-listed-days-prefilter",
+        action="store_true",
+        help="关闭上市天数快速短路。",
+    )
+    parser.add_argument(
         "--checkpoint-path",
         default=str(PROJECT_ROOT / "data" / "hundred_day_high_checkpoint.json"),
         help="checkpoint 路径；开启分片时会自动追加 shard 后缀。",
@@ -385,6 +647,13 @@ def resolve_profile_settings(args: argparse.Namespace) -> tuple[str, KlineSelect
 
     prefilter = None
     if not args.disable_spot_prefilter:
+        min_listed_days = None
+        if not bool(getattr(args, "disable_listed_days_prefilter", False)):
+            min_listed_days = (
+                int(args.min_listed_days_prefilter)
+                if getattr(args, "min_listed_days_prefilter", None) is not None
+                else criteria.history_days_required
+            )
         prefilter = KlineSelectorPrefilter(
             min_change_pct_60d=(
                 args.min_60d_change_pct_prefilter
@@ -406,18 +675,261 @@ def resolve_profile_settings(args: argparse.Namespace) -> tuple[str, KlineSelect
                 if args.exclude_st_prefilter is not None
                 else bool(prefilter_defaults["exclude_st"])
             ),
+            min_listed_days=min_listed_days,
         )
 
     return profile_name, criteria, prefilter
+
+
+def _rolling_ma_value(series: pd.Series, *, window: int, min_periods: int, offset: int = 0) -> Optional[float]:
+    if series is None or series.empty:
+        return None
+    rolling = series.rolling(window=window, min_periods=min_periods).mean()
+    target_index = -1 - max(0, int(offset))
+    if len(rolling) < abs(target_index):
+        return None
+    value = rolling.iloc[target_index]
+    if pd.isna(value):
+        return None
+    return float(value)
+
+
+def _compute_minervini_template_metrics(close: pd.Series, high: pd.Series, low: pd.Series) -> Dict[str, Any]:
+    latest_close = float(close.iloc[-1])
+    ma50 = _rolling_ma_value(close, window=50, min_periods=20)
+    ma150 = _rolling_ma_value(close, window=150, min_periods=60)
+    ma200 = _rolling_ma_value(close, window=200, min_periods=80)
+    ma200_prev_20 = _rolling_ma_value(close, window=200, min_periods=80, offset=20)
+
+    low_52w = float(low.tail(min(252, len(low))).min()) if not low.empty else None
+    high_52w = float(high.tail(min(252, len(high))).max()) if not high.empty else None
+    distance_to_52w_high_pct = (
+        ((high_52w - latest_close) / high_52w * 100.0)
+        if high_52w is not None and high_52w > 0
+        else None
+    )
+
+    score = 0.0
+    if ma50 is not None and latest_close > ma50:
+        score += 2.0
+    if ma50 is not None and ma150 is not None and ma50 > ma150:
+        score += 2.0
+    if ma150 is not None and ma200 is not None and ma150 > ma200:
+        score += 2.0
+    if ma200 is not None and ma200_prev_20 is not None and ma200 >= ma200_prev_20:
+        score += 2.0
+    if low_52w is not None and low_52w > 0 and latest_close >= low_52w * 1.25:
+        score += 1.0
+    if distance_to_52w_high_pct is not None and distance_to_52w_high_pct <= 25.0:
+        score += 1.0
+
+    minervini_score = round(min(10.0, score), 2)
+    return {
+        "minervini_template_score": minervini_score,
+        "minervini_template_passed": bool(minervini_score >= 6.0),
+    }
+
+
+def _compute_breakout_follow_through_score(close: pd.Series, *, breakout_high: Optional[float]) -> float:
+    if close is None or len(close) < 2:
+        return 0.0
+    latest_close = float(close.iloc[-1])
+    score = 0.0
+
+    prior_close = float(close.iloc[-2])
+    if prior_close > 0:
+        one_day_return_pct = (latest_close / prior_close - 1.0) * 100.0
+        if one_day_return_pct >= 0:
+            score += 1.5
+        if one_day_return_pct >= 1.0:
+            score += 0.5
+
+    if len(close) >= 4:
+        base_close = float(close.iloc[-4])
+        if base_close > 0:
+            three_day_return_pct = (latest_close / base_close - 1.0) * 100.0
+            if three_day_return_pct >= 1.0:
+                score += 2.0
+            if three_day_return_pct >= 2.0:
+                score += 1.0
+
+    if breakout_high is not None and breakout_high > 0 and latest_close >= breakout_high * 0.98:
+        score += 2.0
+
+    return round(min(6.0, max(0.0, score)), 2)
+
+
+def compute_breakout_quality_metrics(history: pd.DataFrame) -> Dict[str, Any]:
+    empty_payload = {
+        "breakout_quality_score": 0.0,
+        "breakout_contraction_ratio": None,
+        "breakout_volume_ratio": None,
+        "distance_to_new_high_pct": None,
+        "minervini_template_score": 0.0,
+        "minervini_template_passed": False,
+        "breakout_follow_through_score": 0.0,
+    }
+    if history is None or history.empty:
+        return empty_payload
+
+    numeric = history.copy()
+    for column in ("close", "high", "low"):
+        numeric[column] = pd.to_numeric(numeric[column], errors="coerce")
+    if "volume" in numeric.columns:
+        numeric["volume"] = pd.to_numeric(numeric["volume"], errors="coerce")
+    numeric = numeric.dropna(subset=["close", "high", "low"]).copy()
+    if numeric.empty:
+        return empty_payload
+
+    close = numeric["close"]
+    high = numeric["high"]
+    low = numeric["low"]
+    latest_close = float(close.iloc[-1])
+    high_window = float(high.tail(min(100, len(high))).max())
+    distance_to_new_high_pct = ((high_window - latest_close) / high_window * 100.0) if high_window > 0 else None
+
+    range_pct = ((high - low) / close.replace(0, pd.NA) * 100.0).fillna(0.0)
+    recent_range_pct = float(range_pct.tail(5).mean()) if len(range_pct) >= 5 else float(range_pct.mean() or 0.0)
+    prior_window = range_pct.iloc[-20:-5] if len(range_pct) >= 20 else range_pct.iloc[:-5]
+    prior_range_pct = float(prior_window.mean()) if not prior_window.empty else recent_range_pct
+    contraction_ratio = (recent_range_pct / prior_range_pct) if prior_range_pct and prior_range_pct > 0 else 1.0
+
+    volume_ratio = None
+    if "volume" in numeric.columns:
+        volume_series = pd.to_numeric(numeric["volume"], errors="coerce").dropna()
+        if len(volume_series) >= 6:
+            recent_volume = float(volume_series.iloc[-1])
+            prior_volume = float(volume_series.iloc[-6:-1].mean())
+            if prior_volume > 0:
+                volume_ratio = recent_volume / prior_volume
+
+    minervini_metrics = _compute_minervini_template_metrics(close, high, low)
+    follow_through_score = _compute_breakout_follow_through_score(close, breakout_high=high_window)
+
+    quality_score = 0.0
+    if distance_to_new_high_pct is not None and distance_to_new_high_pct <= 1.0:
+        quality_score += 4.0
+    if contraction_ratio <= 0.85:
+        quality_score += 4.0
+    if contraction_ratio <= 0.70:
+        quality_score += 2.0
+    if volume_ratio is not None and volume_ratio >= 1.2:
+        quality_score += 3.0
+    if volume_ratio is not None and volume_ratio >= 1.5:
+        quality_score += 3.0
+    if minervini_metrics["minervini_template_passed"]:
+        quality_score += 2.0
+    if follow_through_score >= 3.0:
+        quality_score += 2.0
+
+    payload = {
+        "breakout_quality_score": round(min(20.0, quality_score), 2),
+        "breakout_contraction_ratio": round(contraction_ratio, 4),
+        "breakout_volume_ratio": round(volume_ratio, 4) if volume_ratio is not None else None,
+        "distance_to_new_high_pct": round(distance_to_new_high_pct, 2) if distance_to_new_high_pct is not None else None,
+        "breakout_follow_through_score": follow_through_score,
+    }
+    payload.update(minervini_metrics)
+    return payload
+
+
+def _min_breakout_quality_score_for_profile(profile_name: str) -> float:
+    normalized = str(profile_name or DEFAULT_PROFILE_NAME).strip()
+    if normalized == "momentum_strict":
+        return 8.0
+    if normalized in {DEFAULT_PROFILE_NAME, EARNINGS_BALANCED_PROFILE_NAME}:
+        return 6.0
+    return 0.0
+
+
+def _enrich_run_result_with_breakout_quality(
+    run_result: KlineSelectorRunResult,
+    *,
+    service: KlineSelectorService,
+    profile_name: str,
+) -> KlineSelectorRunResult:
+    if not run_result.selected:
+        return run_result
+
+    quality_floor = _min_breakout_quality_score_for_profile(profile_name)
+    retained: List[KlineSelectionEvaluation] = []
+    rejected: List[KlineSelectionEvaluation] = []
+
+    for evaluation in run_result.selected:
+        quality_available = True
+        try:
+            history_df, _ = service.manager.get_daily_data(
+                evaluation.stock_code,
+                days=180,
+            )
+            prepared = KlineSelectorService._prepare_history(history_df)
+            breakout_metrics = compute_breakout_quality_metrics(prepared)
+        except Exception as exc:
+            logger.debug("breakout quality enrich failed for %s: %s", evaluation.stock_code, exc)
+            quality_available = False
+            breakout_metrics = {
+                "breakout_quality_score": 0.0,
+                "breakout_contraction_ratio": None,
+                "breakout_volume_ratio": None,
+                "distance_to_new_high_pct": None,
+                "minervini_template_score": 0.0,
+                "minervini_template_passed": False,
+                "breakout_follow_through_score": 0.0,
+            }
+
+        merged_metrics = dict(evaluation.metrics or {})
+        merged_metrics.update(breakout_metrics)
+        quality_score = float(merged_metrics.get("breakout_quality_score") or 0.0)
+        evaluation.metrics = merged_metrics
+        if (not quality_available) or quality_score >= quality_floor:
+            retained.append(evaluation)
+            continue
+
+        rejected.append(
+            KlineSelectionEvaluation(
+                stock_code=evaluation.stock_code,
+                stock_name=evaluation.stock_name,
+                passed=False,
+                history_source=evaluation.history_source,
+                total_market_cap=evaluation.total_market_cap,
+                failure_reason=f"breakout quality score {quality_score:.1f} < required {quality_floor:.1f}",
+                metrics=merged_metrics,
+                rule_results=copy.deepcopy(evaluation.rule_results),
+            )
+        )
+
+    if not rejected and len(retained) == len(run_result.selected):
+        return run_result
+
+    return KlineSelectorRunResult(
+        criteria=run_result.criteria,
+        universe_size=run_result.universe_size,
+        evaluated_count=run_result.evaluated_count,
+        skipped_market_cap_count=run_result.skipped_market_cap_count,
+        skipped_prefilter_count=run_result.skipped_prefilter_count,
+        skipped_listed_days_count=getattr(run_result, "skipped_listed_days_count", 0),
+        universe_codes=list(run_result.universe_codes),
+        selected=retained,
+        failed=list(run_result.failed) + rejected,
+    )
 
 
 def build_selected_dataframe(run_result: KlineSelectorRunResult) -> pd.DataFrame:
     """Convert selected results into a sorted dataframe for export/enrichment."""
     selected_df = pd.DataFrame([item.to_record() for item in run_result.selected])
     if not selected_df.empty:
+        metrics_by_code = {item.stock_code: dict(item.metrics or {}) for item in run_result.selected}
+        for key in EARNINGS_METRIC_KEYS:
+            selected_df[key] = selected_df["code"].map(lambda code: metrics_by_code.get(code, {}).get(key))
+        for key in QUALITY_OVERLAY_METRIC_KEYS:
+            selected_df[key] = selected_df["code"].map(lambda code: metrics_by_code.get(code, {}).get(key))
+        for key in BREAKOUT_QUALITY_METRIC_KEYS:
+            selected_df[key] = selected_df["code"].map(lambda code: metrics_by_code.get(code, {}).get(key))
+        for key in INDUSTRY_STRENGTH_METRIC_KEYS:
+            selected_df[key] = selected_df["code"].map(lambda code: metrics_by_code.get(code, {}).get(key))
         selected_df = selected_df.sort_values(
-            by=["latest_high", "total_market_cap_yi", "code"],
-            ascending=[False, True, True],
+            by=["breakout_quality_score", "latest_high", "total_market_cap_yi", "code"],
+            ascending=[False, False, True, True],
         ).reset_index(drop=True)
     return selected_df
 
@@ -429,7 +941,7 @@ def build_signal_metrics_payload(
 ) -> Dict[str, Any]:
     """Build a durable metrics payload for one selected signal hit."""
     metrics = evaluation.metrics or {}
-    return {
+    payload = {
         "signal_date": snapshot_date.isoformat(),
         "close": metrics.get("close"),
         "latest_high": metrics.get("latest_high"),
@@ -438,6 +950,17 @@ def build_signal_metrics_payload(
         "total_market_cap": evaluation.total_market_cap,
         "history_source": evaluation.history_source,
     }
+    for key in BREAKOUT_QUALITY_METRIC_KEYS:
+        if key in metrics:
+            payload[key] = metrics.get(key)
+    for key in QUALITY_OVERLAY_METRIC_KEYS:
+        if key in metrics:
+            payload[key] = metrics.get(key)
+    for key in INDUSTRY_STRENGTH_METRIC_KEYS:
+        if key in metrics:
+            payload[key] = metrics.get(key)
+    payload.update(_extract_earnings_metrics(metrics))
+    return payload
 
 
 def build_criteria_payload(
@@ -658,6 +1181,86 @@ def load_snapshot_run_result(
     )
 
 
+def _safe_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _normalize_board_names(raw_value: Any) -> List[str]:
+    if isinstance(raw_value, list):
+        names: List[str] = []
+        for item in raw_value:
+            if isinstance(item, dict):
+                name = _safe_text(item.get("name"))
+            else:
+                name = _safe_text(item)
+            if name and name not in names:
+                names.append(name)
+        return names[:5]
+    if isinstance(raw_value, str):
+        return [name for name in (_safe_text(raw_value),) if name]
+    return []
+
+
+def _split_theme_label_to_boards(theme_label: Any) -> List[str]:
+    label = _safe_text(theme_label)
+    if not label:
+        return []
+    normalized = label
+    for separator in ("、", ",", "|"):
+        normalized = normalized.replace(separator, "/")
+    parts = [part.strip() for part in normalized.split("/") if part.strip()]
+    boards: List[str] = []
+    for part in parts:
+        if part and part not in boards:
+            boards.append(part)
+    return boards[:5]
+
+
+def _build_industry_strength_metrics(
+    evaluation: KlineSelectionEvaluation,
+    cause_payload: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    metrics = dict(evaluation.metrics or {})
+    industry_label = _safe_text((cause_payload or {}).get("industry") or metrics.get("industry_strength_label"))
+    board_names = _normalize_board_names(metrics.get("industry_strength_board_names"))
+    if not board_names:
+        board_names = _split_theme_label_to_boards((cause_payload or {}).get("theme_label"))
+
+    peer_count: Optional[float] = None
+    raw_peer_count = metrics.get("industry_peer_count")
+    if raw_peer_count is not None:
+        try:
+            peer_count = float(raw_peer_count)
+        except (TypeError, ValueError):
+            peer_count = None
+    if peer_count is None and board_names:
+        peer_count = float(len(board_names))
+
+    board_payload = [{"name": name} for name in board_names]
+    signal_factors = SharedSignalFactorsService.build_industry_strength_factors(
+        {
+            "industry": industry_label or None,
+            "industry_peer_count": peer_count,
+            "belong_boards": board_payload,
+        },
+        contextual_payload={
+            "industry": industry_label or None,
+            "industry_peer_count": peer_count,
+            "belong_boards": board_payload,
+        },
+    )
+    result = {key: signal_factors.get(key) for key in INDUSTRY_STRENGTH_METRIC_KEYS}
+    if result.get("industry_strength_score") in (None, 0, 0.0) and industry_label and board_names:
+        result["industry_strength_score"] = float(len(board_names))
+    if not result.get("industry_strength_confirmed") and industry_label and board_names:
+        result["industry_strength_confirmed"] = True
+    if not result.get("industry_strength_label") and industry_label:
+        result["industry_strength_label"] = industry_label
+    if not result.get("industry_strength_board_names") and board_names:
+        result["industry_strength_board_names"] = board_names
+    return result
+
+
 def enrich_selected_results(
     run_result: KlineSelectorRunResult,
     *,
@@ -728,6 +1331,11 @@ def enrich_selected_results(
                     "fundamental_context": {},
                 }
 
+        industry_strength_metrics = _build_industry_strength_metrics(evaluation, cause_payload)
+        merged_metrics = dict(evaluation.metrics or {})
+        merged_metrics.update(industry_strength_metrics)
+        evaluation.metrics = merged_metrics
+
         if persist_snapshot:
             persist_selected_snapshot(
                 evaluation,
@@ -747,6 +1355,9 @@ def enrich_selected_results(
             "technical_logic": str((cause_payload or {}).get("technical_logic", "") or "").strip(),
             "cause_tags": ",".join((cause_payload or {}).get("cause_tags", []) or []),
             "theme_label": str((cause_payload or {}).get("theme_label", "") or "").strip(),
+            "industry_strength_confirmed": bool(industry_strength_metrics.get("industry_strength_confirmed")),
+            "industry_strength_score": industry_strength_metrics.get("industry_strength_score"),
+            "industry_strength_label": industry_strength_metrics.get("industry_strength_label"),
             "latest_previous_hit_date": history_payload.get("latest_previous_hit_date"),
             "previous_hit_count": history_payload.get("previous_hit_count", 0),
             "days_since_previous_hit": history_payload.get("days_since_previous_hit"),
@@ -760,6 +1371,9 @@ def enrich_selected_results(
         "technical_logic",
         "cause_tags",
         "theme_label",
+        "industry_strength_confirmed",
+        "industry_strength_score",
+        "industry_strength_label",
         "latest_previous_hit_date",
         "previous_hit_count",
         "days_since_previous_hit",
@@ -794,6 +1408,7 @@ def build_markdown_report(
         f"- 实际分析数: {run_result.evaluated_count}",
         f"- 因市值预过滤跳过: {run_result.skipped_market_cap_count}",
         f"- 因现货预过滤跳过: {run_result.skipped_prefilter_count}",
+        f"- 因上市天数短路跳过: {run_result.skipped_listed_days_count}",
         f"- 命中数量: {len(run_result.selected)}",
         "",
         "## 当前规则",
@@ -812,18 +1427,24 @@ def build_markdown_report(
         [
             "## 命中结果",
             "",
-            "| 代码 | 名称 | 行业 | 最新 high | 收盘 | 上涨原因 | 标签 | 海外主题 | 上次命中 | 历史次数 | 距上次(天) | 数据源 |",
-            "|------|------|------|----------:|-----:|----------|------|----------|----------|----------:|-----------:|--------|",
+            "| 代码 | 名称 | 行业 | 最新 high | 收盘 | 突破质量 | 行业强度 | 上涨原因 | 标签 | 海外主题 | 上次命中 | 历史次数 | 距上次(天) | 数据源 |",
+            "|------|------|------|----------:|-----:|----------:|----------:|----------|------|----------|----------|----------:|-----------:|--------|",
         ]
     )
     for row in selected_df.itertuples(index=False):
         lines.append(
-            "| {code} | {name} | {industry} | {latest_high} | {close} | {reason_summary} | {cause_tags} | {theme_label} | {latest_previous_hit_date} | {previous_hit_count} | {days_since_previous_hit} | {history_source} |".format(
+            "| {code} | {name} | {industry} | {latest_high} | {close} | {breakout_quality_score} | {industry_strength_score} | {reason_summary} | {cause_tags} | {theme_label} | {latest_previous_hit_date} | {previous_hit_count} | {days_since_previous_hit} | {history_source} |".format(
                 code=_markdown_cell(row.code),
                 name=_markdown_cell(row.name),
                 industry=_markdown_cell(getattr(row, "industry", "")),
                 latest_high=f"{float(row.latest_high):.2f}" if pd.notna(row.latest_high) else "-",
                 close=f"{float(row.close):.2f}" if pd.notna(row.close) else "-",
+                breakout_quality_score=f"{float(getattr(row, 'breakout_quality_score', 0.0)):.2f}"
+                if pd.notna(getattr(row, "breakout_quality_score", None))
+                else "-",
+                industry_strength_score=f"{float(getattr(row, 'industry_strength_score', 0.0)):.2f}"
+                if pd.notna(getattr(row, "industry_strength_score", None))
+                else "-",
                 reason_summary=_markdown_cell(getattr(row, "reason_summary", "")),
                 cause_tags=_markdown_cell(getattr(row, "cause_tags", "")),
                 theme_label=_markdown_cell(getattr(row, "theme_label", "")),
@@ -883,6 +1504,13 @@ def export_results(
         "latest_high",
         "window_high",
         "new_high_window",
+        "breakout_quality_score",
+        "breakout_contraction_ratio",
+        "breakout_volume_ratio",
+        "distance_to_new_high_pct",
+        "minervini_template_score",
+        "minervini_template_passed",
+        "breakout_follow_through_score",
         "history_source",
         "reason_summary",
         "industry_logic",
@@ -890,9 +1518,32 @@ def export_results(
         "technical_logic",
         "cause_tags",
         "theme_label",
+        "industry_strength_confirmed",
+        "industry_strength_score",
+        "industry_strength_label",
         "latest_previous_hit_date",
         "previous_hit_count",
         "days_since_previous_hit",
+        "revenue_yoy",
+        "net_profit_yoy",
+        "roe",
+        "earnings_strategy_score",
+        "earnings_strategy_gate_status",
+        "earnings_quality_signal",
+        "earnings_quality_score",
+        "earnings_quality_verdict",
+        "earnings_continuity_available",
+        "earnings_continuity_score",
+        "quality_overlay_available",
+        "quality_overlay_score",
+        "quality_overlay_label",
+        "quality_overlay_source",
+        "earnings_revenue_positive_quarter_streak",
+        "earnings_profit_positive_quarter_streak",
+        "earnings_roe_positive_quarter_streak",
+        "earnings_financial_series_continuity_score",
+        "earnings_financial_series_quarter_count",
+        "earnings_reason_summary",
         "failure_reason",
     ]
     for column in export_columns:
@@ -929,6 +1580,44 @@ def export_results(
         logger.info("已复制 checkpoint 到输出目录: %s", exported_checkpoint_path)
 
 
+def scan_hundred_day_high_candidates(
+    *,
+    criteria: KlineSelectorCriteria,
+    snapshot_date: date,
+    profile_name: str = DEFAULT_PROFILE_NAME,
+    limit: int | None = None,
+    max_workers: int = 1,
+    shard_count: int = 1,
+    shard_index: int = 0,
+    prefilter: KlineSelectorPrefilter | None = None,
+    checkpoint_path: Path | None = None,
+    checkpoint_every: int = 50,
+    resume: bool = False,
+    on_evaluation: Any = None,
+    service: KlineSelectorService | None = None,
+) -> KlineSelectorRunResult:
+    service = service or KlineSelectorService(manager_factory=KlineSelectorService.build_fast_a_share_manager)
+    universe = service.get_spot_enriched_a_share_universe(limit=limit, as_of_date=snapshot_date)
+    run_result = service.scan_market(
+        criteria=criteria,
+        max_workers=max_workers,
+        shard_count=shard_count,
+        shard_index=shard_index,
+        prefilter=prefilter,
+        checkpoint_path=checkpoint_path,
+        checkpoint_every=checkpoint_every,
+        resume=resume,
+        on_evaluation=on_evaluation,
+        universe=universe,
+        as_of_date=snapshot_date,
+    )
+    return _enrich_run_result_with_breakout_quality(
+        run_result,
+        service=service,
+        profile_name=profile_name,
+    )
+
+
 def main() -> int:
     args = parse_args()
     configure_logging(args.log_level)
@@ -949,8 +1638,11 @@ def main() -> int:
         logger.error("--skip-cause-analysis cannot be used together with --cause-analysis-only")
         return 2
 
-    runtime_signal_type = str(getattr(args, "signal_type", SIGNAL_TYPE) or SIGNAL_TYPE).strip() or SIGNAL_TYPE
     profile_name, criteria, prefilter = resolve_profile_settings(args)
+    runtime_signal_type = resolve_runtime_signal_type(
+        signal_type=str(getattr(args, "signal_type", SIGNAL_TYPE) or SIGNAL_TYPE).strip() or SIGNAL_TYPE,
+        profile_name=profile_name,
+    )
 
     service = KlineSelectorService(manager_factory=KlineSelectorService.build_fast_a_share_manager)
     criteria_payload = build_criteria_payload(
@@ -1043,6 +1735,8 @@ def main() -> int:
         completed: int,
         total_eligible: int,
     ) -> None:
+        if profile_requires_earnings_confirmation(profile_name):
+            return
         if args.skip_db_persist or not evaluation.passed or evaluation.stock_code in partial_persisted_codes:
             return
         persist_selected_snapshot(
@@ -1062,8 +1756,10 @@ def main() -> int:
                 completed,
                 total_eligible,
             )
-    run_result = service.scan_market(
+    run_result = scan_hundred_day_high_candidates(
         criteria=criteria,
+        snapshot_date=snapshot_date,
+        profile_name=profile_name,
         limit=args.limit,
         max_workers=args.max_workers,
         shard_count=args.shard_count,
@@ -1073,7 +1769,25 @@ def main() -> int:
         checkpoint_every=args.checkpoint_every,
         resume=args.resume,
         on_evaluation=handle_incremental_snapshot,
+        service=service,
     )
+    if profile_requires_earnings_confirmation(profile_name):
+        logger.info(
+            "百日新高业绩过滤: 开始按 balanced 业绩口径收口，pre_filter_selected=%s, snapshot_date=%s",
+            len(run_result.selected),
+            snapshot_date.isoformat(),
+        )
+        run_result = filter_selected_results_by_earnings_balanced(
+            run_result,
+            snapshot_date=snapshot_date,
+            db=db,
+        )
+        logger.info(
+            "百日新高业绩过滤完成: selected=%s, rejected=%s, snapshot_date=%s",
+            len(run_result.selected),
+            len(run_result.failed),
+            snapshot_date.isoformat(),
+        )
     if not args.skip_db_persist:
         logger.info(
             "百日新高阶段 1/2 完成: 开始补齐全部已命中快照，selected=%s, snapshot_date=%s",
@@ -1122,11 +1836,12 @@ def main() -> int:
 
     logger.info(
         "百日新高筛选完成: universe=%s, evaluated=%s, skipped_by_market_cap=%s, "
-        "skipped_by_prefilter=%s, selected=%s, snapshot_date=%s",
+        "skipped_by_prefilter=%s, skipped_by_listed_days=%s, selected=%s, snapshot_date=%s",
         run_result.universe_size,
         run_result.evaluated_count,
         run_result.skipped_market_cap_count,
         run_result.skipped_prefilter_count,
+        run_result.skipped_listed_days_count,
         len(run_result.selected),
         snapshot_date.isoformat(),
     )

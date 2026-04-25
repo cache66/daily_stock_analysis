@@ -327,7 +327,14 @@ class AnalysisHistoryTestCase(unittest.TestCase):
                         "financial_report": {"report_date": "2025-12-31", "revenue": 1000},
                         "dividend": {"ttm_dividend_yield_pct": 2.6, "ttm_cash_dividend_per_share": 1.3},
                     }
-                }
+                },
+                "earnings_quality": {
+                    "data": {
+                        "verdict": "good",
+                        "score_total": 74,
+                        "cycle_analysis": {"phase": "expanding", "confidence": "medium"},
+                    }
+                },
             },
         )
 
@@ -340,6 +347,8 @@ class AnalysisHistoryTestCase(unittest.TestCase):
         report = get_history_detail(str(record_id), db_manager=self.db)
         self.assertEqual(report.details.financial_report["report_date"], "2025-12-31")
         self.assertEqual(report.details.dividend_metrics["ttm_dividend_yield_pct"], 2.6)
+        self.assertEqual(report.details.earnings_quality["verdict"], "good")
+        self.assertEqual(report.details.earnings_quality["cycle_analysis"]["phase"], "expanding")
         self.assertEqual(report.details.belong_boards, [{"name": "白酒", "type": "行业"}])
         self.assertEqual(report.details.sector_rankings["top"][0]["name"], "白酒")
 
@@ -408,6 +417,7 @@ class AnalysisHistoryTestCase(unittest.TestCase):
         report = get_history_detail(str(record_id), db_manager=self.db)
         self.assertIsNone(report.details.financial_report)
         self.assertIsNone(report.details.dividend_metrics)
+        self.assertIsNone(report.details.earnings_quality)
         self.assertEqual(report.details.belong_boards, [])
         self.assertIsNone(report.details.sector_rankings)
 

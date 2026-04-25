@@ -1,0 +1,1652 @@
+# AI Modification Log
+
+## 2026-04-25 (local strategy docs rationalization: baseline + parameter clarity)
+
+- Scope: rewrite local strategy docs to remove stale narrative blocks and make current rules/parameters directly readable.
+- Why: existing local strategy docs mixed historical notes with current behavior, making it hard to answer “what is active now” and “which thresholds are actually used”.
+- Changes:
+  - Rewrote [`docs/LOCAL_STRATEGY_BASELINE.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_BASELINE.md):
+    - clarified default strategy layering (`trend_leader_unified` / `earnings_surprise` / `hundred_day_high` + `monthly_slow_rise` extension).
+    - added current daily defaults sourced from `config/local_strategy_profile.json`.
+    - added concise per-strategy condition/parameter sections and a cross-strategy parameter cheat sheet.
+  - Rewrote [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md):
+    - simplified to an actionable catalog (entry script, default signal type, default-daily role, linked doc).
+    - explicitly separated core / extension / observation / topic tooling.
+  - Rewrote strategy docs:
+    - [`docs/TREND_LEADER_UNIFIED_STRATEGY.md`](d:\bb\daily_stock_analysis\docs\TREND_LEADER_UNIFIED_STRATEGY.md)
+    - [`docs/EARNINGS_SURPRISE_TRACKING.md`](d:\bb\daily_stock_analysis\docs\EARNINGS_SURPRISE_TRACKING.md)
+    - [`docs/MONTHLY_SLOW_RISE_SCAN.md`](d:\bb\daily_stock_analysis\docs\MONTHLY_SLOW_RISE_SCAN.md)
+    - aligned all three with current script/service behavior, gate logic, and CLI defaults.
+  - Updated [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md) unreleased entries for this docs governance round.
+- Verification:
+  - Confirmed key defaults from `config/local_strategy_profile.json`.
+  - Confirmed current CLI parameters from:
+    - `python scripts/select_trend_leader_candidates.py --help`
+    - `python scripts/select_earnings_surprise_candidates.py --help`
+    - `python scripts/select_hundred_day_high_candidates.py --help`
+    - `python scripts/select_monthly_slow_rise_candidates.py --help`
+    - `python scripts/run_fast_review_bundle.py --help`
+- Notes:
+  - `README.md` not updated because this round only rationalizes local strategy documentation and does not change onboarding/deployment/entrypoint contracts.
+
+## 2026-04-25 (task-8 performance tuning follow-up: trading-day horizon + fill budget)
+
+- Scope: continue Task 8 performance hardening after 5-minute巡检暴露 `earnings_surprise` 长尾阻塞（bundle 串行下后续信号被排队）。
+- Why: existing horizon check used natural-day gap; for many recent snapshots this still triggered fill attempts on windows that were not reachable by trading days. Combined with no explicit fill budget, this caused long-running I/O-heavy tails.
+- Changes:
+  - Updated [`src/repositories/stock_repo.py`](d:\bb\daily_stock_analysis\src\repositories\stock_repo.py):
+    - Added `count_market_trading_days_between(start_date, end_date)` for market-level distinct trading-day counting.
+  - Updated [`scripts/evaluate_signal_snapshot_performance.py`](d:\bb\daily_stock_analysis\scripts\evaluate_signal_snapshot_performance.py):
+    - Horizon check now prefers trading-day elapsed count via `StockRepository` cache-backed counter, with natural-day fallback only when needed.
+    - Added `--fill-max-attempts` (default `200`, negative for unlimited).
+    - Added fill-budget enforcement in `_fill_once(...)`; once budget is exhausted, remaining rows skip fill directly.
+    - Added `fill_stats` (`fill_attempted_count`, `fill_max_attempts`) into JSON/Markdown report.
+  - Updated [`scripts/run_signal_performance_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_signal_performance_bundle.py):
+    - Added and forwarded `--fill-max-attempts` to per-signal evaluator command.
+  - Updated tests:
+    - [`tests/test_signal_snapshot_performance_report.py`](d:\bb\daily_stock_analysis\tests\test_signal_snapshot_performance_report.py)
+    - [`tests/test_signal_performance_bundle.py`](d:\bb\daily_stock_analysis\tests\test_signal_performance_bundle.py)
+    - Existing regressions still covered by:
+      - [`tests/test_tushare_fetcher_followups.py`](d:\bb\daily_stock_analysis\tests\test_tushare_fetcher_followups.py)
+      - [`tests/test_fetcher_market_prefix_inference.py`](d:\bb\daily_stock_analysis\tests\test_fetcher_market_prefix_inference.py)
+- Verification:
+  - `python -m py_compile src/repositories/stock_repo.py scripts/evaluate_signal_snapshot_performance.py scripts/run_signal_performance_bundle.py tests/test_signal_snapshot_performance_report.py tests/test_signal_performance_bundle.py`
+  - `python -m pytest tests/test_signal_snapshot_performance_report.py tests/test_signal_performance_bundle.py tests/test_tushare_fetcher_followups.py tests/test_fetcher_market_prefix_inference.py -q` (`21 passed`)
+  - Runtime probe:
+    - `python scripts/evaluate_signal_snapshot_performance.py --signal-type earnings_surprise --start-date 2026-04-01 --end-date 2026-04-24 --windows 1,3,5,10 --limit 50 --fill-missing-daily-data --fill-max-attempts 20 --output-json data/manual_runs/perf_fill_budget_probe/earnings_report.json --output-md data/manual_runs/perf_fill_budget_probe/earnings_report.md`
+    - completed in ~24s with `fill_stats={'fill_attempted_count': 0, 'fill_max_attempts': 20}`; non-completed rows were tagged as `insufficient_forward_horizon` instead of triggering fill.
+- Notes:
+  - `README.md` not updated because this round is evaluator/runtime performance tuning and CLI option extension for local strategy tooling; no onboarding/deployment path changed.
+
+## 2026-04-25 (task-8 1+2+3 evaluator/fetcher hardening)
+
+- Scope: close the remaining ordered items for Task 8 (`1+2+3`): fill-path throttling, `monthly_slow_rise completed=0` explainability, and repeated market-default warnings.
+- Why: `run_signal_performance_bundle` default fill still showed provider disconnect storms and long tail; `monthly_slow_rise` rows were hard to interpret when no forward bars were available; some valid A-share code segments still fell into “unknown market” warning paths.
+- Changes:
+  - Updated [`scripts/evaluate_signal_snapshot_performance.py`](d:\bb\daily_stock_analysis\scripts\evaluate_signal_snapshot_performance.py):
+    - Default missing-daily filler now uses a non-Tushare fetcher chain (`Efinance/Akshare/Baostock/Yfinance`) to reduce throttle/disconnect pressure in batch fill mode.
+    - Fill dedupe key changed to `(code, signal_date)` and each row now fills with `max_eval_window` once across all windows, avoiding per-window repeated fetch.
+    - Added forward-horizon precheck and explicit `insufficient_reason` tagging (`missing_forward_bars` vs `insufficient_forward_horizon`).
+    - Added `insufficient_reason_counts` to per-window summary for direct diagnosis.
+  - Updated market inference in [`data_provider/tushare_fetcher.py`](d:\bb\daily_stock_analysis\data_provider\tushare_fetcher.py), [`data_provider/baostock_fetcher.py`](d:\bb\daily_stock_analysis\data_provider\baostock_fetcher.py), [`data_provider/yfinance_fetcher.py`](d:\bb\daily_stock_analysis\data_provider\yfinance_fetcher.py):
+    - expanded A-share prefix mapping to `6/9 -> SH`, `0/1/2/3 -> SZ`, covering `001xxx` / `301xxx` / `605xxx` style codes.
+  - Added/updated tests:
+    - [`tests/test_signal_snapshot_performance_report.py`](d:\bb\daily_stock_analysis\tests\test_signal_snapshot_performance_report.py)
+    - [`tests/test_fetcher_market_prefix_inference.py`](d:\bb\daily_stock_analysis\tests\test_fetcher_market_prefix_inference.py)
+    - [`tests/test_tushare_fetcher_followups.py`](d:\bb\daily_stock_analysis\tests\test_tushare_fetcher_followups.py)
+  - Updated [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md), this log, and [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md) for traceability.
+- Verification:
+  - `python -m pytest tests/test_signal_snapshot_performance_report.py tests/test_tushare_fetcher_followups.py tests/test_fetcher_market_prefix_inference.py -q` (passed, `16 passed`)
+  - `python -m py_compile scripts/evaluate_signal_snapshot_performance.py data_provider/baostock_fetcher.py data_provider/tushare_fetcher.py data_provider/yfinance_fetcher.py tests/test_signal_snapshot_performance_report.py tests/test_tushare_fetcher_followups.py tests/test_fetcher_market_prefix_inference.py`
+  - `python scripts/run_signal_performance_bundle.py --signal-types monthly_slow_rise --start-date 2026-04-24 --end-date 2026-04-24 --windows 1,3,5 --fill-missing-daily-data --limit 10 --output-dir data/manual_runs/task8_perf_fill_probe_monthly --log-level INFO`
+    - completed and generated report with explicit reasons:
+      - `window=1`: `insufficient_reason_counts={'missing_forward_bars': 10}`
+      - `window=3/5`: `insufficient_reason_counts={'insufficient_forward_horizon': 10}`
+- Notes:
+  - `README.md` not updated because this round changes evaluator/fetcher internals and runtime diagnosis fields only; no new user entrypoint or deployment contract was introduced.
+
+## 2026-04-25 (task-8 final full rerun closure)
+
+- Scope: finish the remaining Task 8 closure gap by completing one full 6-signal re-measure run for the target window and writing final evidence.
+- Why: previous attempts with default missing-daily fill were either `completed=0` sample-status artifacts or long-running under provider throttle/remote disconnect conditions.
+- Changes:
+  - Updated [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md), this log, and [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md).
+  - Added a final full rerun record using the same signal/date/window scope with `--skip-fill-missing-daily-data` for stable completion under current provider limits.
+- Verification:
+  - `python scripts/run_signal_performance_bundle.py --signal-types trend_leader_unified,earnings_surprise,hundred_day_high,monthly_slow_rise,continuous_up_ratio,continuous_up_streak --start-date 2026-04-01 --end-date 2026-04-24 --windows 1,3,5,10 --skip-fill-missing-daily-data --output-dir data/manual_runs/task8_remeasure_nofill --log-level INFO`
+    - succeeded; summary path: `data/manual_runs/task8_remeasure_nofill/2026-04-01_to_2026-04-24/signal_performance_bundle_summary.md`.
+    - key completed counts by window (`1/3/5/10`):
+      - `trend_leader_unified`: `62/20/0/0`
+      - `earnings_surprise`: `218/137/0/0`
+      - `hundred_day_high`: `731/266/155/136`
+      - `monthly_slow_rise`: `0/0/0/0`
+      - `continuous_up_ratio`: `863/276/0/0`
+      - `continuous_up_streak`: `534/173/0/0`
+  - `python scripts/run_fast_review_bundle.py --snapshot-date 2026-04-24 --limit 200`
+    - succeeded; core daily counts: `earnings=2`, `hundred_day_high=5`, `trend_leader=2`, `skipped_signals_count=0`.
+- Notes:
+  - `README.md` not updated because this round is re-measure evidence closure and governance trace update only.
+
+## 2026-04-25 (task-8 re-measure clarification and coverage probe)
+
+- Scope: continue ordered Task 8 closure by re-checking runtime evidence consistency and sample-coverage interpretation.
+- Why: the latest docs had one fast-review count mismatch, and `signal_performance_bundle` results remained `completed=0`, which needed explicit explanation to avoid being misread as evaluator failure.
+- Changes:
+  - Updated [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md) and this log:
+    - Corrected default daily core smoke counts to match latest artifact: `earnings=2`, `hundred_day_high=5`, `trend_leader=2`, `skipped_signals_count=0`.
+    - Added coverage interpretation note: with `end_date=2026-04-24` and forward windows `1/3/5/10`, many samples near the window end naturally lack complete forward bars on `2026-04-25`, so `completed=0` is currently a sample-availability status.
+    - Added one controlled coverage probe command with earlier end date to confirm evaluator availability under complete forward windows.
+- Verification:
+  - `python scripts/run_fast_review_bundle.py --snapshot-date 2026-04-24 --limit 200`
+    - succeeded; latest summary remains `earnings=2`, `hundred_day_high=5`, `trend_leader=2`, `skipped_signals_count=0`.
+  - `python scripts/run_signal_performance_bundle.py --signal-types trend_leader_unified,earnings_surprise,hundred_day_high,monthly_slow_rise,continuous_up_ratio,continuous_up_streak --start-date 2026-04-01 --end-date 2026-04-24 --windows 1,3,5,10`
+    - hit local command timeout in this session (long-running), existing summary artifact remains unchanged and still shows `completed=0` rows.
+  - `python scripts/run_signal_performance_bundle.py --signal-types hundred_day_high --start-date 2026-04-01 --end-date 2026-04-10 --windows 1,3,5,10 --limit 20 --output-dir data/manual_runs/signal_performance_bundle_hundred_day_high_coverage_probe`
+    - succeeded; `window=1/3/5/10` all `completed=20`.
+- Notes:
+  - `README.md` not updated because this round is runtime evidence clarification and governance trace correction only.
+
+## 2026-04-25 (step-6 monthly weekly-volatility percentile closure)
+
+- Scope: continue ordered local-strategy execution on `monthly_slow_rise` with a focused weekly-stability metric enhancement.
+- Why: Task 6 already had weekly positive ratio and compression, but lacked an explicit weekly volatility percentile field for ranking and downstream review.
+- Changes:
+  - Updated [`scripts/select_monthly_slow_rise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_monthly_slow_rise_candidates.py).
+    - Added `weekly_volatility_percentile` to `_compute_weekly_stability_metrics(...)`.
+    - Added the new field to selected-result export columns and missing-column backfill.
+    - Added `weekly_volatility_percentile` into selected-dataframe tie-break sorting (lower percentile preferred).
+  - Updated [`tests/test_monthly_slow_rise_candidates.py`](d:\bb\daily_stock_analysis\tests\test_monthly_slow_rise_candidates.py).
+    - Extended `test_scan_monthly_slow_rise_records_weekly_and_earnings_quality_metrics` to assert the new metric exists and stays in `[0, 1]`.
+- Verification:
+  - `python -m pytest tests/test_monthly_slow_rise_candidates.py -k records_weekly_and_earnings_quality_metrics -q`
+  - `python -m py_compile scripts/select_monthly_slow_rise_candidates.py tests/test_monthly_slow_rise_candidates.py`
+  - `python -m pytest tests/test_monthly_slow_rise_candidates.py -q`
+- Notes:
+  - `README.md` not updated because this round only adds strategy-internal metric/scoring visibility and does not change user entry commands.
+
+## 2026-04-25 (step-4 earnings surprise history enhancement)
+
+- Scope: continue ordered local-strategy execution for `earnings_surprise` by adding explicit multi-quarter surprise-history confirmation.
+- Why: Task 4 already had post-event reaction and continuity fields, but still lacked a first-class "surprise history" factor to distinguish one-off beats from persistent multi-quarter earnings surprise quality.
+- Changes:
+  - Updated [`scripts/select_earnings_surprise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_earnings_surprise_candidates.py).
+    - Added surprise-history metrics from `financial_report_series`: positive-quarter count/ratio/streak, history quarter count, and `earnings_surprise_history_score`.
+    - Added `surprise_history` into `earnings_strategy_factor_breakdown` as an independent weighted factor.
+    - Propagated new fields into evaluation metrics, record export (`to_record`), reason summary text, and selected-dataframe sorting.
+  - Updated [`tests/test_earnings_surprise_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_earnings_surprise_signal_flow.py).
+    - Added regression coverage `test_evaluate_candidate_records_surprise_history_metrics`.
+- Verification:
+  - `python -m py_compile scripts/select_earnings_surprise_candidates.py tests/test_earnings_surprise_signal_flow.py`
+  - `python -m pytest tests/test_earnings_surprise_signal_flow.py -k surprise_history_metrics -q`
+  - `python -m pytest tests/test_earnings_surprise_signal_flow.py -q`
+- Notes:
+  - `README.md` not updated because this round only enhances strategy-internal scoring/metrics fields and does not change user entry commands.
+
+## 2026-04-25 (step-3 shared factors follow-up)
+
+- Scope: continue ordered local-strategy upgrade by finishing shared-factor integration for `trend_leader_unified` and `hundred_day_high`.
+- Why: shared factors were already wired into `earnings_surprise` and `monthly_slow_rise`, but the other two core strategies still had partial/manual factor assembly.
+- Changes:
+  - Updated [`scripts/select_trend_leader_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_trend_leader_candidates.py):
+    - Added shared-factor wiring in candidate evaluation path: capital factors now reuse `SharedSignalFactorsService.build_capital_factors(...)`.
+    - Added shared quality and industry enrichment into `earnings_payload`, result rows, and snapshot `metrics_payload`.
+    - Added helper bundle normalization for unified `financial_report_series` / board context extraction.
+  - Updated [`scripts/select_hundred_day_high_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_hundred_day_high_candidates.py):
+    - Added shared `quality_overlay_*` / continuity metrics in `breakout_balanced_with_earnings` evaluation path.
+    - Propagated new shared quality fields into selected dataframe, snapshot metrics payload, and CSV export columns.
+  - Updated tests:
+    - [`tests/test_trend_leader_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_trend_leader_signal_flow.py)
+    - [`tests/test_hundred_day_high_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_hundred_day_high_signal_flow.py)
+- Verification:
+  - `python -m pytest tests/test_trend_leader_signal_flow.py tests/test_hundred_day_high_signal_flow.py tests/test_shared_signal_factors_service.py -q`
+  - `python -m py_compile scripts/select_trend_leader_candidates.py scripts/select_hundred_day_high_candidates.py`
+- Notes:
+  - `README.md` not updated because this round changes strategy-internal factor wiring and signal metrics only; no user entrypoint changed.
+
+## 2026-04-25 (incremental)
+
+- Scope: continue local-strategy code hardening in ordered execution (step-1 performance evaluator fix + step-2 monthly robust/backoff tuning).
+- Why: performance bundle had persistent `completed=0` under insufficient local `stock_daily` coverage; meanwhile `monthly_slow_rise` robust profile remained too strict in practical whole-market runs.
+- Changes:
+  - Updated [`scripts/evaluate_signal_snapshot_performance.py`](d:\bb\daily_stock_analysis\scripts\evaluate_signal_snapshot_performance.py):
+    - Added optional missing-daily fill path (`--fill-missing-daily-data`) with callback injection support for deterministic tests.
+    - Added default filler that uses `DataFetcherManager` to backfill `StockDaily` when start/forward bars are missing.
+  - Updated [`scripts/run_signal_performance_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_signal_performance_bundle.py):
+    - Default now enables missing-daily fill passthrough.
+    - Added `--skip-fill-missing-daily-data` to explicitly disable.
+  - Updated [`scripts/select_monthly_slow_rise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_monthly_slow_rise_candidates.py):
+    - `robust` profile `min_positive_month_ratio` adjusted from `0.67` to `0.60`.
+  - Updated [`data_provider/akshare_fetcher.py`](d:\bb\daily_stock_analysis\data_provider\akshare_fetcher.py):
+    - Added env override `AKSHARE_STOCK_HISTORY_EM_BACKOFF_SECONDS` (default `120`).
+  - Updated tests:
+    - [`tests/test_signal_snapshot_performance_report.py`](d:\bb\daily_stock_analysis\tests\test_signal_snapshot_performance_report.py)
+    - [`tests/test_signal_performance_bundle.py`](d:\bb\daily_stock_analysis\tests\test_signal_performance_bundle.py)
+    - [`tests/test_monthly_slow_rise_candidates.py`](d:\bb\daily_stock_analysis\tests\test_monthly_slow_rise_candidates.py)
+- Verification:
+  - `python -m pytest tests/test_signal_snapshot_performance_report.py tests/test_signal_performance_bundle.py -q`
+  - `python -m pytest tests/test_monthly_slow_rise_candidates.py -k robust_profile_defaults -q`
+  - `python -m pytest tests/test_kline_fast_manager.py -k history_em_failure_enables_backoff -q`
+  - `python scripts/evaluate_signal_snapshot_performance.py --signal-type hundred_day_high --start-date 2026-04-03 --end-date 2026-04-10 --windows 1 --limit 5 --output-json data/_tmp_eval_no_fill.json --output-md data/_tmp_eval_no_fill.md`
+  - `python scripts/evaluate_signal_snapshot_performance.py --signal-type hundred_day_high --start-date 2026-04-03 --end-date 2026-04-10 --windows 1 --limit 5 --fill-missing-daily-data --output-json data/_tmp_eval_fill.json --output-md data/_tmp_eval_fill.md`
+    - Observed: no-fill `completed=0/5`, fill-enabled `completed=5/5`.
+- Notes:
+  - `README.md` not updated in this incremental step because no new user entrypoint was introduced; existing commands keep original names and paths.
+
+## 2026-04-25
+
+- Scope: complete Task 7 + Task 8 governance closure for the local-strategy rationalization plan.
+- Why: after finishing strategy/script changes and topic-tool reclassification, this round still needed one final evidence trail showing the whole-stack re-measure commands and practical default-daily smoke outcomes.
+- Changes:
+  - Updated [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md).
+    - Added an explicit Task 8 runtime-evidence section for the two required commands and output directories.
+    - Recorded that topic/research tools remain opt-in and outside the default daily core loop.
+  - Updated [`docs/AI_MODIFICATION_LOG.md`](d:\bb\daily_stock_analysis\docs\AI_MODIFICATION_LOG.md) and [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md).
+    - Added governance trace entries for this final re-measure/documentation closure.
+- Verification:
+  - `python scripts/run_signal_performance_bundle.py --signal-types trend_leader_unified,earnings_surprise,hundred_day_high,monthly_slow_rise,continuous_up_ratio,continuous_up_streak --start-date 2026-04-01 --end-date 2026-04-24 --windows 1,3,5,10`
+    - command succeeded; outputs written under `data/signal_performance_bundle/2026-04-01_to_2026-04-24/`.
+    - current sample/window availability produced `completed=0` rows in this run, so the result is treated as a baseline-coverage observation rather than a command failure.
+  - `python scripts/run_fast_review_bundle.py --snapshot-date 2026-04-24 --limit 200`
+    - command succeeded; outputs written under `data/fast_review_daily/2026-04-24/`.
+    - default daily core signals executed with non-empty outputs: `earnings=2`, `hundred_day_high=5`, `trend_leader=2`, `skipped_signals_count=0`.
+- Notes:
+  - `README.md` not updated because this final step is governance/runtime evidence closure only; no entrypoint, deployment, or user interaction contract changed.
+
+- Scope: finish `monthly_slow_rise` task-6 export visibility for industry-strength factors.
+- Why: strategy-side industry-strength enrichment already existed in runtime metrics, but export/report surfaces were not explicit enough for empty-run contracts and quick manual review.
+- Changes:
+  - Updated [`scripts/select_monthly_slow_rise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_monthly_slow_rise_candidates.py).
+    - Added `industry_strength_score/confirmed/label/confirmation_hint` to `SELECTED_RESULT_COLUMNS` so empty CSV exports keep stable headers.
+    - Added the same industry fields into missing-column backfill of `build_selected_dataframe(...)`.
+    - Extended markdown selected table with `industry` and `industry_ok` columns.
+  - Updated [`tests/test_monthly_slow_rise_candidates.py`](d:\bb\daily_stock_analysis\tests\test_monthly_slow_rise_candidates.py).
+    - Added assertions that CSV exports include `industry_strength_label` and `industry_strength_confirmed` for both non-empty and empty output cases.
+  - Updated [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md) and [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md).
+    - Recorded this export/report visibility upgrade as part of local-strategy governance traceability.
+- Verification:
+  - `python -m py_compile scripts/select_monthly_slow_rise_candidates.py`
+  - `python -m pytest tests/test_monthly_slow_rise_candidates.py -q`
+  - `python scripts/select_monthly_slow_rise_candidates.py --profile balanced --snapshot-date 2026-04-24 --limit 300` (`selected=4`)
+  - `python scripts/select_monthly_slow_rise_candidates.py --profile robust --snapshot-date 2026-04-24 --limit 300` (`selected=0`)
+- Notes:
+  - `README.md` not updated: this is a strategy-internal export/report field upgrade and does not change user entrypoints or deployment flow.
+
+- Scope: upgrade `hundred_day_high` from plain new-high tagging to quality-breakout scoring.
+- Why: step 3 of the local-strategy rationalization plan requires stronger breakout quality confirmation and lightweight industry-strength fields inside the retained core strategy.
+- Changes:
+  - Updated [`scripts/select_hundred_day_high_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_hundred_day_high_candidates.py).
+    - Added `minervini_template_score/passed` and `breakout_follow_through_score` into breakout quality computation.
+    - Extended selected dataframe/export/snapshot metrics payloads with the new breakout fields.
+    - Added `industry_strength_confirmed/score/label` enrichment during cause-enrich stage and persisted those metrics for same-day reuse.
+  - Updated [`tests/test_hundred_day_high_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_hundred_day_high_signal_flow.py).
+    - Added coverage for new breakout and industry-strength field propagation.
+  - Updated [`docs/KLINE_SELECTOR_GUIDE.md`](d:\bb\daily_stock_analysis\docs\KLINE_SELECTOR_GUIDE.md) and [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md).
+    - Recorded the new quality-breakout fields and their export/snapshot behavior.
+- Verification:
+  - `python -m pytest tests/test_hundred_day_high_signal_flow.py -q`
+  - `python -m py_compile scripts/select_hundred_day_high_candidates.py`
+  - `python scripts/select_hundred_day_high_candidates.py --profile breakout_balanced --snapshot-date 2026-04-24 --limit 300`
+  - `python scripts/select_hundred_day_high_candidates.py --profile breakout_loose --snapshot-date 2026-04-24 --limit 300`
+- Notes:
+  - Runtime sample (limit=300) on 2026-04-24: `breakout_balanced selected=3`, `breakout_loose selected=8`.
+  - `README.md` not updated because this round changes strategy-internal scoring/export fields only; entrypoints remain unchanged.
+
+- Scope: add the first-stage minimal shared layer for local strategy factors, then wire it into `earnings_surprise` and `monthly_slow_rise`.
+- Why: the project has now converged on four main strategies, but `earnings_surprise` and `monthly_slow_rise` were still each building overlapping capital, quality, and industry fields independently. A small shared layer is enough to unblock parallel work on other machines without forcing a large refactor first.
+- Changes:
+  - Added [`src/services/shared_signal_factors_service.py`](d:\bb\daily_stock_analysis\src\services\shared_signal_factors_service.py).
+    - Introduced a minimal shared service for three reusable factor groups: `build_capital_factors(...)`, `build_quality_overlay_factors(...)`, `build_industry_strength_factors(...)`.
+    - Shared outputs now expose generic fields such as `quality_overlay_*` and `industry_strength_*`, while retaining strategy-specific earnings aliases like `earnings_financial_series_continuity_score` and `earnings_industry_confirmed`.
+  - Updated [`scripts/select_earnings_surprise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_earnings_surprise_candidates.py).
+    - Capital-profile refresh now supports the shared service path.
+    - Candidate evaluation now records shared `quality_overlay_*` metrics.
+    - Industry confirmation now comes from the shared factor builder instead of a local one-off path.
+  - Updated [`scripts/select_monthly_slow_rise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_monthly_slow_rise_candidates.py).
+    - Post-selection enrichment now reuses the shared capital-factor builder.
+    - Earnings continuity post-filter now comes from shared `quality overlay` output.
+    - Industry context for the selected pool now writes shared `industry_strength_*` fields.
+  - Updated [`tests/test_shared_signal_factors_service.py`](d:\bb\daily_stock_analysis\tests\test_shared_signal_factors_service.py), [`tests/test_earnings_surprise_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_earnings_surprise_signal_flow.py), and [`tests/test_monthly_slow_rise_candidates.py`](d:\bb\daily_stock_analysis\tests\test_monthly_slow_rise_candidates.py).
+    - Added TDD coverage for the new shared factor service and its minimal integrations.
+- Verification:
+  - `python -m pytest tests/test_shared_signal_factors_service.py -q`
+  - `python -m pytest tests/test_monthly_slow_rise_candidates.py -k "weekly_and_earnings_quality_metrics" -q`
+  - `python -m pytest tests/test_earnings_surprise_signal_flow.py -k "passes_on_positive_text_and_growth" -q`
+  - `python -m pytest tests/test_shared_signal_factors_service.py tests/test_monthly_slow_rise_candidates.py tests/test_earnings_surprise_signal_flow.py -q`
+  - `python -m py_compile src/services/shared_signal_factors_service.py scripts/select_monthly_slow_rise_candidates.py scripts/select_earnings_surprise_candidates.py`
+- Notes:
+  - `trend_leader_unified` and `hundred_day_high` are intentionally not refactored onto this shared layer yet; this round only lands the first minimal seam needed for concurrent follow-up work.
+  - `README.md` not updated because this round changes only internal local-strategy factor reuse and does not alter the external entrypoints or daily operating flow.
+
+- Scope: harden the remaining upstream history-source instability in `monthly_slow_rise`, specifically the repeated `Akshare EM` transport failure storm inside the fast A-share history chain.
+- Why: after the listing-metadata fallback fix, the dominant residual failure was no longer `listed_days` loss. Real-run evidence showed repeated `Akshare EM` `RemoteDisconnected` retries were still being re-hit symbol by symbol, and the chain then mostly fell through to unhelpful `TushareFetcher empty_result` responses.
+- Changes:
+  - Updated [`data_provider/akshare_fetcher.py`](d:\bb\daily_stock_analysis\data_provider\akshare_fetcher.py).
+    - Added a dedicated stock-history EM backoff window (`DEFAULT_STOCK_HISTORY_EM_BACKOFF_SECONDS = 120`) for the history fetch path.
+    - When `em` throws retryable transport failures such as `remote_disconnect` / `timeout`, the fetcher now activates a short backoff and skips repeated EM retries for subsequent symbols during that window.
+    - On a later successful EM history fetch, the temporary backoff is cleared automatically.
+    - This leaves the existing `tencent -> em -> Tushare` chain intact, but prevents a full-market run from hammering the same failing EM source for every stock before falling through.
+  - Updated [`tests/test_kline_fast_manager.py`](d:\bb\daily_stock_analysis\tests\test_kline_fast_manager.py).
+    - Added TDD regression coverage: `test_akshare_history_em_failure_enables_backoff_and_skips_second_em_attempt`.
+  - Updated [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md), [`docs/LOCAL_STRATEGY_BASELINE.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_BASELINE.md), and [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md).
+    - Recorded the new fast-manager history-source guard and moved the local-strategy baseline anchor to this 2026-04-25 follow-up.
+- Verification:
+  - `python -m pytest tests/test_kline_fast_manager.py -k backoff -q`
+  - `python -m pytest tests/test_kline_fast_manager.py tests/test_akshare_sector_rankings_backoff.py -q`
+  - `python -m py_compile data_provider/akshare_fetcher.py tests/test_kline_fast_manager.py`
+  - Real 3-minute live observation, single-process full-market scan:
+    - `python scripts/select_monthly_slow_rise_candidates.py --profile robust --skip-db-persist --output-dir data/manual_runs/monthly_slow_rise_robust_3min_observe_20260425_em_backoff --checkpoint-path data/manual_runs/monthly_slow_rise_robust_3min_observe_20260425_em_backoff/monthly_slow_rise_checkpoint.json --log-level INFO`
+    - Forced stop after 3 minutes:
+      - `universe_size=5198`
+      - `processed=2150`
+      - `selected=0`
+      - `skipped_by_prefilter=178`
+      - `skipped_by_listed_days=91`
+      - checkpoint-visible network/fetch failures: `4`
+      - `run.err.log` showed `history EM source entered backoff` `4` times, after which the dominant checkpoint failure mix remained rule rejections led by `positive-month ratio`.
+  - Real 3-minute live observation, two-process sharded scan:
+    - shard 0:
+      - `python scripts/select_monthly_slow_rise_candidates.py --profile robust --skip-db-persist --shard-count 2 --shard-index 0 --output-dir data/manual_runs/monthly_slow_rise_robust_sharded_3min_observe_20260425_em_backoff/shard0 --checkpoint-path data/manual_runs/monthly_slow_rise_robust_sharded_3min_observe_20260425_em_backoff/shard0/checkpoint.json --log-level INFO`
+      - forced stop after 3 minutes: `universe_size=2599`, `processed=2300`, `skipped_by_prefilter=80`, `skipped_by_listed_days=47`, checkpoint-visible network/fetch failures `16`, `history EM source entered backoff` `4` times
+    - shard 1:
+      - `python scripts/select_monthly_slow_rise_candidates.py --profile robust --skip-db-persist --shard-count 2 --shard-index 1 --output-dir data/manual_runs/monthly_slow_rise_robust_sharded_3min_observe_20260425_em_backoff/shard1 --checkpoint-path data/manual_runs/monthly_slow_rise_robust_sharded_3min_observe_20260425_em_backoff/shard1/checkpoint.json --log-level INFO`
+      - forced stop after 3 minutes: `universe_size=2599`, `processed=2150`, `skipped_by_prefilter=98`, `skipped_by_listed_days=44`, checkpoint-visible network/fetch failures `12`, `history EM source entered backoff` `4` times
+  - Real full convergence continuation for the two-process sharded scan:
+    - shard 0 resume:
+      - `python scripts/select_monthly_slow_rise_candidates.py --profile robust --skip-db-persist --shard-count 2 --shard-index 0 --output-dir data/manual_runs/monthly_slow_rise_robust_sharded_3min_observe_20260425_em_backoff/shard0 --checkpoint-path data/manual_runs/monthly_slow_rise_robust_sharded_3min_observe_20260425_em_backoff/shard0/checkpoint.json --resume --log-level INFO`
+      - final result:
+        - `universe_size=2599`
+        - `evaluated=2472`
+        - `selected=0`
+        - `failed=2472`
+        - `skipped_by_prefilter=80`
+        - `skipped_by_listed_days=47`
+        - `network_or_fetch_failures=19`
+        - `resume.run.err.log` counts:
+          - `history EM source entered backoff`: `2`
+          - `history EM source in backoff, skipping`: `1`
+        - final phase metrics:
+          - `selection_history_fetch_elapsed_sec_sum=432.0482`
+          - `selection_rule_evaluate_elapsed_sec_sum=215.7654`
+          - `selection_elapsed_sec=27.6019`
+          - `total_scan_elapsed_sec=55.5184`
+    - shard 1 resume:
+      - `python scripts/select_monthly_slow_rise_candidates.py --profile robust --skip-db-persist --shard-count 2 --shard-index 1 --output-dir data/manual_runs/monthly_slow_rise_robust_sharded_3min_observe_20260425_em_backoff/shard1 --checkpoint-path data/manual_runs/monthly_slow_rise_robust_sharded_3min_observe_20260425_em_backoff/shard1/checkpoint.json --resume --log-level INFO`
+      - final result:
+        - `universe_size=2599`
+        - `evaluated=2457`
+        - `selected=0`
+        - `failed=2457`
+        - `skipped_by_prefilter=98`
+        - `skipped_by_listed_days=44`
+        - `network_or_fetch_failures=17`
+        - `resume.run.err.log` counts:
+          - `history EM source entered backoff`: `4`
+          - `history EM source in backoff, skipping`: `1`
+        - final phase metrics:
+          - `selection_history_fetch_elapsed_sec_sum=414.9428`
+          - `selection_rule_evaluate_elapsed_sec_sum=211.9967`
+          - `selection_elapsed_sec=35.0063`
+          - `total_scan_elapsed_sec=62.9818`
+    - aggregate sharded result:
+      - `universe_size=5198`
+      - `evaluated=4929`
+      - `selected=0`
+      - `failed=4929`
+      - `skipped_by_prefilter=178`
+      - `skipped_by_listed_days=91`
+      - `network_or_fetch_failures=36`
+      - aggregate dominant failure mix stayed identical to the single-process convergence run:
+        - `positive-month ratio 60% < 67%`: `1127`
+        - `positive-month ratio 53% < 67%`: `1012`
+        - `positive-month ratio 47% < 67%`: `807`
+        - `positive-month ratio 67% < 67%`: `760`
+      - aggregate dominant history source remained cache-backed:
+        - `disk_cache_best_effort_stale:AkshareFetcher`: `4881`
+- Real full convergence continuation from the single-process checkpoint:
+    - `python scripts/select_monthly_slow_rise_candidates.py --profile robust --skip-db-persist --output-dir data/manual_runs/monthly_slow_rise_robust_3min_observe_20260425_em_backoff --checkpoint-path data/manual_runs/monthly_slow_rise_robust_3min_observe_20260425_em_backoff/monthly_slow_rise_checkpoint.json --resume --log-level INFO`
+    - final result:
+      - `universe_size=5198`
+      - `evaluated=4929`
+      - `selected=0`
+      - `failed=4929`
+      - `skipped_by_prefilter=178`
+      - `skipped_by_listed_days=91`
+      - `network_or_fetch_failures=36`
+      - dominant failure mix stayed rule-driven rather than transport-driven:
+        - `positive-month ratio 60% < 67%`: `1127`
+        - `positive-month ratio 53% < 67%`: `1012`
+        - `positive-month ratio 47% < 67%`: `807`
+        - `positive-month ratio 67% < 67%`: `760`
+      - dominant history source stayed cache-backed:
+        - `disk_cache_best_effort_stale:AkshareFetcher`: `4880`
+      - `resume.run.err.log` counts:
+        - `history EM source entered backoff`: `8`
+        - `RemoteDisconnected`: `58`
+        - `empty_result`: `128`
+      - final run summary:
+        - `selection_history_fetch_elapsed_sec_sum=782.2525`
+        - `selection_rule_evaluate_elapsed_sec_sum=292.9447`
+        - `selection_elapsed_sec=155.6915`
+        - `total_scan_elapsed_sec=184.6601`
+- Notes:
+  - `README.md` not updated because this round changes only the internal resilience of the local `monthly_slow_rise` history chain and its governance trace; no onboarding, deployment, or external entrypoint changed.
+  - The single-process live run confirms the new history-EM backoff now leaves the dominant failure mix in rule-level monthly rejection rather than a repeated EM retry storm.
+  - The sharded live run confirms the current limitation: this backoff is effective within each fetcher/process, but it is not shared across processes. Parallel shards still enter their own EM backoff windows independently.
+  - The full convergence rerun confirms that, over the entire `robust` universe on 2026-04-25, upstream transport failures remained a minority (`36 / 4929`) and did not become the dominant reason for rejection after the backoff guard was added.
+  - The full convergence sharded rerun closes the loop: aggregate outcomes match the single-process run, but shard-local backoff counts differ (`2` vs `4` enters), confirming that the EM backoff guard stabilizes each process independently rather than acting as a cross-process shared circuit breaker.
+
+- Scope: analyze why `monthly_slow_rise --profile robust` still produced `0` selections on 2026-04-25 after the upstream-stability loop had already converged.
+- Why: once the live-run stability work was closed, the remaining user question was no longer “can it finish?” but “why does `robust` finish at zero?” We needed to separate data-path instability from rule strictness before changing any threshold.
+- Changes:
+  - Updated [`docs/AI_MODIFICATION_LOG.md`](d:\bb\daily_stock_analysis\docs\AI_MODIFICATION_LOG.md), [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md), and [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md).
+    - Recorded the same-day comparison runs and the threshold interpretation for `monthly_slow_rise robust`.
+- Verification:
+  - Regression re-verification before the diagnostic runs:
+    - `python -m pytest tests/test_kline_fast_manager.py tests/test_akshare_sector_rankings_backoff.py tests/test_monthly_slow_rise_candidates.py -q`
+    - `python -m py_compile data_provider/akshare_fetcher.py src/services/kline_selector_service.py scripts/select_monthly_slow_rise_candidates.py tests/test_kline_fast_manager.py tests/test_monthly_slow_rise_candidates.py`
+  - Fresh single-process rerun of the current `robust` profile:
+    - `python scripts/select_monthly_slow_rise_candidates.py --profile robust --skip-db-persist --output-dir data/manual_runs/monthly_slow_rise_robust_reverify_20260425 --checkpoint-path data/manual_runs/monthly_slow_rise_robust_reverify_20260425/monthly_slow_rise_checkpoint.json --log-level INFO`
+    - result:
+      - `evaluated_count=4929`
+      - `selected_count=0`
+      - `skipped_prefilter_count=178`
+      - `skipped_listed_days_count=91`
+      - `history_fetch_failed=36`
+      - `total_scan_elapsed_sec=283.0091`
+      - `run.err.log` counts:
+        - `history EM source entered backoff`: `8`
+        - `history EM source in backoff, skipping`: `28`
+  - Same-day `balanced` comparison run:
+    - `python scripts/select_monthly_slow_rise_candidates.py --profile balanced --skip-db-persist --output-dir data/manual_runs/monthly_slow_rise_balanced_compare_20260425 --checkpoint-path data/manual_runs/monthly_slow_rise_balanced_compare_20260425/monthly_slow_rise_checkpoint.json --log-level INFO`
+    - result:
+      - `evaluated_count=4955`
+      - `selected_count=65`
+      - `skipped_prefilter_count=178`
+      - `skipped_listed_days_count=65`
+      - dominant failures became a mix of `positive_month_ratio=1970`, `monthly_ma_structure=1393`, `total_return=634`, and `single_month_gain=512`
+  - Same-day `robust` diagnostic run with only `min_positive_month_ratio` relaxed to `0.60`:
+    - `python scripts/select_monthly_slow_rise_candidates.py --profile robust --min-positive-month-ratio 0.60 --skip-db-persist --output-dir data/manual_runs/monthly_slow_rise_robust_pos60_compare_20260425 --checkpoint-path data/manual_runs/monthly_slow_rise_robust_pos60_compare_20260425/monthly_slow_rise_checkpoint.json --log-level INFO`
+    - result:
+      - `evaluated_count=4929`
+      - `selected_count=5`
+      - `skipped_prefilter_count=178`
+      - `skipped_listed_days_count=91`
+      - dominant failures shifted to later gates: `positive_month_ratio=2490`, `higher_low_ratio=327`, `monthly_ma_structure=880`, `total_return=548`, `single_month_gain=494`
+- Notes:
+  - The fresh `robust` rerun confirms the zero-result day was not caused by a broken data path: the scan completed normally, and upstream transport failures remained a minority (`36 / 4929`).
+  - The dominant rejection reason stayed `positive-month ratio`, with the top buckets `60% < 67%` (`1127`), `53% < 67%` (`1012`), `47% < 67%` (`807`), and `67% < 67%` (`760`).
+  - The `67% < 67%` bucket is the important discrete-threshold clue: under `robust`, `monthly_lookback=15`, so `10 / 15 = 0.6667` still fails a floating threshold of `0.67`. In practice, the current rule behaves closer to “at least `11 / 15` positive months” than “roughly two thirds”.
+  - Because the same-day `balanced` run still produced `65` candidates, the 2026-04-25 zero-result should be understood as a `robust` strictness outcome rather than a market-wide absence of all slow-rise structures.
+  - Because changing only `min_positive_month_ratio` from `0.67` to `0.60` immediately restored `5` candidates, the monthly positive-ratio gate is currently the first-order bottleneck for `robust`, although not the only one.
+
+- Scope: execute the 2026-04-25 local-strategy rationalization plan for the retained earnings line and monthly slow-rise line, and finish the required strategy-governance trace.
+- Why: after the earlier default daily set was reduced to the core trio, the remaining gap was strategy quality rather than quantity: `earnings_surprise` still overweighted single-quarter events, and `monthly_slow_rise` still leaned too much on chart shape without enough continuity/liquidity confirmation.
+- Changes:
+  - Updated [`scripts/select_earnings_surprise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_earnings_surprise_candidates.py).
+    - Added post-event price-reaction metrics (`1d/3d` returns and reaction label).
+    - Added multi-quarter continuity metrics and persistent-quality scoring, including revenue/profit positive-quarter streaks and `earnings_financial_series_continuity_score`.
+    - Added optional industry confirmation fields when board context is available, and folded the new factors into the final strategy ranking instead of letting a single event dominate.
+  - Updated [`tests/test_earnings_surprise_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_earnings_surprise_signal_flow.py).
+    - Added regression coverage for post-event reaction and multi-quarter continuity outputs.
+  - Updated [`scripts/select_monthly_slow_rise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_monthly_slow_rise_candidates.py).
+    - Added weekly stability / compression metrics, 20-day average成交额过滤, and earnings-continuity gating through the financial bundle.
+    - Tightened `robust` / `balanced` ranking semantics so retained candidates reflect “slow bull + liquidity + earnings continuity”, not chart smoothness alone.
+  - Updated [`tests/test_monthly_slow_rise_candidates.py`](d:\bb\daily_stock_analysis\tests\test_monthly_slow_rise_candidates.py).
+    - Added weekly-metric, low-liquidity, and low-earnings-continuity regression coverage.
+  - Updated [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md) and [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md).
+    - Recorded the new 2026-04-25 strategy behavior and governance trace for the local-strategy assets touched in this round.
+- Verification:
+  - `python -m pytest tests/test_earnings_surprise_signal_flow.py -q`
+  - `python -m pytest tests/test_monthly_slow_rise_candidates.py -q`
+- Notes:
+  - `README.md` not updated because this round changes strategy internals and local strategy governance only; no onboarding, deployment, or external entrypoint changed.
+
+- Scope: fix the real `monthly_slow_rise --profile robust` fallback path so `listed_days` prefiltering still works when `spot-enriched universe` falls back to the generic provider.
+- Why: the 3-minute real-market observation on 2026-04-25 showed an anomalous `skipped_by_listed_days=0` even though `robust` requires `min_listed_days=400`; a live probe confirmed listing metadata was available (`5510` rows) but was dropped because the generic fallback branch returned before merging it.
+- Changes:
+  - Updated [`src/services/kline_selector_service.py`](d:\bb\daily_stock_analysis\src\services\kline_selector_service.py).
+    - Added a shared listing-metadata merge path so spot success, empty-spot fallback, and generic fallback all preserve `list_date/listed_days` when listing metadata is available.
+    - This keeps `min_listed_days` short-circuiting active during real `Akshare spot` outage windows instead of forcing recent IPOs into expensive history fetch attempts.
+  - Updated [`tests/test_kline_selector_service.py`](d:\bb\daily_stock_analysis\tests\test_kline_selector_service.py).
+    - Added TDD coverage for the real bug: generic fallback must still merge listing metadata and compute `listed_days`.
+- Verification:
+  - `python -m pytest tests/test_kline_selector_service.py -k "listed_days or generic_fallback or cached_spot or retries_once_before_success" -q`
+  - `python -m pytest tests/test_monthly_slow_rise_candidates.py tests/test_fetcher_logging.py tests/test_kline_selector_service.py -q`
+  - Real 3-minute observation run:
+    - `python scripts/select_monthly_slow_rise_candidates.py --profile robust --skip-db-persist --output-dir data/manual_runs/monthly_slow_rise_robust_3min_observe_20260425_2 --checkpoint-path data/manual_runs/monthly_slow_rise_robust_3min_observe_20260425_2/checkpoint.json --log-level INFO`
+    - Result after forced stop at 3 minutes:
+      - `universe=5198`
+      - `completed=2800/4929`
+      - `selected=0`
+      - `skipped_by_prefilter=178`
+      - `skipped_by_listed_days=91`
+      - `history fetch failed=21`
+      - checkpoint top failures returned to rule filters led by `positive-month ratio`
+- Notes:
+  - This fix removed the metadata-loss bug, but it did not remove the remaining upstream data-source instability; the current dominant external slow point is still repeated `Akshare EM` `RemoteDisconnected` retries followed by `TushareFetcher empty_result`.
+
+## 2026-04-24
+
+- Scope: trim `monthly_slow_rise` full-market history-cache overhead after the earlier timing split showed the remaining hot path was dominated by `history_fetch` on cache-backed runs.
+- Why: shrinking the request calendar span alone did not materially improve wall-clock time because most symbols were already served from local disk cache, and the expensive part had become reading cached CSVs plus rebuilding derived daily indicators that `monthly_slow_rise` does not actually consume.
+- Changes:
+  - Updated [`data_provider/base.py`](d:\bb\daily_stock_analysis\data_provider\base.py).
+    - Added manager-level `_daily_data_request_calendar_span_multiplier` with default `2.0` so fast selectors can tighten auto-expanded calendar windows without changing global fetch behavior.
+    - Added manager-level `_daily_data_include_derived_indicators` with default `True`; when disabled, cache-backed history finalization returns cleaned OHLCV rows without rebuilding `ma5/ma10/ma20/volume_ratio`.
+  - Updated [`src/services/kline_selector_service.py`](d:\bb\daily_stock_analysis\src\services\kline_selector_service.py).
+    - `build_fast_a_share_manager()` now uses `1.6x` calendar span and disables derived daily indicators for the fast monthly selector path, while keeping the existing `tencent -> em -> Tushare` fetch chain and covered-cache reuse logic.
+  - Updated [`tests/test_fetcher_logging.py`](d:\bb\daily_stock_analysis\tests\test_fetcher_logging.py) and [`tests/test_kline_fast_manager.py`](d:\bb\daily_stock_analysis\tests\test_kline_fast_manager.py).
+    - TDD: first pinned the manager-level calendar multiplier behavior and the ability to skip derived indicators on disk-cache hits, then implemented the new fast-manager settings.
+  - Updated [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md) and [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md).
+    - Recorded the new fast-manager cache path and the latest real-run evidence.
+- Verification:
+  - `python -m pytest tests/test_kline_selector_service.py tests/test_monthly_slow_rise_candidates.py tests/test_kline_fast_manager.py tests/test_fetcher_logging.py -q`
+  - `python -m py_compile data_provider/base.py src/services/kline_selector_service.py tests/test_fetcher_logging.py tests/test_kline_fast_manager.py tests/test_kline_selector_service.py tests/test_monthly_slow_rise_candidates.py`
+  - Real full-market runs:
+    - `python -u scripts/select_monthly_slow_rise_candidates.py --profile robust --snapshot-date 2026-04-24 --output-dir data/manual_runs/monthly_slow_rise_calendar_span_full_20260424_225939 --log-level INFO`
+    - result: completed, `selected=27`, but the wall-clock fluctuated upward to `total_scan_elapsed_sec=365.9745`, confirming calendar-span tightening alone was not the real bottleneck on cache-backed hot runs.
+    - `python -u scripts/select_monthly_slow_rise_candidates.py --profile robust --snapshot-date 2026-04-24 --output-dir data/manual_runs/monthly_slow_rise_no_indicators_full_20260424_233851 --log-level INFO`
+    - result: completed, `selected=27`, `selection_history_fetch_elapsed_sec_sum=709.1817`, `selection_elapsed_sec=208.0186`, `total_scan_elapsed_sec=230.6251`
+    - key deltas versus the earlier lazy-cap full run:
+      - `selection_history_fetch_elapsed_sec_sum`: `1003.3276 -> 709.1817`
+      - `selection_history_prepare_elapsed_sec_sum`: `59.8667 -> 35.5665`
+      - `selection_rule_evaluate_elapsed_sec_sum`: `114.095 -> 77.7994`
+      - `selection_elapsed_sec`: `297.0219 -> 208.0186`
+      - `total_scan_elapsed_sec`: `319.501 -> 230.6251`
+- Notes:
+  - The selected count stayed at `27` across all compared runs, so this optimization improved runtime without changing the robust profile result set.
+  - The decisive gain came from skipping unused derived daily indicators on cache-backed history reads, not from tightening the calendar span by itself.
+
+- Scope: reduce `monthly_slow_rise` selection-stage realtime quote overhead by making market-cap resolution lazy instead of unconditional.
+- Why: after splitting `selection`, the full-market evidence showed `selection_market_cap_resolve_elapsed_sec_sum=614.1339` while pure `rule_evaluate` was only `91.865`. The hot path was not the monthly rule math; it was resolving `total_market_cap` for every evaluated stock even though most names would fail the history rules first.
+- Changes:
+  - Updated [`src/services/kline_selector_service.py`](d:\bb\daily_stock_analysis\src\services\kline_selector_service.py).
+    - `evaluate_stock()` now defers `MaxMarketCapRule` until all non-market-cap rules pass.
+    - `total_market_cap` is now lazily resolved only when the deferred market-cap rule actually needs it, while still preserving prefetched market-cap values when they already exist.
+  - Updated [`tests/test_kline_selector_service.py`](d:\bb\daily_stock_analysis\tests\test_kline_selector_service.py).
+    - TDD: first pinned that `market_cap_resolve` must be skipped when earlier history-only rules already fail, then implemented the lazy market-cap flow.
+  - Updated [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md) and [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md).
+    - Documented the new lazy market-cap behavior and its runtime impact.
+- Verification:
+  - `python -m pytest tests/test_kline_selector_service.py tests/test_monthly_slow_rise_candidates.py tests/test_kline_fast_manager.py -q`
+  - `python -m py_compile src/services/kline_selector_service.py scripts/select_monthly_slow_rise_candidates.py tests/test_kline_selector_service.py tests/test_monthly_slow_rise_candidates.py tests/test_kline_fast_manager.py`
+  - Smoke run:
+    - `python -u scripts/select_monthly_slow_rise_candidates.py --profile robust --snapshot-date 2026-04-24 --limit 20 --output-dir data/manual_runs/monthly_slow_rise_lazy_cap_smoke_20260424 --log-level WARNING`
+    - result: completed; `selection_market_cap_resolve_elapsed_sec_sum` dropped from the earlier smoke run's `2.0547` to `0.1145`.
+  - Real full-market run:
+    - `python -u scripts/select_monthly_slow_rise_candidates.py --profile robust --snapshot-date 2026-04-24 --output-dir data/manual_runs/monthly_slow_rise_lazy_cap_full_20260424_215956 --log-level INFO`
+    - result: completed, `selected=27`, `total_scan_elapsed_sec=319.501`, `selection_elapsed_sec=297.0219`
+    - key inner deltas versus the prior split run:
+      - `selection_market_cap_resolve_elapsed_sec_sum`: `614.1339 -> 4.8713`
+      - `selection_evaluation_elapsed_sec_sum`: `1395.6756 -> 1178.0132`
+      - `selection_elapsed_sec`: `351.8463 -> 297.0219`
+      - `total_scan_elapsed_sec`: `374.5662 -> 319.501`
+- Notes:
+  - This optimization kept the selected count at `27`, so the improvement came from removing wasted market-cap quote work rather than loosening rules.
+  - After this change, the next primary hot spot is clearly `history_fetch`, which rose to the top of the inner breakdown.
+
+- Scope: split the `selection` phase of `monthly_slow_rise` into service-level subphases so the 350s+ wall-clock block can be attributed to history fetch, market-cap resolve, or rule evaluation instead of staying opaque.
+- Why: the first outer timing split showed `selection_elapsed_sec` dominated the run, but that number still mixed together history fetch, history normalization, quote-based market-cap resolve, and rule execution. Without a deeper breakdown, the next optimization step would still be guesswork.
+- Changes:
+  - Updated [`src/services/kline_selector_service.py`](d:\bb\daily_stock_analysis\src\services\kline_selector_service.py).
+    - Extended `KlineSelectionEvaluation` with `phase_metrics`.
+    - `evaluate_stock()` now records `history_fetch_elapsed_sec`, `history_prepare_elapsed_sec`, `market_cap_resolve_elapsed_sec`, `rule_evaluate_elapsed_sec`, and `evaluation_elapsed_sec`.
+    - `scan_market()` now aggregates these into run-level `selection_*_sum` and `selection_*_avg` metrics, and keeps them stable across checkpoint resume.
+  - Updated [`tests/test_kline_selector_service.py`](d:\bb\daily_stock_analysis\tests\test_kline_selector_service.py).
+    - TDD: first pinned the missing evaluation-level timing contract and run-level aggregation contract, then implemented the service changes.
+  - Updated [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md) and [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md).
+    - Documented that `monthly_slow_rise_run_summary.json` now includes the deeper `selection` split.
+- Verification:
+  - `python -m pytest tests/test_kline_selector_service.py tests/test_monthly_slow_rise_candidates.py tests/test_kline_fast_manager.py -q`
+  - `python -m py_compile src/services/kline_selector_service.py scripts/select_monthly_slow_rise_candidates.py tests/test_kline_selector_service.py tests/test_monthly_slow_rise_candidates.py tests/test_kline_fast_manager.py`
+  - Smoke run:
+    - `python -u scripts/select_monthly_slow_rise_candidates.py --profile robust --snapshot-date 2026-04-24 --limit 20 --output-dir data/manual_runs/monthly_slow_rise_selection_split_smoke_20260424 --log-level WARNING`
+    - result: completed; `monthly_slow_rise_run_summary.json` showed inner `selection_*` metrics as expected.
+  - Real full-market run:
+    - `python -u scripts/select_monthly_slow_rise_candidates.py --profile robust --snapshot-date 2026-04-24 --output-dir data/manual_runs/monthly_slow_rise_selection_split_full_20260424_205816 --log-level INFO`
+    - result: completed, `total_scan_elapsed_sec=374.5662`, `selection_elapsed_sec=351.8463`, `selected=27`
+    - inner `selection` breakdown:
+      - `selection_history_fetch_elapsed_sec_sum=635.609`, `avg=0.1266`
+      - `selection_market_cap_resolve_elapsed_sec_sum=614.1339`, `avg=0.1223`
+      - `selection_history_prepare_elapsed_sec_sum=53.2078`, `avg=0.0106`
+      - `selection_rule_evaluate_elapsed_sec_sum=91.865`, `avg=0.0183`
+- Notes:
+  - This round shows the next optimization target is not the monthly rule math itself. The dominant inner costs are now `history_fetch` and `market_cap_resolve`, while pure `rule_evaluate` is comparatively small.
+
+- Scope: add machine-readable timing breakdowns for real `monthly_slow_rise` runs so the next optimization round can target the actual hot phase instead of guessing.
+- Why: after stabilizing the threaded full-market run, the remaining issue was not correctness but visibility: we had one total wall-clock number (`309.50s`) but no durable phase split showing how much time was spent in universe preparation, rule scan, and post-select capital enrichment.
+- Changes:
+  - Updated [`scripts/select_monthly_slow_rise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_monthly_slow_rise_candidates.py).
+    - Added `phase_metrics` output on `KlineSelectorRunResult`, including `universe_elapsed_sec`, `selection_elapsed_sec`, `capital_enrich_elapsed_sec`, `total_scan_elapsed_sec`, plus selected/failed counts.
+    - Added `monthly_slow_rise_run_summary.json` export artifact so each run leaves a machine-readable summary beside the existing csv/txt/md outputs.
+    - Added a performance section into the markdown export and appended `phase_metrics` into the final completion log line.
+  - Updated [`src/services/kline_selector_service.py`](d:\bb\daily_stock_analysis\src\services\kline_selector_service.py).
+    - Extended `KlineSelectorRunResult` with `phase_metrics` so scripts can persist timing breakdowns without changing strategy rules.
+  - Updated [`tests/test_monthly_slow_rise_candidates.py`](d:\bb\daily_stock_analysis\tests\test_monthly_slow_rise_candidates.py).
+    - TDD: first pinned the missing phase-metric contract and summary export artifact, then implemented the runtime change.
+- Verification:
+  - `python -m pytest tests/test_monthly_slow_rise_candidates.py -q`
+- Notes:
+  - This round intentionally stops at outer phase visibility. It does not yet add per-provider or per-stock profiling, so the next optimization pass should use the new summary artifact to decide whether deeper timing inside `selection` is worth instrumenting.
+
+- Scope: harden the threaded fast A-share manager so real `monthly_slow_rise --profile robust` full-market runs stop crashing inside the Sina history chain.
+- Why: the first real post-optimization run still failed after about `39.74s` with a native `py_mini_racer` crash while the fast manager was using `sina -> tencent -> em` for history. The strategy logic itself was not failing; the process was being terminated by the Sina history dependency in the current Windows environment.
+- Changes:
+  - Updated [`src/services/kline_selector_service.py`](d:\bb\daily_stock_analysis\src\services\kline_selector_service.py).
+    - Changed `build_fast_a_share_manager()` history priority from `("sina", "tencent", "em")` to `("tencent", "em")`.
+    - Kept the existing `Tushare` fallback so symbols missing on Tencent/EM can still continue through the manager-level fallback chain.
+  - Updated [`tests/test_kline_fast_manager.py`](d:\bb\daily_stock_analysis\tests\test_kline_fast_manager.py).
+    - TDD: first pinned that the fast manager should no longer expose the Sina-first history priority, then implemented the runtime change.
+- Verification:
+  - `python -m pytest tests/test_kline_fast_manager.py -q` (red before code, green after code)
+  - `python -m pytest tests/test_kline_fast_manager.py tests/test_monthly_slow_rise_candidates.py tests/test_fetcher_logging.py tests/test_earnings_observation_signal_flow.py -q`
+  - `python -m py_compile src/services/kline_selector_service.py tests/test_kline_fast_manager.py`
+  - Real run before fix:
+    - `python -u scripts/select_monthly_slow_rise_candidates.py --profile robust --snapshot-date 2026-04-24 --output-dir data/manual_runs/monthly_slow_rise_robust_20260424_182433 --log-level INFO`
+    - result: crashed, `EXIT_CODE=-2147483645`, `ELAPSED_SEC=39.74`
+  - Real run after fix:
+    - `python -u scripts/select_monthly_slow_rise_candidates.py --profile robust --snapshot-date 2026-04-24 --output-dir data/manual_runs/monthly_slow_rise_robust_after_fix_20260424_200933 --log-level INFO`
+    - result: completed, `ELAPSED_SEC=309.50`, `universe=5198`, `evaluated=5020`, `selected=27`
+  - Serial comparison:
+    - `python -u scripts/select_monthly_slow_rise_candidates.py --profile robust --snapshot-date 2026-04-24 --max-workers 1 --output-dir data/manual_runs/monthly_slow_rise_robust_serial_20260424_182808 --log-level INFO`
+    - result: completed, `ELAPSED_SEC=817.61`, `selected=27`
+- Notes:
+  - In this environment, the fix turned the default threaded real run from “native crash around 40s” into a completed full-market run, while also reducing wall-clock time from about `817.61s` (serial safe baseline) to about `309.50s`.
+
+- Scope: speed up repeated `monthly_slow_rise` full-market runs by raising the default worker baseline and avoiding unnecessary covered-history refreshes.
+- Why: runtime profiling showed the main bottleneck was history K-line fetching rather than rule evaluation; the selector still defaulted to `--max-workers=1`, and hot reruns could keep paying for tail refreshes even when local disk history already covered the requested date window.
+- Changes:
+  - Updated [`scripts/select_monthly_slow_rise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_monthly_slow_rise_candidates.py).
+    - Changed the default `--max-workers` from `1` to `4` for the real full-market monthly slow-rise scan path.
+  - Updated [`data_provider/base.py`](d:\bb\daily_stock_analysis\data_provider\base.py).
+    - Added manager-level switch `_prefer_cached_history_when_covered`.
+    - When the requested daily-history range is already covered by local disk cache, the manager can now return that covered stale cache directly as `disk_cache_stale_covered:*` instead of forcing a tail refresh first.
+  - Updated [`src/services/kline_selector_service.py`](d:\bb\daily_stock_analysis\src\services\kline_selector_service.py).
+    - Enabled `_prefer_cached_history_when_covered = True` in `build_fast_a_share_manager()` so the fast A-share scan path actually uses the new reuse behavior.
+  - Updated tests:
+    - [`tests/test_monthly_slow_rise_candidates.py`](d:\bb\daily_stock_analysis\tests\test_monthly_slow_rise_candidates.py) pins the new default worker baseline.
+    - [`tests/test_fetcher_logging.py`](d:\bb\daily_stock_analysis\tests\test_fetcher_logging.py) pins the covered stale-cache reuse path and the `disk_cache_stale_covered:*` source label.
+- Verification:
+  - `python -m pytest tests/test_monthly_slow_rise_candidates.py -k parallel_default_for_full_market_scan -q`
+  - `python -m pytest tests/test_fetcher_logging.py -k prefers_covered_stale_cache_for_fast_scan -q`
+  - `python -m pytest tests/test_monthly_slow_rise_candidates.py tests/test_fetcher_logging.py tests/test_hundred_day_high_signal_flow.py -q`
+  - `python -m py_compile scripts/select_monthly_slow_rise_candidates.py data_provider/base.py src/services/kline_selector_service.py tests/test_monthly_slow_rise_candidates.py tests/test_fetcher_logging.py`
+- Notes:
+  - `README.md` not updated because this turn only adjusts local strategy runtime defaults and hot-path cache reuse; it does not add a new external entrypoint, deployment flow, or onboarding step.
+
+- Scope: formalize a “robust” monthly slow-rise profile for the user’s steady monthly watchlist flow.
+- Why: the user wanted a月线“稳健版” that is not frequent, but should be more comprehensive and reliable than the existing three-profile set, and should remain queryable later through the profile snapshot namespace instead of replacing the current default.
+- Changes:
+  - Updated [`scripts/select_monthly_slow_rise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_monthly_slow_rise_candidates.py).
+    - Added a new formal `robust` profile label and preset.
+    - Set `robust` defaults to `monthly_lookback=15`, `min_positive_month_ratio=0.67`, `min_higher_low_ratio=0.60`, `ma_short_months=6`, `ma_long_months=12`, `min_total_return_pct=12`, `max_total_return_pct=90`, `max_single_month_gain_pct=15`, `max_drawdown_pct=12`, and `max_total_market_cap=800 亿`.
+    - Let profile-level prefilter defaults override `min_listed_days`, so `robust` can use `min_change_pct_60d=3` and `min_listed_days=400` without changing the other profiles.
+  - Updated [`tests/test_monthly_slow_rise_candidates.py`](d:\bb\daily_stock_analysis\tests\test_monthly_slow_rise_candidates.py).
+    - TDD: first pinned the missing `robust` preset defaults and preset-level listed-days prefilter behavior, then implemented the runtime change.
+  - Updated [`apps/dsa-web/src/pages/SignalsPage.tsx`](d:\bb\daily_stock_analysis\apps\dsa-web\src\pages\SignalsPage.tsx).
+    - Added `robust` into the monthly compare order so `/signals` profile comparison keeps the steadier profile visible in a stable position.
+  - Updated [`docs/MONTHLY_SLOW_RISE_SCAN.md`](d:\bb\daily_stock_analysis\docs\MONTHLY_SLOW_RISE_SCAN.md), [`docs/LOCAL_STRATEGY_BASELINE.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_BASELINE.md), [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md), and [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md) to keep local-strategy governance aligned.
+- Verification:
+  - `python -m pytest tests/test_monthly_slow_rise_candidates.py -k robust_profile_defaults -q`
+
+- Scope: reduce the daily earnings-observation tail latency by shortening the trend-history fallback chain used after the earnings shortlist is produced.
+- Why: runtime evidence showed the earnings-observation tail itself was mostly cheap, but a single missing-history symbol could spend about one minute walking the generic multi-provider fallback chain and dominate the whole daily tail duration.
+- Changes:
+  - Updated [`scripts/collect_earnings_observation_snapshots.py`](d:\bb\daily_stock_analysis\scripts\collect_earnings_observation_snapshots.py).
+    - Switched trend-history evaluation from the generic `DataFetcherManager()` path to `KlineSelectorService.build_fast_a_share_manager()`.
+    - Kept a safe fallback back to the generic manager if the fast manager cannot be built.
+  - Updated [`tests/test_earnings_observation_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_earnings_observation_signal_flow.py).
+    - Added a regression test to pin that earnings-observation trend evaluation now uses the fast A-share manager path.
+- Verification:
+  - `python -m pytest tests/test_earnings_observation_signal_flow.py tests/test_main_schedule_mode.py tests/test_signal_snapshot_api.py -q`
+  - `python scripts/collect_earnings_observation_snapshots.py --snapshot-date 2026-04-24 --log-level INFO`
+- Notes:
+  - Measured hot rerun improved from about `72.17s` to about `30.96s` in the local Windows environment after the fast-manager switch.
+
+- Scope: add a persistent earnings-observation tail strategy that keeps a long-running watch registry plus a daily active shortlist after the regular schedule flow.
+- Why: the existing `earnings_surprise` selector is good at finding fresh good-quarter events, but it does not model the lifecycle the user wanted: keep watching good-quarter names, only show the still-strong ones in the daily tail step, and permanently remove names after two consecutive bad quarters.
+- Changes:
+  - Added [`scripts/collect_earnings_observation_snapshots.py`](d:\bb\daily_stock_analysis\scripts\collect_earnings_observation_snapshots.py).
+    - Reuses the existing `earnings_surprise balanced` gate as the only earnings entry rule.
+    - Maintains two persisted `signal_type`s: `earnings_observation_registry` and `earnings_observation_active`.
+    - Keeps lifecycle states in existing `kline_signal_snapshot` payloads instead of adding a new table.
+    - Marks names `active / inactive / removed`, reactivates on trend recovery, and permanently removes names after two consecutive bad quarters.
+  - Updated [`main.py`](d:\bb\daily_stock_analysis\main.py), [`src/config.py`](d:\bb\daily_stock_analysis\src\config.py), and [`.env.example`](d:\bb\daily_stock_analysis\.env.example).
+    - Added a new optional schedule tail task hook plus `EARNINGS_OBSERVATION_SNAPSHOT_ENABLED` and `EARNINGS_OBSERVATION_MAX_OBSERVATION_DAYS`.
+  - Updated [`src/services/signal_snapshot_service.py`](d:\bb\daily_stock_analysis\src\services\signal_snapshot_service.py).
+    - Added the two earnings-observation signal types to the default `/signals` signal list and attached strategy display labels.
+  - Updated tests:
+    - [`tests/test_earnings_observation_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_earnings_observation_signal_flow.py)
+    - [`tests/test_main_schedule_mode.py`](d:\bb\daily_stock_analysis\tests\test_main_schedule_mode.py)
+    - [`tests/test_config_env_compat.py`](d:\bb\daily_stock_analysis\tests\test_config_env_compat.py)
+  - Updated [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md) and [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md) to keep local-strategy governance aligned.
+- Verification:
+  - `python -m pytest tests/test_earnings_observation_signal_flow.py -q`
+  - `python -m pytest tests/test_config_env_compat.py -k earnings_observation_snapshot_flags_load_from_env -q`
+  - `python -m pytest tests/test_main_schedule_mode.py -k earnings_observation -q`
+- Notes:
+  - `README.md` not updated because this turn adds a local strategy tail task and signal namespace, but does not change first-run onboarding, deployment flow, or top-level product positioning.
+
+- Scope: add an earnings-confirmed `hundred_day_high` profile without changing the existing default hundred-day-high behavior.
+- Why: the current `hundred_day_high` signal is useful for pure trend breakout observation, but sometimes we want a narrower breakout list that is still confirmed by the existing `earnings_surprise balanced` quality/growth gate; that should live as a separate profile and `signal_type`, not mutate the original signal history.
+- Changes:
+  - Updated [`scripts/select_hundred_day_high_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_hundred_day_high_candidates.py).
+    - Added `breakout_balanced_with_earnings`.
+    - Added runtime default `signal_type=hundred_day_high__earnings_balanced` for that profile when the user does not override `--signal-type`.
+    - Added a post-selection earnings filter that only runs on already-selected hundred-day-high candidates and reuses the existing `earnings_surprise balanced` evaluation path.
+    - Merged earnings confirmation fields such as `revenue_yoy`, `net_profit_yoy`, `roe`, `earnings_strategy_score`, `earnings_strategy_gate_status`, and `earnings_quality_*` into the persisted/exported metrics for the filtered signal.
+    - Disabled stage-1 incremental snapshot persistence for this profile so pre-filter hits are not written into the final signal namespace.
+  - Updated [`tests/test_hundred_day_high_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_hundred_day_high_signal_flow.py).
+    - TDD: first pinned the missing profile choice, the missing runtime `signal_type` namespace, and the missing earnings-filtered retention behavior, then implemented the runtime change.
+  - Updated [`docs/KLINE_SELECTOR_GUIDE.md`](d:\bb\daily_stock_analysis\docs\KLINE_SELECTOR_GUIDE.md), [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md), and [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md) to keep local-strategy governance aligned.
+- Verification:
+  - `python -m pytest tests/test_hundred_day_high_signal_flow.py -v`
+  - `python -m py_compile scripts/select_hundred_day_high_candidates.py tests/test_hundred_day_high_signal_flow.py`
+  - `rg -n "breakout_balanced_with_earnings|hundred_day_high__earnings_balanced" docs/KLINE_SELECTOR_GUIDE.md docs/LOCAL_STRATEGY_CATALOG.md docs/AI_MODIFICATION_LOG.md docs/CHANGELOG.md`
+- Notes:
+  - `README.md` not updated because this turn only expands an existing local strategy profile and signal namespace; onboarding, deployment, and top-level run instructions do not change.
+
+## 2026-04-23
+
+- Scope: narrow the fast-review `earnings` leg to only the current report period's newly announced events while keeping the broader recent-event catalog reusable for other strategies.
+- Why: the daily fast-review goal is "what changed in this report season today", but the previous shared `120d` lookback could still mix in older quarter or annual-report events and dilute the output; trend/history logic still benefits from the reusable broader catalog, so the bundle default should narrow without deleting that capability.
+- Changes:
+  - Updated [`scripts/select_earnings_surprise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_earnings_surprise_candidates.py).
+    - Added `--recent-event-scope` with `lookback/latest_report_period`.
+    - Added latest-report-period filtering for `recent_event_catalog`, including strict behavior that does not fall back to older events when the filtered catalog is empty.
+    - Kept the base selector default on `lookback` so other strategy paths can continue reusing the broader `120d` earnings-event catalog.
+  - Updated [`scripts/run_fast_review_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_fast_review_bundle.py).
+    - Added bundle-side `--earnings-recent-event-scope`.
+    - Set the fast-review default to `latest_report_period` and forwarded it into the earnings selector command.
+  - Updated [`config/local_strategy_profile.json`](d:\bb\daily_stock_analysis\config\local_strategy_profile.json).
+    - Synced the local fast-review default with `earnings_recent_event_scope=latest_report_period`.
+  - Updated tests:
+    - [`tests/test_fast_review_daily_bundle.py`](d:\bb\daily_stock_analysis\tests\test_fast_review_daily_bundle.py)
+    - [`tests/test_earnings_surprise_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_earnings_surprise_signal_flow.py)
+    - TDD: first pinned the missing fast-review default / command forwarding behavior and the strict latest-report-period scan behavior, then implemented the runtime change.
+  - Updated [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md) and [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md) to keep local-strategy governance aligned.
+- Verification:
+  - `D:\bb\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_fast_review_daily_bundle.py tests/test_earnings_surprise_signal_flow.py -q`（51 passed）
+  - `D:\bb\daily_stock_analysis\.venv\Scripts\python.exe -m py_compile scripts/run_fast_review_bundle.py scripts/select_earnings_surprise_candidates.py tests/test_fast_review_daily_bundle.py tests/test_earnings_surprise_signal_flow.py`（通过）
+- Notes:
+  - `README.md` not updated because this turn only changes the default runtime scope of the local fast-review earnings leg and does not introduce a new external entrypoint, deployment change, or onboarding requirement.
+
+- Scope: shrink `trend_leader` main-scan daily-history fetch length to match the current scoring path, so the scan stops paying for unused K-line depth on every candidate.
+- Why: after decoupling `hundred_day_high`, the next bottleneck moved to `trend_leader` at about `266s`; log evidence showed the main scan still evaluated `1138` rows and each row fetched `260` trading days even though the current strategy only consumes about `120` days of trend structure plus short recent-context windows.
+- Changes:
+  - Updated [`scripts/select_trend_leader_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_trend_leader_candidates.py).
+    - Added `TREND_SCAN_HISTORY_FETCH_DAYS = 140`.
+    - Main-scan history fetch and force-refresh fallback now both use `140` days instead of `260`.
+  - Updated [`tests/test_trend_leader_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_trend_leader_signal_flow.py).
+    - TDD: first pinned the trend main-scan history fetch length in focused tests, then implemented the runtime change.
+  - Updated [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md), [`docs/AI_MODIFICATION_LOG.md`](d:\bb\daily_stock_analysis\docs\AI_MODIFICATION_LOG.md), and [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md) to keep local-strategy governance aligned.
+- Verification:
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_trend_leader_signal_flow.py -k "prefers_earnings_only_context or prewarms_sector_rankings_and_passes_scan_context" -q` (red before code, green after code)
+  - Pending broader targeted verification after implementation in this turn.
+- Notes:
+  - `README.md` not updated because this turn only narrows an internal local-strategy runtime window and does not add a new user-facing entrypoint or deployment change.
+
+- Scope: decouple `hundred_day_high` worker concurrency from the bundle-level `--max-workers` default so the fast-review aggregate entry can speed up the new top bottleneck without changing the signal's selection logic.
+- Why: after the 2026-04-23 hot rerun moved `trend_leader` and `continuous_up` off the critical path, the bundle finished in about 14m42s but `hundred_day_high` still consumed `434.38s`; the direct cause was that the aggregate entry still forwarded the global `max_workers=1` into `select_hundred_day_high_candidates.py`.
+- Changes:
+  - Updated [`scripts/run_fast_review_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_fast_review_bundle.py).
+    - Added `DEFAULT_HUNDRED_DAY_MAX_WORKERS = 2`.
+    - Added `--hundred-day-max-workers` and made the hundred-day command prefer this dedicated value over the global `--max-workers`.
+  - Updated [`config/local_strategy_profile.json`](d:\bb\daily_stock_analysis\config\local_strategy_profile.json).
+    - Synced the local fast-review defaults with `hundred_day_max_workers=2`.
+  - Updated [`tests/test_fast_review_daily_bundle.py`](d:\bb\daily_stock_analysis\tests\test_fast_review_daily_bundle.py).
+    - TDD: first pinned the missing CLI/profile default and command forwarding behavior for `hundred_day_high`, then implemented the runtime change.
+  - Updated [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md), [`docs/AI_MODIFICATION_LOG.md`](d:\bb\daily_stock_analysis\docs\AI_MODIFICATION_LOG.md), and [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md) to keep local-strategy governance aligned.
+- Verification:
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_fast_review_daily_bundle.py -k "build_commands_forward_skip_db_persist or applies_strategy_profile_defaults or uses_fast_review_defaults_when_profile_missing" -q` (red before code)
+  - Pending green verification after implementation in this turn.
+- Notes:
+  - `README.md` not updated because this turn only adjusts local fast-review runtime defaults and does not introduce a new user-facing entrypoint or deployment change.
+
+- Scope: raise the fast-review bundle's default parallelism baseline so the daily aggregate entry spends less wall-clock time waiting on external slots and single-thread continuous-up scanning.
+- Why: the 2026-04-23 live run of `run_fast_review_bundle.py` finished in about 22 minutes wall-clock, and the biggest remaining runtime blocks were `trend_leader` plus the shared `continuous_up` scan; the cheapest first batch is to let all three external signals start together and stop making continuous-up default to a single worker.
+- Changes:
+  - Updated [`scripts/run_fast_review_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_fast_review_bundle.py).
+    - Changed `DEFAULT_EXTERNAL_PARALLELISM` from `2` to `3`.
+    - Changed `DEFAULT_CONTINUOUS_MAX_WORKERS` from `1` to `2`.
+    - Updated the `--continuous-max-workers` help text to reflect the new runtime default.
+  - Updated [`config/local_strategy_profile.json`](d:\bb\daily_stock_analysis\config\local_strategy_profile.json).
+    - Synced local fast-review defaults to `external_parallelism=3` and `continuous_max_workers=2`.
+  - Updated [`tests/test_fast_review_daily_bundle.py`](d:\bb\daily_stock_analysis\tests\test_fast_review_daily_bundle.py).
+    - TDD: tightened the missing-profile default assertions to require the new default values first, then implemented the code change.
+  - Updated [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md), [`docs/AI_MODIFICATION_LOG.md`](d:\bb\daily_stock_analysis\docs\AI_MODIFICATION_LOG.md), and [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md) to keep local-strategy governance and default-value docs aligned.
+- Verification:
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_fast_review_daily_bundle.py -k "uses_fast_review_defaults_when_profile_missing" -q`（先红后绿）
+  - Pending full targeted verification after code update in this turn.
+- Notes:
+  - `README.md` not updated because this turn only changes local fast-review runtime defaults and strategy-governance records, without adding a new user-facing entrypoint or deployment workflow.
+
+- Scope: persist hydrated generic-fallback quote fields so repeated `trend_leader` hot runs can reuse them cross-process even when `Akshare spot` stays unavailable.
+- Why: after adding the tiny-cache guardrail, live verification showed the remaining bottleneck had shifted again: spot fetch still failed upstream, but the prefilter itself successfully hydrated all `5198` rows for `pct_change/turnover_rate`; without persisting that hydrated result, every next process would still pay the same full quote-hydration cost from scratch.
+- Changes:
+  - Updated [`scripts/select_trend_leader_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_trend_leader_candidates.py).
+    - `_prepare_scan_prefilter_universe(...)` now accepts `hydrated_quote_cache_writer`.
+    - When prefilter quote hydration actually fills rows, the hydrated universe is persisted through `selector._write_spot_universe_reference_cache(...)`, so the next process can reuse those quote fields through the existing generic-fallback merge path.
+  - Updated [`tests/test_trend_leader_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_trend_leader_signal_flow.py).
+    - Added `test_prepare_scan_prefilter_universe_persists_hydrated_quote_snapshot_for_reuse(...)` to pin the new reuse path in TDD form.
+    - Added partial-gap coverage so quote hydration only skips fully-covered columns and only requests rows that still miss the target fields.
+- Verification:
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_trend_leader_signal_flow.py -k persists_hydrated_quote_snapshot_for_reuse -q`（先红后绿）
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m py_compile src/services/kline_selector_service.py scripts/select_trend_leader_candidates.py tests/test_kline_selector_service.py tests/test_trend_leader_signal_flow.py tests/test_fast_review_daily_bundle.py`
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_kline_selector_service.py tests/test_trend_leader_signal_flow.py tests/test_fast_review_daily_bundle.py -q`（71 passed）
+  - Focused live probe:
+    - first generic fallback run: `quote_requested_rows=5198`
+    - hydrated cache written to `data/cache/reference/kline_selector_spot_universe.csv` with `rows=5198`
+    - second generic fallback run after loading the persisted cache: `quote_requested_rows=1562`
+- Notes:
+  - This turns the current path into “first hot run pays, later hot runs materially reuse” even when upstream spot remains unstable, while still letting real full spot snapshots override the cache whenever they become available again.
+
+- Scope: harden `spot-enriched universe` disk reference cache so `trend_leader` generic fallback only reuses viable spot snapshots.
+- Why: the previous `trend_leader` hot-path verification showed the new cross-process spot cache path was wired correctly, but the real cache artifact under `data/cache/reference/kline_selector_spot_universe.csv` had been polluted into a 1-row snapshot; that made generic fallback keep logging `fallback to generic provider with cached spot quotes` while `quote_requested_rows` still stayed at `5198`.
+- Changes:
+  - Updated [`src/services/kline_selector_service.py`](d:\bb\daily_stock_analysis\src\services\kline_selector_service.py).
+    - Added `_spot_universe_reference_cache_min_rows` guardrail for disk-backed spot reference cache.
+    - Skip writing tiny spot snapshots into the shared reference cache.
+    - Ignore tiny disk cache snapshots both from metadata row counts and after CSV normalization, so generic fallback only merges quote fields from full-enough spot universes.
+  - Updated [`tests/test_kline_selector_service.py`](d:\bb\daily_stock_analysis\tests\test_kline_selector_service.py).
+    - Isolated spot-cache tests onto temporary cache paths to avoid polluting the real repo cache.
+    - Added/kept TDD coverage for both behaviors: a viable disk cache still merges quote fields on generic fallback, while a tiny cache is ignored.
+- Verification:
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_kline_selector_service.py -k "tiny_disk_cached_spot_snapshot or merges_disk_cached_spot_quotes_on_generic_fallback or retries_once_before_success or falls_back_to_cached_spot_snapshot" -q`（4 passed）
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m py_compile src/services/kline_selector_service.py tests/test_kline_selector_service.py tests/test_trend_leader_signal_flow.py tests/test_fast_review_daily_bundle.py`
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_kline_selector_service.py tests/test_trend_leader_signal_flow.py tests/test_fast_review_daily_bundle.py -q`（70 passed）
+- Notes:
+  - `README.md` not updated because this turn is still internal strategy/runtime hardening around cache validity and test isolation rather than a new entrypoint or user-facing workflow.
+
+- 范围（Scope）：继续压缩 `trend_leader` 主扫描热路径，把“历史明显不足的样本”和“板块排行冷启动”都提前从 worker 热点里移走，同时保持候选质量不变。
+- 原因（Why）：上一轮热跑后剩余的大头已经集中在主扫描阶段；日志抽样显示一部分近期上市/历史不足样本仍会进入主扫描后才在 `get_daily_data()` 路径里失败，另外 `dragon_head_analysis_service` 的板块排行在 worker 首批任务里还会出现冷启动尖峰。
+- 改动（Changes）：
+  - 更新 [`scripts/select_trend_leader_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_trend_leader_candidates.py)
+    - 新增基于 `list_date/listed_days` 的主扫描前短路判断；对可明确判定为历史不足（小于 120 天）的样本，不再进入 `pending_rows` 与深度评估链路。
+    - `trend leader scan queue prepared` 与结构化 `run_stats` 新增 `skipped_unscannable_history`，便于把这部分短路效果从主日志里单独观察出来。
+    - 扫描启动前会用共享 manager 预热一次 `get_sector_rankings(10)`，并把结果放入 `scan_context["sector_rankings"]`，后续单票评估复用同一份只读上下文。
+    - `run_stats` 新增 `sector_rankings_prefetched`，用于热跑时快速确认本轮是否已命中预热路径。
+    - `_evaluate_trend_leader_candidate(...)` 新增 `scan_context` 透传，并把它继续传入 `dragon_service.analyze_stock(...)`，让板块排行可以直接复用预热结果。
+  - 更新 [`tests/test_trend_leader_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_trend_leader_signal_flow.py)
+    - 新增 `test_scan_trend_leader_candidates_short_circuits_recent_ipo_before_main_scan(...)`，验证明显历史不足样本不会进入主扫描，并会计入 `skipped_unscannable_history`。
+    - 新增 `test_scan_trend_leader_candidates_prewarms_sector_rankings_and_passes_scan_context(...)`，验证扫描阶段只预热一次板块排行，并通过 `scan_context` 传给龙头分析服务。
+- 验证（Verification）：
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_trend_leader_signal_flow.py -k "short_circuits_recent_ipo or prewarms_sector_rankings" -q`（先红后绿）
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m py_compile scripts/select_trend_leader_candidates.py tests/test_trend_leader_signal_flow.py`
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_trend_leader_signal_flow.py tests/test_fast_review_daily_bundle.py -q`（47 passed）
+- 备注（Notes）：
+  - 这次没有更新 `README.md`，因为改动仍属于本地策略内部热路径优化与日志留痕，不涉及新的外部入口、部署方式或用户操作；信息已同步落到 `docs/LOCAL_STRATEGY_CATALOG.md`、`docs/AI_MODIFICATION_LOG.md`、`docs/CHANGELOG.md`。
+
+- 范围（Scope）：`trend_leader` 主扫描改用轻量 earnings context，减少单票评估阶段对整包基本面链路的重复调用。
+- 原因（Why）：上一轮热跑定位显示，`trend_leader` 主扫描里最稳定的大头已经转到每票 `get_fundamental_context()`，而策略实际只消费 `growth / earnings / earnings_quality` 三块；与此同时，`capital_flow` 与 `boards` 又会在后续链路单独获取，存在明显的整包调用冗余。
+- 改动（Changes）：
+  - 更新 [`data_provider/base.py`](d:\bb\daily_stock_analysis\data_provider\base.py)
+    - 新增 `get_earnings_fundamental_context(...)`，复用 `fundamental_bundle + earnings_quality` 组装出仅包含 `growth / earnings / earnings_quality` 的轻量 context，避免为快扫描额外拉取 `capital_flow / dragon_tiger / boards` 等无关块。
+  - 更新 [`scripts/select_trend_leader_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_trend_leader_candidates.py)
+    - `_evaluate_trend_leader_candidate(...)` 现在会优先调用 `manager.get_earnings_fundamental_context(...)`；仅在管理器未提供该接口时才回退到旧的 `get_fundamental_context(...)`。
+  - 更新 [`tests/test_trend_leader_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_trend_leader_signal_flow.py)
+    - 新增 `test_evaluate_trend_leader_candidate_prefers_earnings_only_context(...)`，验证 `trend_leader` 单票评估优先走轻量 earnings context，且不会再命中完整 fundamental context。
+- 验证（Verification）：
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_trend_leader_signal_flow.py -k prefers_earnings_only_context -q`（先红后绿）
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m py_compile data_provider\base.py scripts/select_trend_leader_candidates.py tests/test_trend_leader_signal_flow.py tests/test_fast_review_daily_bundle.py`
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_trend_leader_signal_flow.py tests/test_fast_review_daily_bundle.py -q`（45 passed）
+  - 热跑验证：
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -u scripts/select_trend_leader_candidates.py --snapshot-date 2026-04-22 --signal-type trend_leader_unified --output-dir data\fast_review_daily_trend_mainscan_verify --max-workers 2 --fallback-top-n 20 --disable-second-stage-news-search --disable-second-stage-business-profile --enrich-top-n 0 --progress-every 200 --log-level INFO`
+    - 日志：`logs/trend_leader_mainscan_verify_20260423.log`
+    - 对比观察：
+      - 上一轮主扫描：`processed=876/892`，扫描阶段约 `545s`
+      - 本轮主扫描：`processed=1082/1099`，扫描阶段约 `568s`
+      - 折算 `sec_per_processed` 约从 `0.62s` 降到 `0.53s`
+- 备注（Notes）：
+  - 这次没有更新 `README.md`，因为变更仍属于本地策略主扫描热路径优化，不涉及新的外部入口、部署方式或对外使用说明；信息已同步落到 `docs/LOCAL_STRATEGY_CATALOG.md`、`docs/AI_MODIFICATION_LOG.md`、`docs/CHANGELOG.md`。
+
+- 范围（Scope）：`trend_leader` 热路径前筛 quote hydration 并发化，继续压缩 preparation/prefilter 阶段耗时，同时保持结果与统计语义不变。
+- 原因（Why）：上一轮已经确认 `change_pct_60d` 不再误触发全市场 hydration，但当前环境下 `pct_change/turnover_rate` 仍需对全量 universe 逐票补水；单线程实时行情回填仍让 `prefilter_elapsed_sec` 停留在约 `495s`，成为准备阶段主瓶颈。
+- 改动（Changes）：
+  - 更新 [`scripts/select_trend_leader_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_trend_leader_candidates.py)
+    - `_hydrate_scan_prefilter_quote_fields(...)` 新增 `manager_factory` 与 `quote_hydration_workers`，在 DataFrame 仍由主线程写入的前提下，将逐票 `get_realtime_quote()` 拉取改为可控并发。
+    - `_prepare_scan_prefilter_universe(...)` 新增 `quote_worker_count` 统计，并把 trend scan 的 `max_workers` 透传到前筛 quote hydration。
+    - `trend leader quote prefilter` 日志新增 `quote_worker_count`，便于从总日志直接判断本轮是否启用了并发补水。
+  - 更新 [`tests/test_trend_leader_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_trend_leader_signal_flow.py)
+    - 新增 `test_hydrate_scan_prefilter_quote_fields_uses_parallel_workers_when_enabled(...)`，用共享并发计数器验证前筛补水在开启 worker 后确实发生并发执行。
+- 验证（Verification）：
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_trend_leader_signal_flow.py -k parallel_workers_when_enabled -q`（先红后绿）
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m py_compile scripts/select_trend_leader_candidates.py tests/test_trend_leader_signal_flow.py tests/test_fast_review_daily_bundle.py`
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_trend_leader_signal_flow.py tests/test_fast_review_daily_bundle.py -q`（44 passed）
+  - 热跑验证：
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -u scripts/select_trend_leader_candidates.py --snapshot-date 2026-04-22 --signal-type trend_leader_unified --output-dir data\fast_review_daily_trend_parallel_verify --max-workers 2 --fallback-top-n 20 --disable-second-stage-news-search --disable-second-stage-business-profile --enrich-top-n 0 --progress-every 200 --log-level INFO`
+    - 日志：`logs/trend_leader_parallel_prefilter_verify_20260423.log`
+    - 关键观察：
+      - `quote_worker_count=2`
+      - `prefilter_elapsed_sec=242.51`（上一轮单线程热跑约 `495.43s`）
+      - `total_prep_elapsed_sec=255.71`（上一轮单线程热跑约 `508.04s`）
+- 备注（Notes）：
+  - 这次没有更新 `README.md`，因为变更仍属于本地策略热路径优化与性能留痕，不涉及新的外部入口、部署方式或对外使用说明；信息已同步落到 `docs/LOCAL_STRATEGY_CATALOG.md`、`docs/AI_MODIFICATION_LOG.md`、`docs/CHANGELOG.md`。
+
+- 范围（Scope）：`trend_leader` 热路径前筛按需 hydration 优化，目标是缩短 preparation/prefilter 阶段的无效实时行情回填。
+- 原因（Why）：2026-04-23 对 `2026-04-22` 的保留持久化热跑日志复盘显示，`trend_leader` 准备阶段约 `527.67s`，其中 `quote_requested_rows=5198`、`quote_hydrated_rows=5198`，但 `removed_change_60d=0`，说明当前实现会因不可稳定补齐的字段触发整轮全市场 hydration，真实热路径里存在明显的无效网络成本。
+- 改动（Changes）：
+  - 更新 [`scripts/select_trend_leader_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_trend_leader_candidates.py)
+    - 新增 `_resolve_scan_prefilter_hydration_fields(...)`，将前筛 hydration 决策从布尔值提升为字段级按需集合。
+    - 新增 `_resolve_scan_prefilter_unsupported_fields(...)`，显式记录像 `change_pct_60d` 这类当前 quote 不稳定支持的缺口字段，保持 fail-open。
+    - `_hydrate_scan_prefilter_quote_fields(...)` 新增 `target_fields`，仅对本轮真正需要的字段执行回填，同时保留旧调用默认“全字段补齐”的兼容语义。
+    - `_prepare_scan_prefilter_universe(...)` 现在会输出 `quote_requested_fields` 与 `quote_missing_unsupported_fields`，便于热跑日志直接判断 hydration 是否仍然在全市场误触发。
+  - 更新 [`tests/test_trend_leader_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_trend_leader_signal_flow.py)
+    - 新增“`change_pct_60d` 单独缺失时不应触发 hydration”回归测试。
+    - 新增“`pct_change / turnover_rate` 缺失时仍应按需 hydration”覆盖。
+    - 新增 `_prepare_scan_prefilter_universe(...)` 的选择性 hydration 统计断言。
+- 验证（Verification）：
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_trend_leader_signal_flow.py -k "hydration_fields or hydrate_scan_prefilter_quote_fields_backfills_missing_quote_columns or only_hydrates_quote_backed_missing_fields" -q`
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m py_compile scripts/select_trend_leader_candidates.py tests/test_trend_leader_signal_flow.py tests/test_fast_review_daily_bundle.py`
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_trend_leader_signal_flow.py tests/test_fast_review_daily_bundle.py -q`（43 passed）
+  - 持久化热跑抽查：`E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -u scripts/run_fast_review_bundle.py --snapshot-date 2026-04-22 --include-signals trend_leader --output-dir data\fast_review_daily_trend_prefilter_verify --progress-every 200 --log-level INFO`
+    - 新日志已显式输出 `quote_requested_fields=pct_change,turnover_rate`
+    - 新日志已显式输出 `quote_missing_unsupported_fields=change_pct_60d`
+    - 本次实跑里 `quote_requested_rows` 仍为 `5198`，说明当前热路径的剩余瓶颈已经收敛到 `pct_change / turnover_rate` 本身仍缺失，而不是误把 `change_pct_60d` 当作可补字段
+
+- 范围（Scope）：快复盘入口补充 `earnings + --skip-persist-snapshots` 的性能误读告警，并同步留下策略文档与变更记录。
+- 原因（Why）：2026-04-22 的性能复盘里，`earnings` 慢并不是单纯代码退化，而是观察样本使用了 `--skip-persist-snapshots`，这会让 `select_earnings_surprise_candidates.py` 不再复用 `signal_fundamental_snapshot` 的 same-day / cross-day cache，把原本约 `80s` 的缓存热跑变成更慢的冷跑，容易误判真实性能。
+- 改动（Changes）：
+  - 更新 [`scripts/run_fast_review_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_fast_review_bundle.py)
+    - 新增 `_warn_earnings_skip_persist_cache_bypass(...)`。
+    - 当 `include_signals` 包含 `earnings` 且 `persist_snapshots=False` 时，在入口启动阶段输出 warning，明确提示 `--skip-persist-snapshots` 会绕过 `signal_fundamental_snapshot` 的 same-day / cross-day cache 复用，并显著放大冷跑耗时。
+  - 更新 [`tests/test_fast_review_daily_bundle.py`](d:\bb\daily_stock_analysis\tests\test_fast_review_daily_bundle.py)
+    - 新增 `test_main_warns_when_earnings_runs_without_persist(...)`，覆盖 `earnings` + `--skip-persist-snapshots` 时的 warning 留痕，校验日志里包含 `--skip-persist-snapshots` 与 `same-day/cross-day cache`。
+  - 更新文档：
+    - [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md)
+    - [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md)
+- 验证（Verification）：
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_fast_review_daily_bundle.py -q`
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m py_compile scripts/run_fast_review_bundle.py tests/test_fast_review_daily_bundle.py`
+- 备注（Notes）：
+  - 这次没有改 `README.md`，因为本次属于本地策略快复盘入口的诊断提示与性能观察纠偏，不涉及新的入门、部署或对外使用方式；信息已同步到 `docs/LOCAL_STRATEGY_CATALOG.md`、`docs/AI_MODIFICATION_LOG.md`、`docs/CHANGELOG.md`。
+
+## 2026-04-22
+
+- 范围（Scope）：补完通用 spot universe 稳定性 + `hundred_day_high` / `monthly_slow_rise` / `earnings_surprise` 三条策略的性能优化收口。
+- 原因（Why）：上一轮全量与小样本复盘已经确认，快复盘主慢点正在从 `earnings` 转向 K 线全量扫描与现货 universe 准备阶段；其中 `hundred_day_high`、`monthly_slow_rise` 仍未吃到 `listed_days + spot-enriched universe` 优化，而 `earnings_surprise` 仍使用通用 universe，spot 失败时也缺少更稳的短路/缓存路径。
+- 改动（Changes）：
+  - 更新 [`src/services/kline_selector_service.py`](d:\bb\daily_stock_analysis\src\services\kline_selector_service.py)
+    - `get_spot_enriched_a_share_universe(...)` 现在会先对 `Akshare spot` 做一次轻量重试。
+    - 若 spot 临时失败且进程内已有成功快照，则优先回退到“上次成功的 spot universe 缓存”，而不是直接退回通用 universe。
+    - 上市元数据也增加了进程内缓存，减少同进程重复抓取 `listing metadata` 的开销。
+  - 更新 [`scripts/select_hundred_day_high_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_hundred_day_high_candidates.py)
+    - 新增 `scan_hundred_day_high_candidates(...)` 包装层，默认改走 `spot-enriched universe`。
+    - `spot prefilter` 默认新增 `min_listed_days`，若未显式指定则与 `criteria.history_days_required` 对齐；可用 `--min-listed-days-prefilter` 覆盖，用 `--disable-listed-days-prefilter` 关闭。
+    - Markdown 导出与最终日志新增 `skipped_listed_days_count` 留痕。
+  - 更新 [`scripts/select_monthly_slow_rise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_monthly_slow_rise_candidates.py)
+    - 默认改走 `spot-enriched universe`，并把 `snapshot_date` 透传到 universe/listed_days 计算。
+    - `spot prefilter` 默认新增 `min_listed_days = criteria.history_days_required`，同样支持显式覆盖或关闭。
+    - 导出与最终日志新增 `skipped_listed_days_count` 留痕。
+  - 更新 [`scripts/select_earnings_surprise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_earnings_surprise_candidates.py)
+    - 扫描 universe 默认改走 `get_spot_enriched_a_share_universe(as_of_date=snapshot_date)`，让 `total_mv/latest_price/listed_days` 更完整。
+    - `scan_depth=low` 且近期业绩目录可用时，会先按 `recent_event_catalog` 缩小 universe，再做 shard/主扫，减少无意义的逐票评估。
+  - 更新测试：
+    - [`tests/test_kline_selector_service.py`](d:\bb\daily_stock_analysis\tests\test_kline_selector_service.py)
+    - [`tests/test_hundred_day_high_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_hundred_day_high_signal_flow.py)
+    - [`tests/test_monthly_slow_rise_candidates.py`](d:\bb\daily_stock_analysis\tests\test_monthly_slow_rise_candidates.py)
+    - [`tests/test_earnings_surprise_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_earnings_surprise_signal_flow.py)
+- 验证（Verification）：
+  - `python -m pytest tests/test_kline_selector_service.py tests/test_hundred_day_high_signal_flow.py tests/test_monthly_slow_rise_candidates.py tests/test_earnings_surprise_signal_flow.py -q`（72 passed）
+- 备注（Notes）：
+  - 这次没有改 `README.md`，因为变更集中在本地策略默认行为与性能链路，不涉及新的外部运行入口；信息已同步到 `docs/LOCAL_STRATEGY_BASELINE.md`、`docs/LOCAL_STRATEGY_CATALOG.md`、`docs/CHANGELOG.md`。
+
+- 范围（Scope）：快复盘性能优化落地（上市天数短路 + 现货优先前筛 + `continuous_up` 历史长度收敛）。
+- 原因（Why）：上一轮全量实跑已经确认主慢点转到 `trend_leader` 准备/主扫和 `continuous_up` 通用 K 线扫描，需要把“新股快速短路”和“更轻的前置筛选路径”真正落到代码里，而不是只停留在观察结论。
+- 改动（Changes）：
+  - 更新 [`src/services/kline_selector_service.py`](d:\bb\daily_stock_analysis\src\services\kline_selector_service.py)
+    - universe 归一化新增 `list_date` / `listed_days` 保留与计算，支持 `list_date` / `上市日期` / `ipoDate`。
+    - `KlineSelectorPrefilter` 新增 `min_listed_days`，上市天数不足时在轻前筛阶段直接跳过，不进入 `get_daily_data()`。
+    - 新增 spot-enriched universe 能力：优先尝试 `Akshare spot` 作为前筛 universe，再合并 Tushare / Baostock 上市日期；失败时回退到通用 A 股 universe。
+    - `KlineSelectorCriteria` 新增 `history_days_override`，允许连续上涨场景使用更短的真实历史窗口。
+  - 更新 [`scripts/select_trend_leader_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_trend_leader_candidates.py)
+    - 趋势前筛默认新增 `scan_prefilter_min_listed_days=120`。
+    - 前筛统计新增 `removed_listed_days`，并新增准备阶段耗时打点：`universe_elapsed_sec` / `prefilter_elapsed_sec` / `total_prep_elapsed_sec`。
+    - 趋势扫描默认改走现货优先 universe；缺失或失败时回退到原通用链路。
+  - 更新 [`scripts/run_fast_review_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_fast_review_bundle.py)
+    - 新增并透传 `--trend-scan-prefilter-min-listed-days`（默认 `120`）。
+    - `continuous_up` 改成按 `max(lookback_days, streak_days) + 5` 抓历史，不再复用通用 K 线的约 `115` 日默认历史需求。
+    - `continuous_up` 默认轻前筛新增上市天数短路，关闭开关沿用 `--disable-continuous-spot-prefilter`，并补充别名 `--disable-continuous-light-prefilter`。
+  - 更新 [`config/local_strategy_profile.json`](d:\bb\daily_stock_analysis\config\local_strategy_profile.json)
+    - 新增默认值 `trend_scan_prefilter_min_listed_days=120`。
+  - 更新测试：
+    - [`tests/test_kline_selector_service.py`](d:\bb\daily_stock_analysis\tests\test_kline_selector_service.py)
+    - [`tests/test_fast_review_daily_bundle.py`](d:\bb\daily_stock_analysis\tests\test_fast_review_daily_bundle.py)
+    - [`tests/test_trend_leader_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_trend_leader_signal_flow.py)
+- 验证（Verification）：
+  - `python -m py_compile src/services/kline_selector_service.py scripts/run_fast_review_bundle.py scripts/select_trend_leader_candidates.py tests/test_kline_selector_service.py tests/test_fast_review_daily_bundle.py tests/test_trend_leader_signal_flow.py`
+  - `python -m pytest tests/test_kline_selector_service.py tests/test_fast_review_daily_bundle.py tests/test_trend_leader_signal_flow.py -q`（58 passed）
+  - 小样本实跑：
+    - `python -u scripts/run_fast_review_bundle.py --snapshot-date 2026-04-22 --limit 20 --skip-persist-snapshots --progress-every 10 --log-level INFO`
+    - 结果摘录：
+      - `trend leader preparation timing: universe_elapsed_sec=7.05 prefilter_elapsed_sec=1.90 total_prep_elapsed_sec=8.96`
+      - `signal_trend_leader_elapsed_sec=24.97`
+      - `signal_continuous_up_ratio_elapsed_sec=3.93`
+      - `signal_continuous_up_streak_elapsed_sec=3.93`
+      - `continuous scan done: evaluated=20 skipped_listed_days=0 ratio_selected=7 streak_selected=4`
+    - 运行日志：[`fast_review_small_perf_2026-04-22.log`](d:\bb\daily_stock_analysis\logs\fast_review_small_perf_2026-04-22.log)
+- 备注（Notes）：
+  - 本轮小样本里，`trend_leader` 与 `continuous_up` 都出现了 `Akshare spot` 远端断开，随后回退到通用 universe；因此“现货优先前筛”能力已接通，但这次样本并没有完全吃到它的最好收益。
+  - `README.md` 未更新：本次属于本地策略默认行为和性能优化留痕，不涉及新的外部运行入口；信息已同步到 `docs/LOCAL_STRATEGY_BASELINE.md`、`docs/LOCAL_STRATEGY_CATALOG.md`、`docs/CHANGELOG.md`。
+
+- 范围（Scope）：2026-04-22 全量快复盘实跑观测留痕（性能观察 + 慢点定位）。
+- 原因（Why）：在完成 `trend_max_workers` 接线和小样本验证后，需要补一轮“今天全量市场、真实默认参数”的实跑证据，确认当前主耗时段是否已经转移，并为下一轮优化定优先级。
+- 改动（Changes）：
+  - 运行全量快复盘：
+    - `python -u scripts/run_fast_review_bundle.py --snapshot-date 2026-04-22 --progress-every 200 --log-level INFO`
+  - 补充本轮 AI 观察结论：
+    - 当前已不再是 `earnings` 最慢；全量运行中最重的已完成外部链路为 `hundred_day_high`。
+    - `trend_leader` 需要拆成两段看：
+      - 进入主扫描前准备阶段较长（从 bundle 启动 trend 子命令到 `trend leader scan start` 之间存在明显准备耗时）
+      - 主扫描阶段本身在 `max_workers=2` 下仍然吞吐偏慢
+    - `continuous_up` 当前仍沿用全市场逐票实时/历史链路，是整轮尾段的重要耗时来源。
+    - `KlineSelectorService` 全量扫描阶段存在大量“Akshare 远端断开 + Tushare 空结果”的双失败路径，疑似次新股/历史不足标的在反复触发无效抓取。
+- 验证（Verification）：
+  - 全量快复盘最终输出：
+    - `snapshot_date=2026-04-22`
+    - `include_signals=earnings,hundred_day_high,trend_leader,continuous_up_ratio,continuous_up_streak`
+    - `persist_snapshots=True`
+    - `signal_earnings_elapsed_sec=81.38`
+    - `signal_hundred_day_high_elapsed_sec=723.76`
+    - `signal_trend_leader_elapsed_sec=1766.19`
+    - `signal_continuous_up_ratio_elapsed_sec=314.91`
+    - `signal_continuous_up_streak_elapsed_sec=314.91`
+  - 产物落点：
+    - [`fast_review_candidates.csv`](d:\bb\daily_stock_analysis\data\fast_review_daily\2026-04-22\review\fast_review_candidates.csv)
+    - [`fast_review_resonance.csv`](d:\bb\daily_stock_analysis\data\fast_review_daily\2026-04-22\review\fast_review_resonance.csv)
+    - [`fast_review_resonance.md`](d:\bb\daily_stock_analysis\data\fast_review_daily\2026-04-22\review\fast_review_resonance.md)
+    - [`fast_review_summary.md`](d:\bb\daily_stock_analysis\data\fast_review_daily\2026-04-22\review\fast_review_summary.md)
+    - 运行日志：[`fast_review_full_2026-04-22_20260422_215258.stdout.log`](d:\bb\daily_stock_analysis\logs\fast_review_full_2026-04-22_20260422_215258.stdout.log)
+  - 关键观测摘录：
+    - `hundred_day_high`：`evaluated=5020`、`skipped_by_prefilter=178`、`selected=232`，耗时约 `723.76s`
+    - `trend_leader`：`trend leader scan start: total=2319`，最终 `selected=41`，耗时约 `1766.19s`
+    - `continuous_up`：两条信号各记录 `314.91s`；这是聚合脚本按同一轮连续上涨扫描总耗时均摊后的每信号耗时
+    - 抽样失败模式集中为：
+      - `AkshareFetcher`: `RemoteDisconnected('Remote end closed connection without response')`
+      - `TushareFetcher`: `(empty_result) returned empty daily data`
+      - 最终落为 `K-line selector failed to fetch history for <code>`
+- 备注（Notes）：
+  - `README.md` 未更新：本次为本地策略全量实跑观测与性能留痕，不涉及入门、部署或外部使用方式变化；信息已同步到 `docs/CHANGELOG.md` 与本日志。
+  - 下一轮优化优先级建议：
+    - 先处理 `KlineSelectorService` / 数据源层对次新股、历史不足标的的快速跳过，减少双数据源失败风暴
+    - 再拆 `trend_leader` 的“准备阶段”和“主扫描阶段”分别做耗时打点与收缩
+
+- 范围（Scope）：快复盘提速改动收尾验证与策略基线同步（`trend_max_workers` 生效确认 + 小样本耗时对比）。
+- 原因（Why）：上一轮已经把 `trend_max_workers` 接到快复盘入口，但还缺“最新代码 + 当前环境”的收尾验证，避免日志写了、默认值也配了，实际日常入口却没有按预期提速。
+- 改动（Changes）：
+  - 更新 [`docs/LOCAL_STRATEGY_BASELINE.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_BASELINE.md)
+    - 同步快复盘当前真实默认值：`hundred_day_profile=breakout_loose`、`trend_max_workers=2`、`external_parallelism=2`、趋势预过滤默认参数。
+    - 在 AI 续写锚点里补充 2026-04-22 小样本实跑结论，方便后续继续沿这条线排查慢点。
+- 验证（Verification）：
+  - `python -m py_compile scripts/run_fast_review_bundle.py tests/test_fast_review_daily_bundle.py`（通过）
+  - `python -m pytest tests/test_fast_review_daily_bundle.py -q`（15 passed）
+  - 趋势龙头单独小样本实跑（`snapshot_date=2026-04-22`, `limit=5`, `skip-persist-snapshots`）：
+    - `trend_max_workers=1`：子命令透传 `--max-workers 1`，`trend_leader` 耗时约 `13.54s`，总墙钟约 `15.19s`
+    - `trend_max_workers=2`：子命令透传 `--max-workers 2`，`trend_leader` 耗时约 `12.26s`，总墙钟约 `13.67s`
+  - 快复盘 bundle 小样本实跑（默认 5 信号，`limit=5`, `trend_max_workers=2`, `skip-persist-snapshots`）：
+    - 总墙钟约 `33.68s`
+    - 外部信号耗时：`earnings` 约 `31.11s`、`hundred_day_high` 约 `16.39s`、`trend_leader` 约 `12.63s`
+    - 当前最慢外部环节仍是 `earnings`
+- 备注（Notes）：
+  - `README.md` 未更新：本次属于本地策略默认参数与验证留痕同步，不涉及入门、部署或对外使用方式变化；信息已同步到策略基线文档、`docs/CHANGELOG.md` 与本日志。
+
+- 范围（Scope）：快复盘聚合入口趋势并发解耦补齐（`trend_max_workers` 独立默认值 + 配置留痕）。
+- 原因（Why）：实跑日志显示趋势龙头仍以 `--max-workers 1` 执行，导致全量快复盘耗时偏长；需要把趋势并发与全局 `max_workers` 解耦，避免默认配置下被单线程拖慢。
+- 改动（Changes）：
+  - 更新 [`scripts/run_fast_review_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_fast_review_bundle.py)
+    - 新增 `--trend-max-workers`（默认 `2`），`build_trend_leader_command(...)` 改为优先透传 `trend_max_workers`，不再受全局 `--max-workers` 影响。
+  - 更新 [`config/local_strategy_profile.json`](d:\bb\daily_stock_analysis\config\local_strategy_profile.json)
+    - 新增默认项 `trend_max_workers=2`，确保本地快复盘默认就启用趋势双 worker。
+  - 更新 [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md)
+    - 在“快复盘提速参数”中补充 `--trend-max-workers` 与 `trend_max_workers` 的默认值和作用说明。
+- 验证（Verification）：
+  - `python -m pytest tests/test_fast_review_daily_bundle.py -q`（15 passed）
+  - `python scripts/run_fast_review_bundle.py --snapshot-date 2026-04-22 --include-signals trend_leader --limit 5 --skip-persist-snapshots --output-dir data/fast_review_daily_tmp --log-level INFO`
+    - 日志确认趋势脚本启动参数为 `max_workers=2`，并正常完成输出。
+- 备注（Notes）：
+  - `README.md` 未更新：本次为本地策略执行参数与默认配置收口，不涉及入门、部署或外部使用方式变化；信息已同步到策略目录文档、`CHANGELOG` 与本日志。
+
+## 记录规范（默认要求）
+
+- 每次“新增或修改”都应在本文件按日期追加记录，禁止只改代码不留痕。
+- 本地策略相关改动（`select_*` / `collect_*` / `signal_type` / 策略排序与参数）至少补齐以下字段：
+  - `范围（Scope）`
+  - `原因（Why）`
+  - `改动（Changes）`
+  - `备注（Notes）`（需说明 `README.md` 是否同步以及原因）
+- 若改动是用户可见或策略行为变化，需同步在 `docs/CHANGELOG.md` 的 `[Unreleased]` 追加扁平条目。
+
+## 2026-04-22
+
+- 范围（Scope）：快复盘全量运行卡死修复（`earnings` 子进程无输出挂起时的超时保护）。
+- 原因（Why）：2026-04-22 实跑中 `trend_leader` 已完成但 `earnings` 长时间无日志/无 CPU 增长，导致 `run_fast_review_bundle.py` 主流程一直等待子进程退出，整轮无法收尾。
+- 改动（Changes）：
+  - 更新 [`scripts/run_fast_review_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_fast_review_bundle.py)
+    - 为外部子策略命令执行增加 watchdog：
+      - 无输出超时：`--external-command-idle-timeout-sec`（默认 900 秒）
+      - 总运行超时：`--external-command-total-timeout-sec`（默认 14400 秒）
+    - `_run_command(...)` 改为线程化读取 stdout + 超时检查，命中超时后主动 kill 子进程并抛出异常，由上层按 `skipped` 处理，不再无限挂起。
+    - `main()` 启动时输出超时保护配置日志，便于实跑观测。
+  - 更新 [`config/local_strategy_profile.json`](d:\bb\daily_stock_analysis\config\local_strategy_profile.json)
+    - 新增默认值 `external_command_idle_timeout_sec=900`、`external_command_total_timeout_sec=14400`。
+  - 更新测试 [`tests/test_fast_review_daily_bundle.py`](d:\bb\daily_stock_analysis\tests\test_fast_review_daily_bundle.py)
+    - 新增无输出超时回归用例。
+    - 补充 parse_args 对超时参数默认值与 profile 覆盖值断言。
+- 验证（Verification）：
+  - `python -m py_compile scripts/run_fast_review_bundle.py tests/test_fast_review_daily_bundle.py`
+  - `python -m pytest tests/test_fast_review_daily_bundle.py tests/test_akshare_sector_rankings_backoff.py -q`（16 passed）
+- 备注（Notes）：
+  - `README.md` 未更新：本次属于本地策略运行健壮性修复，非入门/部署行为变更，信息已同步至策略目录文档、`CHANGELOG` 与本日志。
+
+- 范围（Scope）：快复盘提速项 1+3+4 落地（外部并行默认提速、趋势预过滤参数透传、板块排行失败熔断）。
+- 原因（Why）：全量快复盘实跑中 `trend_leader` 占比过高且板块排行存在重复先打失败源，用户要求先落地 1+3+4 作为下一轮提速基线。
+- 改动（Changes）：
+  - 更新 [`scripts/run_fast_review_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_fast_review_bundle.py)
+    - `--external-parallelism` 默认值从 `1` 提升到 `2`。
+    - 新增趋势预过滤参数并透传到趋势脚本：`--trend-disable-scan-prefilter`、`--trend-scan-prefilter-min-change-pct-60d`、`--trend-scan-prefilter-min-turnover-rate`、`--trend-scan-prefilter-require-positive-change`。
+  - 更新 [`config/local_strategy_profile.json`](d:\bb\daily_stock_analysis\config\local_strategy_profile.json)
+    - 默认 `external_parallelism` 调整为 `2`。
+    - 新增快复盘默认趋势预过滤参数（`4.0/1.0/require_positive_change=true`）。
+  - 更新 [`data_provider/akshare_fetcher.py`](d:\bb\daily_stock_analysis\data_provider\akshare_fetcher.py)
+    - 为 `get_sector_rankings()` 增加东财失败后的短期熔断与跳过逻辑。
+    - 新增环境变量 `AKSHARE_SECTOR_RANK_EM_BACKOFF_SECONDS`（默认 `1200` 秒）控制熔断窗口。
+  - 更新测试：
+    - [`tests/test_fast_review_daily_bundle.py`](d:\bb\daily_stock_analysis\tests\test_fast_review_daily_bundle.py)：补充 trend 预过滤透传、关闭透传和默认值断言。
+    - 新增 [`tests/test_akshare_sector_rankings_backoff.py`](d:\bb\daily_stock_analysis\tests\test_akshare_sector_rankings_backoff.py)：验证东财失败后进入 backoff 并在窗口内跳过东财请求。
+  - 更新策略文档留痕：
+    - [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md)
+    - [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md)
+- 验证（Verification）：
+  - `python -m py_compile scripts/run_fast_review_bundle.py data_provider/akshare_fetcher.py tests/test_fast_review_daily_bundle.py tests/test_akshare_sector_rankings_backoff.py`
+  - `python -m pytest tests/test_fast_review_daily_bundle.py tests/test_akshare_sector_rankings_backoff.py -q`（15 passed）
+- 备注（Notes）：
+  - `README.md` 未更新：本次为本地策略执行参数与数据源 fallback 行为优化，非入门/部署路径变更，说明已同步到策略目录文档、`CHANGELOG` 与本日志。
+
+- 范围（Scope）：`earnings_surprise` 质量优先版策略收口（watch 档质量确认必需 + 质量信号温和兜底）。
+- 原因（Why）：实跑中出现“候选多数仅凭增速/文本进入 watch，通过后质量信号弱”的问题，和“业绩兑现质量优先”的目标不一致。
+- 改动（Changes）：
+  - 更新 [`scripts/select_earnings_surprise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_earnings_surprise_candidates.py)
+    - 新增 `require_quality_confirmation_for_watch` 档位参数：`strict/balanced=true`、`relaxed=false`。
+    - 调整放行逻辑：watch 档在质量优先档位下必须满足 `earnings_quality_signal=True`，否则拦截为 `blocked_missing_quality_confirmation`。
+    - 调整质量信号判定：在保留 `good/strong` 与 `score>=65` 的基础上，增加 `mixed 且 score>=50` 的温和确认兜底。
+    - 在 metrics 与 markdown 规则区补充 `require_quality_confirmation_for_watch` 可观测字段。
+  - 更新测试 [`tests/test_earnings_surprise_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_earnings_surprise_signal_flow.py)
+    - 补充质量优先断言：balanced 在 watch 分够但缺质量确认时返回 `blocked_missing_quality_confirmation`。
+    - 保留 relaxed 可在无质量确认时走原 watch 放行路径（有增速/文本确认即可）。
+  - 更新策略文档留痕：
+    - [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md) 补充“strict/balanced 默认质量优先”说明。
+    - [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md) `[Unreleased]` 追加扁平条目。
+- 备注（Notes）：
+  - `README.md` 未更新：本次为本地策略行为收口，非入门/部署变更，信息已同步落到策略目录文档、`CHANGELOG` 与本日志。
+
+- 范围（Scope）：`earnings_surprise` 提速项 1/2/3 落地收口（近期公告目录跨运行缓存、高深度按需补抓、单 worker 写入优化与锁表修复）。
+- 原因（Why）：P0/P1 已完成后，实跑仍暴露两类问题：一是高深度仍有全量抓取浪费，二是单 worker 共享事务里逐条 `flush` 在 SQLite 场景触发 `database is locked`。
+- 改动（Changes）：
+  - 更新 [`scripts/select_earnings_surprise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_earnings_surprise_candidates.py)
+    - 新增近期公告目录磁盘缓存：同快照直接命中缓存；跨天在复用窗口内优先增量拉取并与存量目录合并。
+    - `scan_depth=high` 改为核心块优先（`financial/forecast/quick_report`）评估，仅对“已通过/临近通过”候选补抓全量块（`dividend/institution/top10`）。
+    - 单 worker 模式下基础面快照读写复用共享 session，写入使用 `auto_commit=False`，降低逐票提交开销。
+  - 更新 [`src/storage.py`](d:\bb\daily_stock_analysis\src\storage.py)
+    - `upsert_signal_fundamental_snapshot(...)` 在 `auto_commit=False` 时不再逐条 `flush`，并先检查 session 内挂起对象，避免同事务重复插入。
+    - `get_signal_fundamental_snapshot(...)` 支持优先读取 session 内挂起对象，保证共享事务未 flush 场景下读取一致性。
+  - 更新测试：
+    - [`tests/test_earnings_surprise_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_earnings_surprise_signal_flow.py) 新增近期目录磁盘缓存、高深度按需补抓、单 worker 非自动提交写入覆盖。
+    - [`tests/test_storage.py`](d:\bb\daily_stock_analysis\tests\test_storage.py) 新增“`auto_commit=False` 不逐条 flush 且同事务二次 upsert 不重复插入”回归用例。
+- 验证（Verification）：
+  - `python -m pytest tests/test_fundamental_adapter.py tests/test_earnings_surprise_signal_flow.py tests/test_storage.py -q`（50 passed）
+  - `python -m py_compile scripts/select_earnings_surprise_candidates.py src/storage.py tests/test_earnings_surprise_signal_flow.py tests/test_storage.py`（通过）
+  - 采样实跑（`limit=30`，`snapshot_date=2026-04-26`，`max-workers=1`）：
+    - `low run1`：`Elapsed seconds=29.345`，`Same-day bundle cache hits=25`，`Fundamental refresh count=5`
+    - `low run2`：`Elapsed seconds=13.052`，`Same-day bundle cache hits=25`，`Fundamental refresh count=5`
+    - `high run1`：`Elapsed seconds=29.515`，`Same-day bundle cache hits=6`，`Fundamental refresh count=24`
+  - 本轮实跑未再出现 `database is locked`。
+- 备注（Notes）：
+  - `README.md` 未更新：本次属于本地策略内部提速与稳定性修复，用户可见说明已同步到 `docs/CHANGELOG.md`、`docs/LOCAL_STRATEGY_CATALOG.md` 与本日志。
+
+- 范围（Scope）：`earnings_surprise` P0/P1 提速实现（基础面候选调用缓存、低深度按需抓取、跨天指纹复用、公告目录动态期数）。
+- 原因（Why）：全量 `earnings` 扫描慢点集中在“重复公告抓取 + 每票多候选接口重试 + 跨天重复拉取”，需要先做“无变化不重拉”的最小可落地优化。
+- 改动（Changes）：
+  - 更新 [`data_provider/fundamental_adapter.py`](d:\bb\daily_stock_analysis\data_provider\fundamental_adapter.py)
+    - `AkshareFundamentalAdapter._call_df_candidates(...)` 增加进程内缓存（按 `func_name + kwargs` 键控），成功结果与失败结果都缓存，减少同轮重复调用。
+  - 更新 [`scripts/select_earnings_surprise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_earnings_surprise_candidates.py)
+    - 新增 `resolve_effective_required_blocks(...)`：`low/medium` 下若近期业绩目录已覆盖 `forecast/quick_report`，只抓 `financial` 核心块并叠加 overlay。
+    - 新增跨天复用逻辑：同日 miss 后会尝试读取前一日快照，在事件指纹未变化且块覆盖满足时直接复用（`cache_source=cross_day_cache`）。
+    - 新增 `recent_event_fingerprint` 落盘字段，并将跨天复用纳入 bundle cache 统计口径。
+    - `build_recent_earnings_event_catalog(...)` 改为 `event_lookback_days` 驱动的动态报告期数量（默认 120 天约对应 4 期，不再固定 6 期）。
+  - 更新 [`src/storage.py`](d:\bb\daily_stock_analysis\src\storage.py)
+    - 新增 `get_latest_signal_fundamental_snapshot(...)`，支持读取某信号某股票“指定日期之前”的最新基础面快照。
+  - 更新测试：
+    - [`tests/test_fundamental_adapter.py`](d:\bb\daily_stock_analysis\tests\test_fundamental_adapter.py) 新增 `_call_df_candidates` 成功/失败缓存回归用例。
+    - [`tests/test_earnings_surprise_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_earnings_surprise_signal_flow.py) 新增低深度按需抓取、跨天复用、动态期数回归用例。
+- 验证（Verification）：
+  - `python -m pytest tests/test_fundamental_adapter.py tests/test_earnings_surprise_signal_flow.py -q`（40 passed）
+  - `python -m py_compile data_provider/fundamental_adapter.py scripts/select_earnings_surprise_candidates.py src/storage.py tests/test_fundamental_adapter.py tests/test_earnings_surprise_signal_flow.py`（通过）
+  - 采样实跑（`limit=30`）：
+    - `low`（2026-04-24）：`Elapsed seconds=32.680`，`bundle cache hits=19`，`fundamental refresh=11`
+    - `low` 同日复跑（2026-04-24）：`Elapsed seconds=26.911`，`bundle cache hits=25`，`fundamental refresh=5`
+    - `high`（2026-04-24）：`Elapsed seconds=64.868`，`bundle cache hits=0`，`fundamental refresh=30`
+- 备注（Notes）：
+  - `README.md` 未更新：本次为本地策略扫描链路提速与缓存策略优化，已同步留痕到 `docs/LOCAL_STRATEGY_CATALOG.md`、`docs/CHANGELOG.md` 与本日志。
+
+- 范围（Scope）：`earnings_surprise` 扫描深度参数接线补齐（快复盘入口 + 业绩脚本运行链路）。
+- 原因（Why）：昨天的设计与测试已经约定 `scan-depth` 三档和快复盘默认 `low`，但实际代码仍缺少关键透传，导致 `tests/test_fast_review_daily_bundle.py` 与 `tests/test_earnings_surprise_signal_flow.py` 失败。
+- 改动（Changes）：
+  - 更新 [`scripts/run_fast_review_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_fast_review_bundle.py)
+    - 新增 `--earnings-scan-depth`（`low/medium/high`，默认 `low`）。
+    - `build_earnings_command(...)` 透传 `--scan-depth` 给 `select_earnings_surprise_candidates.py`。
+  - 更新 [`scripts/select_earnings_surprise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_earnings_surprise_candidates.py)
+    - `parse_args_v2()` 新增 `--scan-depth`。
+    - `scan_market(...)` 新增 `scan_depth` 入参，并把标准化后的扫描深度与 `required_blocks` 透传到 `load_or_fetch_signal_fundamental_snapshot(...)`，确保低深度时按核心块抓取。
+  - 更新策略目录与变更记录：
+    - [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md) 补充 `--scan-depth` 说明与快复盘默认 `low` 口径。
+    - [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md) 在 `[Unreleased]` 追加扁平条目。
+- 验证（Verification）：
+  - `python -m pytest tests/test_fast_review_daily_bundle.py -v`（10 passed）
+  - `python -m pytest tests/test_earnings_surprise_signal_flow.py -v`（22 passed）
+  - `python -m pytest tests/test_fundamental_adapter.py -v`（13 passed）
+  - `python -m py_compile scripts/run_fast_review_bundle.py scripts/select_earnings_surprise_candidates.py`（通过）
+- 备注（Notes）：
+  - `README.md` 未更新：本次是本地策略运行参数与执行链路修复，信息已同步到策略目录、AI 修改日志与 `docs/CHANGELOG.md`。
+  - 本次只补最小接线，不改变既有 `strict / balanced / relaxed` 评分口径。
+
+## 2026-04-21
+
+- Scope: local strategy baseline documentation
+- Why: the repo already had a strategy catalog, but it still lacked a single maintenance baseline that answers “which strategies are actually in daily use now, what are their implementation conditions, and where should AI continue updating next time”.
+- Changes:
+  - Added [`docs/LOCAL_STRATEGY_BASELINE.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_BASELINE.md) as the new strategy baseline document for Word export, daily maintenance, and future strategy updates.
+  - Documented the current daily default strategies from [`config/local_strategy_profile.json`](d:\bb\daily_stock_analysis\config\local_strategy_profile.json): `earnings`, `hundred_day_high`, `trend_leader`, `continuous_up_ratio`, and `continuous_up_streak`.
+  - Summarized each strategy’s current implementation conditions, default parameters, main entry script, signal namespace, and snapshot landing behavior; also included `monthly_slow_rise` as a non-default extension strategy.
+  - Added an AI continuation anchor section in the new baseline doc so later updates can see the last handled date, scope, and next update position.
+  - Updated [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md) so future local strategy changes explicitly update the baseline document first.
+- Notes:
+  - `README.md` was not updated because this change is strategy-governance documentation, not onboarding, runtime, or deployment behavior.
+  - This is a docs-only change and does not alter strategy implementation.
+
+- Scope: trend leader V1 acceptance closure follow-up for real speedup
+- Why: the first acceptance benchmark showed only 2.63% improvement because the universe fallback path returned quote columns as null, so the prefilter never actually reduced scan load.
+- Changes:
+  - Updated [`scripts/select_trend_leader_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_trend_leader_candidates.py)
+    - Added quote hydration for scan prefilter preparation so missing `pct_change / turnover_rate / total_mv / latest_price` can be backfilled from realtime quotes before deep scan.
+    - Added adaptive positive-change gating when `change_pct_60d` is unavailable, plus a relaxed buffer pool that keeps a limited number of high-priority deferred names in the scan queue instead of falling back to full-universe deep scan.
+    - Extended `run_stats` with adaptive-prefilter and quote-hydration observability for reproducible benchmark inspection.
+  - Updated [`scripts/benchmark_trend_leader_v1.py`](d:\bb\daily_stock_analysis\scripts\benchmark_trend_leader_v1.py)
+    - Benchmark reports now include adaptive-positive-change and hydrated-row counts so the real source of speedup is visible in artifacts.
+  - Updated tests in [`tests/test_trend_leader_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_trend_leader_signal_flow.py) for quote hydration, adaptive positive-change fallback, and relaxed buffer ordering.
+- Verification:
+  - `python -m py_compile scripts/select_trend_leader_candidates.py scripts/benchmark_trend_leader_v1.py tests/test_trend_leader_signal_flow.py tests/test_trend_leader_benchmark.py`
+  - inline run of all `test_*` in `tests.test_trend_leader_signal_flow`
+  - `.\.venv\Scripts\python.exe -m unittest tests.test_trend_leader_benchmark tests.test_capital_profile_service`
+  - `.\.venv\Scripts\python.exe scripts/benchmark_trend_leader_v1.py --snapshot-date 2026-04-21 --limit 200 --max-workers 1 --output-dir data/trend_leader_benchmarks --log-level INFO`
+- Notes:
+  - Real benchmark artifact: `data/trend_leader_benchmarks/2026-04-21/trend_leader_v1_benchmark.json`
+  - Same-parameter result on April 21, 2026: baseline `127.7336s` -> optimized `51.7061s`, improvement `59.5204%`; optimized prefilter reduced the deep-scan queue from `200` to `99` through `quote_hydrated_rows=200`, `after_primary=59`, `added_relaxed_buffer=40`.
+  - Candidate count for this `limit=200` sample remained `0`, so this round closes the speed-acceptance evidence but does not yet prove the “daily non-zero candidate” goal on the benchmark sample.
+
+- 范围（Scope）：趋势龙头 V1 验收补齐（保守 `tier4_last_resort` + 可复现实跑 benchmark）。
+- 原因（Why）：前一轮虽然已落地预过滤、缓存复用与分层 fallback，但仍缺少“前后提速证据”，且 `optimized_v1` 单次实跑导出仍出现空结果文件，验收口径没有真正闭环。
+- 改动（Changes）：
+  - 更新 [`scripts/select_trend_leader_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_trend_leader_candidates.py)
+    - 收紧 `tier3_broader_pool` 与 `tier4_last_resort` 的边界：`tier4_last_resort` 现在只接收非 `pseudo_leader`、非 `blocked_*`、`overall_score > 0` 且存在最低信号强度的候选。
+    - 新增 `scan_trend_leader_candidates_with_stats(...)`，为扫描链路补充结构化 `run_stats`，包含 `elapsed_seconds`、`selected_count`、`fallback_selected_count` 与 prefilter 统计，便于后续 benchmark 与验收。
+  - 新增 [`scripts/benchmark_trend_leader_v1.py`](d:\bb\daily_stock_analysis\scripts\benchmark_trend_leader_v1.py)
+    - 同参数跑 `baseline`（关闭 prefilter / quote-seed / prefetch）与 `optimized`（开启 V1 快路径）两轮扫描。
+    - 输出 `trend_leader_v1_benchmark.json` 与 `trend_leader_v1_benchmark.md` 到 `data/trend_leader_benchmarks/<date>/`，固定留存前后对比证据。
+  - 更新测试
+    - [`tests/test_trend_leader_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_trend_leader_signal_flow.py)：新增 `tier4_last_resort` 触发与 blocked 排除测试。
+    - [`tests/test_trend_leader_benchmark.py`](d:\bb\daily_stock_analysis\tests\test_trend_leader_benchmark.py)：新增 benchmark 报告生成与 improvement 百分比测试。
+- 验证（Verification）：
+  - `.\.venv\Scripts\python.exe -m unittest tests.test_trend_leader_benchmark`
+  - 内联执行 `tests.test_trend_leader_signal_flow` 新增的 fallback 测试函数，确认 red -> green
+- 备注（Notes）：
+  - `README.md` 未更新：本次为本地策略扫描验收闭环与证据工具补齐，信息已同步落到 `docs/CHANGELOG.md`、`docs/LOCAL_STRATEGY_CATALOG.md` 与本日志。
+
+- 范围（Scope）：趋势龙头统一链路 V1 三项优化（提速、兜底命中率、资金阈值分层）。
+- 原因（Why）：当前全量扫描耗时高、弱市下 strict 命中少，且资金流绝对阈值对大小盘不公平。
+- 改动（Changes）：
+  - 更新 [`scripts/select_trend_leader_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_trend_leader_candidates.py)
+    - 新增扫描前行情级预过滤能力：`--disable-scan-prefilter`、`--scan-prefilter-min-change-pct-60d`、`--scan-prefilter-min-turnover-rate`、`--scan-prefilter-require-positive-change`。
+    - 新增 `_apply_scan_prefilters(...)`，在深度评估前先按 `change_pct_60d/turnover_rate/pct_change` 做轻量过滤（缺失值 fail-open）。
+    - 候选兜底改为分层策略：`tier1_near_miss -> tier2_watchlist -> tier3_broader_pool -> tier4_last_resort`，并写入 `fallback_tier` 与 `fallback_tier_*` 风险标记。
+    - 复用扫描行内行情字段作为 `quote_seed`，减少重复 `get_realtime_quote` 调用。
+  - 更新 [`src/services/capital_profile_service.py`](d:\bb\daily_stock_analysis\src\services\capital_profile_service.py)
+    - 资金流打分改为按市值分层绝对阈值：small/mid/large cap。
+    - 通过 `total_market_cap` 参与 `_score_capital_flow(...)` 阈值选择，保留 pct-mv 口径兜底。
+  - 更新测试
+    - [`tests/test_trend_leader_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_trend_leader_signal_flow.py)：新增扫描预过滤测试与分层 fallback 测试。
+    - [`tests/test_capital_profile_service.py`](d:\bb\daily_stock_analysis\tests\test_capital_profile_service.py)：新增小盘/大盘资金流阈值分层测试。
+- 验证（Verification）：
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m py_compile scripts/select_trend_leader_candidates.py src/services/capital_profile_service.py tests/test_capital_profile_service.py tests/test_trend_leader_signal_flow.py`
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_capital_profile_service.py tests/test_trend_leader_signal_flow.py -q`（19 passed）
+  - 本地实跑（2026-04-21，limit=200，max-workers=4，跳过入库）：耗时约 66.54s，输出文件已生成于 `data/trend_leader_daily/2026-04-21/optimized_v1/`。
+- 备注（Notes）：
+  - 本次 run 中 `trend_leader_unified_candidates.csv` 结果为 0 行（仅表头），主要受当日 strict/fallback 条件与数据可用性影响。
+  - `README.md` 未更新：本次为本地策略执行链路与评分口径优化，已同步到 `docs/CHANGELOG.md` 与本日志。
+
+- 范围（Scope）：快复盘聚合入口（`run_fast_review_bundle.py`）增加“无结果策略跳过 + 未执行策略可视化”。
+- 原因（Why）：用户希望日常跑批不要因为某一策略没结果而中断，并且在最终结果中明确看到“哪些策略未执行/无结果”。
+- 改动（Changes）：
+  - 更新 [`scripts/run_fast_review_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_fast_review_bundle.py)：
+    - 新增 `SkippedSignal` 结构。
+    - 外部信号执行改为容错聚合：子策略异常或 `csv` 解析后 0 行时，标记为 `skipped`（`execution_failed` / `no_rows`）并继续执行其他策略。
+    - 连续上涨双口径（`continuous_up_ratio` / `continuous_up_streak`）在 0 行时不再进入主候选集合，改为 `skipped` 记录；同时跳过空结果入库动作。
+    - 汇总输出增强：`fast_review_summary.md` 新增 `Skipped / No-result Signals` 区块；控制台新增 `skipped_signals_count` 与逐条 `skipped_signal=...` 输出。
+  - 更新测试 [`tests/test_fast_review_daily_bundle.py`](d:\bb\daily_stock_analysis\tests\test_fast_review_daily_bundle.py)：
+    - 覆盖并行任务顺序、空结果跳过标记、summary skipped 区块渲染。
+- 验证（Verification）：
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m py_compile scripts/run_fast_review_bundle.py tests/test_fast_review_daily_bundle.py`（通过）
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_fast_review_daily_bundle.py -q`（10 passed）
+  - 本地实跑：
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts/run_fast_review_bundle.py --snapshot-date 2026-04-21 --output-dir data/fast_review_daily --limit 20 --max-workers 2 --continuous-max-workers 2 --external-parallelism 2 --skip-persist-snapshots --log-level INFO`
+    - 输出包含 `skipped_signals_count=3`，并列出 `earnings/hundred_day_high/trend_leader` 的 `no_rows`。
+- 备注（Notes）：
+  - `README.md` 未更新：本次为本地策略聚合脚本行为改造，用户可见变更已同步到 `docs/CHANGELOG.md` 与本日志。
+
+- 范围（Scope）：趋势龙头统一策略资金层容错增强（资金流缺失不再硬否决）+ 板块资金数据源 fallback。
+- 原因（Why）：用户反馈“真实资金流经常拿不到，导致 strict 几乎很难命中”，希望“拿不到时先降级提示，不要直接卡死”，并尝试改用其他来源补齐板块资金上下文。
+- 改动（Changes）：
+  - 更新 [`src/services/trend_leader_strategy_service.py`](d:\bb\daily_stock_analysis\src\services\trend_leader_strategy_service.py)：
+    - 新增 `capital_flow_available` 判定（结合 `capital_flow_status` 与 `main_net_inflow/inflow_5d/inflow_10d` 数值可用性）。
+    - 当资金流状态为不可用（如 `failed/not_supported/unknown/empty`）时，`weak_capital_consensus`、`weak_capital_flow`、`weak_capital_continuity` 仅保留风险提示，不再触发 `hard_blocked`。
+    - 新增风险标签 `capital_flow_unavailable`，并在返回结构补充 `capital_flow_status`、`capital_flow_available` 字段，便于快照/导出时解释“为何放行或降级”。
+  - 更新 [`data_provider/fundamental_adapter.py`](d:\bb\daily_stock_analysis\data_provider\fundamental_adapter.py)：
+    - 在 `get_capital_flow(...)` 的板块资金排行分支增加 Tushare fallback：优先尝试 `moneyflow_ind_ths`，再尝试 `moneyflow_ind_dc`。
+    - 新增板块排行解析与日级内存缓存（含线程锁），减少同日重复请求。
+  - 更新测试：
+    - [`tests/test_trend_leader_strategy_service.py`](d:\bb\daily_stock_analysis\tests\test_trend_leader_strategy_service.py) 新增“`capital_flow_status=failed` 不应硬拦截”覆盖。
+    - [`tests/test_fundamental_adapter.py`](d:\bb\daily_stock_analysis\tests\test_fundamental_adapter.py) 新增“AkShare 板块资金为空时走 Tushare fallback”覆盖。
+- 验证（Verification）：
+  - `python -m py_compile src/services/trend_leader_strategy_service.py data_provider/fundamental_adapter.py`（通过）
+  - `python -m pytest tests/test_trend_leader_strategy_service.py tests/test_fundamental_adapter.py -q`（当前环境缺少 `pytest`，未执行）
+- 备注（Notes）：
+  - `README.md` 未更新：本次为本地策略内部打分容错与数据源 fallback 调整，用户可见行为变化已同步到 `docs/CHANGELOG.md` 与本日志。
+
+- 范围（Scope）：趋势龙头链路新增“同板块业绩暴雷联动提示”策略（板块级风险提示层）。
+- 原因（Why）：用户希望即使个股本身分数通过，也能在同板块出现业绩暴雷时给出风险提示，避免资金联想导致的板块联动回撤被忽略。
+- 改动（Changes）：
+  - 更新 [`scripts/select_trend_leader_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_trend_leader_candidates.py)：
+    - 单票评估阶段补充板块信息提取：新增 `primary_board_name / board_names / board_count`。
+    - 新增板块业绩风险聚合：按全市场扫描结果统计同板块 `blocked_*` 业绩信号（重点 `blocked_negative_text / blocked_quality_risk`）。
+    - 新增候选提示注入：为入选结果追加 `board_earnings_risk_level / board_earnings_risk_hint / board_earnings_risk_*count`，并同步写入 `risk_flags` 与 `strategy_summary`。
+    - 快照 `metrics_payload` 新增上述板块风险字段；`cause_payload` 新增 `industry` 与 `industry_logic`（写入风险提示文案）。
+  - 更新测试 [`tests/test_trend_leader_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_trend_leader_signal_flow.py)：
+    - 新增板块业绩风险提示注入与板块优先级选择测试。
+    - 扩展 `build_snapshot_metrics_payload` 字段断言，覆盖新风险字段。
+  - 同步更新 [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md) `[Unreleased]` 扁平条目。
+- 验证（Verification）：
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m py_compile scripts/select_trend_leader_candidates.py`
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_trend_leader_signal_flow.py tests/test_trend_leader_daily_bundle.py -q`（16 passed）
+- 备注（Notes）：
+  - `README.md` 未更新：本次为本地策略内部风控提示增强，文档留痕已同步到 changelog 与本日志。
+
+- 范围（Scope）：优先可完善点 V1 落地（快复盘中心化配置 + 统一评估入口 + 行业拐点日更入口 + 共振导出）。
+- 原因（Why）：用户希望本地策略先“稳定、清晰、可追踪”，减少入口分散与脚本耦合，同时降低长耗时链路的日常使用复杂度。
+- 改动（Changes）：
+  - 更新 [`scripts/run_fast_review_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_fast_review_bundle.py)：
+    - 新增 `--strategy-profile-file`（默认读取 `config/local_strategy_profile.json`），支持集中管理本地默认参数。
+    - 新增 `--continuous-max-workers`，将连续上涨本地扫描并发与外部脚本并发解耦，默认 `1`。
+    - 新增共振聚合输出：`fast_review_resonance.csv` 与 `fast_review_resonance.md`，按 `code` 聚合多信号重叠。
+    - 汇总 Markdown 的后续命令提示改为多信号统一评估入口。
+  - 新增 [`config/local_strategy_profile.json`](d:\bb\daily_stock_analysis\config\local_strategy_profile.json)：
+    - 提供本地策略默认配置中心（include/exclude、并发、趋势/业绩/连续上涨参数）。
+  - 新增 [`scripts/run_signal_performance_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_signal_performance_bundle.py)：
+    - 独立聚合入口，按 `signal_type` 列表批量调用 `evaluate_signal_snapshot_performance.py`。
+    - 输出分信号 JSON/Markdown 报告，并汇总 `signal_performance_bundle_summary.csv/.md`。
+  - 新增 [`scripts/run_industry_turning_point_daily.py`](d:\bb\daily_stock_analysis\scripts\run_industry_turning_point_daily.py)：
+    - 独立聚合入口，串联 `collect_board_recognizability_rankings.py` 与 `collect_board_theme_core_snapshots.py`。
+    - 支持按日执行并产出 `industry_turning_point_daily_summary.md`。
+  - 新增/更新测试：
+    - [`tests/test_fast_review_daily_bundle.py`](d:\bb\daily_stock_analysis\tests\test_fast_review_daily_bundle.py)：新增策略配置默认值、连续上涨并发参数、共振去重测试。
+    - [`tests/test_signal_performance_bundle.py`](d:\bb\daily_stock_analysis\tests\test_signal_performance_bundle.py)：新增多信号评估入口核心函数测试。
+    - [`tests/test_industry_turning_point_daily.py`](d:\bb\daily_stock_analysis\tests\test_industry_turning_point_daily.py)：新增行业拐点日更入口命令构建测试。
+- 验证（Verification）：
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m py_compile scripts/run_fast_review_bundle.py scripts/run_signal_performance_bundle.py scripts/run_industry_turning_point_daily.py`
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_fast_review_daily_bundle.py tests/test_signal_performance_bundle.py tests/test_industry_turning_point_daily.py -q`（14 passed）
+- 备注（Notes）：
+  - `README.md` 未更新：本次改动为本地策略脚本编排与执行入口治理，已同步记录到 `docs/CHANGELOG.md` 与本日志。
+
+## 2026-04-20
+
+- 范围（Scope）：趋势龙头扫描并发化 + 入口参数透传（获取与策略执行提速）
+- 原因（Why）：用户反馈全量扫描耗时过长，希望“获取多线程、策略执行多线程”。
+- 改动（Changes）：
+  - 更新 [`scripts/select_trend_leader_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_trend_leader_candidates.py)：
+    - 新增 `--max-workers` 参数，并在 `scan_trend_leader_candidates(...)` 中接入线程池并发扫描。
+    - 新增 `--shard-count/--shard-index` 参数，支持多实例分片扫描；并在分片模式下要求 `--skip-db-persist`，避免分片间互相覆盖快照。
+    - 将单票评估逻辑抽为 `_evaluate_trend_leader_candidate(...)`，主线程统一聚合结果、进度日志与 checkpoint，保持落库/断点续跑语义稳定。
+    - 新增并发场景日志：`pending`、`workers`、`completed/progress`，便于判断当前处理位置与速度。
+    - `criteria_payload` 新增 `max_workers` 记录，便于后续复盘定位执行参数。
+  - 更新 [`scripts/run_fast_review_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_fast_review_bundle.py)：
+    - 构建趋势龙头子命令时透传 `--max-workers`，使快复盘入口可直接控制趋势扫描并发。
+    - 新增并透传趋势分片参数 `--trend-shard-count/--trend-shard-index`。
+  - 更新 [`scripts/run_trend_leader_daily_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_trend_leader_daily_bundle.py)：
+    - 新增 CLI 参数 `--max-workers`，并透传到 `select_trend_leader_candidates.py`。
+    - 新增并透传分片参数 `--shard-count/--shard-index`。
+  - 新增 [`scripts/run_trend_leader_sharded_pipeline.py`](d:\bb\daily_stock_analysis\scripts\run_trend_leader_sharded_pipeline.py)：
+    - 支持 `download -> merge -> persist` 两段式（可分阶段执行），避免“下载扫描”和其他策略执行同步耦合。
+    - 分片下载阶段强制 `--skip-db-persist`，在合并阶段统一可选入库，降低分片互相覆盖风险。
+  - 更新 [`scripts/run_fast_review_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_fast_review_bundle.py)：
+    - 新增 `--exclude-signals`，支持在工程层面快速剔除当前不需要的策略信号（在 `--include-signals` 展开后再过滤）。
+  - 新增测试 [`tests/test_trend_leader_sharded_pipeline.py`](d:\bb\daily_stock_analysis\tests\test_trend_leader_sharded_pipeline.py)，并更新 [`tests/test_fast_review_daily_bundle.py`](d:\bb\daily_stock_analysis\tests\test_fast_review_daily_bundle.py)。
+  - 更新测试：
+    - [`tests/test_fast_review_daily_bundle.py`](d:\bb\daily_stock_analysis\tests\test_fast_review_daily_bundle.py) 新增趋势命令 `--max-workers` 透传断言。
+    - [`tests/test_trend_leader_daily_bundle.py`](d:\bb\daily_stock_analysis\tests\test_trend_leader_daily_bundle.py) 新增 `--max-workers` 参数透传断言。
+- 验证（Verification）：
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m py_compile scripts/select_trend_leader_candidates.py scripts/run_fast_review_bundle.py scripts/run_trend_leader_daily_bundle.py`
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_fast_review_daily_bundle.py tests/test_trend_leader_daily_bundle.py -q`（8 passed）
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_trend_leader_signal_flow.py -q`（10 passed）
+  - 实跑对比（2026-04-21，`limit=10`，关闭二阶段补抓，`skip-db-persist`）：`--max-workers 1` 约 `47.89s`，`--max-workers 4`（独立 worker manager）约 `37.39s`。
+- 备注（Notes）：
+  - `README.md` 未更新：本次属于本地策略执行性能与可观测性优化，信息已同步到 `docs/CHANGELOG.md` 与本日志。
+
+- 范围（Scope）：快复盘聚合入口执行性能优化（并行 + 分段耗时可观测）
+- 原因（Why）：用户反馈“全量一次下来时间较长”，需要先做低风险、可开关的提速能力，并让慢点定位更直观。
+- 改动（Changes）：
+  - 更新 [`scripts/run_fast_review_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_fast_review_bundle.py)：
+    - 新增 `--external-parallelism` 参数，用于并行执行 `earnings/hundred_day_high/trend_leader` 三个独立外部信号脚本（默认 `1`，保持现有稳定行为）。
+    - 新增 `_run_external_signal_jobs(...)` 并行执行器；并发模式下仍按任务定义顺序汇总结果，避免后续导出顺序抖动。
+    - 新增分信号耗时统计：每个信号输出 `elapsed_sec`，汇总 Markdown 增加耗时列与“信号总耗时”。
+    - 运行结束的控制台摘要新增 `signal_<key>_elapsed_sec`，便于快速判断瓶颈环节。
+  - 更新 [`tests/test_fast_review_daily_bundle.py`](d:\bb\daily_stock_analysis\tests\test_fast_review_daily_bundle.py)：
+    - 新增并行执行器顺序稳定性测试 `test_run_external_signal_jobs_keeps_job_order`。
+  - 同步更新 [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md) 的 `[Unreleased]` 扁平条目。
+- 备注（Notes）：
+  - `README.md` 未更新：本次为本地策略脚本执行层优化，信息已落地到 changelog 与本日志。
+  - 稳定性默认优先：默认仍是串行；需要提速时显式传入 `--external-parallelism 2/3`。
+
+- 范围（Scope）：新增两段式快复盘聚合入口（不改 `run_trend_leader_daily_bundle.py`）。
+- 原因（Why）：把“快复盘”和“全扫描/回测”拆开，降低入口复杂度，先保证每天稳定产出可复盘结果。
+- 改动（Changes）：
+  - 新增 [`scripts/run_fast_review_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_fast_review_bundle.py)：
+    - 聚合 `earnings`、`hundred_day_high`、`trend_leader`、`continuous_up_ratio`、`continuous_up_streak`。
+    - 支持 `--snapshot-date`、`--output-dir`、`--persist-snapshots/--skip-persist-snapshots`、`--include-signals`。
+    - 快复盘统一导出 `fast_review_candidates.csv` 与 `fast_review_summary.md`。
+    - 连续上涨双口径由聚合脚本补齐落库（`continuous_up_ratio` / `continuous_up_streak`）。
+  - 新增 [`tests/test_fast_review_daily_bundle.py`](d:\bb\daily_stock_analysis\tests\test_fast_review_daily_bundle.py)，覆盖 include-signals 归一化、参数透传与主流程冒烟。
+  - 同步更新 [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md) 的 `[Unreleased]` 扁平条目。
+- 备注（Notes）：
+  - `README.md` 未更新：本次是本地策略脚本与复盘流程编排改造，信息已落在 changelog + 本日志。
+  - V1 仍不接问财接口（无手动导入、无自动抓取）。
+
+- Scope: trend_leader_unified 扫描池瘦身 + 外部ID名单接入
+- Why: 用户希望在统一评分前先缩小候选池，减少全市场扫描耗时，并支持同花顺问财等第三方工具导出的股票ID复用。
+- Changes:
+  - Updated [`scripts/select_trend_leader_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_trend_leader_candidates.py) with new CLI flags:
+    - `--exclude-st`
+    - `--exclude-kcb` (exclude STAR board `688/689`)
+    - `--exclude-cyb` (exclude ChiNext `300/301`)
+    - `--universe-codes-file` (load TXT/CSV stock IDs and intersect with normalized A-share universe)
+  - Added pre-scan universe filtering right after universe load and before quote prefetch so downstream requests are reduced.
+  - Updated [`scripts/run_trend_leader_daily_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_trend_leader_daily_bundle.py) to forward all new flags for one-command daily runs.
+  - Added/updated tests:
+    - [`tests/test_trend_leader_daily_bundle.py`](d:\bb\daily_stock_analysis\tests\test_trend_leader_daily_bundle.py) for flag forwarding.
+    - [`tests/test_trend_leader_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_trend_leader_signal_flow.py) for whitelist loading and universe filtering behavior.
+  - Recorded user-visible behavior change in [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md).
+- Notes:
+  - This turn intentionally introduces a generic local-file universe adapter first (stable / low-dependency) instead of directly binding a live iWenCai API.
+  - `README.md` not updated: this is a local strategy script enhancement, tracked in changelog + this log.
+
+- 范围：本地策略文档治理收敛
+- 原因：用户反馈“添加和修改都要记录到文档”，且本地策略入口与记录位置分散，导致回看成本高。
+- 改动：
+  - 更新 [`AGENTS.md`](d:\bb\daily_stock_analysis\AGENTS.md)，补充本地策略文档同步与交付留痕的硬规则。
+  - 更新 [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md)，在顶部新增维护约定与检查清单，作为策略文档入口。
+  - 更新 [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md) 的 `[Unreleased]`，追加扁平化 `[文档]` 治理记录。
+- 备注：
+  - 本次未更新 `README.md`：改动属于策略文档治理收敛，信息已落在 `AGENTS.md`、`LOCAL_STRATEGY_CATALOG.md` 与本日志。
+
+- 范围：趋势龙头统一链路进度可视化 + 绩效评估兼容性修复
+- 原因：用户希望脚本运行时能看到“处理了多少、当前位置”；同时一键链路在样本不足场景会因 `first_hit` 缺失中断。
+- 改动：
+  - 更新 [`scripts/select_trend_leader_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_trend_leader_candidates.py)，新增 `--progress-every` 参数，并在扫描/补抓阶段输出进度日志（位置、百分比、已处理数量、当前代码）。
+  - 更新 [`scripts/run_trend_leader_daily_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_trend_leader_daily_bundle.py)，透传 `--progress-every` 到扫描脚本，保证一键入口可直接看到进度。
+  - 修复 [`scripts/evaluate_signal_snapshot_performance.py`](d:\bb\daily_stock_analysis\scripts\evaluate_signal_snapshot_performance.py) 在 `insufficient_data` 分支缺少 `first_hit` 等字段导致的汇总崩溃。
+  - 新增/更新测试：
+    - [`tests/test_trend_leader_daily_bundle.py`](d:\bb\daily_stock_analysis\tests\test_trend_leader_daily_bundle.py)：校验 `--progress-every` 参数透传。
+    - [`tests/test_signal_snapshot_performance_report.py`](d:\bb\daily_stock_analysis\tests\test_signal_snapshot_performance_report.py)：校验缺少起始价格时报告仍可生成且标记为 `insufficient`。
+  - 同步更新 [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md) 与 [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md)。
+- 备注：
+  - 本次未更新 `README.md`：改动属于策略内部运行体验与健壮性增强，信息已落在策略文档、变更日志与本记录。
+
+- 范围：趋势龙头统一流程全量扫描提速（不改策略口径）
+- 原因：用户反馈“这个扫描还是有点慢”，全市场 5000+ 股票扫描时重复抓取较多。
+- 改动：
+  - 更新 [`scripts/select_trend_leader_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_trend_leader_candidates.py)：在单票循环中复用同一份 `quote_data`、`fundamental_context` 与 `daily_context`，透传给龙头分析、资金画像、业绩打分，减少重复请求。
+  - 更新 [`src/services/dragon_head_analysis_service.py`](d:\bb\daily_stock_analysis\src\services\dragon_head_analysis_service.py)：`analyze_stock()` 新增可选入参 `quote_data`、`daily_context`、`fundamental_context`、`boards`；优先使用上游已取数据，缺失时再回退原有抓取逻辑。
+  - 资金画像调用改为优先复用扫描阶段实时行情（`quote_data`），减少重复 `get_realtime_quote()`。
+- 验证：
+  - `pytest tests/test_trend_leader_daily_bundle.py -q`（4 passed）
+  - `pytest tests/test_dragon_head_analysis_service.py -q`（6 passed）
+  - `python -m py_compile scripts/select_trend_leader_candidates.py src/services/dragon_head_analysis_service.py`（通过）
+- 备注：
+  - 本次未更新 `README.md`：属于策略内部性能优化，已同步记录到 [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md) 与本日志。
+
+- Scope: trend_leader_unified 二阶段补抓（新闻/主营）
+- Why: 用户希望保留全市场快扫稳定性，同时让最终入选结果补充更多可读信息。
+- Changes:
+  - Updated [`scripts/select_trend_leader_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_trend_leader_candidates.py) to keep stage-1 fast scan (`enable_news_search=False`, `enable_business_profile=False`) and add stage-2 enrichment on selected candidates only.
+  - Added CLI flags in [`scripts/select_trend_leader_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_trend_leader_candidates.py): `--disable-second-stage-news-search`, `--disable-second-stage-business-profile`, `--enrich-top-n`.
+  - Added enrichment status fields into trend leader snapshot metrics payload: `news_search_enabled`, `business_profile_enabled`, `post_select_enriched`, `news_items_count`, `has_business_profile`, `enrichment_stage`, `enrichment_error`.
+  - Updated [`scripts/run_trend_leader_daily_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_trend_leader_daily_bundle.py) to forward the stage-2 enrichment flags so one-command daily run behavior stays consistent.
+  - Added/updated tests in [`tests/test_trend_leader_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_trend_leader_signal_flow.py) and [`tests/test_trend_leader_daily_bundle.py`](d:\bb\daily_stock_analysis\tests\test_trend_leader_daily_bundle.py).
+  - Recorded user-visible behavior change in [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md).
+- Notes:
+  - `README.md` not updated: this is strategy-internal behavior tuning with script-level flags and snapshot fields, so details are captured in strategy docs/changelog and this modification log.
+
+## 2026-04-19
+
+- Scope: capital-layer documentation pass
+- Why: after wiring the reusable `capital_profile` into the earnings line and monthly trend line, the repo still lacked one easy-to-read document that explains the actual资金层字段、分数、快照字段和接入位置，回看时仍然要来回翻脚本。
+- Changes:
+  - Added [`docs/CAPITAL_PROFILE_STRATEGY.md`](d:\bb\daily_stock_analysis\docs\CAPITAL_PROFILE_STRATEGY.md) as a dedicated capital-layer chapter.
+  - Documented the current `capital_profile` output fields, raw snapshot fields, factor breakdown layout, score thresholds, and how `capital_consensus_score` is derived.
+  - Explained how the shared capital profile is currently used inside [`scripts/select_earnings_surprise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_earnings_surprise_candidates.py) and [`scripts/select_monthly_slow_rise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_monthly_slow_rise_candidates.py).
+  - Added navigation links from [`docs/MAIN_STRATEGY_BLUEPRINT.md`](d:\bb\daily_stock_analysis\docs\MAIN_STRATEGY_BLUEPRINT.md), [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md), and recorded the change in [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md).
+- Notes:
+  - This is a docs-only follow-up on top of the already-landed capital-profile code integration.
+  - `README.md` was not updated because this is strategy-internal documentation rather than onboarding or deployment guidance.
+
+- Scope: reusable capital-profile integration for the main strategy axis
+- Why: after locking the repo onto `logic + capital + trend + earnings realization`, the next practical gap was that `earnings_surprise` and `monthly_slow_rise` still lacked one shared资金层口径，导致排序、快照和复盘里只能看到趋势或业绩，缺少承接强弱。
+- Changes:
+  - Added [`src/services/capital_profile_service.py`](d:\bb\daily_stock_analysis\src\services\capital_profile_service.py) as a reusable capital-profile scorer that consolidates liquidity, recent relative strength, and capital-flow context into `capital_consensus_score`, `capital_profile_score`, `capital_flow_score`, `relative_strength_score`, `liquidity_score`, and raw flow snapshot fields.
+  - Updated [`scripts/select_earnings_surprise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_earnings_surprise_candidates.py) so passed `earnings_surprise` candidates now enrich `metrics_payload` with the reusable capital profile, write those fields into snapshot records, and use capital strength as a tie-breaker after the primary earnings score.
+  - Updated [`scripts/select_monthly_slow_rise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_monthly_slow_rise_candidates.py) so selected monthly slow-rise candidates now enrich their snapshot/export payload with the same capital profile and fold capital strength into post-structure ranking.
+  - Added regression coverage in [`tests/test_capital_profile_service.py`](d:\bb\daily_stock_analysis\tests\test_capital_profile_service.py), [`tests/test_earnings_surprise_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_earnings_surprise_signal_flow.py), and [`tests/test_monthly_slow_rise_candidates.py`](d:\bb\daily_stock_analysis\tests\test_monthly_slow_rise_candidates.py).
+  - Recorded the user-visible behavior change in [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md).
+- Notes:
+  - This turn intentionally reuses the existing generic capital fields already understood by the snapshot/query layer instead of introducing a new signal-specific schema.
+  - `README.md` was not updated because this is strategy-internal evolution; the durable record stays in strategy docs and the changelog.
+
+- Scope: main strategy blueprint alignment
+- Why: the user clarified that future work should center on one primary selection philosophy instead of continuing to add disconnected strategy branches, so the repo needed a stable written strategy north star.
+- Changes:
+  - Added [`docs/MAIN_STRATEGY_BLUEPRINT.md`](d:\bb\daily_stock_analysis\docs\MAIN_STRATEGY_BLUEPRINT.md) to define the long-term core framework around `logic + capital + trend + earnings realization`.
+  - Documented the four-layer interpretation model there: `趋势层 / 逻辑层 / 资金层 / 兑现层`, plus the preferred cross-signal combinations and future development priority.
+  - Updated [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md) so the local strategy inventory now points back to the main blueprint and explicitly maps current strategy assets into that common framework.
+  - Recorded the change in [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md).
+- Notes:
+  - This is a docs-only alignment step; no strategy logic or runtime behavior changed in this turn.
+  - `README.md` was not updated because this is an internal strategy-governance and domain-planning change rather than onboarding or deployment guidance.
+
+## 2026-04-19
+
+- Scope: low-points Tushare trade-calendar cache hardening
+- Why: after enabling the local low-points Tushare token, live verification showed that `trade_cal` itself is not accessible for the current account, so stock-list caching alone was not enough to keep date-sensitive scans usable.
+- Changes:
+  - Added local `trade_cal` reference-cache helpers in [`data_provider/tushare_fetcher.py`](d:\bb\daily_stock_analysis\data_provider\tushare_fetcher.py) so recent SSE trading-calendar rows can be persisted to `data/cache/reference/tushare_trade_cal_sse.csv`.
+  - Updated [`data_provider/tushare_fetcher.py`](d:\bb\daily_stock_analysis\data_provider\tushare_fetcher.py) so `_get_trade_dates()` now prefers a fresh local calendar cache, falls back to stale cache when the remote request fails, and only re-requests Tushare when the cache is old or missing.
+  - Added a last-resort weekday fallback in [`data_provider/tushare_fetcher.py`](d:\bb\daily_stock_analysis\data_provider\tushare_fetcher.py) for low-permission tokens that cannot access `trade_cal`, so date-sensitive logic can still proceed with an explicit approximation instead of raising immediately.
+  - Added regression coverage in [`tests/test_tushare_fetcher_get_stock_list.py`](d:\bb\daily_stock_analysis\tests\test_tushare_fetcher_get_stock_list.py) for fresh-cache reuse, stale-cache fallback, and no-cache permission-denied fallback.
+- Notes:
+  - Live verification on April 19, 2026 confirmed the current token has no direct `trade_cal` access permission, so the weekday fallback path is now part of the practical low-points runtime behavior.
+  - `README.md` was not updated because this is an internal fetcher/runtime resilience change; the user-facing record lives in [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md).
+
+## 2026-04-19
+
+- Scope: low-points Tushare enablement and stock-list cache hardening
+- Why: the local environment only has a 120-point Tushare token, which is enough for low-threshold endpoints such as `daily` and `stock_basic`, but repeated stock-list/name pulls would still waste quota and could make the token feel unusable in daily scanning workflows.
+- Changes:
+  - Enabled the local `TUSHARE_TOKEN` only in the ignored repo-root `.env`, avoiding writing secrets into tracked files.
+  - Added local reference-data cache helpers in [`data_provider/tushare_fetcher.py`](d:\bb\daily_stock_analysis\data_provider\tushare_fetcher.py) so `stock_basic` results are persisted to `data/cache/reference/tushare_stock_basic_list.csv`.
+  - Updated [`data_provider/tushare_fetcher.py`](d:\bb\daily_stock_analysis\data_provider\tushare_fetcher.py) so `get_stock_list()` now prefers a fresh local cache, refreshes the cache after a successful remote fetch, and falls back to stale cache when the API is unavailable or quota-limited.
+  - Updated [`data_provider/tushare_fetcher.py`](d:\bb\daily_stock_analysis\data_provider\tushare_fetcher.py) so `get_stock_name()` primes the in-memory name cache from the persisted stock-list cache before making per-symbol API calls.
+  - Adjusted market-stat aggregation in [`data_provider/tushare_fetcher.py`](d:\bb\daily_stock_analysis\data_provider\tushare_fetcher.py) to reuse cached stock-list/name data instead of blindly issuing another `stock_basic` request.
+  - Added regression coverage in [`tests/test_tushare_fetcher_get_stock_list.py`](d:\bb\daily_stock_analysis\tests\test_tushare_fetcher_get_stock_list.py) for fresh-cache reuse and stale-cache fallback.
+- Notes:
+  - Live verification with the local token on April 19, 2026 successfully pulled and cached 5506 A-share rows.
+  - This change was recorded in [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md); `README.md` was not updated because this is an internal fetcher/runtime optimization rather than an onboarding or deployment change.
+
+## 2026-04-19
+
+- Scope: earnings-line fix 1 / fix 3 hardening for `earnings_surprise`
+- Why: the earnings line still had two practical gaps in live runs: recent earnings-event period resolution could fail around incomplete quarters, and fetched earnings/fundamental inputs were not being reused as same-day snapshots across multiple strategy tiers.
+- Changes:
+  - Added `SignalFundamentalSnapshot` plus `upsert_signal_fundamental_snapshot(...)` and `get_signal_fundamental_snapshot(...)` in [`src/storage.py`](d:\bb\daily_stock_analysis\src\storage.py) so the earnings line can persist same-day bundle/quote payloads by `signal_type + snapshot_date + code`.
+  - Extended [`scripts/select_earnings_surprise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_earnings_surprise_candidates.py) with recent earnings-event overlay logic, including `stock_yjyg_em` / `stock_yjkb_em` catalog merge, same-day cache reuse, and automatic cache refresh when fresher overlay fields appear.
+  - Added `strict / balanced / relaxed` strategy tiers through `--strategy-profile`, with profile-specific pass scores and signal namespaces `earnings_surprise_strict` / `earnings_surprise_relaxed` while keeping `balanced` on `earnings_surprise`.
+  - Fixed the incomplete-quarter bug in recent report period resolution so dates such as April 19, 2026 now resolve to `2026-03-31` instead of falling into recursive quarter-end calculation.
+  - Added regression coverage in [`tests/test_earnings_surprise_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_earnings_surprise_signal_flow.py) for profile splitting, recent overlay merge, snapshot cache round-trip, and incomplete-quarter report-period resolution.
+  - Updated strategy docs in [`docs/EARNINGS_SURPRISE_TRACKING.md`](d:\bb\daily_stock_analysis\docs\EARNINGS_SURPRISE_TRACKING.md), [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md), and [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md).
+- Notes:
+  - Current implementation intentionally shares the same-day fundamental cache under `signal_type=earnings_surprise`, so different earnings strategy tiers reuse the same raw snapshot while final selected signals still write to profile-specific `kline_signal_snapshot` namespaces.
+  - Live validation on April 19, 2026 confirmed the same-day rerun became much faster after cache warm-up, and recent-event-subset scans produced persisted balanced/relaxed signal rows.
+
+## 2026-04-18
+
+- Scope: earnings-line integration for `earnings_surprise`
+- Why: the repo already had derived `earnings_quality`, but the earnings scan still mainly relied on text keywords and simple YoY thresholds.
+- Changes:
+  - Integrated `earnings_quality` into [`scripts/select_earnings_surprise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_earnings_surprise_candidates.py) so `good/strong` quality verdicts and score-based quality signals can participate in pass/fail and ranking.
+  - Persisted additional metrics such as `earnings_quality_signal`, `earnings_quality_verdict`, `earnings_quality_score`, `earnings_quality_cycle_phase`, `earnings_quality_quarterly_trend`, and `earnings_quality_dual_positive_streak`.
+  - Extended snapshot read models in [`src/services/signal_snapshot_service.py`](d:\bb\daily_stock_analysis\src\services\signal_snapshot_service.py), [`api/v1/schemas/signals.py`](d:\bb\daily_stock_analysis\api\v1\schemas\signals.py), and [`apps/dsa-web/src/types/signals.ts`](d:\bb\daily_stock_analysis\apps\dsa-web\src\types\signals.ts) for the new earnings-quality fields.
+  - Added regression coverage in [`tests/test_earnings_surprise_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_earnings_surprise_signal_flow.py) and [`tests/test_signal_snapshot_service.py`](d:\bb\daily_stock_analysis\tests\test_signal_snapshot_service.py).
+- Notes:
+  - This change is intentionally conservative: negative earnings text still blocks selection first.
+  - The new quality signal is mainly used as an additional confirmation path, not as a replacement for the existing text/growth rules.
+
+- Scope: hybrid earnings strategy scoring for `earnings_surprise`
+- Why: after integrating `earnings_quality`, the next gap was that the scan still behaved mostly like an OR-based gate instead of a reusable multi-factor ranking strategy.
+- Changes:
+  - Upgraded [`scripts/select_earnings_surprise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_earnings_surprise_candidates.py) from simple pass-through rules to a conservative `hard gate + weighted factors` model.
+  - Reused existing `earnings_quality` sub-scores for growth continuity, profit quality, profitability, disclosure signal, cycle phase, event freshness, and risk penalty instead of introducing a parallel scoring system.
+  - Persisted strategy-facing fields such as `earnings_strategy_score`, `earnings_strategy_label`, `earnings_strategy_gate_status`, and factor-level scores for later snapshot inspection.
+  - Extended snapshot read/output models in [`src/services/signal_snapshot_service.py`](d:\bb\daily_stock_analysis\src\services\signal_snapshot_service.py), [`api/v1/schemas/signals.py`](d:\bb\daily_stock_analysis\api\v1\schemas\signals.py), and [`apps/dsa-web/src/types/signals.ts`](d:\bb\daily_stock_analysis\apps\dsa-web\src\types\signals.ts).
+  - Added regression coverage in [`tests/test_earnings_surprise_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_earnings_surprise_signal_flow.py), [`tests/test_signal_snapshot_service.py`](d:\bb\daily_stock_analysis\tests\test_signal_snapshot_service.py), and [`tests/test_signal_snapshot_api.py`](d:\bb\daily_stock_analysis\tests\test_signal_snapshot_api.py).
+  - Reorganized earnings docs in [`docs/EARNINGS_SURPRISE_TRACKING.md`](d:\bb\daily_stock_analysis\docs\EARNINGS_SURPRISE_TRACKING.md) and refreshed [`docs/EARNINGS_SURPRISE_QUALITY_SIGNAL.md`](d:\bb\daily_stock_analysis\docs\EARNINGS_SURPRISE_QUALITY_SIGNAL.md).
+- Notes:
+  - The new pass threshold is intentionally moderate: obvious negative text still blocks first, and borderline names still need at least one confirmation signal.
+  - Documentation was updated in `docs/` instead of `README.md` because this change is strategy-specific rather than an onboarding or deployment change.
+
+- Scope: local strategy catalog documentation
+- Why: the repo had accumulated multiple scan scripts, snapshot collectors, signal namespaces, and agent YAML strategies, but they were spread across different files and hard to inspect together.
+- Changes:
+  - Added [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md) to summarize local strategy assets in one place.
+  - Grouped strategies into runnable scan scripts, snapshot collection scripts, `/signals` signal namespaces, and `strategies/*.yaml` agent strategies.
+  - Documented the current earnings line, trend line, dragon-head line, theme-core line, and commodity pass-through line with their main entry scripts and related docs.
+  - Noted the current runtime caveat that default agent skill IDs may resolve to empty when `PyYAML` is unavailable, even though the YAML metadata still marks `bull_trend` and `shrink_pullback` as defaults.
+- Notes:
+  - This is a docs-only change and does not alter strategy logic.
+  - The strategy catalog was added under `docs/` rather than `README.md` because it is a domain-specific reference, not onboarding or deployment guidance.
+
+- Scope: earnings-line strategy chapter
+- Why: after adding the local strategy catalog, the earnings line still needed a dedicated doc that explains the real `earnings_surprise` decision logic in implementation terms rather than only high-level usage notes.
+- Changes:
+  - Added [`docs/EARNINGS_SURPRISE_STRATEGY_BREAKDOWN.md`](d:\bb\daily_stock_analysis\docs\EARNINGS_SURPRISE_STRATEGY_BREAKDOWN.md) as a dedicated earnings-line chapter.
+  - Broke down the current `earnings_surprise` logic into default thresholds, positive/negative text fields, confirmation signals, factor weights, cycle/freshness scoring, risk penalties, pass thresholds, and `earnings_strategy_gate_status` meanings.
+  - Listed which metrics are persisted in snapshot payloads and which earnings fields are currently surfaced directly in `/signals`.
+  - Added navigation links from [`docs/EARNINGS_SURPRISE_TRACKING.md`](d:\bb\daily_stock_analysis\docs\EARNINGS_SURPRISE_TRACKING.md) and [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md).
+- Notes:
+  - This is still a docs-only change and does not modify the earnings strategy implementation.
+  - One important implementation nuance documented there: `quarterly_continuity_score` is currently persisted and displayed, but not added as a standalone weighted factor in the hybrid score sum.
+
+- Scope: earnings-line interpretation playbook
+- Why: after documenting the implementation details of `earnings_surprise`, the next gap was practical interpretation: how to read passed vs blocked candidates and how to combine the earnings line with trend and theme signals in day-to-day review.
+- Changes:
+  - Added [`docs/EARNINGS_SURPRISE_PLAYBOOK.md`](d:\bb\daily_stock_analysis\docs\EARNINGS_SURPRISE_PLAYBOOK.md) as a practical interpretation handbook for the earnings line.
+  - Organized common `earnings_strategy_gate_status` results into actionable reading guidance, including `passed_strategy_score`, `passed_watch_with_confirmation`, `blocked_negative_text`, `blocked_quality_risk`, and `blocked_duplicate_event`.
+  - Added a practical review order, a simple four-quadrant framework, and recommendations for combining `earnings_surprise` with `hundred_day_high`, dragon-head candidates, and theme-core signals.
+  - Linked the new playbook from [`docs/EARNINGS_SURPRISE_TRACKING.md`](d:\bb\daily_stock_analysis\docs\EARNINGS_SURPRISE_TRACKING.md), [`docs/EARNINGS_SURPRISE_STRATEGY_BREAKDOWN.md`](d:\bb\daily_stock_analysis\docs\EARNINGS_SURPRISE_STRATEGY_BREAKDOWN.md), and [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md).
+- Notes:
+  - This remains a docs-only change.
+  - The playbook is intentionally opinionated for review efficiency, but the implementation truth source is still the strategy breakdown doc plus the script itself.

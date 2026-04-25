@@ -141,6 +141,112 @@ class SignalSnapshotApiTestCase(unittest.TestCase):
         self.assertEqual(payload["items"][0]["code"], "600488")
         self.assertEqual(payload["items"][0]["event_date"], "2026-04-04")
 
+    def test_list_endpoint_returns_earnings_strategy_fields(self) -> None:
+        self.db.upsert_signal_snapshot(
+            signal_type="earnings_surprise",
+            signal_date="2026-04-05",
+            code="600489",
+            name="策略样本",
+            criteria_payload={"signal_type": "earnings_surprise"},
+            metrics_payload={
+                "close": 16.2,
+                "event_date": "2026-04-04",
+                "earnings_quality_signal": True,
+                "earnings_strategy_score": 72.0,
+                "earnings_strategy_label": "qualified",
+                "earnings_strategy_gate_status": "passed_strategy_score",
+                "earnings_growth_continuity_score": 28.0,
+                "earnings_profit_quality_score": 21.0,
+            },
+            cause_payload={"reason_summary": "业绩策略通过"},
+            history_payload={"previous_hit_count": 0, "days_since_previous_hit": None},
+        )
+
+        response = self.client.get(
+            "/api/v1/signals/kline-snapshots",
+            params={"signal_type": "earnings_surprise", "signal_date": "2026-04-05"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["total"], 1)
+        item = payload["items"][0]
+        self.assertEqual(item["earnings_strategy_score"], 72.0)
+        self.assertEqual(item["earnings_strategy_label"], "qualified")
+        self.assertEqual(item["earnings_strategy_gate_status"], "passed_strategy_score")
+        self.assertEqual(item["earnings_growth_continuity_score"], 28.0)
+        self.assertEqual(item["earnings_profit_quality_score"], 21.0)
+
+    def test_list_endpoint_returns_cache_observability_fields(self) -> None:
+        self.db.upsert_signal_snapshot(
+            signal_type="earnings_surprise",
+            signal_date="2026-04-05",
+            code="600490",
+            name="cache observed sample",
+            criteria_payload={"signal_type": "earnings_surprise"},
+            metrics_payload={
+                "close": 16.2,
+                "cache_source": "same_day_cache",
+                "bundle_refreshed_at": "2026-04-05T09:35:00",
+                "capital_profile_refreshed_at": "2026-04-05T09:40:00",
+                "capital_profile_cache_hit": True,
+            },
+            cause_payload={"reason_summary": "cache observed"},
+            history_payload={"previous_hit_count": 0, "days_since_previous_hit": None},
+        )
+
+        response = self.client.get(
+            "/api/v1/signals/kline-snapshots",
+            params={"signal_type": "earnings_surprise", "signal_date": "2026-04-05"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        item = payload["items"][0]
+        self.assertEqual(item["cache_source"], "same_day_cache")
+        self.assertEqual(item["bundle_refreshed_at"], "2026-04-05T09:35:00")
+        self.assertEqual(item["capital_profile_refreshed_at"], "2026-04-05T09:40:00")
+        self.assertTrue(item["capital_profile_cache_hit"])
+
+    def test_list_endpoint_returns_trend_leader_tag_fields(self) -> None:
+        self.db.upsert_signal_snapshot(
+            signal_type="trend_leader_unified",
+            signal_date="2026-04-19",
+            code="600001",
+            name="寮哄娍榫欏ご",
+            criteria_payload={"profile_scope": "unified"},
+            metrics_payload={
+                "primary_profile": "breakout",
+                "breakout_score": 82.0,
+                "pullback_score": 41.0,
+                "hybrid_score": 86.0,
+                "overall_score": 86.0,
+                "trend_label": "near_new_high",
+                "selection_mode": "strict",
+                "is_breakout_candidate": True,
+                "is_pullback_candidate": False,
+                "near_new_high": True,
+            },
+            cause_payload={"reason_summary": "缁熶竴绛栫暐鍛戒腑"},
+            history_payload={"previous_hit_count": 0, "days_since_previous_hit": None},
+        )
+
+        response = self.client.get(
+            "/api/v1/signals/kline-snapshots",
+            params={"signal_type": "trend_leader_unified", "signal_date": "2026-04-19"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["total"], 1)
+        item = payload["items"][0]
+        self.assertEqual(item["selection_mode"], "strict")
+        self.assertTrue(item["is_breakout_candidate"])
+        self.assertFalse(item["is_pullback_candidate"])
+        self.assertTrue(item["near_new_high"])
+        self.assertIn("百日新高", item.get("signal_tags") or [])
+        self.assertIn("严格命中", item.get("signal_tags") or [])
+
     def test_counts_endpoint_returns_totals_for_main_signal_tabs(self) -> None:
         self._seed_snapshot("2026-04-05", code="300001", latest_high=12.0, close=11.8)
         self.db.upsert_signal_snapshot(
@@ -210,6 +316,31 @@ class SignalSnapshotApiTestCase(unittest.TestCase):
         counts = {item["signal_type"]: item["total"] for item in payload["items"]}
         self.assertEqual(counts["dragon_head_candidate"], 1)
 
+    def test_counts_endpoint_includes_trend_leader_unified_signal_type(self) -> None:
+        self.db.upsert_signal_snapshot(
+            signal_type="trend_leader_unified",
+            signal_date="2026-04-05",
+            code="600001",
+            name="强势龙头",
+            criteria_payload={"profile_scope": "unified"},
+            metrics_payload={
+                "primary_profile": "breakout",
+                "overall_score": 86.0,
+            },
+            cause_payload={"reason_summary": "统一策略命中"},
+            history_payload={"previous_hit_count": 0, "days_since_previous_hit": None},
+        )
+
+        response = self.client.get(
+            "/api/v1/signals/kline-snapshot-counts",
+            params={"signal_date": "2026-04-05"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        counts = {item["signal_type"]: item["total"] for item in payload["items"]}
+        self.assertEqual(counts["trend_leader_unified"], 1)
+
     def test_counts_endpoint_includes_board_recognizability_metadata(self) -> None:
         self.db.upsert_signal_snapshot(
             signal_type="board_recognizability__board_semiconductor_1234567890",
@@ -245,6 +376,50 @@ class SignalSnapshotApiTestCase(unittest.TestCase):
         self.assertEqual(board_item["total"], 1)
         self.assertEqual(board_item["group"], "board_recognizability")
         self.assertEqual(board_item["display_label"], "半导体辨识度")
+
+    def test_counts_endpoint_includes_monthly_slow_rise_profile_metadata(self) -> None:
+        self.db.upsert_signal_snapshot(
+            signal_type="monthly_slow_rise_profile__balanced",
+            signal_date="2026-04-05",
+            code="600519",
+            name="贵州茅台",
+            criteria_payload={
+                "profile_name": "balanced",
+                "profile_label": "月线慢牛·均衡",
+                "criteria": {"monthly_lookback": 12},
+            },
+            metrics_payload={
+                "profile_name": "balanced",
+                "profile_label": "月线慢牛·均衡",
+                "monthly_positive_ratio": 0.75,
+                "monthly_higher_low_ratio": 0.67,
+                "monthly_total_return_pct": 38.5,
+                "monthly_max_single_gain_pct": 9.8,
+                "monthly_worst_drawdown_pct": -6.2,
+                "monthly_ma_short": 1678.5,
+                "monthly_ma_long": 1588.2,
+                "monthly_latest_month": "2026-03",
+                "close": 1800.0,
+                "latest_high": 1818.0,
+            },
+            cause_payload={"reason_summary": "月线稳步抬升"},
+            history_payload={"previous_hit_count": 1, "days_since_previous_hit": 30},
+        )
+
+        response = self.client.get(
+            "/api/v1/signals/kline-snapshot-counts",
+            params={"signal_date": "2026-04-05"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        monthly_item = next(
+            item for item in payload["items"]
+            if item["signal_type"] == "monthly_slow_rise_profile__balanced"
+        )
+        self.assertEqual(monthly_item["total"], 1)
+        self.assertEqual(monthly_item["group"], "monthly_slow_rise")
+        self.assertEqual(monthly_item["display_label"], "月线慢牛·均衡")
 
     def test_list_endpoint_returns_commodity_snapshot_fields(self) -> None:
         self.db.upsert_signal_snapshot(
@@ -314,6 +489,42 @@ class SignalSnapshotApiTestCase(unittest.TestCase):
         self.assertEqual(item["leader_probability"], "high")
         self.assertEqual(item["recognizability_score"], 3)
 
+    def test_list_endpoint_returns_trend_leader_unified_fields(self) -> None:
+        self.db.upsert_signal_snapshot(
+            signal_type="trend_leader_unified",
+            signal_date="2026-04-19",
+            code="600001",
+            name="强势龙头",
+            criteria_payload={"profile_scope": "unified"},
+            metrics_payload={
+                "primary_profile": "breakout",
+                "breakout_score": 82.0,
+                "pullback_score": 41.0,
+                "hybrid_score": 86.0,
+                "overall_score": 86.0,
+                "trend_label": "near_new_high",
+                "strategy_summary": "统一策略命中",
+                "leader_probability": "high",
+                "leader_type": "hybrid_leader",
+                "risk_flags": [],
+            },
+            cause_payload={"reason_summary": "统一策略命中"},
+            history_payload={"previous_hit_count": 0, "days_since_previous_hit": None},
+        )
+
+        response = self.client.get(
+            "/api/v1/signals/kline-snapshots",
+            params={"signal_type": "trend_leader_unified", "signal_date": "2026-04-19"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["total"], 1)
+        item = payload["items"][0]
+        self.assertEqual(item["primary_profile"], "breakout")
+        self.assertEqual(item["overall_score"], 86.0)
+        self.assertEqual(item["trend_label"], "near_new_high")
+
     def test_list_endpoint_returns_board_recognizability_fields(self) -> None:
         self.db.upsert_signal_snapshot(
             signal_type="board_recognizability__board_semiconductor_1234567890",
@@ -350,6 +561,54 @@ class SignalSnapshotApiTestCase(unittest.TestCase):
         self.assertEqual(item["source_signal_type"], "hundred_day_high")
         self.assertEqual(item["source_signal_date"], "2026-04-10")
         self.assertAlmostEqual(item["total_market_cap_yi"], 1234.57, places=2)
+
+    def test_list_endpoint_returns_monthly_slow_rise_fields(self) -> None:
+        self.db.upsert_signal_snapshot(
+            signal_type="monthly_slow_rise_profile__strict",
+            signal_date="2026-04-10",
+            code="600519",
+            name="贵州茅台",
+            criteria_payload={
+                "profile_name": "strict",
+                "profile_label": "月线慢牛·严格",
+                "criteria": {"monthly_lookback": 12},
+            },
+            metrics_payload={
+                "profile_name": "strict",
+                "profile_label": "月线慢牛·严格",
+                "monthly_positive_ratio": 0.83,
+                "monthly_higher_low_ratio": 0.75,
+                "monthly_total_return_pct": 42.3,
+                "monthly_max_single_gain_pct": 8.1,
+                "monthly_worst_drawdown_pct": -5.4,
+                "monthly_ma_short": 1688.6,
+                "monthly_ma_long": 1588.2,
+                "monthly_latest_month": "2026-03",
+                "close": 1820.0,
+                "latest_high": 1836.0,
+            },
+            cause_payload={"reason_summary": "月线低波动慢涨"},
+            history_payload={"previous_hit_count": 2, "days_since_previous_hit": 31},
+        )
+
+        response = self.client.get(
+            "/api/v1/signals/kline-snapshots",
+            params={"signal_type": "monthly_slow_rise_profile__strict", "signal_date": "2026-04-10"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        item = payload["items"][0]
+        self.assertEqual(item["profile_name"], "strict")
+        self.assertEqual(item["profile_label"], "月线慢牛·严格")
+        self.assertAlmostEqual(item["monthly_positive_ratio"], 0.83, places=2)
+        self.assertAlmostEqual(item["monthly_higher_low_ratio"], 0.75, places=2)
+        self.assertAlmostEqual(item["monthly_total_return_pct"], 42.3, places=2)
+        self.assertAlmostEqual(item["monthly_max_single_gain_pct"], 8.1, places=2)
+        self.assertAlmostEqual(item["monthly_worst_drawdown_pct"], -5.4, places=2)
+        self.assertAlmostEqual(item["monthly_ma_short"], 1688.6, places=2)
+        self.assertAlmostEqual(item["monthly_ma_long"], 1588.2, places=2)
+        self.assertEqual(item["monthly_latest_month"], "2026-03")
 
     def test_counts_endpoint_includes_dragon_head_snapshot_type(self) -> None:
         self.db.upsert_signal_snapshot(

@@ -15,6 +15,7 @@ from typing import Optional, List, Dict, Any
 
 import pandas as pd
 from sqlalchemy import and_, desc, select
+from sqlalchemy import func
 
 from src.storage import DatabaseManager, StockDaily
 
@@ -191,3 +192,20 @@ class StockRepository:
                 .limit(eval_window_days)
             ).scalars().all()
             return list(rows)
+
+    def count_market_trading_days_between(self, *, start_date: date, end_date: date) -> int:
+        """
+        Return market-level distinct trading days in (start_date, end_date].
+
+        This query is intentionally code-agnostic so horizon checks do not
+        depend on whether a single symbol has complete local history.
+        """
+        with self.db.get_session() as session:
+            value = session.execute(
+                select(func.count(func.distinct(StockDaily.date)))
+                .where(and_(StockDaily.date > start_date, StockDaily.date <= end_date))
+            ).scalar_one()
+            try:
+                return max(0, int(value or 0))
+            except (TypeError, ValueError):
+                return 0

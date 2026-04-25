@@ -177,6 +177,45 @@ class TestPrefetchStockNames(unittest.TestCase):
         self.assertIsNone(error)
         pipeline.fetcher_manager.get_stock_name.assert_called_once_with("600519", allow_realtime=False)
 
+    def test_fetch_and_save_stock_data_passes_force_refresh_to_manager(self):
+        pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)
+        pipeline.fetcher_manager = MagicMock()
+        pipeline.db = MagicMock()
+        pipeline.fetcher_manager.get_stock_name.return_value = "璐靛窞鑼呭彴"
+        pipeline.db.has_today_data.return_value = False
+        pipeline.fetcher_manager.get_daily_data.return_value = (
+            pd.DataFrame(
+                [
+                    {
+                        "date": "2026-03-27",
+                        "open": 1.0,
+                        "high": 1.0,
+                        "low": 1.0,
+                        "close": 1.0,
+                        "volume": 1,
+                        "amount": 1.0,
+                        "pct_chg": 0.0,
+                    }
+                ]
+            ),
+            "dummy",
+        )
+        pipeline.db.save_daily_data.return_value = 1
+
+        success, error = StockAnalysisPipeline.fetch_and_save_stock_data(
+            pipeline,
+            "600519",
+            force_refresh=True,
+        )
+
+        self.assertTrue(success)
+        self.assertIsNone(error)
+        pipeline.fetcher_manager.get_daily_data.assert_called_once_with(
+            "600519",
+            days=30,
+            force_refresh=True,
+        )
+
     def test_pytdx_get_stock_name_reads_all_security_list_pages(self):
         fetcher = PytdxFetcher(hosts=[])
 

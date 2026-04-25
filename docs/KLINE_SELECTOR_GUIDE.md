@@ -71,6 +71,7 @@ E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\select_kline_candi
   - `streak` 按主题或行业分组
   - 点击 `新增 / 掉队` 标签联动筛选
   - `streak` 多选联动与“选择本组”
+  - 分组联动后显示当前主题组 / 行业组，并支持再次点击“取消本组”
   - 当前选中结果导出为 `Markdown / JSON`
   - 当前选中结果一键推送到已配置通知渠道
 - 长日期范围下已补充几项稳态优化：
@@ -80,6 +81,7 @@ E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\select_kline_candi
   - 联动筛选改为状态驱动，减少“点击一次触发两次请求”的重复加载
 - 导出 / 推送的作用范围说明：
   - 若当前有联动选中，则优先导出 / 推送联动结果
+  - 若联动来自 `streak` 分组选择，导出 / 推送摘要会带上对应主题组 / 行业组标签
   - 若开启“只看连续新高”且没有联动选中，则导出 / 推送当前页连续新高结果
 - 其他情况下，导出 / 推送当前页可见结果
 
@@ -568,6 +570,7 @@ E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\select_hundred_day
 
 ```powershell
 E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\select_hundred_day_high_candidates.py --profile breakout_balanced
+E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\select_hundred_day_high_candidates.py --profile breakout_balanced_with_earnings
 E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\select_hundred_day_high_candidates.py --profile momentum_strict
 E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\select_hundred_day_high_candidates.py --profile breakout_loose
 ```
@@ -592,6 +595,7 @@ E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\collect_hundred_da
 三套预设的定位建议：
 
 - `breakout_balanced`：当前默认口径，偏“先抓突破，再看后续表现”
+- `breakout_balanced_with_earnings`：沿用 `breakout_balanced` 的百日新高条件，但只保留通过 `earnings_surprise balanced` 口径确认的股票；若未手动传 `--signal-type`，默认落库到 `hundred_day_high__earnings_balanced`
 - `momentum_strict`：更强调强势确认，会启用上涨占比和近期涨停规则，并收紧市值/预过滤
 - `breakout_loose`：更偏宽松突破，用于观察更大样本池里的后续演化
 
@@ -611,6 +615,10 @@ E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\select_hundred_day
   - `min_60d_change_pct_prefilter=12`
   - `min_turnover_rate_prefilter=0.8`
   - 默认启用：上涨占比规则、正涨幅预过滤、排除 ST
+- `breakout_balanced_with_earnings`
+  - K 线参数与 `breakout_balanced` 相同
+  - 在命中百日新高后，继续复用 `earnings_surprise balanced` 做业绩确认
+  - 默认 `signal_type=hundred_day_high__earnings_balanced`
 - `momentum_strict`
   - `lookback_days=8`
   - `min_up_ratio=0.67`
@@ -657,7 +665,7 @@ E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\select_hundred_day
 如需进一步走“快速结构化归因”模式，可继续附加：
 
 ```powershell
-E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\select_hundred_day_high_candidates.py --snapshot-date 2026-04-04 --cause-analysis-only --disable-news-search --disable-llm-reason-card
+E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\select_hundred_day_high_candidates.py --snapshot-date 2026-04-04 --cause-analysis-only --disable-llm-reason-card
 ```
 
 说明：
@@ -676,7 +684,8 @@ SIGNAL_SNAPSHOT_HUNDRED_DAY_HIGH_CAUSE_ANALYSIS_ENABLED=false
 说明：
 
 - 打开 `SIGNAL_SNAPSHOT_HUNDRED_DAY_HIGH_ENABLED=true` 后，现有 `python main.py --schedule` 每日分析完成后，会自动刷新百日新高快照
-- 若同时打开 `SIGNAL_SNAPSHOT_HUNDRED_DAY_HIGH_CAUSE_ANALYSIS_ENABLED=true`，会继续在快照阶段之后补全归因；当前定时模式默认走“跳过新闻搜索 + 不调用 LLM 原因卡”的快速结构化归因，以控制日更耗时
+- 若同时打开 `SIGNAL_SNAPSHOT_HUNDRED_DAY_HIGH_CAUSE_ANALYSIS_ENABLED=true`，会继续在快照阶段之后补全归因；当前定时模式默认走“双阶段”：
+  阶段 1 全扫保持稳定快扫，阶段 2 仅对入选候选补抓新闻与主营，并默认关闭 LLM 原因卡以控制日更耗时
 - 若只想保证 `/signals` 每天有数据、优先缩短耗时，建议先只开第一项，把第二项保持 `false`
 
 当你想评估这条信号本身有没有持续有效，而不只是看当天命中列表时，可以直接基于已落库快照跑一个轻量表现报告：
@@ -880,3 +889,32 @@ E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\merge_kline_shard_
   C:\temp\hundred_day_high_full_20260331\shard_04_of_04 `
   --output-dir C:\temp\hundred_day_high_full_20260331\merged
 ```
+
+## 2026-04-25 补充：百日新高质量突破字段
+
+- `scripts/select_hundred_day_high_candidates.py` 现在会在命中结果中补充以下质量字段：
+  - `minervini_template_score` / `minervini_template_passed`
+  - `breakout_follow_through_score`
+  - `industry_strength_confirmed` / `industry_strength_score` / `industry_strength_label`
+- 新字段会同时进入：
+  - `hundred_day_high_candidates.csv`
+  - 快照 `metrics_payload`（供 `--cause-analysis-only` 与 `/signals` 查询复用）
+  - `hundred_day_high_candidates.md` 的结果行（便于人工复盘）
+
+## 鏃ョ嚎缂撳瓨
+
+涓轰簡闄嶄綆澶氱瓥鐣ャ€佸ぇ鏍锋湰鎵弿鏃剁殑閲嶅涓嬭浇鍘嬪姏锛孌ataFetcherManager` 鐜板湪浼氬湪 manager 灞傝嚜鍔ㄥ鐢ㄦ湰鍦版棩绾跨紦瀛橈細
+
+- 榛樿鐩綍锛?`data/cache/history/`
+- 璇诲彇绛栫暐锛氬厛璇荤紦瀛橈紝鍐嶆寜闇€鑱旂綉
+- 澧為噺绛栫暐锛氬綋璇锋眰鍙戠敓鍒板熬閮ㄦ墿灞曟椂锛屽彧琛ュ熬閮ㄧ己澶辩殑閭ｄ竴娈靛巻鍙叉棩绾?
+- 鎸囨爣涓€鑷存€э細纾佺洏鍙繚瀛樺熀纭€鏃ョ嚎鍒楋紝璇诲洖鍚庝細閲嶇畻 `ma5 / ma10 / ma20 / volume_ratio`
+
+鍙€夌幆澧冨彉閲忥細
+
+- `HISTORY_DISK_CACHE_ENABLED`
+- `HISTORY_DISK_CACHE_DIR`
+- `HISTORY_DISK_CACHE_TTL_SECONDS`
+- `HISTORY_DISK_CACHE_OVERLAP_DAYS`
+
+鍏朵腑 `TTL` 涓昏鐢ㄤ簬鈥滃寘鍚渶鏂拌鎯呯殑璇锋眰鈥濓紝閬垮厤鏃犻檺澶嶇敤褰撴棩闄勮繎鐨勫彲鑳介檲鏃ф暟鎹紱鑰屽凡缁忔埅姝㈢殑鍘嗗彶鏃堕棿鑼冨洿浼氫紭鍏堢洿鎺ュ鐢ㄧ紦瀛樸€?

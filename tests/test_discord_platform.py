@@ -4,7 +4,9 @@ import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from nacl.signing import SigningKey
+import pytest
+
+SigningKey = pytest.importorskip("nacl.signing").SigningKey
 
 from bot.models import ChatType
 from bot.platforms.discord import DiscordPlatform

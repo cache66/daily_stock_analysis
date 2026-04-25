@@ -1020,6 +1020,33 @@ class CommodityPassThroughService:
         return "unclear", score, reasons[:8]
 
     def _infer_earnings_validation(self, fundamental_context: Dict[str, Any]) -> Tuple[str, int, List[str]]:
+        earnings_quality_data = (
+            ((fundamental_context.get("earnings_quality") or {}).get("data") or {})
+            if isinstance(fundamental_context, dict)
+            else {}
+        )
+        if isinstance(earnings_quality_data, dict):
+            quality_verdict = _safe_text(earnings_quality_data.get("verdict")).lower()
+            quality_score = _safe_float(earnings_quality_data.get("score_total"))
+            if quality_verdict in {"strong", "good", "mixed", "weak"}:
+                mapped_status = {
+                    "strong": "positive",
+                    "good": "positive",
+                    "mixed": "mixed",
+                    "weak": "negative",
+                }.get(quality_verdict, "mixed")
+                details: List[str] = [f"earnings_quality_verdict={quality_verdict}"]
+                if quality_score is not None:
+                    details.append(f"earnings_quality_score={quality_score}")
+                for key in ("positive_signals", "risk_flags"):
+                    values = earnings_quality_data.get(key)
+                    if isinstance(values, list):
+                        for item in values[:2]:
+                            text = _safe_text(item)
+                            if text:
+                                details.append(f"{key}={text}")
+                return mapped_status, int(round(quality_score or 0)), details[:6]
+
         growth_data = ((fundamental_context.get("growth") or {}).get("data") or {}) if isinstance(fundamental_context, dict) else {}
         earnings_data = ((fundamental_context.get("earnings") or {}).get("data") or {}) if isinstance(fundamental_context, dict) else {}
         financial_report = earnings_data.get("financial_report") or {}

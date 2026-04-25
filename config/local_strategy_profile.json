@@ -1,0 +1,41 @@
+{
+  "defaults": {
+    "include_signals": [
+      "earnings",
+      "hundred_day_high",
+      "trend_leader"
+    ],
+    "exclude_signals": [],
+    "persist_snapshots": true,
+    "max_workers": 1,
+    "trend_max_workers": 2,
+    "hundred_day_max_workers": 2,
+    "external_parallelism": 3,
+    "external_command_idle_timeout_sec": 900,
+    "external_command_total_timeout_sec": 14400,
+    "continuous_max_workers": 2,
+    "progress_every": 25,
+    "earnings_strategy_profile": "balanced",
+    "earnings_recent_event_scope": "latest_report_period",
+    "hundred_day_signal_type": "hundred_day_high",
+    "hundred_day_skip_cause_analysis": true,
+    "trend_signal_type": "trend_leader_unified",
+    "trend_disable_second_stage_enrichment": true,
+    "trend_fallback_top_n": 20,
+    "trend_shard_count": 1,
+    "trend_shard_index": 0,
+    "trend_disable_scan_prefilter": false,
+    "trend_scan_prefilter_min_listed_days": 120,
+    "trend_scan_prefilter_min_change_pct_60d": 4.0,
+    "trend_scan_prefilter_min_turnover_rate": 1.0,
+    "trend_scan_prefilter_require_positive_change": true,
+    "continuous_up_lookback_days": 10,
+    "continuous_up_min_ratio": 0.7,
+    "continuous_up_streak_days": 3,
+    "continuous_max_total_mv_yi": 500.0,
+    "disable_continuous_spot_prefilter": false,
+    "exclude_st": false,
+    "exclude_kcb": false,
+    "exclude_cyb": false
+  }
+}

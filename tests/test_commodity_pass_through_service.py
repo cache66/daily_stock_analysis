@@ -59,6 +59,32 @@ class _FakeSearchService:
 
 
 class CommodityPassThroughServiceTestCase(unittest.TestCase):
+    def test_earnings_validation_prefers_structured_earnings_quality_block(self):
+        manager = _FakeManager(
+            fundamental_context={"status": "ok"},
+            boards=[],
+            stock_name="样本股",
+        )
+        service = CommodityPassThroughService(manager=manager, search_service=_FakeSearchService([]))
+
+        status, score, details = service._infer_earnings_validation(
+            {
+                "earnings_quality": {
+                    "data": {
+                        "verdict": "good",
+                        "score_total": 78,
+                        "positive_signals": ["cashflow_covers_profit_well"],
+                    }
+                },
+                "growth": {"data": {"revenue_yoy": -5.0, "net_profit_yoy": -10.0}},
+                "earnings": {"data": {}},
+            }
+        )
+
+        self.assertEqual(status, "positive")
+        self.assertEqual(score, 78)
+        self.assertIn("earnings_quality_verdict=good", details)
+
     def test_optical_fiber_upstream_maps_to_direct_high_probability(self):
         manager = _FakeManager(
             fundamental_context={

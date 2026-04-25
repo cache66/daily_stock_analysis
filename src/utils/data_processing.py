@@ -40,6 +40,21 @@ def _non_empty_dict(value: Any) -> Optional[Dict[str, Any]]:
     return value if value else None
 
 
+def _normalize_earnings_quality(value: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, dict) or not value:
+        return None
+    verdict = str(value.get("verdict") or "").strip().lower()
+    if verdict and verdict != "unavailable":
+        return value
+    for key in ("metrics", "positive_signals", "risk_flags"):
+        current = value.get(key)
+        if isinstance(current, dict) and current:
+            return value
+        if isinstance(current, list) and current:
+            return value
+    return None
+
+
 def _normalize_belong_boards(value: Any) -> List[Dict[str, Any]]:
     if not isinstance(value, list):
         return []
@@ -148,18 +163,25 @@ def extract_fundamental_detail_fields(
         fallback_fundamental_payload=fallback_fundamental_payload,
     )
     if not isinstance(fundamental_ctx, dict):
-        return {"financial_report": None, "dividend_metrics": None}
+        return {"financial_report": None, "dividend_metrics": None, "earnings_quality": None}
 
     earnings_block = fundamental_ctx.get("earnings")
     earnings_data = earnings_block.get("data") if isinstance(earnings_block, dict) else None
+    earnings_quality_block = fundamental_ctx.get("earnings_quality")
+    earnings_quality_data = earnings_quality_block.get("data") if isinstance(earnings_quality_block, dict) else None
     if not isinstance(earnings_data, dict):
-        return {"financial_report": None, "dividend_metrics": None}
+        return {
+            "financial_report": None,
+            "dividend_metrics": None,
+            "earnings_quality": _normalize_earnings_quality(earnings_quality_data),
+        }
 
     financial_report = _non_empty_dict(earnings_data.get("financial_report"))
     dividend_metrics = _non_empty_dict(earnings_data.get("dividend"))
     return {
         "financial_report": financial_report,
         "dividend_metrics": dividend_metrics,
+        "earnings_quality": _normalize_earnings_quality(earnings_quality_data),
     }
 
 

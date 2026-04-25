@@ -1175,6 +1175,7 @@ class SignalCauseAnalysisService:
             "valuation",
             "growth",
             "earnings",
+            "earnings_quality",
             "institution",
             "capital_flow",
             "dragon_tiger",
@@ -1186,6 +1187,10 @@ class SignalCauseAnalysisService:
             data = block.get("data")
             if data in (None, {}, []):
                 continue
+            if block_name == "earnings_quality" and isinstance(data, dict):
+                verdict = str(data.get("verdict") or "").strip().lower()
+                if verdict in {"", "unavailable"} and not data.get("metrics") and not data.get("positive_signals") and not data.get("risk_flags"):
+                    continue
             summary[block_name] = data
 
         belong_boards = context.get("belong_boards")

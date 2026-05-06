@@ -23,12 +23,14 @@ AkshareFetcher - 主数据源 (Priority 1)
 - 筹码分布：获利比例、平均成本、筹码集中度
 """
 
+import json
 import logging
 import os
 import random
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple, Sequence
 
 import pandas as pd
@@ -63,6 +65,8 @@ TENCENT_REALTIME_ENDPOINT = "qt.gtimg.cn/q"
 DEFAULT_STOCK_HISTORY_SOURCE_PRIORITY: Tuple[str, ...] = ("em", "sina", "tencent")
 DEFAULT_SECTOR_RANK_EM_BACKOFF_SECONDS = int(os.getenv("AKSHARE_SECTOR_RANK_EM_BACKOFF_SECONDS", "1200"))
 DEFAULT_STOCK_HISTORY_EM_BACKOFF_SECONDS = int(os.getenv("AKSHARE_STOCK_HISTORY_EM_BACKOFF_SECONDS", "120"))
+DEFAULT_SECTOR_RANKINGS_CACHE_TTL_SECONDS = int(os.getenv("AKSHARE_SECTOR_RANKINGS_CACHE_TTL_SECONDS", "3600"))
+DEFAULT_SECTOR_RANKINGS_CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "cache" / "sector_rankings"
 
 
 # User-Agent 池，用于随机轮换
@@ -282,6 +286,7 @@ class AkshareFetcher(BaseFetcher):
         sleep_min: float = 2.0,
         sleep_max: float = 5.0,
         stock_history_source_priority: Optional[Sequence[str]] = None,
+        stock_history_retry_attempts: int = 2,
     ):
         """
         初始化 AkshareFetcher
@@ -295,9 +300,12 @@ class AkshareFetcher(BaseFetcher):
         self.stock_history_source_priority = self._normalize_stock_history_source_priority(
             stock_history_source_priority
         )
+        self._stock_history_retry_attempts = max(1, int(stock_history_retry_attempts))
         self._last_request_time: Optional[float] = None
         self._sector_rank_em_backoff_seconds = max(0, int(DEFAULT_SECTOR_RANK_EM_BACKOFF_SECONDS))
         self._sector_rank_em_backoff_until_ts: float = 0.0
+        self._sector_rankings_cache_dir: Path = DEFAULT_SECTOR_RANKINGS_CACHE_DIR
+        self._sector_rankings_cache_ttl_seconds: int = max(0, int(DEFAULT_SECTOR_RANKINGS_CACHE_TTL_SECONDS))
         self._stock_history_em_backoff_seconds = max(0, int(DEFAULT_STOCK_HISTORY_EM_BACKOFF_SECONDS))
         self._stock_history_em_backoff_until_ts: float = 0.0
         # 东财补丁开启才执行打补丁操作
@@ -377,6 +385,64 @@ class AkshareFetcher(BaseFetcher):
     def _clear_sector_rank_em_backoff(self) -> None:
         self._sector_rank_em_backoff_until_ts = 0.0
 
+    def _sector_rankings_cache_file(self, *, n: int) -> Path:
+        cache_n = max(1, int(n))
+        return Path(self._sector_rankings_cache_dir) / f"sector_rankings_top{cache_n}.json"
+
+    def _load_sector_rankings_disk_cache(self, *, n: int) -> Optional[Tuple[List[Dict], List[Dict]]]:
+        ttl_seconds = max(0, int(getattr(self, "_sector_rankings_cache_ttl_seconds", 0) or 0))
+        if ttl_seconds <= 0:
+            return None
+        cache_file = self._sector_rankings_cache_file(n=n)
+        try:
+            if not cache_file.exists():
+                return None
+            payload = json.loads(cache_file.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        fetched_at_text = str(payload.get("fetched_at") or "").strip()
+        try:
+            fetched_at = datetime.fromisoformat(fetched_at_text)
+        except ValueError:
+            return None
+        if time.time() - fetched_at.timestamp() > ttl_seconds:
+            return None
+        top = payload.get("top")
+        bottom = payload.get("bottom")
+        if not isinstance(top, list) or not isinstance(bottom, list):
+            return None
+        return top[: max(1, int(n))], bottom[: max(1, int(n))]
+
+    def _write_sector_rankings_disk_cache(
+        self,
+        *,
+        n: int,
+        top: List[Dict],
+        bottom: List[Dict],
+        source: str,
+    ) -> None:
+        ttl_seconds = max(0, int(getattr(self, "_sector_rankings_cache_ttl_seconds", 0) or 0))
+        if ttl_seconds <= 0:
+            return
+        cache_file = self._sector_rankings_cache_file(n=n)
+        try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            cache_file.write_text(
+                json.dumps(
+                    {
+                        "fetched_at": datetime.now().replace(microsecond=0).isoformat(),
+                        "source": str(source or "").strip() or None,
+                        "top": list(top or []),
+                        "bottom": list(bottom or []),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+        except Exception:
+            return
+
     def _is_stock_history_em_backoff_active(self) -> bool:
         return time.time() < float(self._stock_history_em_backoff_until_ts)
 
@@ -448,7 +514,7 @@ class AkshareFetcher(BaseFetcher):
         return category in {"remote_disconnect", "timeout"}
 
     def _run_stock_history_call_with_retry(self, source_name: str, stock_code: str, func):
-        max_attempts = 2
+        max_attempts = max(1, int(getattr(self, "_stock_history_retry_attempts", 2)))
         for attempt in range(1, max_attempts + 1):
             try:
                 return func()
@@ -1922,6 +1988,11 @@ class AkshareFetcher(BaseFetcher):
                 for _, row in bottom.iterrows()
             ]
             return top_sectors, bottom_sectors
+
+        cached_rankings = self._load_sector_rankings_disk_cache(n=n)
+        if cached_rankings is not None:
+            logger.info("[Akshare] 使用 sector rankings 磁盘缓存: top_n=%s", max(1, int(n)))
+            return cached_rankings
         
         # 优先东财接口；若短时间内连续失败，则在 backoff 窗口内直接走新浪回退
         if self._is_sector_rank_em_backoff_active():
@@ -1941,7 +2012,14 @@ class AkshareFetcher(BaseFetcher):
                     self._clear_sector_rank_em_backoff()
                     change_col = '涨跌幅'
                     name = '板块名称'
-                    return _get_rank_top_n(df, change_col, name, n)
+                    rankings = _get_rank_top_n(df, change_col, name, n)
+                    self._write_sector_rankings_disk_cache(
+                        n=n,
+                        top=rankings[0],
+                        bottom=rankings[1],
+                        source="eastmoney_em",
+                    )
+                    return rankings
                 logger.warning("[Akshare] 东财接口返回空板块排行，切换新浪回退")
             except Exception as e:
                 self._activate_sector_rank_em_backoff(str(e))
@@ -1958,7 +2036,14 @@ class AkshareFetcher(BaseFetcher):
                 return None
             change_col = '涨跌幅'
             name = '板块'
-            return _get_rank_top_n(df, change_col, name, n)
+            rankings = _get_rank_top_n(df, change_col, name, n)
+            self._write_sector_rankings_disk_cache(
+                n=n,
+                top=rankings[0],
+                bottom=rankings[1],
+                source="sina_sector_spot",
+            )
+            return rankings
         
         except Exception as e:
             logger.error(f"[Akshare] 新浪接口获取板块排行也失败: {e}")

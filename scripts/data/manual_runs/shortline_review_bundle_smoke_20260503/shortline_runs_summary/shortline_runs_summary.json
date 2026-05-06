@@ -1,0 +1,569 @@
+{
+  "runs_root": "D:\\bb\\daily_stock_analysis\\data\\manual_runs",
+  "run_count": 12,
+  "latest_run_id": "shortline_persist_realwt_replace_20260503",
+  "trade_date_counts": {
+    "2026-05-03": 12
+  },
+  "upstream_tool_counts": {
+    "ChipAnalysisTool": 11,
+    "HotMoneyTool": 11
+  },
+  "runs": [
+    {
+      "run_id": "shortline_persist_realwt_replace_20260503",
+      "trade_date": "2026-05-03",
+      "top_n": 3,
+      "candidate_count": 3,
+      "explanation_count": 3,
+      "tool_error_count": 0,
+      "total_explain_elapsed_ms": 170737,
+      "avg_explain_elapsed_ms": 56912,
+      "scan_source_counts": {
+        "wondertrader_real_engine": 3
+      },
+      "setup_tag_counts": {
+        "涨停后高换手分歧": 1,
+        "涨停强势延续": 2
+      },
+      "risk_flag_counts": {
+        "volume_reconstructed_from_amount": 3
+      },
+      "explanation_source_counts": {
+        "upstream_tools": 3
+      },
+      "upstream_tool_hit_counts": {
+        "HotMoneyTool": 3,
+        "ChipAnalysisTool": 3
+      },
+      "top_symbols": [
+        "300083",
+        "688256",
+        "688400"
+      ],
+      "top_boards": [
+        "机床制造",
+        "半导体",
+        "专用机械"
+      ],
+      "top_setups": [
+        "涨停后高换手分歧",
+        "涨停强势延续",
+        "涨停强势延续"
+      ],
+      "used_upstream_tools": [
+        "ChipAnalysisTool",
+        "HotMoneyTool"
+      ],
+      "run_dir": "D:\\bb\\daily_stock_analysis\\data\\manual_runs\\shortline_persist_realwt_replace_20260503"
+    },
+    {
+      "run_id": "shortline_persist_realwt_20260503",
+      "trade_date": "2026-05-03",
+      "top_n": 3,
+      "candidate_count": 3,
+      "explanation_count": 3,
+      "tool_error_count": 0,
+      "total_explain_elapsed_ms": 194971,
+      "avg_explain_elapsed_ms": 64990,
+      "scan_source_counts": {
+        "wondertrader_real_engine": 3
+      },
+      "setup_tag_counts": {
+        "涨停后高换手分歧": 1,
+        "涨停强势延续": 2
+      },
+      "risk_flag_counts": {
+        "volume_reconstructed_from_amount": 3
+      },
+      "explanation_source_counts": {
+        "upstream_tools": 3
+      },
+      "upstream_tool_hit_counts": {
+        "HotMoneyTool": 3,
+        "ChipAnalysisTool": 3
+      },
+      "top_symbols": [
+        "300083",
+        "688256",
+        "688400"
+      ],
+      "top_boards": [
+        "机床制造",
+        "半导体",
+        "专用机械"
+      ],
+      "top_setups": [
+        "涨停后高换手分歧",
+        "涨停强势延续",
+        "涨停强势延续"
+      ],
+      "used_upstream_tools": [
+        "ChipAnalysisTool",
+        "HotMoneyTool"
+      ],
+      "run_dir": "D:\\bb\\daily_stock_analysis\\data\\manual_runs\\shortline_persist_realwt_20260503"
+    },
+    {
+      "run_id": "shortline_persist_smoke_20260503",
+      "trade_date": "2026-05-03",
+      "top_n": 3,
+      "candidate_count": 3,
+      "explanation_count": 3,
+      "tool_error_count": 0,
+      "total_explain_elapsed_ms": 217063,
+      "avg_explain_elapsed_ms": 72354,
+      "scan_source_counts": {
+        "wondertrader_cache_scan": 3
+      },
+      "setup_tag_counts": {
+        "涨停后高换手分歧": 2,
+        "涨停后分歧承接": 1
+      },
+      "risk_flag_counts": {
+        "limit_up_extension": 3,
+        "high_turnover": 3
+      },
+      "explanation_source_counts": {
+        "upstream_tools": 3
+      },
+      "upstream_tool_hit_counts": {
+        "HotMoneyTool": 3,
+        "ChipAnalysisTool": 3
+      },
+      "top_symbols": [
+        "300083",
+        "688531",
+        "300632"
+      ],
+      "top_boards": [
+        "机床制造",
+        "专用机械",
+        "半导体"
+      ],
+      "top_setups": [
+        "涨停后高换手分歧",
+        "涨停后高换手分歧",
+        "涨停后分歧承接"
+      ],
+      "used_upstream_tools": [
+        "ChipAnalysisTool",
+        "HotMoneyTool"
+      ],
+      "run_dir": "D:\\bb\\daily_stock_analysis\\data\\manual_runs\\shortline_persist_smoke_20260503"
+    },
+    {
+      "run_id": "shortline_daily_report_dedup_top3_20260503",
+      "trade_date": "2026-05-03",
+      "top_n": 3,
+      "candidate_count": 3,
+      "explanation_count": 3,
+      "tool_error_count": 0,
+      "total_explain_elapsed_ms": 118151,
+      "avg_explain_elapsed_ms": 39383,
+      "scan_source_counts": {
+        "wondertrader_real_engine": 3
+      },
+      "setup_tag_counts": {
+        "涨停后高换手分歧": 1,
+        "涨停强势延续": 2
+      },
+      "risk_flag_counts": {
+        "volume_reconstructed_from_amount": 3
+      },
+      "explanation_source_counts": {
+        "upstream_tools": 3
+      },
+      "upstream_tool_hit_counts": {
+        "HotMoneyTool": 3,
+        "ChipAnalysisTool": 3
+      },
+      "top_symbols": [
+        "300083",
+        "688256",
+        "688400"
+      ],
+      "top_boards": [
+        "机床制造",
+        "半导体",
+        "专用机械"
+      ],
+      "top_setups": [
+        "涨停后高换手分歧",
+        "涨停强势延续",
+        "涨停强势延续"
+      ],
+      "used_upstream_tools": [
+        "ChipAnalysisTool",
+        "HotMoneyTool"
+      ],
+      "run_dir": "D:\\bb\\daily_stock_analysis\\data\\manual_runs\\shortline_daily_report_dedup_top3_20260503"
+    },
+    {
+      "run_id": "shortline_daily_stability_b_20260503",
+      "trade_date": "2026-05-03",
+      "top_n": 3,
+      "candidate_count": 3,
+      "explanation_count": 3,
+      "tool_error_count": 0,
+      "total_explain_elapsed_ms": 111100,
+      "avg_explain_elapsed_ms": 37033,
+      "scan_source_counts": {
+        "wondertrader_real_engine": 3
+      },
+      "setup_tag_counts": {
+        "涨停后高换手分歧": 1,
+        "涨停强势延续": 2
+      },
+      "risk_flag_counts": {
+        "volume_reconstructed_from_amount": 3
+      },
+      "explanation_source_counts": {
+        "upstream_tools": 3
+      },
+      "upstream_tool_hit_counts": {
+        "HotMoneyTool": 3,
+        "ChipAnalysisTool": 3
+      },
+      "top_symbols": [
+        "300083",
+        "688256",
+        "688400"
+      ],
+      "top_boards": [
+        "机床制造",
+        "半导体",
+        "专用机械"
+      ],
+      "top_setups": [
+        "涨停后高换手分歧",
+        "涨停强势延续",
+        "涨停强势延续"
+      ],
+      "used_upstream_tools": [
+        "ChipAnalysisTool",
+        "HotMoneyTool"
+      ],
+      "run_dir": "D:\\bb\\daily_stock_analysis\\data\\manual_runs\\shortline_daily_stability_b_20260503"
+    },
+    {
+      "run_id": "shortline_daily_stability_a_20260503",
+      "trade_date": "2026-05-03",
+      "top_n": 3,
+      "candidate_count": 3,
+      "explanation_count": 3,
+      "tool_error_count": 0,
+      "total_explain_elapsed_ms": 135445,
+      "avg_explain_elapsed_ms": 45148,
+      "scan_source_counts": {
+        "wondertrader_real_engine": 3
+      },
+      "setup_tag_counts": {
+        "涨停后高换手分歧": 1,
+        "涨停强势延续": 2
+      },
+      "risk_flag_counts": {
+        "volume_reconstructed_from_amount": 3
+      },
+      "explanation_source_counts": {
+        "upstream_tools": 3
+      },
+      "upstream_tool_hit_counts": {
+        "HotMoneyTool": 3,
+        "ChipAnalysisTool": 3
+      },
+      "top_symbols": [
+        "300083",
+        "688256",
+        "688400"
+      ],
+      "top_boards": [
+        "机床制造",
+        "半导体",
+        "专用机械"
+      ],
+      "top_setups": [
+        "涨停后高换手分歧",
+        "涨停强势延续",
+        "涨停强势延续"
+      ],
+      "used_upstream_tools": [
+        "ChipAnalysisTool",
+        "HotMoneyTool"
+      ],
+      "run_dir": "D:\\bb\\daily_stock_analysis\\data\\manual_runs\\shortline_daily_stability_a_20260503"
+    },
+    {
+      "run_id": "shortline_daily_coreperf_top3_20260503",
+      "trade_date": "2026-05-03",
+      "top_n": 3,
+      "candidate_count": 3,
+      "explanation_count": 3,
+      "tool_error_count": 0,
+      "total_explain_elapsed_ms": 130856,
+      "avg_explain_elapsed_ms": 43618,
+      "scan_source_counts": {
+        "wondertrader_real_engine": 3
+      },
+      "setup_tag_counts": {
+        "涨停后高换手分歧": 1,
+        "涨停强势延续": 2
+      },
+      "risk_flag_counts": {
+        "volume_reconstructed_from_amount": 3
+      },
+      "explanation_source_counts": {
+        "upstream_tools": 3
+      },
+      "upstream_tool_hit_counts": {
+        "HotMoneyTool": 3,
+        "ChipAnalysisTool": 3
+      },
+      "top_symbols": [
+        "300083",
+        "688256",
+        "688400"
+      ],
+      "top_boards": [
+        "机床制造",
+        "半导体",
+        "专用机械"
+      ],
+      "top_setups": [
+        "涨停后高换手分歧",
+        "涨停强势延续",
+        "涨停强势延续"
+      ],
+      "used_upstream_tools": [
+        "ChipAnalysisTool",
+        "HotMoneyTool"
+      ],
+      "run_dir": "D:\\bb\\daily_stock_analysis\\data\\manual_runs\\shortline_daily_coreperf_top3_20260503"
+    },
+    {
+      "run_id": "shortline_daily_calibrated_top3_20260503",
+      "trade_date": "2026-05-03",
+      "top_n": 3,
+      "candidate_count": 3,
+      "explanation_count": 3,
+      "tool_error_count": 0,
+      "total_explain_elapsed_ms": 106990,
+      "avg_explain_elapsed_ms": 35663,
+      "scan_source_counts": {
+        "wondertrader_real_engine": 3
+      },
+      "setup_tag_counts": {
+        "涨停后高换手分歧": 1,
+        "涨停强势延续": 2
+      },
+      "risk_flag_counts": {
+        "volume_reconstructed_from_amount": 3
+      },
+      "explanation_source_counts": {
+        "upstream_tools": 3
+      },
+      "upstream_tool_hit_counts": {
+        "HotMoneyTool": 3,
+        "ChipAnalysisTool": 3
+      },
+      "top_symbols": [
+        "300083",
+        "688256",
+        "688400"
+      ],
+      "top_boards": [
+        "机床制造",
+        "半导体",
+        "专用机械"
+      ],
+      "top_setups": [
+        "涨停后高换手分歧",
+        "涨停强势延续",
+        "涨停强势延续"
+      ],
+      "used_upstream_tools": [
+        "ChipAnalysisTool",
+        "HotMoneyTool"
+      ],
+      "run_dir": "D:\\bb\\daily_stock_analysis\\data\\manual_runs\\shortline_daily_calibrated_top3_20260503"
+    },
+    {
+      "run_id": "shortline_daily_layered_top1_20260503",
+      "trade_date": "2026-05-03",
+      "top_n": 1,
+      "candidate_count": 1,
+      "explanation_count": 1,
+      "tool_error_count": 0,
+      "total_explain_elapsed_ms": 40780,
+      "avg_explain_elapsed_ms": 40780,
+      "scan_source_counts": {
+        "wondertrader_real_engine": 1
+      },
+      "setup_tag_counts": {
+        "涨停后高换手分歧": 1
+      },
+      "risk_flag_counts": {
+        "volume_reconstructed_from_amount": 1
+      },
+      "explanation_source_counts": {
+        "upstream_tools": 1
+      },
+      "upstream_tool_hit_counts": {
+        "HotMoneyTool": 1,
+        "ChipAnalysisTool": 1
+      },
+      "top_symbols": [
+        "300083"
+      ],
+      "top_boards": [
+        "机床制造"
+      ],
+      "top_setups": [
+        "涨停后高换手分歧"
+      ],
+      "used_upstream_tools": [
+        "ChipAnalysisTool",
+        "HotMoneyTool"
+      ],
+      "run_dir": "D:\\bb\\daily_stock_analysis\\data\\manual_runs\\shortline_daily_layered_top1_20260503"
+    },
+    {
+      "run_id": "shortline_stub_layered_20260503",
+      "trade_date": "2026-05-03",
+      "top_n": 3,
+      "candidate_count": 3,
+      "explanation_count": 3,
+      "tool_error_count": 0,
+      "total_explain_elapsed_ms": 0,
+      "avg_explain_elapsed_ms": 0,
+      "scan_source_counts": {
+        "wondertrader_stub": 3
+      },
+      "setup_tag_counts": {
+        "回调再突破": 1,
+        "相对强势整理": 1,
+        "放量突破": 1
+      },
+      "risk_flag_counts": {
+        "earnings_pending": 1,
+        "(none)": 1,
+        "high_volatility": 1
+      },
+      "explanation_source_counts": {
+        "legacy_unknown": 3
+      },
+      "upstream_tool_hit_counts": {},
+      "top_symbols": [
+        "300750",
+        "000001",
+        "600000"
+      ],
+      "top_boards": [
+        "新能源",
+        "金融",
+        "银行"
+      ],
+      "top_setups": [
+        "放量突破",
+        "回调再突破",
+        "相对强势整理"
+      ],
+      "used_upstream_tools": [],
+      "run_dir": "D:\\bb\\daily_stock_analysis\\data\\manual_runs\\shortline_stub_layered_20260503"
+    },
+    {
+      "run_id": "shortline_daily_readability_recheck_20260503",
+      "trade_date": "2026-05-03",
+      "top_n": 3,
+      "candidate_count": 3,
+      "explanation_count": 3,
+      "tool_error_count": 0,
+      "total_explain_elapsed_ms": 82409,
+      "avg_explain_elapsed_ms": 27469,
+      "scan_source_counts": {
+        "wondertrader_real_engine": 3
+      },
+      "setup_tag_counts": {
+        "涨停后高换手分歧": 1,
+        "涨停强势延续": 2
+      },
+      "risk_flag_counts": {
+        "volume_reconstructed_from_amount": 3
+      },
+      "explanation_source_counts": {
+        "upstream_tools": 3
+      },
+      "upstream_tool_hit_counts": {
+        "HotMoneyTool": 3,
+        "ChipAnalysisTool": 3
+      },
+      "top_symbols": [
+        "300083",
+        "688256",
+        "688400"
+      ],
+      "top_boards": [
+        "机床制造",
+        "半导体",
+        "专用机械"
+      ],
+      "top_setups": [
+        "涨停后高换手分歧",
+        "涨停强势延续",
+        "涨停强势延续"
+      ],
+      "used_upstream_tools": [
+        "ChipAnalysisTool",
+        "HotMoneyTool"
+      ],
+      "run_dir": "D:\\bb\\daily_stock_analysis\\data\\manual_runs\\shortline_daily_readability_recheck_20260503"
+    },
+    {
+      "run_id": "shortline_daily_volume_repair_flagcheck_20260503",
+      "trade_date": "2026-05-03",
+      "top_n": 3,
+      "candidate_count": 3,
+      "explanation_count": 3,
+      "tool_error_count": 0,
+      "total_explain_elapsed_ms": 81436,
+      "avg_explain_elapsed_ms": 27145,
+      "scan_source_counts": {
+        "wondertrader_real_engine": 3
+      },
+      "setup_tag_counts": {
+        "涨停后高换手分歧": 1,
+        "涨停强势延续": 2
+      },
+      "risk_flag_counts": {
+        "volume_reconstructed_from_amount": 3
+      },
+      "explanation_source_counts": {
+        "upstream_tools": 3
+      },
+      "upstream_tool_hit_counts": {
+        "HotMoneyTool": 3,
+        "ChipAnalysisTool": 3
+      },
+      "top_symbols": [
+        "300083",
+        "688256",
+        "688400"
+      ],
+      "top_boards": [
+        "机床制造",
+        "半导体",
+        "专用机械"
+      ],
+      "top_setups": [
+        "涨停后高换手分歧",
+        "涨停强势延续",
+        "涨停强势延续"
+      ],
+      "used_upstream_tools": [
+        "ChipAnalysisTool",
+        "HotMoneyTool"
+      ],
+      "run_dir": "D:\\bb\\daily_stock_analysis\\data\\manual_runs\\shortline_daily_volume_repair_flagcheck_20260503"
+    }
+  ]
+}

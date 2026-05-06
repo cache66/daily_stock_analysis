@@ -7,6 +7,9 @@ import os
 import sys
 import time
 import unittest
+import tempfile
+import json
+from pathlib import Path
 from threading import BoundedSemaphore, Event
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -121,6 +124,86 @@ class TestFundamentalContext(unittest.TestCase):
         self.assertEqual(top[0]["name"], "地产")
         self.assertEqual(bottom[0]["name"], "煤炭")
 
+    def test_sector_rankings_can_fallback_to_stale_disk_cache_when_fetchers_fail(self) -> None:
+        class _FailingFetcher:
+            def __init__(self) -> None:
+                self.name = "AkshareFetcher"
+                self.priority = 1
+                self.calls = 0
+
+            def get_sector_rankings(self, _n: int = 5):
+                self.calls += 1
+                raise RuntimeError("offline")
+
+        failing = _FailingFetcher()
+        manager = DataFetcherManager(fetchers=[failing])
+        cache_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(cache_dir.cleanup)
+        manager._sector_rankings_disk_cache_dir = Path(cache_dir.name)
+        manager._sector_rankings_disk_cache_ttl_seconds = 1
+
+        cache_file = manager._sector_rankings_disk_cache_file(1)
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        cache_file.write_text(
+            json.dumps(
+                {
+                    "fetched_at": "2026-04-29T09:30:00",
+                    "top": [{"name": "绠楀姏", "change_pct": 6.8}],
+                    "bottom": [{"name": "鍦颁骇", "change_pct": -2.1}],
+                    "source_chain": [{"provider": "disk_cache", "result": "ok", "duration_ms": 0}],
+                    "last_error": "",
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        top, bottom = manager.get_sector_rankings(1)
+
+        self.assertEqual(failing.calls, 1)
+        self.assertEqual(top[0]["name"], "绠楀姏")
+        self.assertEqual(bottom[0]["name"], "鍦颁骇")
+
+    def test_sector_rankings_can_prefer_stale_disk_cache_before_fetchers(self) -> None:
+        class _FailingFetcher:
+            def __init__(self) -> None:
+                self.name = "AkshareFetcher"
+                self.priority = 1
+                self.calls = 0
+
+            def get_sector_rankings(self, _n: int = 5):
+                self.calls += 1
+                raise RuntimeError("offline")
+
+        failing = _FailingFetcher()
+        manager = DataFetcherManager(fetchers=[failing])
+        cache_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(cache_dir.cleanup)
+        manager._sector_rankings_disk_cache_dir = Path(cache_dir.name)
+        manager._sector_rankings_disk_cache_ttl_seconds = 1
+
+        cache_file = manager._sector_rankings_disk_cache_file(1)
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        cache_file.write_text(
+            json.dumps(
+                {
+                    "fetched_at": "2026-04-29T09:30:00",
+                    "top": [{"name": "绠楀姏", "change_pct": 6.8}],
+                    "bottom": [{"name": "鍦颁骇", "change_pct": -2.1}],
+                    "source_chain": [{"provider": "disk_cache", "result": "ok", "duration_ms": 0}],
+                    "last_error": "",
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        top, bottom = manager.get_sector_rankings(1, prefer_stale_cache=True)
+
+        self.assertEqual(failing.calls, 0)
+        self.assertEqual(top[0]["name"], "绠楀姏")
+        self.assertEqual(bottom[0]["name"], "鍦颁骇")
+
     def test_fundamental_context_aggregates_blocks(self) -> None:
         manager = DataFetcherManager(fetchers=[])
         cfg = SimpleNamespace(
@@ -212,6 +295,151 @@ class TestFundamentalContext(unittest.TestCase):
             places=6,
         )
         self.assertIn("cashflow_covers_profit_well", earnings_quality["positive_signals"])
+
+    def test_earnings_fundamental_context_requests_only_trend_needed_blocks(self) -> None:
+        manager = DataFetcherManager(fetchers=[])
+        cache_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(cache_dir.cleanup)
+        manager._earnings_fundamental_disk_cache_dir = Path(cache_dir.name)
+        cfg = SimpleNamespace(
+            enable_fundamental_pipeline=True,
+            fundamental_cache_ttl_seconds=120,
+            fundamental_stage_timeout_seconds=1.5,
+            fundamental_fetch_timeout_seconds=0.8,
+            fundamental_retry_max=1,
+        )
+        captured_enabled_blocks = {}
+
+        def _fake_get_fundamental_bundle(stock_code: str, *, enabled_blocks=None):
+            captured_enabled_blocks["stock_code"] = stock_code
+            captured_enabled_blocks["enabled_blocks"] = tuple(enabled_blocks or ())
+            return {
+                "status": "ok",
+                "growth": {"revenue_yoy": 18.0, "net_profit_yoy": 35.0},
+                "earnings": {
+                    "financial_report": {"report_date": "2026-03-31"},
+                    "forecast_summary": "预增",
+                    "quick_report_summary": "快报摘要",
+                },
+                "source_chain": [],
+                "errors": [],
+            }
+
+        with patch("src.config.get_config", return_value=cfg), patch.object(
+            manager._fundamental_adapter,
+            "get_fundamental_bundle",
+            side_effect=_fake_get_fundamental_bundle,
+        ):
+            ctx = manager.get_earnings_fundamental_context("600519", budget_seconds=1.5)
+
+        self.assertEqual(captured_enabled_blocks["stock_code"], "600519")
+        self.assertEqual(
+            captured_enabled_blocks["enabled_blocks"],
+            ("financial", "forecast", "quick_report"),
+        )
+        self.assertEqual(ctx["status"], "ok")
+        self.assertFalse(bool(ctx.get("cache_hit")))
+        self.assertIsNone(ctx.get("cache_source"))
+        self.assertEqual(ctx["coverage"].get("growth"), "ok")
+        self.assertEqual(ctx["coverage"].get("earnings"), "ok")
+
+    def test_earnings_fundamental_context_financial_only_reuses_superset_memory_cache(self) -> None:
+        manager = DataFetcherManager(fetchers=[])
+        cache_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(cache_dir.cleanup)
+        manager._earnings_fundamental_disk_cache_dir = Path(cache_dir.name)
+        cfg = SimpleNamespace(
+            enable_fundamental_pipeline=True,
+            fundamental_cache_ttl_seconds=120,
+            fundamental_stage_timeout_seconds=1.5,
+            fundamental_fetch_timeout_seconds=0.8,
+            fundamental_retry_max=1,
+            fundamental_cache_max_entries=256,
+        )
+        captured_enabled_blocks = []
+
+        def _fake_get_fundamental_bundle(stock_code: str, *, enabled_blocks=None):
+            captured_enabled_blocks.append((stock_code, tuple(enabled_blocks or ())))
+            return {
+                "status": "ok",
+                "growth": {"revenue_yoy": 18.0, "net_profit_yoy": 35.0},
+                "earnings": {"financial_report": {"report_date": "2026-03-31"}},
+                "source_chain": [],
+                "errors": [],
+            }
+
+        with patch("src.config.get_config", return_value=cfg), patch.object(
+            manager._fundamental_adapter,
+            "get_fundamental_bundle",
+            side_effect=_fake_get_fundamental_bundle,
+        ):
+            first = manager.get_earnings_fundamental_context("600519", budget_seconds=1.5)
+            second = manager.get_earnings_fundamental_context(
+                "600519",
+                budget_seconds=1.5,
+                enabled_blocks=("financial",),
+            )
+
+        self.assertEqual(len(captured_enabled_blocks), 1)
+        self.assertEqual(captured_enabled_blocks[0], ("600519", ("financial", "forecast", "quick_report")))
+        self.assertFalse(bool(first.get("cache_hit")))
+        self.assertTrue(bool(second.get("cache_hit")))
+        self.assertEqual(second.get("cache_source"), "memory")
+
+    def test_earnings_fundamental_context_financial_only_reuses_superset_disk_cache(self) -> None:
+        cache_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(cache_dir.cleanup)
+        cfg = SimpleNamespace(
+            enable_fundamental_pipeline=True,
+            fundamental_cache_ttl_seconds=120,
+            fundamental_stage_timeout_seconds=1.5,
+            fundamental_fetch_timeout_seconds=0.8,
+            fundamental_retry_max=1,
+            fundamental_cache_max_entries=256,
+        )
+        first_manager = DataFetcherManager(fetchers=[])
+        first_manager._earnings_fundamental_disk_cache_dir = Path(cache_dir.name)
+        second_manager = DataFetcherManager(fetchers=[])
+        second_manager._earnings_fundamental_disk_cache_dir = Path(cache_dir.name)
+
+        def _fake_get_fundamental_bundle(stock_code: str, *, enabled_blocks=None):
+            return {
+                "status": "ok",
+                "growth": {"revenue_yoy": 18.0, "net_profit_yoy": 35.0},
+                "earnings": {
+                    "financial_report": {"report_date": "2026-03-31"},
+                    "forecast_summary": f"{stock_code}-forecast",
+                    "quick_report_summary": f"{stock_code}-quick",
+                },
+                "source_chain": [],
+                "errors": [],
+            }
+
+        with patch("src.config.get_config", return_value=cfg), patch.object(
+            first_manager._fundamental_adapter,
+            "get_fundamental_bundle",
+            side_effect=_fake_get_fundamental_bundle,
+        ):
+            first = first_manager.get_earnings_fundamental_context("600519", budget_seconds=1.5)
+
+        with patch("src.config.get_config", return_value=cfg), patch.object(
+            second_manager._fundamental_adapter,
+            "get_fundamental_bundle",
+            side_effect=AssertionError("financial-only request should reuse superset disk cache"),
+        ):
+            second = second_manager.get_earnings_fundamental_context(
+                "600519",
+                budget_seconds=1.5,
+                enabled_blocks=("financial",),
+            )
+
+        self.assertFalse(bool(first.get("cache_hit")))
+        self.assertTrue(bool(second.get("cache_hit")))
+        self.assertEqual(second.get("cache_source"), "disk")
+        self.assertEqual(
+            first["earnings"]["data"]["financial_report"]["report_date"],
+            second["earnings"]["data"]["financial_report"]["report_date"],
+        )
 
     def test_fundamental_context_uses_quarterly_series_for_earnings_quality_continuity(self) -> None:
         manager = DataFetcherManager(fetchers=[])
@@ -695,10 +923,216 @@ class TestFundamentalContext(unittest.TestCase):
         key_default = manager._get_fundamental_cache_key("600519")
         key_low = manager._get_fundamental_cache_key("600519", 0.4)
         key_high = manager._get_fundamental_cache_key("600519", 1.5)
+        key_earnings = manager._get_fundamental_cache_key("600519", 1.5, scope="earnings")
 
         self.assertNotEqual(key_default, key_low)
         self.assertNotEqual(key_low, key_high)
+        self.assertNotEqual(key_high, key_earnings)
         self.assertIn("budget=", key_low)
+
+    def test_earnings_fundamental_context_reuses_cache_within_ttl(self) -> None:
+        manager = DataFetcherManager(fetchers=[])
+        cache_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(cache_dir.cleanup)
+        manager._earnings_fundamental_disk_cache_dir = Path(cache_dir.name)
+        cfg = SimpleNamespace(
+            enable_fundamental_pipeline=True,
+            fundamental_cache_ttl_seconds=120,
+            fundamental_stage_timeout_seconds=1.5,
+            fundamental_fetch_timeout_seconds=0.8,
+            fundamental_retry_max=1,
+            fundamental_cache_max_entries=256,
+        )
+        calls = {"count": 0}
+
+        def _fake_get_fundamental_bundle(stock_code: str, *, enabled_blocks=None):
+            calls["count"] += 1
+            return {
+                "status": "ok",
+                "growth": {"revenue_yoy": 18.0, "net_profit_yoy": 35.0},
+                "earnings": {
+                    "financial_report": {"report_date": "2026-03-31"},
+                    "forecast_summary": f"{stock_code}-预增",
+                    "quick_report_summary": f"{stock_code}-快报",
+                },
+                "source_chain": [],
+                "errors": [],
+            }
+
+        with patch("src.config.get_config", return_value=cfg), patch.object(
+            manager._fundamental_adapter,
+            "get_fundamental_bundle",
+            side_effect=_fake_get_fundamental_bundle,
+        ):
+            first = manager.get_earnings_fundamental_context("600519", budget_seconds=1.5)
+            second = manager.get_earnings_fundamental_context("600519", budget_seconds=1.5)
+
+        self.assertEqual(calls["count"], 1)
+        self.assertFalse(bool(first.get("cache_hit")))
+        self.assertIsNone(first.get("cache_source"))
+        self.assertTrue(bool(second.get("cache_hit")))
+        self.assertEqual(second.get("cache_source"), "memory")
+        self.assertEqual(
+            first["earnings"]["data"]["forecast_summary"],
+            second["earnings"]["data"]["forecast_summary"],
+        )
+
+    def test_earnings_fundamental_context_cache_is_isolated_from_full_context(self) -> None:
+        manager = DataFetcherManager(fetchers=[])
+        cache_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(cache_dir.cleanup)
+        manager._earnings_fundamental_disk_cache_dir = Path(cache_dir.name)
+        cfg = SimpleNamespace(
+            enable_fundamental_pipeline=True,
+            fundamental_cache_ttl_seconds=120,
+            fundamental_stage_timeout_seconds=1.5,
+            fundamental_fetch_timeout_seconds=0.8,
+            fundamental_retry_max=1,
+            fundamental_cache_max_entries=256,
+        )
+        quote = SimpleNamespace(
+            price=20.0,
+            pe_ratio=12.3,
+            pb_ratio=2.1,
+            total_mv=1.0e11,
+            circ_mv=7.0e10,
+            source=SimpleNamespace(value="tencent"),
+        )
+        calls = {"count": 0}
+
+        def _fake_get_fundamental_bundle(stock_code: str, *, enabled_blocks=None):
+            calls["count"] += 1
+            enabled_block_set = set(enabled_blocks or ())
+            payload = {
+                "status": "ok",
+                "growth": {"revenue_yoy": 18.0, "net_profit_yoy": 35.0},
+                "earnings": {
+                    "financial_report": {"report_date": "2026-03-31"},
+                    "forecast_summary": f"{stock_code}-预增",
+                    "quick_report_summary": f"{stock_code}-快报",
+                },
+                "institution": {"institution_holding_change": 1.2} if "institution" in enabled_block_set else {},
+                "source_chain": [],
+                "errors": [],
+            }
+            return payload
+
+        with patch("src.config.get_config", return_value=cfg), \
+                patch.object(manager, "get_realtime_quote", return_value=quote), \
+                patch.object(
+                    manager._fundamental_adapter,
+                    "get_fundamental_bundle",
+                    side_effect=_fake_get_fundamental_bundle,
+                ), \
+                patch.object(manager, "get_capital_flow_context", return_value={"status": "not_supported", "source_chain": [], "errors": [], "data": {}}), \
+                patch.object(manager, "get_dragon_tiger_context", return_value={"status": "not_supported", "source_chain": [], "errors": [], "data": {}}), \
+                patch.object(manager, "get_board_context", return_value={"status": "not_supported", "source_chain": [], "errors": [], "data": {}}):
+            earnings_ctx = manager.get_earnings_fundamental_context("600519", budget_seconds=1.5)
+            full_ctx = manager.get_fundamental_context("600519", budget_seconds=1.5)
+
+        self.assertEqual(calls["count"], 2)
+        self.assertFalse(bool(earnings_ctx.get("cache_hit")))
+        self.assertIsNone(earnings_ctx.get("cache_source"))
+        self.assertEqual(earnings_ctx["coverage"].get("growth"), "ok")
+        self.assertIn("institution", full_ctx)
+
+    def test_earnings_fundamental_context_reuses_disk_cache_across_manager_instances(self) -> None:
+        cache_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(cache_dir.cleanup)
+        cfg = SimpleNamespace(
+            enable_fundamental_pipeline=True,
+            fundamental_cache_ttl_seconds=120,
+            fundamental_stage_timeout_seconds=1.5,
+            fundamental_fetch_timeout_seconds=0.8,
+            fundamental_retry_max=1,
+            fundamental_cache_max_entries=256,
+        )
+        first_manager = DataFetcherManager(fetchers=[])
+        first_manager._earnings_fundamental_disk_cache_dir = Path(cache_dir.name)
+        second_manager = DataFetcherManager(fetchers=[])
+        second_manager._earnings_fundamental_disk_cache_dir = Path(cache_dir.name)
+        calls = {"count": 0}
+
+        def _fake_get_fundamental_bundle(stock_code: str, *, enabled_blocks=None):
+            calls["count"] += 1
+            return {
+                "status": "ok",
+                "growth": {"revenue_yoy": 18.0, "net_profit_yoy": 35.0},
+                "earnings": {
+                    "financial_report": {"report_date": "2026-03-31"},
+                    "forecast_summary": f"{stock_code}-预增",
+                    "quick_report_summary": f"{stock_code}-快报",
+                },
+                "source_chain": [],
+                "errors": [],
+            }
+
+        with patch("src.config.get_config", return_value=cfg), patch.object(
+            first_manager._fundamental_adapter,
+            "get_fundamental_bundle",
+            side_effect=_fake_get_fundamental_bundle,
+        ):
+            first = first_manager.get_earnings_fundamental_context("600519", budget_seconds=1.5)
+
+        with patch("src.config.get_config", return_value=cfg), patch.object(
+            second_manager._fundamental_adapter,
+            "get_fundamental_bundle",
+            side_effect=AssertionError("disk cache should be used"),
+        ):
+            second = second_manager.get_earnings_fundamental_context("600519", budget_seconds=1.5)
+
+        self.assertEqual(calls["count"], 1)
+        self.assertFalse(bool(first.get("cache_hit")))
+        self.assertIsNone(first.get("cache_source"))
+        self.assertTrue(bool(second.get("cache_hit")))
+        self.assertEqual(second.get("cache_source"), "disk")
+        self.assertEqual(
+            first["earnings"]["data"]["forecast_summary"],
+            second["earnings"]["data"]["forecast_summary"],
+        )
+
+    def test_earnings_fundamental_failed_context_reuses_disk_cache_across_manager_instances(self) -> None:
+        cache_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(cache_dir.cleanup)
+        cfg = SimpleNamespace(
+            enable_fundamental_pipeline=True,
+            fundamental_cache_ttl_seconds=120,
+            fundamental_stage_timeout_seconds=1.5,
+            fundamental_fetch_timeout_seconds=0.8,
+            fundamental_retry_max=1,
+            fundamental_cache_max_entries=256,
+        )
+        first_manager = DataFetcherManager(fetchers=[])
+        first_manager._earnings_fundamental_disk_cache_dir = Path(cache_dir.name)
+        second_manager = DataFetcherManager(fetchers=[])
+        second_manager._earnings_fundamental_disk_cache_dir = Path(cache_dir.name)
+        calls = {"count": 0}
+
+        def _fake_failed_bundle(_stock_code: str, *, enabled_blocks=None):
+            calls["count"] += 1
+            return None
+
+        with patch("src.config.get_config", return_value=cfg), patch.object(
+            first_manager._fundamental_adapter,
+            "get_fundamental_bundle",
+            side_effect=_fake_failed_bundle,
+        ):
+            first = first_manager.get_earnings_fundamental_context("600519", budget_seconds=1.5)
+
+        with patch("src.config.get_config", return_value=cfg), patch.object(
+            second_manager._fundamental_adapter,
+            "get_fundamental_bundle",
+            side_effect=AssertionError("failed context should be reused from disk cache"),
+        ):
+            second = second_manager.get_earnings_fundamental_context("600519", budget_seconds=1.5)
+
+        self.assertEqual(calls["count"], 1)
+        self.assertEqual(first["status"], "failed")
+        self.assertFalse(bool(first.get("cache_hit")))
+        self.assertIsNone(first.get("cache_source"))
+        self.assertEqual(second["status"], "failed")
+        self.assertTrue(bool(second.get("cache_hit")))
+        self.assertEqual(second.get("cache_source"), "disk")
 
     def test_board_context_empty_rankings_mark_failed(self) -> None:
         manager = DataFetcherManager(fetchers=[])
@@ -714,6 +1148,86 @@ class TestFundamentalContext(unittest.TestCase):
             ctx = manager.get_board_context("600519", budget_seconds=0.5)
         self.assertEqual(ctx["status"], "failed")
         self.assertEqual(ctx["data"], {})
+
+    def test_capital_flow_context_reuses_memory_cache_within_ttl(self) -> None:
+        cache_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(cache_dir.cleanup)
+        manager = DataFetcherManager(fetchers=[])
+        manager._capital_flow_disk_cache_dir = Path(cache_dir.name)
+        cfg = SimpleNamespace(
+            enable_fundamental_pipeline=True,
+            fundamental_cache_ttl_seconds=120,
+            fundamental_stage_timeout_seconds=1.5,
+            fundamental_fetch_timeout_seconds=0.8,
+            fundamental_retry_max=1,
+        )
+        calls = {"count": 0}
+
+        def _fake_get_capital_flow(stock_code: str, *, include_sector_rankings: bool = True):
+            calls["count"] += 1
+            return {
+                "status": "partial",
+                "stock_flow": {"main_net_inflow": 1.2e8},
+                "sector_rankings": {"top": [], "bottom": []},
+                "source_chain": [],
+                "errors": [],
+            }
+
+        with patch("src.config.get_config", return_value=cfg), patch.object(
+            manager._fundamental_adapter,
+            "get_capital_flow",
+            side_effect=_fake_get_capital_flow,
+        ):
+            first = manager.get_capital_flow_context("600519", include_sector_rankings=False)
+            second = manager.get_capital_flow_context("600519", include_sector_rankings=False)
+
+        self.assertEqual(calls["count"], 1)
+        self.assertFalse(bool(first.get("cache_hit")))
+        self.assertIsNone(first.get("cache_source"))
+        self.assertTrue(bool(second.get("cache_hit")))
+        self.assertEqual(second.get("cache_source"), "memory")
+
+    def test_capital_flow_context_failed_result_reuses_disk_cache_across_manager_instances(self) -> None:
+        cache_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(cache_dir.cleanup)
+        cfg = SimpleNamespace(
+            enable_fundamental_pipeline=True,
+            fundamental_cache_ttl_seconds=120,
+            fundamental_stage_timeout_seconds=1.5,
+            fundamental_fetch_timeout_seconds=0.8,
+            fundamental_retry_max=1,
+        )
+        first_manager = DataFetcherManager(fetchers=[])
+        second_manager = DataFetcherManager(fetchers=[])
+        first_manager._capital_flow_disk_cache_dir = Path(cache_dir.name)
+        second_manager._capital_flow_disk_cache_dir = Path(cache_dir.name)
+        calls = {"count": 0}
+
+        def _fake_get_capital_flow(_stock_code: str, *, include_sector_rankings: bool = True):
+            calls["count"] += 1
+            return None
+
+        with patch("src.config.get_config", return_value=cfg), patch.object(
+            first_manager._fundamental_adapter,
+            "get_capital_flow",
+            side_effect=_fake_get_capital_flow,
+        ):
+            first = first_manager.get_capital_flow_context("600519", include_sector_rankings=False)
+
+        with patch("src.config.get_config", return_value=cfg), patch.object(
+            second_manager._fundamental_adapter,
+            "get_capital_flow",
+            side_effect=AssertionError("failed capital-flow context should be reused from disk cache"),
+        ):
+            second = second_manager.get_capital_flow_context("600519", include_sector_rankings=False)
+
+        self.assertEqual(calls["count"], 1)
+        self.assertEqual(first["status"], "failed")
+        self.assertFalse(bool(first.get("cache_hit")))
+        self.assertIsNone(first.get("cache_source"))
+        self.assertEqual(second["status"], "failed")
+        self.assertTrue(bool(second.get("cache_hit")))
+        self.assertEqual(second.get("cache_source"), "disk")
 
     def test_capital_flow_not_supported_status(self) -> None:
         manager = DataFetcherManager(fetchers=[])

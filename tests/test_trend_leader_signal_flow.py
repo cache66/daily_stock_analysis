@@ -20,17 +20,21 @@ from scripts.select_trend_leader_candidates import (
     _build_board_earnings_risk_map,
     _evaluate_trend_leader_candidate,
     _hydrate_scan_prefilter_quote_fields,
+    _is_unscannable_history_candidate,
     _load_scan_checkpoint,
     _load_universe_code_whitelist,
     _pick_scan_prefilter_relaxed_buffer,
     _pick_fallback_pool,
+    _pick_watch_pool,
     _prepare_scan_prefilter_universe,
     _resolve_primary_board_name,
     _resolve_scan_prefilter_hydration_fields,
     _save_scan_checkpoint,
+    _should_skip_capital_flow_fetch_for_trend_payload,
     _should_apply_adaptive_positive_change,
     build_trend_payload,
     build_snapshot_metrics_payload,
+    export_results,
     persist_run_summary_snapshot,
 )
 from src.config import Config
@@ -656,6 +660,116 @@ def test_pick_fallback_pool_safety_net_picks_non_blocked_zero_score_candidate() 
     assert selected[0]["fallback_tier"] == "tier5_safety_net"
 
 
+def test_pick_watch_pool_returns_positive_score_trend_neutral_candidates_only() -> None:
+    all_results = [
+        {
+            "code": "600030",
+            "name": "strict-hit",
+            "overall_score": 72.0,
+            "leader_gate_score": 65.0,
+            "trend_score": 55.0,
+            "capital_score": 48.0,
+            "leader_type": "hybrid_leader",
+            "risk_flags": [],
+            "is_breakout_candidate": True,
+            "is_pullback_candidate": False,
+            "strategy_summary": "strict",
+        },
+        {
+            "code": "600031",
+            "name": "watch-a",
+            "overall_score": 36.0,
+            "leader_gate_score": 52.0,
+            "trend_score": 0.0,
+            "capital_score": 46.0,
+            "leader_type": "logic_leader",
+            "risk_flags": ["weak_trend_structure"],
+            "is_breakout_candidate": False,
+            "is_pullback_candidate": False,
+            "strategy_summary": "watch-a",
+        },
+        {
+            "code": "600032",
+            "name": "blocked",
+            "overall_score": 33.0,
+            "leader_gate_score": 50.0,
+            "trend_score": 0.0,
+            "capital_score": 42.0,
+            "leader_type": "logic_leader",
+            "risk_flags": ["blocked_quality_risk"],
+            "is_breakout_candidate": False,
+            "is_pullback_candidate": False,
+            "strategy_summary": "blocked",
+        },
+        {
+            "code": "600033",
+            "name": "pseudo",
+            "overall_score": 31.0,
+            "leader_gate_score": 49.0,
+            "trend_score": 0.0,
+            "capital_score": 40.0,
+            "leader_type": "pseudo_leader",
+            "risk_flags": [],
+            "is_breakout_candidate": False,
+            "is_pullback_candidate": False,
+            "strategy_summary": "pseudo",
+        },
+        {
+            "code": "600034",
+            "name": "watch-b",
+            "overall_score": 28.0,
+            "leader_gate_score": 44.0,
+            "trend_score": 0.0,
+            "capital_score": 35.0,
+            "leader_type": "capital_leader",
+            "risk_flags": ["weak_trend_structure"],
+            "is_breakout_candidate": False,
+            "is_pullback_candidate": False,
+            "strategy_summary": "watch-b",
+        },
+    ]
+
+    selected = _pick_watch_pool(all_results, top_n=3, excluded_codes={"600030"})
+
+    assert [item["code"] for item in selected] == ["600031", "600034"]
+    assert selected[0]["selection_mode"] == "watch"
+    assert selected[0]["strict_core_hit"] is False
+    assert selected[0]["watch_reason"] == "trend_structure_missing"
+
+
+def test_export_results_writes_watchlist_sidecar_files() -> None:
+    temp_dir = tempfile.TemporaryDirectory()
+    try:
+        output_dir = Path(temp_dir.name)
+        export_results(
+            [
+                {
+                    "code": "300408",
+                    "name": "三环集团",
+                    "overall_score": 75.0,
+                    "selection_mode": "strict",
+                }
+            ],
+            output_dir=output_dir,
+            watchlist=[
+                {
+                    "code": "600031",
+                    "name": "watch-a",
+                    "overall_score": 36.0,
+                    "selection_mode": "watch",
+                    "watch_reason": "trend_structure_missing",
+                }
+            ],
+        )
+
+        assert (output_dir / "trend_leader_unified_candidates.csv").exists()
+        assert (output_dir / "trend_leader_unified_watchlist.csv").exists()
+        assert (output_dir / "trend_leader_unified_watchlist.txt").exists()
+        assert (output_dir / "trend_leader_unified_watchlist.md").exists()
+    finally:
+        temp_dir.cleanup()
+
+
 def test_scan_checkpoint_roundtrip_and_validation() -> None:
     temp_dir = tempfile.TemporaryDirectory()
     try:
@@ -767,9 +881,9 @@ def test_evaluate_trend_leader_candidate_prefers_earnings_only_context() -> None
             }
 
         def get_daily_data(self, _code: str, days: int, force_refresh: bool = False):
-            assert days == 140
+            assert days == trend_leader_module.TREND_SCAN_HISTORY_FETCH_DAYS
             assert force_refresh is False
-            closes = [10.0 + idx * 0.2 for idx in range(130)]
+            closes = [10.0 + idx * 0.2 for idx in range(max(days, 130))]
             history = pd.DataFrame(
                 {
                     "date": pd.date_range("2025-01-01", periods=len(closes), freq="D"),
@@ -882,6 +996,487 @@ def test_evaluate_trend_leader_candidate_prefers_earnings_only_context() -> None
     assert result["quality_overlay_label"] in {"strong", "qualified"}
     assert result["industry_strength_label"] == "算力"
     assert result["primary_board_name"] == "算力"
+
+
+def test_evaluate_trend_leader_candidate_skips_capital_flow_for_weak_trend_setup() -> None:
+    class FakeManager:
+        def __init__(self) -> None:
+            self.calls = {
+                "earnings_context": 0,
+                "boards": 0,
+            }
+
+        def get_daily_data(self, _code: str, days: int, force_refresh: bool = False):
+            assert days == trend_leader_module.TREND_SCAN_HISTORY_FETCH_DAYS
+            assert force_refresh is False
+            closes = []
+            for idx in range(max(days, 130)):
+                if idx < 110:
+                    closes.append(10.0 + idx * 0.02)
+                else:
+                    closes.append(12.2 - (idx - 110) * 0.12)
+            history = pd.DataFrame(
+                {
+                    "date": pd.date_range("2025-01-01", periods=len(closes), freq="D"),
+                    "open": closes,
+                    "high": [value + 0.1 for value in closes],
+                    "low": [value - 0.1 for value in closes],
+                    "close": closes,
+                    "volume": [1_000_000 for _ in closes],
+                    "amount": [2_000_000 for _ in closes],
+                    "turnover_rate": [1.2 for _ in closes],
+                }
+            )
+            return history, "fake"
+
+        def get_earnings_fundamental_context(self, _code: str):
+            self.calls["earnings_context"] += 1
+            return {
+                "growth": {"data": {"revenue_yoy": 15.0, "net_profit_yoy": 18.0}},
+                "earnings": {"data": {"report_date": "2026-03-31"}},
+                "earnings_quality": {"data": {"score_total": 68.0, "verdict": "good"}},
+            }
+
+        def get_belong_boards(self, _code: str):
+            self.calls["boards"] += 1
+            return [{"name": "AI", "type": "concept"}]
+
+    class FakeDragonService:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def analyze_stock(self, *_args, **_kwargs):
+            self.calls += 1
+            return {
+                "leader_probability": "medium",
+                "leader_type": "logic_leader",
+                "recognizability_score": 2,
+                "sector_leadership_score": 1,
+                "relative_strength_score": 1,
+                "liquidity_score": 1,
+                "catalyst_score": 0,
+            }
+
+    class GuardedSharedFactorsService:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.capital_flow_contexts = []
+
+        def build_capital_factors(self, *_args, **kwargs):
+            self.calls += 1
+            self.capital_flow_contexts.append(kwargs.get("capital_flow_context"))
+            return {
+                "capital_consensus_score": 0,
+                "capital_profile_score": 20.0,
+                "capital_flow_score": 0,
+                "capital_flow_continuity_score": 0,
+                "capital_structure_score": 0,
+                "relative_strength_score": 1,
+                "liquidity_score": 1,
+                "capital_flow_status": "skipped",
+                "main_net_inflow": None,
+                "inflow_5d": None,
+                "inflow_10d": None,
+            }
+
+    class FakeCapitalService:
+        def build_stock_profile(self, *_args, **_kwargs):
+            raise AssertionError("shared factors path should be used in this test")
+
+    class FakeStrategyService:
+        def score_candidate(self, **kwargs):
+            capital_payload = kwargs["capital_payload"]
+            return {
+                "code": kwargs["stock_code"],
+                "name": kwargs["stock_name"],
+                "passed": False,
+                "risk_flags": ["weak_trend_structure"],
+                "capital_flow_status": capital_payload.get("capital_flow_status"),
+            }
+
+    manager = FakeManager()
+    dragon_service = FakeDragonService()
+    shared_factors_service = GuardedSharedFactorsService()
+    result = _evaluate_trend_leader_candidate(
+        manager=manager,
+        dragon_service=dragon_service,
+        capital_service=FakeCapitalService(),
+        shared_factors_service=shared_factors_service,
+        strategy_service=FakeStrategyService(),
+        code="600001",
+        name="weak-case",
+        total_mv=5.0e9,
+        quote_seed={"price": 9.8, "change_pct": -1.6, "turnover_rate": 1.2, "total_mv": 5.0e9},
+    )
+
+    assert result is not None
+    assert shared_factors_service.calls == 1
+    assert shared_factors_service.capital_flow_contexts == [{"status": "skipped", "data": {"stock_flow": {}}}]
+    assert manager.calls["earnings_context"] == 0
+    assert manager.calls["boards"] == 0
+    assert dragon_service.calls == 0
+    assert result["capital_flow_status"] == "skipped"
+
+
+def test_evaluate_trend_leader_candidate_does_not_build_dragon_service_for_weak_short_circuit() -> None:
+    class FakeManager:
+        def get_daily_data(self, _code: str, days: int, force_refresh: bool = False):
+            assert days == trend_leader_module.TREND_SCAN_HISTORY_FETCH_DAYS
+            assert force_refresh is False
+            closes = []
+            for idx in range(max(days, 130)):
+                if idx < 110:
+                    closes.append(10.0 + idx * 0.02)
+                else:
+                    closes.append(12.2 - (idx - 110) * 0.12)
+            history = pd.DataFrame(
+                {
+                    "date": pd.date_range("2025-01-01", periods=len(closes), freq="D"),
+                    "open": closes,
+                    "high": [value + 0.1 for value in closes],
+                    "low": [value - 0.1 for value in closes],
+                    "close": closes,
+                    "volume": [1_000_000 for _ in closes],
+                    "amount": [2_000_000 for _ in closes],
+                    "turnover_rate": [1.2 for _ in closes],
+                }
+            )
+            return history, "fake"
+
+    class GuardedSharedFactorsService:
+        def build_capital_factors(self, *_args, **_kwargs):
+            return {
+                "capital_consensus_score": 0,
+                "capital_profile_score": 20.0,
+                "capital_flow_score": 0,
+                "capital_flow_continuity_score": 0,
+                "capital_structure_score": 0,
+                "relative_strength_score": 1,
+                "liquidity_score": 1,
+                "capital_flow_status": "skipped",
+                "main_net_inflow": None,
+                "inflow_5d": None,
+                "inflow_10d": None,
+            }
+
+    class FakeCapitalService:
+        def build_stock_profile(self, *_args, **_kwargs):
+            raise AssertionError("shared factors path should be used in this test")
+
+    class FakeStrategyService:
+        def score_candidate(self, **kwargs):
+            return {
+                "code": kwargs["stock_code"],
+                "name": kwargs["stock_name"],
+                "passed": False,
+                "risk_flags": ["weak_trend_structure"],
+            }
+
+    state = {"factory_calls": 0}
+
+    def guarded_dragon_factory():
+        state["factory_calls"] += 1
+        raise AssertionError("dragon service factory should not be called for weak short-circuit candidates")
+
+    result = _evaluate_trend_leader_candidate(
+        manager=FakeManager(),
+        dragon_service=None,
+        dragon_service_factory=guarded_dragon_factory,
+        capital_service=FakeCapitalService(),
+        shared_factors_service=GuardedSharedFactorsService(),
+        strategy_service=FakeStrategyService(),
+        code="600001",
+        name="weak-case",
+        total_mv=5.0e9,
+        quote_seed={"price": 9.8, "change_pct": -1.6, "turnover_rate": 1.2, "total_mv": 5.0e9},
+    )
+
+    assert result is not None
+    assert state["factory_calls"] == 0
+
+
+def test_evaluate_trend_leader_candidate_overlaps_fundamental_and_capital_profile_work() -> None:
+    class FakeManager:
+        def get_daily_data(self, _code: str, days: int, force_refresh: bool = False):
+            assert days == trend_leader_module.TREND_SCAN_HISTORY_FETCH_DAYS
+            assert force_refresh is False
+            closes = [10.0 + idx * 0.08 for idx in range(max(days, 140))]
+            history = pd.DataFrame(
+                {
+                    "date": pd.date_range("2025-01-01", periods=len(closes), freq="D"),
+                    "open": closes,
+                    "high": [value + 0.2 for value in closes],
+                    "low": [value - 0.2 for value in closes],
+                    "close": closes,
+                    "volume": [1_000_000 for _ in closes],
+                    "amount": [2_000_000 for _ in closes],
+                    "turnover_rate": [1.5 for _ in closes],
+                }
+            )
+            return history, "fake"
+
+        def get_earnings_fundamental_context(self, _code: str):
+            time.sleep(0.2)
+            return {
+                "growth": {"data": {"revenue_yoy": 22.0, "net_profit_yoy": 35.0}},
+                "earnings": {
+                    "data": {
+                        "financial_report": {"report_date": "2026-03-31"},
+                        "financial_report_series": [
+                            {"report_date": "2026-03-31", "revenue_yoy": 22.0, "net_profit_yoy": 35.0, "roe": 14.0},
+                            {"report_date": "2025-12-31", "revenue_yoy": 18.0, "net_profit_yoy": 28.0, "roe": 12.0},
+                        ],
+                    }
+                },
+                "earnings_quality": {"data": {"score_total": 78.0, "verdict": "good"}},
+            }
+
+        def get_belong_boards(self, _code: str):
+            return [{"name": "算力", "type": "行业"}]
+
+    class FakeDragonService:
+        def analyze_stock(self, *_args, **_kwargs):
+            return {
+                "leader_probability": "high",
+                "leader_type": "hybrid_leader",
+                "recognizability_score": 3,
+                "sector_leadership_score": 2,
+                "relative_strength_score": 2,
+                "liquidity_score": 2,
+                "catalyst_score": 1,
+            }
+
+    class SlowCapitalService:
+        def build_stock_profile(self, *_args, **_kwargs):
+            time.sleep(0.2)
+            return {
+                "capital_consensus_score": 2,
+                "capital_profile_score": 70.0,
+                "capital_flow_score": 2,
+                "capital_flow_continuity_score": 2,
+                "capital_structure_score": 1,
+                "relative_strength_score": 2,
+                "liquidity_score": 2,
+                "capital_flow_status": "ok",
+                "main_net_inflow": 1_000_000.0,
+                "inflow_5d": 2_000_000.0,
+                "inflow_10d": 3_000_000.0,
+            }
+
+    class FakeStrategyService:
+        def score_candidate(self, **kwargs):
+            return {
+                "code": kwargs["stock_code"],
+                "name": kwargs["stock_name"],
+                "passed": True,
+                "risk_flags": [],
+                "overall_score": 88.0,
+            }
+
+    started_at = time.perf_counter()
+    result = _evaluate_trend_leader_candidate(
+        manager=FakeManager(),
+        dragon_service=FakeDragonService(),
+        capital_service=SlowCapitalService(),
+        strategy_service=FakeStrategyService(),
+        code="600001",
+        name="并行样例",
+        total_mv=5.0e9,
+        quote_seed={"price": 12.3, "change_pct": 2.1, "turnover_rate": 1.8, "total_mv": 5.0e9},
+    )
+    elapsed = time.perf_counter() - started_at
+
+    assert result is not None
+    assert elapsed < 0.32
+
+
+def test_evaluate_trend_leader_candidate_forwards_fast_enrichment_budgets() -> None:
+    captured = {
+        "fundamental_budget_seconds": None,
+        "fundamental_enabled_blocks": None,
+        "capital_flow_budget_seconds": None,
+    }
+
+    class FakeManager:
+        def get_daily_data(self, _code: str, days: int, force_refresh: bool = False):
+            assert days == trend_leader_module.TREND_SCAN_HISTORY_FETCH_DAYS
+            assert force_refresh is False
+            closes = [10.0 + idx * 0.08 for idx in range(max(days, 140))]
+            history = pd.DataFrame(
+                {
+                    "date": pd.date_range("2025-01-01", periods=len(closes), freq="D"),
+                    "open": closes,
+                    "high": [value + 0.2 for value in closes],
+                    "low": [value - 0.2 for value in closes],
+                    "close": closes,
+                    "volume": [1_000_000 for _ in closes],
+                    "amount": [2_000_000 for _ in closes],
+                    "turnover_rate": [1.5 for _ in closes],
+                }
+            )
+            return history, "fake"
+
+        def get_earnings_fundamental_context(
+            self,
+            _code: str,
+            budget_seconds: float | None = None,
+            enabled_blocks: tuple[str, ...] | None = None,
+        ):
+            captured["fundamental_budget_seconds"] = budget_seconds
+            captured["fundamental_enabled_blocks"] = tuple(enabled_blocks or ())
+            return {
+                "growth": {"data": {"revenue_yoy": 22.0, "net_profit_yoy": 35.0}},
+                "earnings": {"data": {"financial_report": {"report_date": "2026-03-31"}}},
+            }
+
+        def get_belong_boards(self, _code: str):
+            return [{"name": "AI", "type": "concept"}]
+
+    class FakeDragonService:
+        def analyze_stock(self, *_args, **_kwargs):
+            return {
+                "leader_probability": "high",
+                "leader_type": "hybrid_leader",
+                "recognizability_score": 3,
+                "sector_leadership_score": 2,
+                "relative_strength_score": 2,
+                "liquidity_score": 2,
+                "catalyst_score": 1,
+            }
+
+    class FakeCapitalService:
+        def build_stock_profile(self, *_args, **kwargs):
+            captured["capital_flow_budget_seconds"] = kwargs.get("capital_flow_budget_seconds")
+            return {
+                "capital_consensus_score": 2,
+                "capital_profile_score": 70.0,
+                "capital_flow_score": 2,
+                "capital_flow_continuity_score": 2,
+                "capital_structure_score": 1,
+                "relative_strength_score": 2,
+                "liquidity_score": 2,
+                "capital_flow_status": "ok",
+                "main_net_inflow": 1_000_000.0,
+                "inflow_5d": 2_000_000.0,
+                "inflow_10d": 3_000_000.0,
+            }
+
+    class FakeStrategyService:
+        def score_candidate(self, **kwargs):
+            return {
+                "code": kwargs["stock_code"],
+                "name": kwargs["stock_name"],
+                "passed": True,
+                "risk_flags": [],
+                "overall_score": 88.0,
+            }
+
+    result = _evaluate_trend_leader_candidate(
+        manager=FakeManager(),
+        dragon_service=FakeDragonService(),
+        capital_service=FakeCapitalService(),
+        strategy_service=FakeStrategyService(),
+        code="600001",
+        name="budget-case",
+        total_mv=5.0e9,
+        quote_seed={"price": 12.8, "change_pct": 1.6, "turnover_rate": 1.5, "total_mv": 5.0e9},
+        fundamental_budget_seconds=0.45,
+        capital_flow_budget_seconds=0.35,
+    )
+
+    assert result is not None
+    assert captured["fundamental_budget_seconds"] == 0.45
+    assert captured["fundamental_enabled_blocks"] == ("financial",)
+    assert captured["capital_flow_budget_seconds"] == 0.35
+
+
+def test_evaluate_trend_leader_candidate_can_disable_nested_parallel_enrichment(monkeypatch) -> None:
+    class FakeManager:
+        def get_daily_data(self, _code: str, days: int, force_refresh: bool = False):
+            assert days == trend_leader_module.TREND_SCAN_HISTORY_FETCH_DAYS
+            assert force_refresh is False
+            closes = [10.0 + idx * 0.08 for idx in range(max(days, 140))]
+            history = pd.DataFrame(
+                {
+                    "date": pd.date_range("2025-01-01", periods=len(closes), freq="D"),
+                    "open": closes,
+                    "high": [value + 0.2 for value in closes],
+                    "low": [value - 0.2 for value in closes],
+                    "close": closes,
+                    "volume": [1_000_000 for _ in closes],
+                    "amount": [2_000_000 for _ in closes],
+                    "turnover_rate": [1.5 for _ in closes],
+                }
+            )
+            return history, "fake"
+
+        def get_earnings_fundamental_context(self, _code: str):
+            return {
+                "growth": {"data": {"revenue_yoy": 22.0, "net_profit_yoy": 35.0}},
+                "earnings": {"data": {"financial_report": {"report_date": "2026-03-31"}}},
+            }
+
+        def get_belong_boards(self, _code: str):
+            return [{"name": "AI", "type": "concept"}]
+
+    class FakeDragonService:
+        def analyze_stock(self, *_args, **_kwargs):
+            return {
+                "leader_probability": "high",
+                "leader_type": "hybrid_leader",
+                "recognizability_score": 3,
+                "sector_leadership_score": 2,
+                "relative_strength_score": 2,
+                "liquidity_score": 2,
+                "catalyst_score": 1,
+            }
+
+    class FakeCapitalService:
+        def build_stock_profile(self, *_args, **_kwargs):
+            return {
+                "capital_consensus_score": 2,
+                "capital_profile_score": 70.0,
+                "capital_flow_score": 2,
+                "capital_flow_continuity_score": 2,
+                "capital_structure_score": 1,
+                "relative_strength_score": 2,
+                "liquidity_score": 2,
+                "capital_flow_status": "ok",
+                "main_net_inflow": 1_000_000.0,
+                "inflow_5d": 2_000_000.0,
+                "inflow_10d": 3_000_000.0,
+            }
+
+    class FakeStrategyService:
+        def score_candidate(self, **kwargs):
+            return {
+                "code": kwargs["stock_code"],
+                "name": kwargs["stock_name"],
+                "passed": True,
+                "risk_flags": [],
+                "overall_score": 88.0,
+            }
+
+    class GuardedThreadPoolExecutor:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("nested executor should not be created when parallelize_enrichment=False")
+
+    monkeypatch.setattr(trend_leader_module, "ThreadPoolExecutor", GuardedThreadPoolExecutor)
+
+    result = _evaluate_trend_leader_candidate(
+        manager=FakeManager(),
+        dragon_service=FakeDragonService(),
+        capital_service=FakeCapitalService(),
+        strategy_service=FakeStrategyService(),
+        code="600001",
+        name="strong-case",
+        total_mv=5.0e9,
+        quote_seed={"price": 12.8, "change_pct": 1.6, "turnover_rate": 1.5, "total_mv": 5.0e9},
+        parallelize_enrichment=False,
+    )
+
+    assert result is not None
+    assert result["passed"] is True
 
 
 def test_hydrate_scan_prefilter_quote_fields_backfills_missing_quote_columns() -> None:
@@ -1023,7 +1618,7 @@ def test_resolve_scan_prefilter_hydration_fields_requests_quote_backed_fields() 
     assert fields == {"pct_change", "turnover_rate"}
 
 
-def test_resolve_scan_prefilter_hydration_fields_requests_partial_missing_quote_backed_fields() -> None:
+def test_resolve_scan_prefilter_hydration_fields_skips_partial_missing_pct_change_when_column_is_already_present() -> None:
     universe = pd.DataFrame(
         [
             {"code": "600001", "pct_change": 1.5, "turnover_rate": 1.2},
@@ -1038,7 +1633,7 @@ def test_resolve_scan_prefilter_hydration_fields_requests_partial_missing_quote_
         require_positive_change=True,
     )
 
-    assert fields == {"pct_change", "turnover_rate"}
+    assert fields == {"turnover_rate"}
 
 
 def test_should_apply_adaptive_positive_change_when_60d_change_is_missing() -> None:
@@ -1201,6 +1796,78 @@ def test_prepare_scan_prefilter_universe_persists_hydrated_quote_snapshot_for_re
     assert prepared["code"].tolist() == ["600001", "600002"]
 
 
+def test_prepare_scan_prefilter_universe_reuses_cached_spot_quotes_before_per_code_hydration() -> None:
+    class FakeManager:
+        def __init__(self) -> None:
+            self.requested_codes = []
+
+        def get_realtime_quote(self, code: str):
+            self.requested_codes.append(code)
+            return {"change_pct": 9.9, "turnover_rate": 9.9}
+
+    manager = FakeManager()
+    universe = pd.DataFrame(
+        [
+            {"code": "600001", "name": "A", "change_pct_60d": None, "pct_change": None, "turnover_rate": None},
+            {"code": "600002", "name": "B", "change_pct_60d": None, "pct_change": None, "turnover_rate": None},
+        ]
+    )
+    cached_quote_universe = pd.DataFrame(
+        [
+            {"code": "600001", "pct_change": 2.5, "turnover_rate": 1.8},
+            {"code": "600002", "pct_change": 1.2, "turnover_rate": 0.9},
+        ]
+    )
+
+    prepared, stats = _prepare_scan_prefilter_universe(
+        universe,
+        manager=manager,
+        cached_quote_universe=cached_quote_universe,
+        min_change_pct_60d=4.0,
+        min_turnover_rate=0.8,
+        require_positive_change=True,
+        relaxed_buffer_top_n=0,
+    )
+
+    assert manager.requested_codes == []
+    assert stats["quote_requested_rows"] == 0
+    assert prepared["pct_change"].notna().all()
+    assert prepared["turnover_rate"].notna().all()
+    assert prepared["code"].tolist() == ["600001", "600002"]
+
+
+def test_prepare_scan_prefilter_universe_skips_pct_change_hydration_when_partial_values_already_exist() -> None:
+    class FakeManager:
+        def __init__(self) -> None:
+            self.requested_codes = []
+
+        def get_realtime_quote(self, code: str):
+            self.requested_codes.append(code)
+            raise AssertionError(f"pct_change hydration should be skipped for {code}")
+
+    manager = FakeManager()
+    universe = pd.DataFrame(
+        [
+            {"code": "600001", "name": "A", "change_pct_60d": None, "pct_change": 2.5, "turnover_rate": 1.8},
+            {"code": "600002", "name": "B", "change_pct_60d": None, "pct_change": None, "turnover_rate": 0.9},
+        ]
+    )
+
+    prepared, stats = _prepare_scan_prefilter_universe(
+        universe,
+        manager=manager,
+        min_change_pct_60d=4.0,
+        min_turnover_rate=0.8,
+        require_positive_change=True,
+        relaxed_buffer_top_n=0,
+    )
+
+    assert manager.requested_codes == []
+    assert stats["quote_requested_rows"] == 0
+    assert stats["quote_hydrated_rows"] == 0
+    assert prepared["code"].tolist() == ["600001", "600002"]
+
+
 def test_scan_trend_leader_candidates_short_circuits_recent_ipo_before_main_scan(monkeypatch) -> None:
     evaluated_codes = []
 
@@ -1268,21 +1935,493 @@ def test_scan_trend_leader_candidates_short_circuits_recent_ipo_before_main_scan
     assert payload["run_stats"]["skipped_unscannable_history"] == 1
 
 
+def test_scan_trend_leader_candidates_prefers_shared_prepare_scan_universe(monkeypatch) -> None:
+    captured = {}
+    evaluated_codes = []
+
+    class FakeManager:
+        def get_sector_rankings(self, _n: int):
+            return [], []
+
+    fake_manager = FakeManager()
+
+    class FakeSelector:
+        build_fast_a_share_manager = staticmethod(lambda: fake_manager)
+        _prepare_history = staticmethod(lambda df: df.copy() if df is not None else pd.DataFrame())
+
+        def __init__(self, manager_factory=None) -> None:
+            self.manager = fake_manager
+
+        def get_spot_enriched_a_share_universe(self, limit=None, as_of_date=None):
+            return pd.DataFrame(
+                [
+                    {"code": "600001", "name": "normal"},
+                    {"code": "600002", "name": "filtered"},
+                ]
+            )
+
+        def prepare_scan_universe(self, **kwargs):
+            captured["prepare_kwargs"] = kwargs
+            return SimpleNamespace(
+                prepared_universe=pd.DataFrame([{"code": "600001", "name": "normal"}]),
+                base_universe_size=2,
+                sharded_universe_size=1,
+                prepared_universe_size=1,
+                filter_stats={"before": 2, "after": 1, "removed_invalid_code": 0, "removed_whitelist": 0, "removed_st": 0, "removed_kcb": 0, "removed_cyb": 0},
+                prefilter_stats={"before": 1, "after": 1, "after_primary": 1, "after_relaxed": 1, "removed_listed_days": 0, "removed_change_60d": 0, "removed_turnover_rate": 0, "removed_negative_change": 0, "added_relaxed_buffer": 0, "adaptive_positive_change_applied": False, "quote_hydrated_rows": 0, "quote_requested_rows": 0, "quote_requested_fields": "", "quote_missing_unsupported_fields": "", "quote_worker_count": 0},
+            )
+
+    def fake_evaluate_candidate(**kwargs):
+        evaluated_codes.append(kwargs["code"])
+        return {
+            "code": kwargs["code"],
+            "name": kwargs["name"],
+            "passed": True,
+            "risk_flags": [],
+            "overall_score": 80.0,
+            "leader_gate_score": 70.0,
+            "trend_score": 60.0,
+            "capital_score": 50.0,
+        }
+
+    monkeypatch.setattr(trend_leader_module, "KlineSelectorService", FakeSelector)
+    monkeypatch.setattr(trend_leader_module, "_evaluate_trend_leader_candidate", fake_evaluate_candidate)
+
+    payload = trend_leader_module.scan_trend_leader_candidates_with_stats(
+        max_workers=1,
+        fallback_top_n=0,
+        progress_every=0,
+        prefetch_realtime_quotes=False,
+        second_stage_news_search_enabled=False,
+        second_stage_business_profile_enabled=False,
+        scan_prefilter_enabled=False,
+    )
+
+    assert captured["prepare_kwargs"]["exclude_st"] is False
+    assert evaluated_codes == ["600001"]
+    assert payload["run_stats"]["pending_total"] == 1
+    assert captured["prepare_kwargs"]["prefilter"] is None
+
+
+def test_scan_trend_leader_candidates_builds_prefilter_for_shared_scan_shell(monkeypatch) -> None:
+    captured = {}
+    evaluated_codes = []
+
+    class FakeManager:
+        def get_sector_rankings(self, _n: int):
+            return [], []
+
+    fake_manager = FakeManager()
+
+    class FakeSelector:
+        build_fast_a_share_manager = staticmethod(lambda: fake_manager)
+        _prepare_history = staticmethod(lambda df: df.copy() if df is not None else pd.DataFrame())
+
+        def __init__(self, manager_factory=None) -> None:
+            self.manager = fake_manager
+
+        def get_spot_enriched_a_share_universe(self, limit=None, as_of_date=None):
+            return pd.DataFrame([{"code": "600001", "name": "normal"}])
+
+        def prepare_scan_universe(self, **kwargs):
+            captured["prepare_kwargs"] = kwargs
+            return SimpleNamespace(
+                prepared_universe=pd.DataFrame([{"code": "600001", "name": "normal"}]),
+                base_universe_size=1,
+                sharded_universe_size=1,
+                prepared_universe_size=1,
+                filter_stats={"before": 1, "after": 1, "removed_invalid_code": 0, "removed_whitelist": 0, "removed_st": 0, "removed_kcb": 0, "removed_cyb": 0},
+                prefilter_stats={"before": 1, "after": 1, "after_primary": 1, "after_relaxed": 1, "removed_listed_days": 0, "removed_change_60d": 0, "removed_turnover_rate": 0, "removed_negative_change": 0, "added_relaxed_buffer": 0, "adaptive_positive_change_applied": False, "quote_hydrated_rows": 0, "quote_requested_rows": 0, "quote_requested_fields": "", "quote_missing_unsupported_fields": "", "quote_worker_count": 0},
+            )
+
+    def fake_evaluate_candidate(**kwargs):
+        evaluated_codes.append(kwargs["code"])
+        return {
+            "code": kwargs["code"],
+            "name": kwargs["name"],
+            "passed": True,
+            "risk_flags": [],
+            "overall_score": 80.0,
+            "leader_gate_score": 70.0,
+            "trend_score": 60.0,
+            "capital_score": 50.0,
+        }
+
+    monkeypatch.setattr(trend_leader_module, "KlineSelectorService", FakeSelector)
+    monkeypatch.setattr(trend_leader_module, "_evaluate_trend_leader_candidate", fake_evaluate_candidate)
+
+    payload = trend_leader_module.scan_trend_leader_candidates_with_stats(
+        max_workers=1,
+        fallback_top_n=0,
+        progress_every=0,
+        prefetch_realtime_quotes=False,
+        second_stage_news_search_enabled=False,
+        second_stage_business_profile_enabled=False,
+        scan_prefilter_enabled=True,
+        scan_prefilter_min_listed_days=120,
+        scan_prefilter_min_change_pct_60d=3.0,
+        scan_prefilter_min_turnover_rate=0.8,
+        scan_prefilter_require_positive_change=False,
+    )
+
+    prefilter = captured["prepare_kwargs"]["prefilter"]
+    assert prefilter is not None
+    assert prefilter.min_listed_days == 120
+    assert prefilter.min_change_pct_60d == 3.0
+    assert prefilter.min_turnover_rate == 0.8
+    assert prefilter.require_positive_change is False
+    assert evaluated_codes == ["600001"]
+    assert payload["run_stats"]["pending_total"] == 1
+
+
+def test_scan_trend_leader_candidates_uses_snapshot_date_for_scan_preparation(monkeypatch) -> None:
+    captured = {}
+
+    class FakeManager:
+        def get_sector_rankings(self, _n: int):
+            return [], []
+
+    fake_manager = FakeManager()
+
+    class FakeSelector:
+        build_fast_a_share_manager = staticmethod(lambda: fake_manager)
+        _prepare_history = staticmethod(lambda df: df.copy() if df is not None else pd.DataFrame())
+
+        def __init__(self, manager_factory=None) -> None:
+            self.manager = fake_manager
+
+        def get_spot_enriched_a_share_universe(self, limit=None, as_of_date=None):
+            captured["universe_as_of_date"] = as_of_date
+            return pd.DataFrame([{"code": "600001", "name": "normal"}])
+
+        def prepare_scan_universe(self, **kwargs):
+            captured["prepare_as_of_date"] = kwargs.get("as_of_date")
+            return SimpleNamespace(
+                prepared_universe=pd.DataFrame([{"code": "600001", "name": "normal", "listed_days": 800}]),
+                base_universe_size=1,
+                sharded_universe_size=1,
+                prepared_universe_size=1,
+                filter_stats={"before": 1, "after": 1, "removed_invalid_code": 0, "removed_whitelist": 0, "removed_st": 0, "removed_kcb": 0, "removed_cyb": 0},
+                prefilter_stats={"before": 1, "after": 1, "after_primary": 1, "after_relaxed": 1, "removed_listed_days": 0, "removed_change_60d": 0, "removed_turnover_rate": 0, "removed_negative_change": 0, "added_relaxed_buffer": 0, "adaptive_positive_change_applied": False, "quote_hydrated_rows": 0, "quote_requested_rows": 0, "quote_requested_fields": "", "quote_missing_unsupported_fields": "", "quote_worker_count": 0},
+            )
+
+    def fake_evaluate_candidate(**kwargs):
+        return {
+            "code": kwargs["code"],
+            "name": kwargs["name"],
+            "passed": True,
+            "risk_flags": [],
+            "overall_score": 80.0,
+            "leader_gate_score": 70.0,
+            "trend_score": 60.0,
+            "capital_score": 50.0,
+        }
+
+    def fake_unscannable_history(_row, *, as_of_date=None):
+        captured["scan_as_of_date"] = as_of_date
+        return False
+
+    snapshot_date = date(2026, 4, 24)
+    monkeypatch.setattr(trend_leader_module, "KlineSelectorService", FakeSelector)
+    monkeypatch.setattr(trend_leader_module, "_evaluate_trend_leader_candidate", fake_evaluate_candidate)
+    monkeypatch.setattr(trend_leader_module, "_is_unscannable_history_candidate", fake_unscannable_history)
+
+    payload = trend_leader_module.scan_trend_leader_candidates_with_stats(
+        snapshot_date=snapshot_date,
+        max_workers=1,
+        fallback_top_n=0,
+        progress_every=0,
+        prefetch_realtime_quotes=False,
+        second_stage_news_search_enabled=False,
+        second_stage_business_profile_enabled=False,
+        scan_prefilter_enabled=False,
+    )
+
+    assert captured["universe_as_of_date"] == snapshot_date
+    assert captured["prepare_as_of_date"] == snapshot_date
+    assert captured["scan_as_of_date"] == snapshot_date
+    assert payload["run_stats"]["pending_total"] == 1
+
+
+def test_scan_trend_leader_candidates_can_disable_shared_scan_shell(monkeypatch) -> None:
+    captured = {"prepare_called": False}
+
+    class FakeManager:
+        def get_sector_rankings(self, _n: int):
+            return [], []
+
+    fake_manager = FakeManager()
+
+    class FakeSelector:
+        build_fast_a_share_manager = staticmethod(lambda: fake_manager)
+        _prepare_history = staticmethod(lambda df: df.copy() if df is not None else pd.DataFrame())
+
+        def __init__(self, manager_factory=None) -> None:
+            self.manager = fake_manager
+
+        def get_spot_enriched_a_share_universe(self, limit=None, as_of_date=None):
+            return pd.DataFrame([{"code": "600001", "name": "normal"}])
+
+        def prepare_scan_universe(self, **kwargs):
+            captured["prepare_called"] = True
+            raise AssertionError("shared scan shell should be disabled")
+
+    def fake_evaluate_candidate(**kwargs):
+        return {
+            "code": kwargs["code"],
+            "name": kwargs["name"],
+            "passed": True,
+            "risk_flags": [],
+            "overall_score": 80.0,
+            "leader_gate_score": 70.0,
+            "trend_score": 60.0,
+            "capital_score": 50.0,
+        }
+
+    monkeypatch.setattr(trend_leader_module, "KlineSelectorService", FakeSelector)
+    monkeypatch.setattr(trend_leader_module, "_evaluate_trend_leader_candidate", fake_evaluate_candidate)
+
+    payload = trend_leader_module.scan_trend_leader_candidates_with_stats(
+        shared_scan_shell_enabled=False,
+        max_workers=1,
+        fallback_top_n=0,
+        progress_every=0,
+        prefetch_realtime_quotes=False,
+        second_stage_news_search_enabled=False,
+        second_stage_business_profile_enabled=False,
+        scan_prefilter_enabled=False,
+    )
+
+    assert captured["prepare_called"] is False
+    assert payload["run_stats"]["pending_total"] == 1
+    assert payload["run_stats"]["shared_scan_shell_enabled"] is False
+
+
+def test_scan_trend_leader_candidates_reports_capital_flow_skip_count(monkeypatch) -> None:
+    class FakeManager:
+        def get_sector_rankings(self, _n: int):
+            return [], []
+
+    fake_manager = FakeManager()
+
+    class FakeSelector:
+        build_fast_a_share_manager = staticmethod(lambda: fake_manager)
+        _prepare_history = staticmethod(lambda df: df.copy() if df is not None else pd.DataFrame())
+
+        def __init__(self, manager_factory=None) -> None:
+            self.manager = fake_manager
+
+        def get_spot_enriched_a_share_universe(self, limit=None, as_of_date=None):
+            return pd.DataFrame(
+                [
+                    {"code": "600001", "name": "A"},
+                    {"code": "600002", "name": "B"},
+                ]
+            )
+
+        def prepare_scan_universe(self, **kwargs):
+            return SimpleNamespace(
+                prepared_universe=pd.DataFrame(
+                    [
+                        {"code": "600001", "name": "A"},
+                        {"code": "600002", "name": "B"},
+                    ]
+                ),
+                base_universe_size=2,
+                sharded_universe_size=2,
+                prepared_universe_size=2,
+                filter_stats={"before": 2, "after": 2, "removed_invalid_code": 0, "removed_whitelist": 0, "removed_st": 0, "removed_kcb": 0, "removed_cyb": 0},
+                prefilter_stats={"before": 2, "after": 2, "after_primary": 2, "after_relaxed": 2, "removed_listed_days": 0, "removed_change_60d": 0, "removed_turnover_rate": 0, "removed_negative_change": 0, "added_relaxed_buffer": 0, "adaptive_positive_change_applied": False, "quote_hydrated_rows": 0, "quote_requested_rows": 0, "quote_requested_fields": "", "quote_missing_unsupported_fields": "", "quote_worker_count": 0},
+            )
+
+    def fake_evaluate_candidate(**kwargs):
+        code = kwargs["code"]
+        return {
+            "code": code,
+            "name": kwargs["name"],
+            "passed": code == "600001",
+            "risk_flags": [],
+            "overall_score": 80.0,
+            "leader_gate_score": 70.0,
+            "trend_score": 60.0,
+            "capital_score": 50.0,
+            "capital_flow_fetch_skipped": code == "600002",
+        }
+
+    monkeypatch.setattr(trend_leader_module, "KlineSelectorService", FakeSelector)
+    monkeypatch.setattr(trend_leader_module, "_evaluate_trend_leader_candidate", fake_evaluate_candidate)
+
+    payload = trend_leader_module.scan_trend_leader_candidates_with_stats(
+        max_workers=1,
+        fallback_top_n=0,
+        progress_every=0,
+        prefetch_realtime_quotes=False,
+        second_stage_news_search_enabled=False,
+        second_stage_business_profile_enabled=False,
+        scan_prefilter_enabled=False,
+    )
+
+    assert payload["run_stats"]["capital_flow_fetch_skipped_count"] == 1
+
+
+def test_scan_trend_leader_candidates_disables_nested_parallel_enrichment_when_multi_worker(
+    monkeypatch,
+) -> None:
+    captured_parallel_flags = []
+
+    class FakeManager:
+        def get_sector_rankings(self, _n: int):
+            return [], []
+
+    fake_manager = FakeManager()
+
+    class FakeSelector:
+        build_fast_a_share_manager = staticmethod(lambda: fake_manager)
+        _prepare_history = staticmethod(lambda df: df.copy() if df is not None else pd.DataFrame())
+
+        def __init__(self, manager_factory=None) -> None:
+            self.manager = fake_manager
+
+        def get_spot_enriched_a_share_universe(self, limit=None, as_of_date=None):
+            return pd.DataFrame(
+                [
+                    {"code": "600001", "name": "Alpha", "list_date": "2020-01-01", "listed_days": 1000},
+                    {"code": "600002", "name": "Beta", "list_date": "2020-01-01", "listed_days": 1000},
+                ]
+            )
+
+        def prepare_scan_universe(self, **kwargs):
+            return SimpleNamespace(
+                prepared_universe=pd.DataFrame(
+                    [
+                        {"code": "600001", "name": "Alpha", "list_date": "2020-01-01", "listed_days": 1000},
+                        {"code": "600002", "name": "Beta", "list_date": "2020-01-01", "listed_days": 1000},
+                    ]
+                ),
+                base_universe_size=2,
+                sharded_universe_size=2,
+                prepared_universe_size=2,
+                filter_stats={"before": 2, "after": 2, "removed_invalid_code": 0, "removed_whitelist": 0, "removed_st": 0, "removed_kcb": 0, "removed_cyb": 0},
+                prefilter_stats={"before": 2, "after": 2, "after_primary": 2, "after_relaxed": 2, "removed_listed_days": 0, "removed_change_60d": 0, "removed_turnover_rate": 0, "removed_negative_change": 0, "added_relaxed_buffer": 0, "adaptive_positive_change_applied": False, "quote_hydrated_rows": 0, "quote_requested_rows": 0, "quote_requested_fields": "", "quote_missing_unsupported_fields": "", "quote_worker_count": 0},
+            )
+
+    def fake_evaluate_candidate(**kwargs):
+        captured_parallel_flags.append(kwargs["parallelize_enrichment"])
+        return {
+            "code": kwargs["code"],
+            "name": kwargs["name"],
+            "passed": True,
+            "risk_flags": [],
+            "overall_score": 80.0,
+            "leader_gate_score": 70.0,
+            "trend_score": 60.0,
+            "capital_score": 50.0,
+        }
+
+    monkeypatch.setattr(trend_leader_module, "KlineSelectorService", FakeSelector)
+    monkeypatch.setattr(trend_leader_module, "_evaluate_trend_leader_candidate", fake_evaluate_candidate)
+
+    payload = trend_leader_module.scan_trend_leader_candidates_with_stats(
+        max_workers=2,
+        fallback_top_n=0,
+        progress_every=0,
+        prefetch_realtime_quotes=False,
+        second_stage_news_search_enabled=False,
+        second_stage_business_profile_enabled=False,
+        scan_prefilter_enabled=False,
+    )
+
+    assert payload["run_stats"]["selected_count"] == 2
+    assert captured_parallel_flags == [False, False]
+
+
+def test_should_skip_capital_flow_fetch_for_weak_non_pattern_payload() -> None:
+    payload = {
+        "is_breakout_candidate": False,
+        "is_pullback_candidate": False,
+        "near_new_high": False,
+        "trend_template_score": 13.5,
+        "trend_stage2_score": 9.0,
+        "base_quality_score": 8.5,
+        "return_20d": 5.8,
+    }
+
+    assert _should_skip_capital_flow_fetch_for_trend_payload(payload) is True
+
+
+def test_should_skip_capital_flow_fetch_for_marginal_non_pattern_with_weak_quote_tape() -> None:
+    payload = {
+        "is_breakout_candidate": False,
+        "is_pullback_candidate": False,
+        "near_new_high": False,
+        "trend_template_score": 15.5,
+        "trend_stage2_score": 10.0,
+        "base_quality_score": 9.5,
+        "return_20d": 7.5,
+        "distance_to_high_pct": 9.8,
+        "pullback_depth_pct": 7.2,
+    }
+
+    assert _should_skip_capital_flow_fetch_for_trend_payload(
+        payload,
+        quote_data={"change_pct": 0.2, "turnover_rate": 1.3},
+    ) is True
+
+
+def test_is_unscannable_history_candidate_uses_business_day_lower_bound() -> None:
+    recent_ipo = {
+        "code": "688790",
+        "list_date": "2025-12-19",
+        "listed_days": 123,
+    }
+
+    assert _is_unscannable_history_candidate(
+        recent_ipo,
+        as_of_date=date(2026, 4, 21),
+    ) is True
+
+
+def test_is_unscannable_history_candidate_skips_business_day_scan_when_listed_days_is_sufficient(
+    monkeypatch,
+) -> None:
+    row = {
+        "code": "600001",
+        "list_date": "2025-01-02",
+        "listed_days": 240,
+    }
+    state = {"calls": 0}
+
+    def _tracked_bdate_range(*args, **kwargs):
+        state["calls"] += 1
+        return pd.date_range("2025-01-02", periods=180, freq="B")
+
+    monkeypatch.setattr(trend_leader_module.pd, "bdate_range", _tracked_bdate_range)
+
+    assert _is_unscannable_history_candidate(
+        row,
+        as_of_date=date(2026, 4, 21),
+    ) is False
+    assert state["calls"] == 0
+
+
 def test_scan_trend_leader_candidates_prewarms_sector_rankings_and_passes_scan_context(monkeypatch) -> None:
     captured_scan_contexts = []
+    selector_flags = []
 
     class FakeManager:
         def __init__(self) -> None:
             self.sector_ranking_calls = 0
+            self.prefer_stale_flags = []
 
-        def get_sector_rankings(self, _n: int):
+        def get_sector_rankings(self, _n: int, prefer_stale_cache: bool = False):
             self.sector_ranking_calls += 1
+            self.prefer_stale_flags.append(bool(prefer_stale_cache))
             return ([{"name": "算力", "change_pct": 6.8}], [{"name": "地产", "change_pct": -2.1}])
 
         def get_daily_data(self, _code: str, days: int, force_refresh: bool = False):
-            assert days == 140
+            assert days == trend_leader_module.TREND_SCAN_HISTORY_FETCH_DAYS
             assert force_refresh is False
-            closes = [10.0 + idx * 0.1 for idx in range(140)]
+            closes = [10.0 + idx * 0.1 for idx in range(max(days, 140))]
             history = pd.DataFrame(
                 {
                     "date": pd.date_range("2025-01-01", periods=len(closes), freq="D"),
@@ -1313,6 +2452,12 @@ def test_scan_trend_leader_candidates_prewarms_sector_rankings_and_passes_scan_c
             self.manager = fake_manager
 
         def get_spot_enriched_a_share_universe(self, limit=None, as_of_date=None):
+            selector_flags.append(
+                (
+                    bool(getattr(self, "_prefer_spot_universe_reference_cache", False)),
+                    bool(getattr(self, "_prefer_stale_spot_universe_reference_cache", False)),
+                )
+            )
             return pd.DataFrame(
                 [
                     {
@@ -1390,6 +2535,8 @@ def test_scan_trend_leader_candidates_prewarms_sector_rankings_and_passes_scan_c
     )
 
     assert fake_manager.sector_ranking_calls == 1
+    assert fake_manager.prefer_stale_flags == [True]
+    assert selector_flags == [(True, True)]
     assert captured_scan_contexts == [
         {
             "sector_rankings": (
@@ -1399,6 +2546,111 @@ def test_scan_trend_leader_candidates_prewarms_sector_rankings_and_passes_scan_c
         }
     ]
     assert payload["run_stats"]["sector_rankings_prefetched"] is True
+    assert payload["run_stats"]["sector_rankings_prefetch_status"] == "available"
+    assert payload["run_stats"]["sector_rankings_prefetch_elapsed_sec"] >= 0.0
+
+
+def test_scan_trend_leader_candidates_aggregates_phase_timing_stats(monkeypatch) -> None:
+    class FakeManager:
+        def get_sector_rankings(self, _n: int):
+            return None
+
+    fake_manager = FakeManager()
+
+    class FakeSelector:
+        build_fast_a_share_manager = staticmethod(lambda: fake_manager)
+
+        def __init__(self, manager_factory=None) -> None:
+            self.manager = fake_manager
+
+        def get_spot_enriched_a_share_universe(self, limit=None, as_of_date=None):
+            return pd.DataFrame(
+                [
+                    {"code": "600001", "name": "A"},
+                    {"code": "600002", "name": "B"},
+                ]
+            )
+
+        def prepare_scan_universe(self, **kwargs):
+            return SimpleNamespace(
+                prepared_universe=pd.DataFrame(
+                    [
+                        {"code": "600001", "name": "A"},
+                        {"code": "600002", "name": "B"},
+                    ]
+                ),
+                base_universe_size=2,
+                sharded_universe_size=2,
+                prepared_universe_size=2,
+                filter_stats={"before": 2, "after": 2, "removed_invalid_code": 0, "removed_whitelist": 0, "removed_st": 0, "removed_kcb": 0, "removed_cyb": 0},
+                prefilter_stats={"before": 2, "after": 2, "after_primary": 2, "after_relaxed": 2, "removed_listed_days": 0, "removed_change_60d": 0, "removed_turnover_rate": 0, "removed_negative_change": 0, "added_relaxed_buffer": 0, "adaptive_positive_change_applied": False, "quote_hydrated_rows": 0, "quote_requested_rows": 0, "quote_requested_fields": "", "quote_missing_unsupported_fields": "", "quote_worker_count": 0},
+            )
+
+    def fake_evaluate_candidate(**kwargs):
+        code = kwargs["code"]
+        if code == "600001":
+            return {
+                "code": code,
+                "name": kwargs["name"],
+                "passed": True,
+                "risk_flags": [],
+                "_fundamental_cache_hit": False,
+                "_fundamental_cache_source": None,
+                "_capital_flow_cache_hit": False,
+                "_capital_flow_cache_source": None,
+                "_phase_timing_sec": {
+                    "history_fetch": 0.8,
+                    "quote_fetch": 0.1,
+                    "fundamental_fetch": 0.4,
+                    "dragon_analysis": 0.3,
+                    "capital_profile": 0.2,
+                    "score_candidate": 0.05,
+                },
+            }
+        return {
+            "code": code,
+            "name": kwargs["name"],
+            "passed": False,
+            "risk_flags": [],
+            "_fundamental_cache_hit": True,
+            "_fundamental_cache_source": "disk",
+            "_capital_flow_cache_hit": True,
+            "_capital_flow_cache_source": "disk",
+            "_phase_timing_sec": {
+                "history_fetch": 1.2,
+                "quote_fetch": 0.2,
+                "fundamental_fetch": 0.0,
+                "dragon_analysis": 0.0,
+                "capital_profile": 0.1,
+                "score_candidate": 0.04,
+            },
+        }
+
+    monkeypatch.setattr(trend_leader_module, "KlineSelectorService", FakeSelector)
+    monkeypatch.setattr(trend_leader_module, "_evaluate_trend_leader_candidate", fake_evaluate_candidate)
+
+    payload = trend_leader_module.scan_trend_leader_candidates_with_stats(
+        max_workers=1,
+        fallback_top_n=0,
+        progress_every=0,
+        prefetch_realtime_quotes=False,
+        second_stage_news_search_enabled=False,
+        second_stage_business_profile_enabled=False,
+        scan_prefilter_enabled=False,
+    )
+
+    phase_timing = payload["run_stats"]["phase_timing_sec"]
+    assert round(float(phase_timing["history_fetch"]), 2) == 2.00
+    assert round(float(phase_timing["quote_fetch"]), 2) == 0.30
+    assert round(float(phase_timing["fundamental_fetch"]), 2) == 0.40
+    assert round(float(phase_timing["dragon_analysis"]), 2) == 0.30
+    assert round(float(phase_timing["capital_profile"]), 2) == 0.30
+    assert round(float(phase_timing["score_candidate"]), 2) == 0.09
+    assert round(float(payload["run_stats"]["avg_candidate_eval_elapsed_sec"]), 3) == 1.695
+    assert payload["run_stats"]["fundamental_cache_hit_count"] == 1
+    assert payload["run_stats"]["fundamental_cache_source_counts"] == {"disk": 1}
+    assert payload["run_stats"]["capital_flow_cache_hit_count"] == 1
+    assert payload["run_stats"]["capital_flow_cache_source_counts"] == {"disk": 1}
 
 
 def test_board_earnings_risk_warning_is_injected_into_selected() -> None:

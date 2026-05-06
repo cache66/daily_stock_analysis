@@ -18,12 +18,13 @@ import json
 import logging
 import math
 import random
+import re
 import time
 from threading import BoundedSemaphore, RLock, Thread
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Callable, Optional, List, Tuple, Dict, Any
+from typing import Callable, Optional, List, Tuple, Dict, Any, Iterable
 
 import pandas as pd
 import numpy as np
@@ -36,7 +37,15 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_BELONG_BOARDS_CACHE_TTL_SECONDS = 24 * 60 * 60
 DEFAULT_SECTOR_RANKINGS_CACHE_TTL_SECONDS = 120
+DEFAULT_SECTOR_RANKINGS_DISK_CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "cache" / "manager_sector_rankings"
 DEFAULT_BOARD_CONSTITUENTS_CACHE_TTL_SECONDS = 30 * 60
+DEFAULT_EARNINGS_FUNDAMENTAL_DISK_CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "cache" / "earnings_fundamental_context"
+DEFAULT_EARNINGS_FUNDAMENTAL_DISK_CACHE_TTL_SECONDS = 6 * 60 * 60
+DEFAULT_FAILED_EARNINGS_FUNDAMENTAL_DISK_CACHE_TTL_SECONDS = 30 * 60
+DEFAULT_CAPITAL_FLOW_DISK_CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "cache" / "capital_flow_context"
+DEFAULT_CAPITAL_FLOW_DISK_CACHE_TTL_SECONDS = 6 * 60 * 60
+DEFAULT_FAILED_CAPITAL_FLOW_DISK_CACHE_TTL_SECONDS = 30 * 60
+DEFAULT_FAILED_HISTORY_DISK_CACHE_TTL_SECONDS = 30 * 60
 DEFAULT_DAILY_DATA_REQUEST_CALENDAR_SPAN_MULTIPLIER = 2.0
 _EARNINGS_QUALITY_POSITIVE_KEYWORDS = (
     "预增",
@@ -385,7 +394,12 @@ class BaseFetcher(ABC):
         """
         return None
 
-    def get_sector_rankings(self, n: int = 5) -> Optional[Tuple[List[Dict], List[Dict]]]:
+    def get_sector_rankings(
+        self,
+        n: int = 5,
+        *,
+        prefer_stale_cache: bool = False,
+    ) -> Optional[Tuple[List[Dict], List[Dict]]]:
         """
         获取板块涨跌榜
 
@@ -574,11 +588,18 @@ class DataFetcherManager:
         self._sector_rankings_cache: Dict[int, Dict[str, Any]] = {}
         self._sector_rankings_cache_lock = RLock()
         self._sector_rankings_cache_ttl_seconds = DEFAULT_SECTOR_RANKINGS_CACHE_TTL_SECONDS
+        self._sector_rankings_disk_cache_dir: Path = DEFAULT_SECTOR_RANKINGS_DISK_CACHE_DIR
+        self._sector_rankings_disk_cache_ttl_seconds = DEFAULT_SECTOR_RANKINGS_CACHE_TTL_SECONDS
+        self._earnings_fundamental_disk_cache_dir: Path = DEFAULT_EARNINGS_FUNDAMENTAL_DISK_CACHE_DIR
+        self._earnings_fundamental_disk_cache_ttl_seconds = DEFAULT_EARNINGS_FUNDAMENTAL_DISK_CACHE_TTL_SECONDS
+        self._capital_flow_disk_cache_dir: Path = DEFAULT_CAPITAL_FLOW_DISK_CACHE_DIR
+        self._capital_flow_disk_cache_ttl_seconds = DEFAULT_CAPITAL_FLOW_DISK_CACHE_TTL_SECONDS
         self._board_constituents_cache: Dict[str, Dict[str, Any]] = {}
         self._board_constituents_cache_lock = RLock()
         self._board_constituents_cache_ttl_seconds = DEFAULT_BOARD_CONSTITUENTS_CACHE_TTL_SECONDS
         self._history_cache_locks: Dict[str, RLock] = {}
         self._history_cache_locks_lock = RLock()
+        self._history_failed_disk_cache_ttl_seconds = DEFAULT_FAILED_HISTORY_DISK_CACHE_TTL_SECONDS
         
         if fetchers:
             # 按优先级排序
@@ -600,6 +621,7 @@ class DataFetcherManager:
         self._daily_data_request_calendar_span_multiplier = DEFAULT_DAILY_DATA_REQUEST_CALENDAR_SPAN_MULTIPLIER
         self._daily_data_include_derived_indicators = True
         self._prefer_cached_history_when_covered = False
+        self._skip_tushare_history_fallback_for_fast_scan = False
 
     def _ensure_concurrency_guards(self) -> None:
         """Lazily initialize thread-safety primitives for test scaffolds using __new__."""
@@ -625,6 +647,26 @@ class DataFetcherManager:
             self._sector_rankings_cache_lock = RLock()
         if not hasattr(self, "_sector_rankings_cache_ttl_seconds") or self._sector_rankings_cache_ttl_seconds is None:
             self._sector_rankings_cache_ttl_seconds = DEFAULT_SECTOR_RANKINGS_CACHE_TTL_SECONDS
+        if (
+            not hasattr(self, "_earnings_fundamental_disk_cache_dir")
+            or self._earnings_fundamental_disk_cache_dir is None
+        ):
+            self._earnings_fundamental_disk_cache_dir = DEFAULT_EARNINGS_FUNDAMENTAL_DISK_CACHE_DIR
+        if (
+            not hasattr(self, "_earnings_fundamental_disk_cache_ttl_seconds")
+            or self._earnings_fundamental_disk_cache_ttl_seconds is None
+        ):
+            self._earnings_fundamental_disk_cache_ttl_seconds = DEFAULT_EARNINGS_FUNDAMENTAL_DISK_CACHE_TTL_SECONDS
+        if (
+            not hasattr(self, "_capital_flow_disk_cache_dir")
+            or self._capital_flow_disk_cache_dir is None
+        ):
+            self._capital_flow_disk_cache_dir = DEFAULT_CAPITAL_FLOW_DISK_CACHE_DIR
+        if (
+            not hasattr(self, "_capital_flow_disk_cache_ttl_seconds")
+            or self._capital_flow_disk_cache_ttl_seconds is None
+        ):
+            self._capital_flow_disk_cache_ttl_seconds = DEFAULT_CAPITAL_FLOW_DISK_CACHE_TTL_SECONDS
         if not hasattr(self, "_board_constituents_cache") or self._board_constituents_cache is None:
             self._board_constituents_cache = {}
         if not hasattr(self, "_board_constituents_cache_lock") or self._board_constituents_cache_lock is None:
@@ -635,6 +677,11 @@ class DataFetcherManager:
             self._history_cache_locks = {}
         if not hasattr(self, "_history_cache_locks_lock") or self._history_cache_locks_lock is None:
             self._history_cache_locks_lock = RLock()
+        if (
+            not hasattr(self, "_history_failed_disk_cache_ttl_seconds")
+            or self._history_failed_disk_cache_ttl_seconds is None
+        ):
+            self._history_failed_disk_cache_ttl_seconds = DEFAULT_FAILED_HISTORY_DISK_CACHE_TTL_SECONDS
         if not hasattr(self, "_fundamental_timeout_worker_limit") or self._fundamental_timeout_worker_limit is None:
             self._fundamental_timeout_worker_limit = 8
         if not hasattr(self, "_fundamental_timeout_slots") or self._fundamental_timeout_slots is None:
@@ -659,11 +706,32 @@ class DataFetcherManager:
             self._daily_data_include_derived_indicators = True
         if not hasattr(self, "_prefer_cached_history_when_covered") or self._prefer_cached_history_when_covered is None:
             self._prefer_cached_history_when_covered = False
+        if (
+            not hasattr(self, "_skip_tushare_history_fallback_for_fast_scan")
+            or self._skip_tushare_history_fallback_for_fast_scan is None
+        ):
+            self._skip_tushare_history_fallback_for_fast_scan = False
 
     def _get_fetchers_snapshot(self) -> List[BaseFetcher]:
         self._ensure_concurrency_guards()
         with self._fetchers_lock:
             return list(getattr(self, "_fetchers", []))
+
+    def _should_skip_fast_scan_tushare_history_fallback(
+        self,
+        *,
+        fetcher_name: str,
+        next_fetcher_name: str,
+        days: int,
+        error_reason: str,
+    ) -> bool:
+        if not getattr(self, "_skip_tushare_history_fallback_for_fast_scan", False):
+            return False
+        if fetcher_name != "AkshareFetcher" or next_fetcher_name != "TushareFetcher":
+            return False
+        if days <= 0 or days > 160:
+            return False
+        return "Akshare 所有渠道获取失败" in str(error_reason or "")
 
     def _get_fetcher_call_lock(self, fetcher: BaseFetcher) -> RLock:
         self._ensure_concurrency_guards()
@@ -835,6 +903,83 @@ class DataFetcherManager:
         filename = self._history_cache_filename(stock_code)
         return cache_root / f"{filename}.csv", cache_root / f"{filename}.json"
 
+    def _history_failure_cache_key(
+        self,
+        stock_code: str,
+        *,
+        start_date: str,
+        end_date: str,
+        days: int,
+    ) -> str:
+        normalized_code = normalize_stock_code(stock_code)
+        return (
+            f"{_market_tag(normalized_code)}:{canonical_stock_code(normalized_code)}"
+            f"|start={start_date}|end={end_date}|days={max(0, int(days or 0))}"
+        )
+
+    def _history_failure_disk_cache_file(self, cache_key: str, cache_dir: Path) -> Path:
+        safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(cache_key or "").strip()) or "default"
+        return Path(cache_dir) / "_failed" / f"{safe_key}.json"
+
+    def _load_history_failure_disk_cache(self, cache_key: str, *, cache_dir: Path) -> Optional[Dict[str, Any]]:
+        self._ensure_concurrency_guards()
+        ttl_seconds = max(0, int(getattr(self, "_history_failed_disk_cache_ttl_seconds", 0) or 0))
+        if ttl_seconds <= 0:
+            return None
+        cache_file = self._history_failure_disk_cache_file(cache_key, cache_dir)
+        try:
+            if not cache_file.exists():
+                return None
+            payload = json.loads(cache_file.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        fetched_at_text = str(payload.get("fetched_at") or "").strip()
+        try:
+            fetched_at = datetime.fromisoformat(fetched_at_text)
+        except ValueError:
+            return None
+        if time.time() - fetched_at.timestamp() > ttl_seconds:
+            return None
+        return payload
+
+    def _write_history_failure_disk_cache(
+        self,
+        cache_key: str,
+        *,
+        cache_dir: Path,
+        error_message: str,
+    ) -> None:
+        self._ensure_concurrency_guards()
+        ttl_seconds = max(0, int(getattr(self, "_history_failed_disk_cache_ttl_seconds", 0) or 0))
+        if ttl_seconds <= 0:
+            return
+        cache_file = self._history_failure_disk_cache_file(cache_key, cache_dir)
+        try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            cache_file.write_text(
+                json.dumps(
+                    {
+                        "fetched_at": datetime.now().replace(microsecond=0).isoformat(),
+                        "ttl_seconds": ttl_seconds,
+                        "error_message": str(error_message or "").strip(),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+        except Exception:
+            return
+
+    def _clear_history_failure_disk_cache(self, cache_key: str, *, cache_dir: Path) -> None:
+        cache_file = self._history_failure_disk_cache_file(cache_key, cache_dir)
+        try:
+            cache_file.unlink(missing_ok=True)
+        except Exception:
+            return
+
     @staticmethod
     def _history_cache_is_fresh(metadata: Dict[str, Any], request_end_date: str, ttl_seconds: int) -> bool:
         try:
@@ -934,25 +1079,86 @@ class DataFetcherManager:
     def _get_cached_sector_rankings(
         self,
         n: int,
+        *,
+        allow_stale: bool = False,
     ) -> Optional[Tuple[List[Dict], List[Dict], List[Dict[str, Any]], str]]:
         self._ensure_concurrency_guards()
         ttl_seconds = max(0, int(getattr(self, "_sector_rankings_cache_ttl_seconds", 0)))
-        if ttl_seconds <= 0:
+        if ttl_seconds <= 0 and not allow_stale:
             return None
         now_ts = time.time()
         with self._sector_rankings_cache_lock:
             item = self._sector_rankings_cache.get(int(n))
             if not item:
+                item = None
+            if item:
+                if ttl_seconds > 0 and now_ts - float(item.get("ts", 0)) > ttl_seconds:
+                    if not allow_stale:
+                        self._sector_rankings_cache.pop(int(n), None)
+                        item = None
+                    else:
+                        top = [dict(row) for row in (item.get("top") or []) if isinstance(row, dict)]
+                        bottom = [dict(row) for row in (item.get("bottom") or []) if isinstance(row, dict)]
+                        source_chain = [
+                            dict(row) for row in (item.get("source_chain") or []) if isinstance(row, dict)
+                        ]
+                        return top, bottom, source_chain, str(item.get("last_error") or "")
+                else:
+                    top = [dict(row) for row in (item.get("top") or []) if isinstance(row, dict)]
+                    bottom = [dict(row) for row in (item.get("bottom") or []) if isinstance(row, dict)]
+                    source_chain = [
+                        dict(row) for row in (item.get("source_chain") or []) if isinstance(row, dict)
+                    ]
+                    return top, bottom, source_chain, str(item.get("last_error") or "")
+        cached_disk = self._load_sector_rankings_disk_cache(n, allow_stale=allow_stale)
+        if cached_disk is not None:
+            top, bottom, source_chain, last_error = cached_disk
+            if not allow_stale:
+                with self._sector_rankings_cache_lock:
+                    self._sector_rankings_cache[int(n)] = {
+                        "ts": time.time(),
+                        "top": [dict(row) for row in top if isinstance(row, dict)],
+                        "bottom": [dict(row) for row in bottom if isinstance(row, dict)],
+                        "source_chain": [dict(row) for row in source_chain if isinstance(row, dict)],
+                        "last_error": str(last_error or ""),
+                    }
+            return cached_disk
+        return None
+
+    def _sector_rankings_disk_cache_file(self, n: int) -> Path:
+        cache_n = max(1, int(n))
+        return Path(self._sector_rankings_disk_cache_dir) / f"sector_rankings_top{cache_n}.json"
+
+    def _load_sector_rankings_disk_cache(
+        self,
+        n: int,
+        *,
+        allow_stale: bool = False,
+    ) -> Optional[Tuple[List[Dict], List[Dict], List[Dict[str, Any]], str]]:
+        self._ensure_concurrency_guards()
+        ttl_seconds = max(0, int(getattr(self, "_sector_rankings_disk_cache_ttl_seconds", 0)))
+        if ttl_seconds <= 0 and not allow_stale:
+            return None
+        cache_file = self._sector_rankings_disk_cache_file(n)
+        try:
+            if not cache_file.exists():
                 return None
-            if now_ts - float(item.get("ts", 0)) > ttl_seconds:
-                self._sector_rankings_cache.pop(int(n), None)
-                return None
-            top = [dict(row) for row in (item.get("top") or []) if isinstance(row, dict)]
-            bottom = [dict(row) for row in (item.get("bottom") or []) if isinstance(row, dict)]
-            source_chain = [
-                dict(row) for row in (item.get("source_chain") or []) if isinstance(row, dict)
-            ]
-            return top, bottom, source_chain, str(item.get("last_error") or "")
+            payload = json.loads(cache_file.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        fetched_at_text = str(payload.get("fetched_at") or "").strip()
+        try:
+            fetched_at = datetime.fromisoformat(fetched_at_text)
+        except ValueError:
+            return None
+        if ttl_seconds > 0 and time.time() - fetched_at.timestamp() > ttl_seconds and not allow_stale:
+            return None
+        top = [dict(row) for row in (payload.get("top") or []) if isinstance(row, dict)]
+        bottom = [dict(row) for row in (payload.get("bottom") or []) if isinstance(row, dict)]
+        source_chain = [dict(row) for row in (payload.get("source_chain") or []) if isinstance(row, dict)]
+        if not top and not bottom:
+            return None
+        return top, bottom, source_chain, str(payload.get("last_error") or "")
 
     def _cache_sector_rankings(
         self,
@@ -975,6 +1181,28 @@ class DataFetcherManager:
                 "source_chain": [dict(row) for row in source_chain if isinstance(row, dict)],
                 "last_error": str(last_error or ""),
             }
+        disk_ttl_seconds = max(0, int(getattr(self, "_sector_rankings_disk_cache_ttl_seconds", 0)))
+        if disk_ttl_seconds <= 0:
+            return
+        cache_file = self._sector_rankings_disk_cache_file(n)
+        try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            cache_file.write_text(
+                json.dumps(
+                    {
+                        "fetched_at": datetime.now().replace(microsecond=0).isoformat(),
+                        "top": [dict(row) for row in top if isinstance(row, dict)],
+                        "bottom": [dict(row) for row in bottom if isinstance(row, dict)],
+                        "source_chain": [dict(row) for row in source_chain if isinstance(row, dict)],
+                        "last_error": str(last_error or ""),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+        except Exception:
+            return
 
     def _get_cached_board_constituents(self, cache_key: str) -> Optional[pd.DataFrame]:
         self._ensure_concurrency_guards()
@@ -1074,18 +1302,25 @@ class DataFetcherManager:
             # Best-effort cleanup during interpreter shutdown.
             pass
 
-    def _get_fundamental_cache_key(self, stock_code: str, budget_seconds: Optional[float] = None) -> str:
+    def _get_fundamental_cache_key(
+        self,
+        stock_code: str,
+        budget_seconds: Optional[float] = None,
+        *,
+        scope: str = "full",
+    ) -> str:
         """生成基本面缓存 key（包含预算分桶以避免低预算结果污染高预算请求）。"""
         normalized_code = normalize_stock_code(stock_code)
+        normalized_scope = str(scope or "full").strip().lower() or "full"
         if budget_seconds is None:
-            return f"{normalized_code}|budget=default"
+            return f"{normalized_code}|scope={normalized_scope}|budget=default"
         try:
             budget = max(0.0, float(budget_seconds))
         except (TypeError, ValueError):
             budget = 0.0
         # 100ms bucket to balance cache reuse and scenario isolation.
         budget_bucket = int(round(budget * 10))
-        return f"{normalized_code}|budget={budget_bucket}"
+        return f"{normalized_code}|scope={normalized_scope}|budget={budget_bucket}"
 
     def _prune_fundamental_cache(self, ttl_seconds: int, max_entries: int) -> None:
         """Prune expired and overflow fundamental cache items."""
@@ -1112,6 +1347,190 @@ class DataFetcherManager:
                 )
                 for key, _ in sorted_items[:overflow]:
                     self._fundamental_cache.pop(key, None)
+
+    def _earnings_fundamental_disk_cache_file(self, cache_key: str) -> Path:
+        safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(cache_key or "").strip()) or "default"
+        return Path(self._earnings_fundamental_disk_cache_dir) / f"{safe_key}.json"
+
+    def _load_earnings_fundamental_disk_cache(self, cache_key: str) -> Optional[Dict[str, Any]]:
+        self._ensure_concurrency_guards()
+        default_ttl_seconds = max(0, int(getattr(self, "_earnings_fundamental_disk_cache_ttl_seconds", 0) or 0))
+        if default_ttl_seconds <= 0:
+            return None
+        cache_file = self._earnings_fundamental_disk_cache_file(cache_key)
+        try:
+            if not cache_file.exists():
+                return None
+            payload = json.loads(cache_file.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        ttl_seconds = max(0, int(payload.get("ttl_seconds") or default_ttl_seconds))
+        if ttl_seconds <= 0:
+            return None
+        fetched_at_text = str(payload.get("fetched_at") or "").strip()
+        try:
+            fetched_at = datetime.fromisoformat(fetched_at_text)
+        except ValueError:
+            return None
+        if time.time() - fetched_at.timestamp() > ttl_seconds:
+            return None
+        context = payload.get("context")
+        if not isinstance(context, dict):
+            return None
+        return dict(context)
+
+    @staticmethod
+    def _resolve_earnings_fundamental_disk_cache_ttl_seconds(
+        context: Any,
+        *,
+        default_ttl_seconds: int,
+    ) -> int:
+        ttl_seconds = max(0, int(default_ttl_seconds or 0))
+        if ttl_seconds <= 0:
+            return 0
+        if not isinstance(context, dict):
+            return ttl_seconds
+        status = str(context.get("status") or "").strip().lower()
+        if status == "failed":
+            return min(ttl_seconds, DEFAULT_FAILED_EARNINGS_FUNDAMENTAL_DISK_CACHE_TTL_SECONDS)
+        return ttl_seconds
+
+    def _write_earnings_fundamental_disk_cache(self, cache_key: str, context: Dict[str, Any]) -> None:
+        self._ensure_concurrency_guards()
+        ttl_seconds = self._resolve_earnings_fundamental_disk_cache_ttl_seconds(
+            context,
+            default_ttl_seconds=max(
+                0,
+                int(getattr(self, "_earnings_fundamental_disk_cache_ttl_seconds", 0) or 0),
+            ),
+        )
+        if ttl_seconds <= 0 or not isinstance(context, dict):
+            return
+        cache_file = self._earnings_fundamental_disk_cache_file(cache_key)
+        try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            cache_file.write_text(
+                json.dumps(
+                    {
+                        "fetched_at": datetime.now().replace(microsecond=0).isoformat(),
+                        "ttl_seconds": ttl_seconds,
+                        "context": context,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+        except Exception:
+            return
+
+    def _capital_flow_disk_cache_file(self, cache_key: str) -> Path:
+        safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(cache_key or "").strip()) or "default"
+        return Path(self._capital_flow_disk_cache_dir) / f"{safe_key}.json"
+
+    def _load_capital_flow_disk_cache(self, cache_key: str) -> Optional[Dict[str, Any]]:
+        self._ensure_concurrency_guards()
+        default_ttl_seconds = max(0, int(getattr(self, "_capital_flow_disk_cache_ttl_seconds", 0) or 0))
+        if default_ttl_seconds <= 0:
+            return None
+        cache_file = self._capital_flow_disk_cache_file(cache_key)
+        try:
+            if not cache_file.exists():
+                return None
+            payload = json.loads(cache_file.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        ttl_seconds = max(0, int(payload.get("ttl_seconds") or default_ttl_seconds))
+        if ttl_seconds <= 0:
+            return None
+        fetched_at_text = str(payload.get("fetched_at") or "").strip()
+        try:
+            fetched_at = datetime.fromisoformat(fetched_at_text)
+        except ValueError:
+            return None
+        if time.time() - fetched_at.timestamp() > ttl_seconds:
+            return None
+        context = payload.get("context")
+        if not isinstance(context, dict):
+            return None
+        return dict(context)
+
+    @staticmethod
+    def _resolve_capital_flow_disk_cache_ttl_seconds(
+        context: Any,
+        *,
+        default_ttl_seconds: int,
+    ) -> int:
+        ttl_seconds = max(0, int(default_ttl_seconds or 0))
+        if ttl_seconds <= 0:
+            return 0
+        if not isinstance(context, dict):
+            return ttl_seconds
+        status = str(context.get("status") or "").strip().lower()
+        if status == "failed":
+            return min(ttl_seconds, DEFAULT_FAILED_CAPITAL_FLOW_DISK_CACHE_TTL_SECONDS)
+        return ttl_seconds
+
+    def _write_capital_flow_disk_cache(
+        self,
+        cache_key: str,
+        context: Dict[str, Any],
+        *,
+        default_ttl_seconds: Optional[int] = None,
+    ) -> None:
+        self._ensure_concurrency_guards()
+        resolved_default_ttl_seconds = max(
+            0,
+            int(
+                default_ttl_seconds
+                if default_ttl_seconds is not None
+                else getattr(self, "_capital_flow_disk_cache_ttl_seconds", 0) or 0
+            ),
+        )
+        ttl_seconds = self._resolve_capital_flow_disk_cache_ttl_seconds(
+            context,
+            default_ttl_seconds=resolved_default_ttl_seconds,
+        )
+        if ttl_seconds <= 0 or not isinstance(context, dict):
+            return
+        cache_file = self._capital_flow_disk_cache_file(cache_key)
+        try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            cache_file.write_text(
+                json.dumps(
+                    {
+                        "fetched_at": datetime.now().replace(microsecond=0).isoformat(),
+                        "ttl_seconds": ttl_seconds,
+                        "context": context,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+        except Exception:
+            return
+
+    @staticmethod
+    def _decorate_fundamental_context_cache_meta(
+        context: Any,
+        *,
+        cache_hit: bool,
+        cache_source: Optional[str],
+    ) -> Dict[str, Any]:
+        if not isinstance(context, dict):
+            return {
+                "cache_hit": bool(cache_hit),
+                "cache_source": str(cache_source or "").strip() or None,
+            }
+        decorated = dict(context)
+        decorated["cache_hit"] = bool(cache_hit)
+        decorated["cache_source"] = str(cache_source or "").strip() or None
+        return decorated
 
     @staticmethod
     def _try_scalar_isna(value: Any, context: str) -> Optional[bool]:
@@ -1480,6 +1899,23 @@ class DataFetcherManager:
                 errors.append(error_msg)
                 if attempt < total_fetchers:
                     next_fetcher = fetchers[attempt]
+                    if self._should_skip_fast_scan_tushare_history_fallback(
+                        fetcher_name=fetcher.name,
+                        next_fetcher_name=next_fetcher.name,
+                        days=days,
+                        error_reason=error_reason,
+                    ):
+                        logger.info(
+                            "[manager] skip fast-scan Tushare history fallback: stock=%s current=%s next=%s days=%s reason=%s",
+                            stock_code,
+                            fetcher.name,
+                            next_fetcher.name,
+                            days,
+                            error_reason,
+                        )
+                        break
+                if attempt < total_fetchers:
+                    next_fetcher = fetchers[attempt]
                     logger.info(f"[数据源切换] {stock_code}: [{fetcher.name}] -> [{next_fetcher.name}]")
                 # 继续尝试下一个数据源
                 continue
@@ -1509,6 +1945,13 @@ class DataFetcherManager:
             days=days,
         )
         cache_settings = self._get_history_cache_config()
+        history_failure_cache_key = self._history_failure_cache_key(
+            stock_code,
+            start_date=resolved_start_date,
+            end_date=resolved_end_date,
+            days=days,
+        )
+        history_cache_dir = Path(cache_settings["cache_dir"])
 
         if not cache_settings["enabled"]:
             return self._fetch_daily_data_from_sources(
@@ -1536,11 +1979,19 @@ class DataFetcherManager:
                 )
 
                 if cache_covers_request and cache_fresh:
+                    self._clear_history_failure_disk_cache(
+                        history_failure_cache_key,
+                        cache_dir=history_cache_dir,
+                    )
                     return (
                         self._slice_history_range(cached_df, resolved_start_date, resolved_end_date),
                         f"disk_cache:{cached_source}" if cached_source else "disk_cache",
                     )
                 if cache_covers_request and getattr(self, "_prefer_cached_history_when_covered", False):
+                    self._clear_history_failure_disk_cache(
+                        history_failure_cache_key,
+                        cache_dir=history_cache_dir,
+                    )
                     return (
                         self._slice_history_range(cached_df, resolved_start_date, resolved_end_date),
                         (
@@ -1606,6 +2057,10 @@ class DataFetcherManager:
                                 stock_code,
                                 exc_info=True,
                             )
+                            self._clear_history_failure_disk_cache(
+                                history_failure_cache_key,
+                                cache_dir=history_cache_dir,
+                            )
                             return (
                                 self._slice_history_range(cached_df, resolved_start_date, resolved_end_date),
                                 f"disk_cache_stale:{cached_source}" if cached_source else "disk_cache_stale",
@@ -1617,18 +2072,45 @@ class DataFetcherManager:
 
                 if not merged_df.empty:
                     self._write_history_cache(stock_code, merged_df, active_source or cached_source or "unknown")
+                    self._clear_history_failure_disk_cache(
+                        history_failure_cache_key,
+                        cache_dir=history_cache_dir,
+                    )
                     sliced = self._slice_history_range(merged_df, resolved_start_date, resolved_end_date)
                     if not sliced.empty:
                         return sliced, active_source or cached_source or "unknown"
 
-            network_df, network_source = self._fetch_daily_data_from_sources(
-                stock_code,
-                start_date=resolved_start_date,
-                end_date=resolved_end_date,
-                days=days,
+            cached_failure = self._load_history_failure_disk_cache(
+                history_failure_cache_key,
+                cache_dir=history_cache_dir,
             )
+            if cached_failure is not None:
+                cached_error_message = (
+                    str(cached_failure.get("error_message") or "").strip()
+                    or f"cached history fetch failure for {stock_code}"
+                )
+                raise DataFetchError(cached_error_message)
+
+            try:
+                network_df, network_source = self._fetch_daily_data_from_sources(
+                    stock_code,
+                    start_date=resolved_start_date,
+                    end_date=resolved_end_date,
+                    days=days,
+                )
+            except Exception as exc:
+                self._write_history_failure_disk_cache(
+                    history_failure_cache_key,
+                    cache_dir=history_cache_dir,
+                    error_message=str(exc),
+                )
+                raise
             finalized_df = self._finalize_history_frame(network_df)
             self._write_history_cache(stock_code, finalized_df, network_source)
+            self._clear_history_failure_disk_cache(
+                history_failure_cache_key,
+                cache_dir=history_cache_dir,
+            )
             return self._slice_history_range(finalized_df, resolved_start_date, resolved_end_date), network_source
 
     @property
@@ -3727,6 +4209,7 @@ class DataFetcherManager:
         self,
         stock_code: str,
         budget_seconds: Optional[float] = None,
+        enabled_blocks: Optional[Iterable[str]] = None,
     ) -> Dict[str, Any]:
         """Fetch only the earnings-related fundamental blocks needed by fast scans."""
         from src.config import get_config
@@ -3756,6 +4239,75 @@ class DataFetcherManager:
         stage_timeout = max(0.0, stage_timeout)
         fetch_timeout = max(0.0, float(config.fundamental_fetch_timeout_seconds))
         bundle_timeout = min(fetch_timeout, stage_timeout)
+        resolved_enabled_blocks = tuple(
+            block
+            for block in sorted(
+                {
+                    str(block or "").strip()
+                    for block in (
+                        enabled_blocks
+                        if enabled_blocks is not None
+                        else ("financial", "forecast", "quick_report")
+                    )
+                    if str(block or "").strip()
+                }
+            )
+        )
+        default_enabled_blocks = ("financial", "forecast", "quick_report")
+        cache_ttl = int(config.fundamental_cache_ttl_seconds)
+        cache_max_entries = max(0, int(getattr(config, "fundamental_cache_max_entries", 256)))
+        cache_key = self._get_fundamental_cache_key(
+            stock_code,
+            stage_timeout,
+            scope=f"earnings:{','.join(resolved_enabled_blocks)}",
+        )
+        superset_cache_key = None
+        if resolved_enabled_blocks != default_enabled_blocks and set(resolved_enabled_blocks).issubset(default_enabled_blocks):
+            # Allow narrower fast-scan block profiles to reuse older broader caches
+            # so financial-only callers do not lose warm-start benefits.
+            superset_cache_key = self._get_fundamental_cache_key(
+                stock_code,
+                stage_timeout,
+                scope=f"earnings:{','.join(default_enabled_blocks)}",
+            )
+        if cache_ttl > 0:
+            self._prune_fundamental_cache(cache_ttl, cache_max_entries)
+            candidate_memory_keys = [cache_key]
+            if superset_cache_key:
+                candidate_memory_keys.append(superset_cache_key)
+            with self._fundamental_cache_lock:
+                for candidate_key in candidate_memory_keys:
+                    cache_item = self._fundamental_cache.get(candidate_key)
+                    if not cache_item:
+                        continue
+                    age = time.time() - float(cache_item.get("ts", 0))
+                    if age > cache_ttl:
+                        continue
+                    cached_context = cache_item.get("context", {})
+                    if candidate_key != cache_key:
+                        self._fundamental_cache[cache_key] = {
+                            "ts": time.time(),
+                            "context": cached_context,
+                        }
+                    return self._decorate_fundamental_context_cache_meta(
+                        cached_context,
+                        cache_hit=True,
+                        cache_source="memory",
+                    )
+            cached_disk_context = self._load_earnings_fundamental_disk_cache(cache_key)
+            if not isinstance(cached_disk_context, dict) and superset_cache_key:
+                cached_disk_context = self._load_earnings_fundamental_disk_cache(superset_cache_key)
+            if isinstance(cached_disk_context, dict):
+                with self._fundamental_cache_lock:
+                    self._fundamental_cache[cache_key] = {
+                        "ts": time.time(),
+                        "context": cached_disk_context,
+                    }
+                return self._decorate_fundamental_context_cache_meta(
+                    cached_disk_context,
+                    cache_hit=True,
+                    cache_source="disk",
+                )
 
         if bundle_timeout <= 0:
             bundle_status = "failed"
@@ -3764,7 +4316,10 @@ class DataFetcherManager:
             bundle_ms = 0
         else:
             bundle_payload, bundle_err_msg, bundle_ms = self._run_with_retry(
-                lambda: self._fundamental_adapter.get_fundamental_bundle(stock_code),
+                lambda: self._fundamental_adapter.get_fundamental_bundle(
+                    stock_code,
+                    enabled_blocks=resolved_enabled_blocks,
+                ),
                 bundle_timeout,
                 "fundamental_bundle",
             )
@@ -3816,9 +4371,11 @@ class DataFetcherManager:
         else:
             overall_status = bundle_status or "failed"
 
-        return {
+        result_ctx = {
             "market": market,
             "status": overall_status,
+            "cache_hit": False,
+            "cache_source": None,
             "coverage": {
                 "growth": growth_status,
                 "earnings": earnings_status,
@@ -3845,6 +4402,18 @@ class DataFetcherManager:
                 list(adapter_errors),
             ),
         }
+        should_cache_result = self._should_cache_fundamental_context(result_ctx) or (
+            str(result_ctx.get("status") or "").strip().lower() == "failed"
+        )
+        if cache_ttl > 0 and should_cache_result:
+            with self._fundamental_cache_lock:
+                self._fundamental_cache[cache_key] = {
+                    "ts": time.time(),
+                    "context": result_ctx,
+                }
+            self._prune_fundamental_cache(cache_ttl, cache_max_entries)
+            self._write_earnings_fundamental_disk_cache(cache_key, result_ctx)
+        return result_ctx
 
     def get_fundamental_context(
         self,
@@ -4166,68 +4735,128 @@ class DataFetcherManager:
             self._prune_fundamental_cache(cache_ttl, cache_max_entries)
         return result_ctx
 
-    def get_capital_flow_context(self, stock_code: str, budget_seconds: Optional[float] = None) -> Dict[str, Any]:
+    def get_capital_flow_context(
+        self,
+        stock_code: str,
+        budget_seconds: Optional[float] = None,
+        *,
+        include_sector_rankings: bool = True,
+    ) -> Dict[str, Any]:
         """资金流向块（fail-open）。"""
         from src.config import get_config
 
         config = get_config()
         stock_code = normalize_stock_code(stock_code)
         timeout = float(budget_seconds if budget_seconds is not None else config.fundamental_fetch_timeout_seconds)
+        cache_ttl = max(0, int(getattr(config, "fundamental_cache_ttl_seconds", 0) or 0))
+        cache_max_entries = max(0, int(getattr(config, "fundamental_cache_max_entries", 256)))
+        cache_key = self._get_fundamental_cache_key(
+            stock_code,
+            timeout,
+            scope=f"capital_flow:sector_rankings={1 if include_sector_rankings else 0}",
+        )
+        if cache_ttl > 0:
+            self._prune_fundamental_cache(cache_ttl, cache_max_entries)
+            with self._fundamental_cache_lock:
+                cache_item = self._fundamental_cache.get(cache_key)
+                if cache_item:
+                    age = time.time() - float(cache_item.get("ts", 0))
+                    if age <= cache_ttl:
+                        return self._decorate_fundamental_context_cache_meta(
+                            cache_item.get("context", {}),
+                            cache_hit=True,
+                            cache_source="memory",
+                        )
+            cached_disk_context = self._load_capital_flow_disk_cache(cache_key)
+            if isinstance(cached_disk_context, dict):
+                with self._fundamental_cache_lock:
+                    self._fundamental_cache[cache_key] = {
+                        "ts": time.time(),
+                        "context": cached_disk_context,
+                    }
+                return self._decorate_fundamental_context_cache_meta(
+                    cached_disk_context,
+                    cache_hit=True,
+                    cache_source="disk",
+                )
+
         if _market_tag(stock_code) != "cn" or _is_etf_code(stock_code):
-            return self._build_fundamental_block(
+            result_ctx = self._build_fundamental_block(
                 "not_supported",
                 {},
                 [{"provider": "fundamental_pipeline", "result": "not_supported", "duration_ms": 0}],
                 ["not supported"],
             )
-
-        if timeout <= 0:
-            return self._build_fundamental_block(
+        elif timeout <= 0:
+            result_ctx = self._build_fundamental_block(
                 "failed",
                 {},
                 [{"provider": "fundamental_pipeline", "result": "failed", "duration_ms": 0}],
                 ["fundamental stage timeout"],
             )
-        payload, err, cost_ms = self._run_with_retry(
-            lambda: self._fundamental_adapter.get_capital_flow(stock_code),
-            timeout,
-            "capital_flow",
-        )
-        if not isinstance(payload, dict):
-            return self._build_fundamental_block(
-                "failed",
-                {},
-                [{"provider": "fundamental_pipeline", "result": "failed", "duration_ms": cost_ms}],
-                [err or "capital_flow failed"],
-            )
-
-        stock_flow = payload.get("stock_flow") or {}
-        sector_rankings = payload.get("sector_rankings") or {}
-        has_stock_flow = False
-        if isinstance(stock_flow, dict):
-            has_stock_flow = any(v is not None for v in stock_flow.values())
-        has_sector_rankings = bool(sector_rankings.get("top")) or bool(sector_rankings.get("bottom"))
-        adapter_status = str(payload.get("status", "not_supported"))
-        if has_stock_flow or has_sector_rankings:
-            capital_flow_status = "ok"
-        elif adapter_status == "not_supported":
-            capital_flow_status = "not_supported"
         else:
-            capital_flow_status = "partial"
-
-        return self._build_fundamental_block(
-            capital_flow_status,
-            {
-                "stock_flow": payload.get("stock_flow", {}),
-                "sector_rankings": payload.get("sector_rankings", {}),
-            },
-            self._normalize_source_chain(
-                payload.get("source_chain", []),
+            payload, err, cost_ms = self._run_with_retry(
+                lambda: self._fundamental_adapter.get_capital_flow(
+                    stock_code,
+                    include_sector_rankings=include_sector_rankings,
+                ),
+                timeout,
                 "capital_flow",
-                capital_flow_status,
-                cost_ms,
-            ),
-            list(payload.get("errors", [])) + ([err] if err else []),
+            )
+            if not isinstance(payload, dict):
+                result_ctx = self._build_fundamental_block(
+                    "failed",
+                    {},
+                    [{"provider": "fundamental_pipeline", "result": "failed", "duration_ms": cost_ms}],
+                    [err or "capital_flow failed"],
+                )
+            else:
+                stock_flow = payload.get("stock_flow") or {}
+                sector_rankings = payload.get("sector_rankings") or {}
+                has_stock_flow = False
+                if isinstance(stock_flow, dict):
+                    has_stock_flow = any(v is not None for v in stock_flow.values())
+                has_sector_rankings = bool(sector_rankings.get("top")) or bool(sector_rankings.get("bottom"))
+                adapter_status = str(payload.get("status", "not_supported"))
+                if has_stock_flow or has_sector_rankings:
+                    capital_flow_status = "ok"
+                elif adapter_status == "not_supported":
+                    capital_flow_status = "not_supported"
+                else:
+                    capital_flow_status = "partial"
+
+                result_ctx = self._build_fundamental_block(
+                    capital_flow_status,
+                    {
+                        "stock_flow": payload.get("stock_flow", {}),
+                        "sector_rankings": payload.get("sector_rankings", {}),
+                    },
+                    self._normalize_source_chain(
+                        payload.get("source_chain", []),
+                        "capital_flow",
+                        capital_flow_status,
+                        cost_ms,
+                    ),
+                    list(payload.get("errors", [])) + ([err] if err else []),
+                )
+
+        status = str(result_ctx.get("status") or "").strip().lower()
+        should_cache_result = self._should_cache_fundamental_context(result_ctx) or status in {
+            "failed",
+            "not_supported",
+        }
+        if cache_ttl > 0 and should_cache_result:
+            with self._fundamental_cache_lock:
+                self._fundamental_cache[cache_key] = {
+                    "ts": time.time(),
+                    "context": result_ctx,
+                }
+            self._prune_fundamental_cache(cache_ttl, cache_max_entries)
+            self._write_capital_flow_disk_cache(cache_key, result_ctx)
+        return self._decorate_fundamental_context_cache_meta(
+            result_ctx,
+            cache_hit=False,
+            cache_source=None,
         )
 
     def get_dragon_tiger_context(self, stock_code: str, budget_seconds: Optional[float] = None) -> Dict[str, Any]:
@@ -4341,9 +4970,14 @@ class DataFetcherManager:
     def _get_sector_rankings_with_meta(
             self,
             n: int = 5,
+            *,
+            prefer_stale_cache: bool = False,
         ) -> Tuple[List[Dict], List[Dict], List[Dict[str, Any]], str]:
             """Get sector rankings with ordered fallback chain metadata."""
-            cached_rankings = self._get_cached_sector_rankings(n)
+            cached_rankings = self._get_cached_sector_rankings(
+                n,
+                allow_stale=bool(prefer_stale_cache),
+            )
             if cached_rankings is not None:
                 return cached_rankings
             source_chain: List[Dict[str, Any]] = []
@@ -4399,12 +5033,38 @@ class DataFetcherManager:
                     )
                     logger.warning(f"[{fetcher.name}] 获取板块排行失败: {error_reason}")
 
+            stale_cached_rankings = self._get_cached_sector_rankings(n, allow_stale=True)
+            if stale_cached_rankings is not None:
+                top, bottom, cached_chain, cached_last_error = stale_cached_rankings
+                if top or bottom:
+                    stale_chain = [dict(row) for row in source_chain if isinstance(row, dict)]
+                    stale_chain.extend(
+                        dict(row) for row in cached_chain if isinstance(row, dict)
+                    )
+                    stale_chain.append(
+                        {
+                            "provider": "sector_rankings_cache",
+                            "result": "stale_fallback",
+                            "duration_ms": 0,
+                        }
+                    )
+                    logger.info("[sector_rankings] 浣跨敤杩囨湡 cache 浣滀负澶辫触鍏滃簳")
+                    return top, bottom, stale_chain, last_error or cached_last_error
+
             return [], [], source_chain, last_error
 
-    def get_sector_rankings(self, n: int = 5) -> Tuple[List[Dict], List[Dict]]:
+    def get_sector_rankings(
+        self,
+        n: int = 5,
+        *,
+        prefer_stale_cache: bool = False,
+    ) -> Tuple[List[Dict], List[Dict]]:
         """获取板块涨跌榜（自动切换数据源）"""
         # 按需求固定回退顺序：Akshare(EM) -> Akshare(Sina) -> Tushare -> Efinance
-        top, bottom, _, last_error = self._get_sector_rankings_with_meta(n)
+        top, bottom, _, last_error = self._get_sector_rankings_with_meta(
+            n,
+            prefer_stale_cache=prefer_stale_cache,
+        )
         if top or bottom:
             return top, bottom
         logger.warning(f"[板块排行] 所有数据源均失败，最终错误: {last_error}")

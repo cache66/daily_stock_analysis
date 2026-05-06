@@ -571,6 +571,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-spot-prefilter", action="store_true")
     parser.add_argument("--min-listed-days-prefilter", type=int, default=None)
     parser.add_argument("--disable-listed-days-prefilter", action="store_true")
+    parser.add_argument(
+        "--disable-shared-scan-shell",
+        action="store_true",
+        help="Disable service-level shared scan shell for diagnostics.",
+    )
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return parser.parse_args()
 
@@ -1076,26 +1081,127 @@ def _passes_earnings_continuity_filter(
     return True, ""
 
 
-def scan_monthly_slow_rise_candidates(*, criteria: MonthlySlowRiseCriteria, limit: int | None = None, max_workers: int = 1, shard_count: int = 1, shard_index: int = 0, prefilter: KlineSelectorPrefilter | None = None, checkpoint_path: Path | None = None, checkpoint_every: int = 50, resume: bool = False, service: KlineSelectorService | None = None, snapshot_date: date | None = None) -> KlineSelectorRunResult:
+def _safe_count(value: Any) -> int:
+    try:
+        numeric = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, numeric)
+
+
+def _apply_shared_scan_shell_stats(
+    run_result: KlineSelectorRunResult,
+    prepared_universe: Any,
+    *,
+    prefilter: KlineSelectorPrefilter | None,
+) -> KlineSelectorRunResult:
+    filter_stats = dict(getattr(prepared_universe, "filter_stats", {}) or {})
+    prefilter_stats = dict(getattr(prepared_universe, "prefilter_stats", {}) or {})
+    skipped_prefilter_count = sum(
+        _safe_count(prefilter_stats.get(key))
+        for key in ("removed_change_60d", "removed_turnover_rate", "removed_negative_change")
+    )
+    if prefilter is not None and prefilter.exclude_st:
+        skipped_prefilter_count += _safe_count(filter_stats.get("removed_st"))
+
+    run_result.skipped_prefilter_count += skipped_prefilter_count
+    run_result.skipped_listed_days_count += _safe_count(prefilter_stats.get("removed_listed_days"))
+    run_result.universe_size = _safe_count(
+        getattr(prepared_universe, "sharded_universe_size", run_result.universe_size)
+    )
+    phase_metrics = dict(getattr(run_result, "phase_metrics", {}) or {})
+    phase_metrics.update(
+        {
+            "shared_scan_shell_enabled": True,
+            "scan_shell_base_universe_size": _safe_count(getattr(prepared_universe, "base_universe_size", 0)),
+            "scan_shell_sharded_universe_size": _safe_count(
+                getattr(prepared_universe, "sharded_universe_size", 0)
+            ),
+            "scan_shell_prepared_universe_size": _safe_count(
+                getattr(prepared_universe, "prepared_universe_size", 0)
+            ),
+            "scan_shell_filter_stats": filter_stats,
+            "scan_shell_prefilter_stats": prefilter_stats,
+        }
+    )
+    run_result.phase_metrics = phase_metrics
+    return run_result
+
+
+def scan_monthly_slow_rise_candidates(
+    *,
+    criteria: MonthlySlowRiseCriteria,
+    limit: int | None = None,
+    max_workers: int = 1,
+    shard_count: int = 1,
+    shard_index: int = 0,
+    prefilter: KlineSelectorPrefilter | None = None,
+    checkpoint_path: Path | None = None,
+    checkpoint_every: int = 50,
+    resume: bool = False,
+    service: KlineSelectorService | None = None,
+    snapshot_date: date | None = None,
+    shared_scan_shell_enabled: bool = True,
+) -> KlineSelectorRunResult:
     service = service or KlineSelectorService(manager_factory=KlineSelectorService.build_fast_a_share_manager)
     total_started_at = time.perf_counter()
     universe_started_at = time.perf_counter()
     universe = service.get_spot_enriched_a_share_universe(limit=limit, as_of_date=snapshot_date)
     universe_elapsed_sec = round(time.perf_counter() - universe_started_at, 4)
     selection_started_at = time.perf_counter()
-    run_result = service.scan_market(
-        criteria=criteria,
-        rules=build_monthly_slow_rise_rules(criteria),
-        max_workers=max_workers,
-        shard_count=shard_count,
-        shard_index=shard_index,
-        prefilter=prefilter,
-        checkpoint_path=checkpoint_path,
-        checkpoint_every=checkpoint_every,
-        resume=resume,
-        universe=universe,
-        as_of_date=snapshot_date,
-    )
+    use_shared_scan_shell = bool(shared_scan_shell_enabled) and hasattr(service, "prepare_scan_universe")
+    if use_shared_scan_shell:
+        prepared_universe = service.prepare_scan_universe(
+            universe=universe,
+            prefilter=prefilter,
+            exclude_st=bool(prefilter.exclude_st) if prefilter is not None else False,
+            shard_count=shard_count,
+            shard_index=shard_index,
+            cached_quote_universe=service._read_spot_universe_reference_cache()
+            if hasattr(service, "_read_spot_universe_reference_cache")
+            else None,
+            hydrated_quote_cache_writer=service._write_spot_universe_reference_cache
+            if hasattr(service, "_write_spot_universe_reference_cache")
+            else None,
+            quote_hydration_workers=max(1, int(max_workers)),
+            as_of_date=snapshot_date,
+        )
+        run_result = service.scan_market(
+            criteria=criteria,
+            rules=build_monthly_slow_rise_rules(criteria),
+            max_workers=max_workers,
+            shard_count=1,
+            shard_index=0,
+            prefilter=None,
+            checkpoint_path=checkpoint_path,
+            checkpoint_every=checkpoint_every,
+            resume=resume,
+            universe=prepared_universe.prepared_universe,
+            as_of_date=snapshot_date,
+        )
+        _apply_shared_scan_shell_stats(run_result, prepared_universe, prefilter=prefilter)
+        logger.info(
+            "monthly_slow_rise shared scan shell prepared: base=%s sharded=%s prepared=%s filter=%s prefilter=%s",
+            run_result.phase_metrics.get("scan_shell_base_universe_size"),
+            run_result.phase_metrics.get("scan_shell_sharded_universe_size"),
+            run_result.phase_metrics.get("scan_shell_prepared_universe_size"),
+            run_result.phase_metrics.get("scan_shell_filter_stats"),
+            run_result.phase_metrics.get("scan_shell_prefilter_stats"),
+        )
+    else:
+        run_result = service.scan_market(
+            criteria=criteria,
+            rules=build_monthly_slow_rise_rules(criteria),
+            max_workers=max_workers,
+            shard_count=shard_count,
+            shard_index=shard_index,
+            prefilter=prefilter,
+            checkpoint_path=checkpoint_path,
+            checkpoint_every=checkpoint_every,
+            resume=resume,
+            universe=universe,
+            as_of_date=snapshot_date,
+        )
     selection_elapsed_sec = round(time.perf_counter() - selection_started_at, 4)
     capital_profile_service = CapitalProfileService(manager=service.manager)
     shared_factors_service = SharedSignalFactorsService(
@@ -1167,6 +1273,7 @@ def main() -> int:
         checkpoint_every=args.checkpoint_every,
         resume=args.resume,
         snapshot_date=snapshot_date,
+        shared_scan_shell_enabled=not bool(args.disable_shared_scan_shell),
     )
     export_results(run_result, output_dir, checkpoint_path=checkpoint_path, profile_name=profile_name, snapshot_date=snapshot_date)
     if not args.skip_db_persist:

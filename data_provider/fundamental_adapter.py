@@ -12,7 +12,8 @@ import json
 import logging
 import re
 from datetime import datetime, timedelta
-from threading import RLock
+from pathlib import Path
+from threading import BoundedSemaphore, RLock, Thread
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
@@ -27,6 +28,10 @@ _SUPPORTED_FUNDAMENTAL_BLOCKS = (
     "institution",
     "top10",
 )
+_DEFAULT_DF_CANDIDATE_TIMEOUT_SECONDS = 8.0
+_DEFAULT_DF_CANDIDATE_TIMEOUT_WORKERS = 8
+_DEFAULT_MARKET_EXPECTATION_CACHE_MAX_AGE_DAYS = 1
+_DEFAULT_MARKET_EXPECTATION_CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "cache" / "market_expectation"
 
 _DIVIDEND_KEYWORD_MAP: Dict[str, List[str]] = {
     "per_share": [
@@ -320,6 +325,73 @@ def _build_financial_series_item(row: pd.Series) -> Dict[str, Any]:
     return {key: value for key, value in payload.items() if value is not None}
 
 
+def _period_column_to_report_date(value: Any) -> Optional[str]:
+    text = _safe_str(value)
+    if len(text) == 8 and text.isdigit():
+        return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
+    return _normalize_report_date(text)
+
+
+def _field_from_wide_financial_metric(metric_name: Any) -> Optional[str]:
+    text = _safe_str(metric_name)
+    if not text:
+        return None
+    if any(token in text for token in ("\u8425\u4e1a\u603b\u6536\u5165\u589e\u957f\u7387", "\u8425\u4e1a\u6536\u5165\u589e\u957f\u7387", "\u8425\u6536\u589e\u957f\u7387")):
+        return "revenue_yoy"
+    if any(token in text for token in ("\u5f52\u5c5e\u6bcd\u516c\u53f8\u51c0\u5229\u6da6\u589e\u957f\u7387", "\u5f52\u6bcd\u51c0\u5229\u6da6\u589e\u957f\u7387")):
+        return "net_profit_yoy"
+    if "\u51c0\u8d44\u4ea7\u6536\u76ca\u7387" in text or "ROE" in text.upper():
+        return "roe"
+    if "\u6bdb\u5229\u7387" in text:
+        return "gross_margin"
+    if text in ("\u8425\u4e1a\u603b\u6536\u5165", "\u8425\u4e1a\u6536\u5165"):
+        return "revenue"
+    if text in ("\u5f52\u6bcd\u51c0\u5229\u6da6", "\u5f52\u5c5e\u6bcd\u516c\u53f8\u51c0\u5229\u6da6"):
+        return "net_profit_parent"
+    if "\u7ecf\u8425\u73b0\u91d1\u6d41" in text or "\u7ecf\u8425\u6d3b\u52a8\u51c0\u73b0\u91d1" in text:
+        return "operating_cash_flow"
+    return None
+
+
+def _build_wide_financial_report_series(fin_df: pd.DataFrame, max_periods: int = 12) -> List[Dict[str, Any]]:
+    if fin_df is None or fin_df.empty:
+        return []
+    metric_col = next((col for col in fin_df.columns if _safe_str(col) == "\u6307\u6807"), None)
+    if metric_col is None:
+        return []
+    period_columns = [
+        col
+        for col in fin_df.columns
+        if _period_column_to_report_date(col) is not None
+    ]
+    if not period_columns:
+        return []
+
+    items_by_period: Dict[str, Dict[str, Any]] = {}
+    for _, row in fin_df.iterrows():
+        field_name = _field_from_wide_financial_metric(row.get(metric_col))
+        if not field_name:
+            continue
+        for period_col in period_columns:
+            report_date = _period_column_to_report_date(period_col)
+            if not report_date:
+                continue
+            value = _safe_float(row.get(period_col))
+            if value is None:
+                continue
+            item = items_by_period.setdefault(report_date, {"report_date": report_date})
+            if field_name == "roe" and item.get("roe") is not None:
+                continue
+            item[field_name] = value
+
+    series = [
+        item
+        for _, item in sorted(items_by_period.items(), key=lambda pair: pair[0], reverse=True)
+        if any(key != "report_date" for key in item)
+    ]
+    return series[: max(1, int(max_periods))]
+
+
 def _build_financial_report_series(
     fin_df: pd.DataFrame,
     stock_code: str,
@@ -328,6 +400,10 @@ def _build_financial_report_series(
     work_df = _extract_relevant_rows(fin_df, stock_code)
     if work_df.empty:
         return []
+
+    wide_series = _build_wide_financial_report_series(work_df, max_periods=max_periods)
+    if wide_series:
+        return wide_series
 
     series: List[Dict[str, Any]] = []
     seen_report_dates = set()
@@ -369,6 +445,8 @@ class AkshareFundamentalAdapter:
     def __init__(self) -> None:
         self._df_candidates_cache_lock = RLock()
         self._df_candidates_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._df_candidate_timeout_seconds = _DEFAULT_DF_CANDIDATE_TIMEOUT_SECONDS
+        self._df_candidate_timeout_slots = BoundedSemaphore(_DEFAULT_DF_CANDIDATE_TIMEOUT_WORKERS)
         self._tushare_sector_rankings_cache_lock = RLock()
         self._tushare_sector_rankings_cache: Dict[str, Any] = {
             "cache_date": "",
@@ -378,6 +456,8 @@ class AkshareFundamentalAdapter:
             "source": None,
             "errors": [],
         }
+        self._market_expectation_cache_dir: Path = _DEFAULT_MARKET_EXPECTATION_CACHE_DIR
+        self._market_expectation_cache_max_age_days: int = _DEFAULT_MARKET_EXPECTATION_CACHE_MAX_AGE_DAYS
 
     @staticmethod
     def _build_candidate_cache_key(
@@ -390,6 +470,58 @@ class AkshareFundamentalAdapter:
             fallback_items = sorted((str(key), repr(value)) for key, value in (kwargs or {}).items())
             serialized_kwargs = repr(fallback_items)
         return str(func_name), serialized_kwargs
+
+    def _call_df_candidate_with_timeout(
+        self,
+        fn: Any,
+        *,
+        func_name: str,
+        kwargs: Dict[str, Any],
+    ) -> Any:
+        timeout_seconds = max(
+            0.0,
+            float(
+                getattr(
+                    self,
+                    "_df_candidate_timeout_seconds",
+                    _DEFAULT_DF_CANDIDATE_TIMEOUT_SECONDS,
+                )
+                or 0.0
+            ),
+        )
+        if timeout_seconds <= 0:
+            return fn(**kwargs)
+
+        slots = getattr(self, "_df_candidate_timeout_slots", None)
+        if slots is None:
+            self._df_candidate_timeout_slots = BoundedSemaphore(_DEFAULT_DF_CANDIDATE_TIMEOUT_WORKERS)
+            slots = self._df_candidate_timeout_slots
+
+        if not slots.acquire(blocking=False):
+            raise TimeoutError(f"{func_name} timeout worker pool exhausted")
+
+        result_holder: Dict[str, Any] = {}
+        error_holder: Dict[str, BaseException] = {}
+
+        def runner() -> None:
+            try:
+                result_holder["value"] = fn(**kwargs)
+            except BaseException as exc:
+                error_holder["value"] = exc
+            finally:
+                try:
+                    slots.release()
+                except ValueError:
+                    pass
+
+        worker = Thread(target=runner, daemon=True, name=f"fundamental-df-{func_name}")
+        worker.start()
+        worker.join(timeout_seconds)
+        if worker.is_alive():
+            raise TimeoutError(f"{func_name} timeout after {timeout_seconds:.2f}s")
+        if "value" in error_holder:
+            raise error_holder["value"]
+        return result_holder.get("value")
 
     def _call_df_candidates(
         self,
@@ -411,7 +543,11 @@ class AkshareFundamentalAdapter:
 
             if not cached:
                 try:
-                    df = fn(**kwargs)
+                    df = self._call_df_candidate_with_timeout(
+                        fn,
+                        func_name=func_name,
+                        kwargs=kwargs,
+                    )
                     if isinstance(df, pd.Series):
                         df = df.to_frame().T
                     if isinstance(df, pd.DataFrame) and not df.empty:
@@ -433,6 +569,64 @@ class AkshareFundamentalAdapter:
                 source_name = str(cached.get("source") or func_name)
                 return cached_df.copy(deep=False), source_name, errors
         return None, None, errors
+
+    def _market_expectation_cache_file(
+        self,
+        *,
+        stock_code: str,
+        prefer_year: Optional[int],
+    ) -> Path:
+        normalized_code = _normalize_code(stock_code) or _safe_str(stock_code)
+        year_token = str(int(prefer_year)) if prefer_year is not None else "auto"
+        return Path(self._market_expectation_cache_dir) / f"{normalized_code}_{year_token}.json"
+
+    def _load_market_expectation_cache(
+        self,
+        *,
+        stock_code: str,
+        prefer_year: Optional[int],
+    ) -> Optional[Dict[str, Any]]:
+        cache_file = self._market_expectation_cache_file(stock_code=stock_code, prefer_year=prefer_year)
+        try:
+            if not cache_file.exists():
+                return None
+            payload = json.loads(cache_file.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        fetched_at_text = _safe_str(payload.get("fetched_at"))
+        fetched_at = _safe_datetime(fetched_at_text)
+        max_age_days = max(0, int(getattr(self, "_market_expectation_cache_max_age_days", 0) or 0))
+        if fetched_at is None or max_age_days <= 0:
+            return None
+        if datetime.now() - fetched_at > timedelta(days=max_age_days):
+            return None
+        cached_result = payload.get("result")
+        if not isinstance(cached_result, dict):
+            return None
+        return dict(cached_result)
+
+    def _write_market_expectation_cache(
+        self,
+        *,
+        stock_code: str,
+        prefer_year: Optional[int],
+        result: Dict[str, Any],
+    ) -> None:
+        cache_file = self._market_expectation_cache_file(stock_code=stock_code, prefer_year=prefer_year)
+        try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "fetched_at": datetime.now().replace(microsecond=0).isoformat(),
+                "result": dict(result or {}),
+            }
+            cache_file.write_text(
+                json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                encoding="utf-8",
+            )
+        except Exception:
+            return
 
     def _load_tushare_sector_rankings(
         self,
@@ -720,7 +914,120 @@ class AkshareFundamentalAdapter:
         result["status"] = "partial" if has_content else "not_supported"
         return result
 
-    def get_capital_flow(self, stock_code: str, top_n: int = 5) -> Dict[str, Any]:
+    def get_market_expectation_snapshot(
+        self,
+        stock_code: str,
+        *,
+        prefer_year: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Return a lightweight sell-side expectation snapshot for review reference."""
+        result: Dict[str, Any] = {
+            "status": "not_supported",
+            "source": None,
+            "forecast_year": None,
+            "institution_count": None,
+            "eps_min": None,
+            "eps_mean": None,
+            "eps_max": None,
+            "industry_avg_eps": None,
+            "summary": None,
+            "errors": [],
+            "cache_hit": False,
+            "cache_source": None,
+        }
+
+        cached_result = self._load_market_expectation_cache(
+            stock_code=stock_code,
+            prefer_year=prefer_year,
+        )
+        if isinstance(cached_result, dict):
+            cached_result["cache_hit"] = True
+            cached_result["cache_source"] = "disk"
+            merged = dict(result)
+            merged.update(cached_result)
+            return merged
+
+        forecast_df, forecast_source, forecast_errors = self._call_df_candidates(
+            [
+                (
+                    "stock_profit_forecast_ths",
+                    {"symbol": stock_code, "indicator": "预测年报每股收益"},
+                ),
+            ]
+        )
+        result["errors"].extend(forecast_errors)
+        if forecast_df is None or forecast_df.empty:
+            return result
+
+        year_col = next((col for col in forecast_df.columns if "年度" in str(col)), None)
+        inst_col = next((col for col in forecast_df.columns if "预测机构数" in str(col)), None)
+        min_col = next((col for col in forecast_df.columns if "最小值" in str(col)), None)
+        mean_col = next((col for col in forecast_df.columns if "均值" in str(col)), None)
+        max_col = next((col for col in forecast_df.columns if "最大值" in str(col)), None)
+        industry_avg_col = next((col for col in forecast_df.columns if "行业平均" in str(col)), None)
+        if year_col is None or mean_col is None:
+            return result
+
+        selected_row = None
+        if prefer_year is not None:
+            target_year = str(int(prefer_year))
+            for _, row in forecast_df.iterrows():
+                if target_year == _safe_str(row.get(year_col)):
+                    selected_row = row
+                    break
+        if selected_row is None:
+            selected_row = forecast_df.iloc[0]
+
+        forecast_year = _safe_str(selected_row.get(year_col)) or None
+        institution_count = _safe_float(selected_row.get(inst_col)) if inst_col else None
+        eps_min = _safe_float(selected_row.get(min_col)) if min_col else None
+        eps_mean = _safe_float(selected_row.get(mean_col)) if mean_col else None
+        eps_max = _safe_float(selected_row.get(max_col)) if max_col else None
+        industry_avg_eps = _safe_float(selected_row.get(industry_avg_col)) if industry_avg_col else None
+
+        if eps_mean is None:
+            return result
+
+        summary_parts = []
+        if forecast_year:
+            summary_parts.append(f"{forecast_year}年EPS一致预期 {eps_mean:.2f} 元")
+        else:
+            summary_parts.append(f"EPS一致预期 {eps_mean:.2f} 元")
+        if institution_count is not None:
+            summary_parts.append(f"{int(round(institution_count))}家机构")
+        if eps_min is not None and eps_max is not None:
+            summary_parts.append(f"区间 {eps_min:.2f}-{eps_max:.2f}")
+        if industry_avg_eps is not None:
+            summary_parts.append(f"行业均值 {industry_avg_eps:.2f}")
+
+        result.update(
+            {
+                "status": "available",
+                "source": forecast_source or "stock_profit_forecast_ths",
+                "forecast_year": forecast_year,
+                "institution_count": int(round(institution_count)) if institution_count is not None else None,
+                "eps_min": eps_min,
+                "eps_mean": eps_mean,
+                "eps_max": eps_max,
+                "industry_avg_eps": industry_avg_eps,
+                "summary": "（".join(summary_parts[:1])
+                + (f"（{'；'.join(summary_parts[1:])}）" if len(summary_parts) > 1 else ""),
+            }
+        )
+        self._write_market_expectation_cache(
+            stock_code=stock_code,
+            prefer_year=prefer_year,
+            result=result,
+        )
+        return result
+
+    def get_capital_flow(
+        self,
+        stock_code: str,
+        top_n: int = 5,
+        *,
+        include_sector_rankings: bool = True,
+    ) -> Dict[str, Any]:
         """
         Return stock + sector capital flow.
         """
@@ -752,6 +1059,11 @@ class AkshareFundamentalAdapter:
                     "inflow_10d": inflow_10d,
                 }
                 result["source_chain"].append(f"capital_stock:{stock_source}")
+
+        if not include_sector_rankings:
+            has_content = bool(result["stock_flow"])
+            result["status"] = "partial" if has_content else "not_supported"
+            return result
 
         sector_df, sector_source, sector_errors = self._call_df_candidates([
             ("stock_sector_fund_flow_rank", {}),

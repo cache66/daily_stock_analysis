@@ -5,9 +5,12 @@ Tests for fundamental adapter helpers.
 
 import os
 import sys
+import time
+import tempfile
 import types
 import unittest
 from datetime import datetime, timedelta
+from pathlib import Path
 from unittest.mock import patch
 
 import pandas as pd
@@ -110,6 +113,97 @@ class TestFundamentalAdapter(unittest.TestCase):
         self.assertIsNone(second_source)
         self.assertIn("stock_yjkb_em:RuntimeError", first_errors)
         self.assertIn("stock_yjkb_em:RuntimeError", second_errors)
+
+    def test_call_df_candidates_times_out_slow_endpoint_and_caches_failure(self) -> None:
+        adapter = AkshareFundamentalAdapter()
+        adapter._df_candidate_timeout_seconds = 0.01
+        calls = {"count": 0}
+
+        def _slow_stock_yjyg_em(*, symbol: str) -> pd.DataFrame:
+            calls["count"] += 1
+            time.sleep(0.2)
+            return pd.DataFrame({"股票代码": [symbol], "预告": ["预增"]})
+
+        fake_ak = types.SimpleNamespace(stock_yjyg_em=_slow_stock_yjyg_em)
+        with patch.dict(sys.modules, {"akshare": fake_ak}):
+            started = time.perf_counter()
+            first_df, first_source, first_errors = adapter._call_df_candidates(
+                [("stock_yjyg_em", {"symbol": "600519"})]
+            )
+            elapsed = time.perf_counter() - started
+            second_df, second_source, second_errors = adapter._call_df_candidates(
+                [("stock_yjyg_em", {"symbol": "600519"})]
+            )
+
+        self.assertLess(elapsed, 0.15)
+        self.assertEqual(calls["count"], 1)
+        self.assertIsNone(first_df)
+        self.assertIsNone(first_source)
+        self.assertIsNone(second_df)
+        self.assertIsNone(second_source)
+        self.assertIn("stock_yjyg_em:TimeoutError", first_errors)
+        self.assertIn("stock_yjyg_em:TimeoutError", second_errors)
+
+    def test_market_expectation_snapshot_uses_disk_cache_between_calls(self) -> None:
+        adapter = AkshareFundamentalAdapter()
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        adapter._market_expectation_cache_dir = Path(temp_dir.name)
+        adapter._market_expectation_cache_max_age_days = 3
+        calls = {"count": 0}
+
+        forecast_df = pd.DataFrame(
+            {
+                "年度": ["2026"],
+                "预测机构数": [19],
+                "最小值": [12.59],
+                "均值": [17.54],
+                "最大值": [27.18],
+                "行业平均值": [2.86],
+            }
+        )
+
+        def _fake_call_df_candidates(candidates):
+            calls["count"] += 1
+            return forecast_df.copy(), "stock_profit_forecast_ths", []
+
+        with patch.object(adapter, "_call_df_candidates", side_effect=_fake_call_df_candidates):
+            first = adapter.get_market_expectation_snapshot("300502", prefer_year=2026)
+        with patch.object(adapter, "_call_df_candidates", side_effect=AssertionError("disk cache should be used")):
+            second = adapter.get_market_expectation_snapshot("300502", prefer_year=2026)
+
+        self.assertEqual(calls["count"], 1)
+        self.assertEqual(first["status"], "available")
+        self.assertEqual(second["status"], "available")
+        self.assertFalse(bool(first.get("cache_hit")))
+        self.assertTrue(bool(second.get("cache_hit")))
+        self.assertEqual(second.get("cache_source"), "disk")
+
+    def test_capital_flow_can_skip_sector_rankings_fetch(self) -> None:
+        adapter = AkshareFundamentalAdapter()
+        stock_df = pd.DataFrame(
+            {
+                "股票代码": ["600519"],
+                "主力净流入": [1.2e8],
+                "5日": [2.4e8],
+                "10日": [3.6e8],
+            }
+        )
+
+        def _fake_call_df_candidates(candidates):
+            first_name = str(candidates[0][0])
+            if first_name == "stock_individual_fund_flow":
+                return stock_df.copy(), "stock_individual_fund_flow", []
+            raise AssertionError(f"unexpected sector fetch: {first_name}")
+
+        with patch.object(adapter, "_call_df_candidates", side_effect=_fake_call_df_candidates):
+            result = adapter.get_capital_flow("600519", include_sector_rankings=False)
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["stock_flow"]["main_net_inflow"], 1.2e8)
+        self.assertEqual(result["stock_flow"]["inflow_5d"], 2.4e8)
+        self.assertEqual(result["stock_flow"]["inflow_10d"], 3.6e8)
+        self.assertEqual(result["sector_rankings"], {"top": [], "bottom": []})
 
     def test_dragon_tiger_no_match_with_code_column_is_ok(self) -> None:
         adapter = AkshareFundamentalAdapter()
@@ -236,6 +330,42 @@ class TestFundamentalAdapter(unittest.TestCase):
         self.assertEqual(financial_series[0]["net_profit_yoy"], 35.0)
         self.assertEqual(growth_series[0]["gross_margin"], 34.0)
         self.assertEqual(growth_series[-1]["revenue_yoy"], 8.0)
+
+    def test_fundamental_bundle_parses_stock_financial_abstract_wide_table(self) -> None:
+        adapter = AkshareFundamentalAdapter()
+        fin_df = pd.DataFrame(
+            {
+                "选项": ["成长能力", "成长能力", "成长能力", "成长能力", "盈利能力"],
+                "指标": ["营业总收入", "归母净利润", "营业总收入增长率", "归属母公司净利润增长率", "净资产收益率(ROE)"],
+                "20260331": [131.38e8, 11.1e8, 52.72, 143.47, 5.05],
+                "20251231": [401.25e8, 13.86e8, 9.12, 27.67, 6.89],
+            }
+        )
+
+        with patch.object(
+            adapter,
+            "_call_df_candidates",
+            side_effect=[
+                (fin_df, "stock_financial_abstract", []),
+                (None, None, []),
+                (None, None, []),
+                (None, None, []),
+                (None, None, []),
+                (None, None, []),
+            ],
+        ):
+            result = adapter.get_fundamental_bundle("002384")
+
+        financial_report = result["earnings"].get("financial_report", {})
+        financial_series = result["earnings"].get("financial_report_series", [])
+
+        self.assertEqual(financial_report.get("report_date"), "2026-03-31")
+        self.assertEqual(financial_report.get("revenue"), 131.38e8)
+        self.assertEqual(financial_report.get("net_profit_parent"), 11.1e8)
+        self.assertEqual(result["growth"].get("revenue_yoy"), 52.72)
+        self.assertEqual(result["growth"].get("net_profit_yoy"), 143.47)
+        self.assertEqual(financial_series[1]["report_date"], "2025-12-31")
+        self.assertEqual(financial_series[1]["net_profit_yoy"], 27.67)
 
     def test_fundamental_bundle_respects_enabled_blocks(self) -> None:
         adapter = AkshareFundamentalAdapter()

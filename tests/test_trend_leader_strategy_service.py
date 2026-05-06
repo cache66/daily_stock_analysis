@@ -527,7 +527,7 @@ def test_overextended_trend_adds_risk_penalty() -> None:
     assert overextended["overall_score"] < normal["overall_score"]
 
 
-def test_weak_trend_structure_can_pass_when_leadership_is_strong() -> None:
+def test_weak_trend_structure_cannot_pass_strict_even_when_leadership_is_strong() -> None:
     service = TrendLeaderStrategyService()
 
     result = service.score_candidate(
@@ -565,5 +565,5 @@ def test_weak_trend_structure_can_pass_when_leadership_is_strong() -> None:
         commodity_payload=None,
     )
 
-    assert result["passed"] is True
+    assert result["passed"] is False
     assert "weak_trend_structure" in result["risk_flags"]

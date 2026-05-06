@@ -17,6 +17,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.select_trend_leader_candidates import (
+    DEFAULT_FAST_CAPITAL_FLOW_BUDGET_SECONDS,
+    DEFAULT_FAST_FUNDAMENTAL_BUDGET_SECONDS,
     DEFAULT_FALLBACK_TOP_N,
     configure_logging,
     parse_snapshot_date,
@@ -43,6 +45,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--exclude-kcb", action="store_true")
     parser.add_argument("--exclude-cyb", action="store_true")
     parser.add_argument("--universe-codes-file", default=None)
+    parser.add_argument(
+        "--compare-hotpath-round",
+        action="store_true",
+        help="Compare the previous hotpath control vs the current lazy-dragon/tightened-short-circuit hotpath under the same prefilter settings.",
+    )
+    parser.add_argument(
+        "--fundamental-budget-seconds",
+        type=float,
+        default=DEFAULT_FAST_FUNDAMENTAL_BUDGET_SECONDS,
+        help="Fast-scan earnings fundamental budget passed to both runs.",
+    )
+    parser.add_argument(
+        "--capital-flow-budget-seconds",
+        type=float,
+        default=DEFAULT_FAST_CAPITAL_FLOW_BUDGET_SECONDS,
+        help="Fast-scan capital-flow budget passed to both runs.",
+    )
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return parser.parse_args()
 
@@ -81,6 +100,14 @@ def build_benchmark_report(
 def _build_markdown(report: Dict[str, Any]) -> str:
     baseline = report.get("baseline") if isinstance(report.get("baseline"), dict) else {}
     optimized = report.get("optimized") if isinstance(report.get("optimized"), dict) else {}
+    cache_sensitivity_note = ""
+    baseline_label = str(baseline.get("label") or "")
+    optimized_label = str(optimized.get("label") or "")
+    if baseline_label.startswith("hotpath_") or optimized_label.startswith("hotpath_"):
+        cache_sensitivity_note = (
+            "- Note: `hotpath_*` compare runs inside one process and is cache-sensitive; "
+            "use fresh-process reruns before treating the improvement percentage as final evidence.\n"
+        )
     lines = [
         f"# Trend Leader V1 Benchmark ({report.get('snapshot_date')})",
         "",
@@ -88,6 +115,7 @@ def _build_markdown(report: Dict[str, Any]) -> str:
         "",
         f"- Improvement Seconds: `{report.get('improvement_seconds')}`",
         f"- Improvement Percent: `{report.get('improvement_pct')}%`",
+        cache_sensitivity_note.rstrip(),
         "",
         "## Comparison",
         "",
@@ -141,6 +169,10 @@ def _run_scan_mode(
     scan_prefilter_enabled: bool,
     prefetch_realtime_quotes: bool,
     quote_seed_enabled: bool,
+    dragon_service_lazy_init_enabled: bool = True,
+    tighten_non_trend_enrichment_short_circuit: bool = True,
+    fundamental_budget_seconds: float | None = DEFAULT_FAST_FUNDAMENTAL_BUDGET_SECONDS,
+    capital_flow_budget_seconds: float | None = DEFAULT_FAST_CAPITAL_FLOW_BUDGET_SECONDS,
 ) -> Dict[str, Any]:
     payload = scan_trend_leader_candidates_with_stats(
         limit=limit,
@@ -157,6 +189,10 @@ def _run_scan_mode(
         universe_codes_file=Path(universe_codes_file) if universe_codes_file else None,
         scan_prefilter_enabled=scan_prefilter_enabled,
         quote_seed_enabled=quote_seed_enabled,
+        dragon_service_lazy_init_enabled=dragon_service_lazy_init_enabled,
+        tighten_non_trend_enrichment_short_circuit=tighten_non_trend_enrichment_short_circuit,
+        fundamental_budget_seconds=fundamental_budget_seconds,
+        capital_flow_budget_seconds=capital_flow_budget_seconds,
     )
     run_stats = payload.get("run_stats") if isinstance(payload.get("run_stats"), dict) else {}
     return {
@@ -170,6 +206,15 @@ def _run_scan_mode(
         "quote_seed_enabled": bool(run_stats.get("quote_seed_enabled")),
         "prefetch_realtime_quotes": bool(run_stats.get("prefetch_realtime_quotes")),
         "scan_prefilter_enabled": bool(run_stats.get("scan_prefilter_enabled")),
+        "scan_eval_elapsed_sec": _round_float(run_stats.get("scan_eval_elapsed_sec")),
+        "avg_candidate_eval_elapsed_sec": _round_float(run_stats.get("avg_candidate_eval_elapsed_sec")),
+        "phase_timing_sec": run_stats.get("phase_timing_sec") or {},
+        "candidate_inner_parallel_enrichment": bool(run_stats.get("candidate_inner_parallel_enrichment")),
+        "dragon_service_lazy_init_enabled": bool(run_stats.get("dragon_service_lazy_init_enabled")),
+        "tighten_non_trend_enrichment_short_circuit": bool(run_stats.get("tighten_non_trend_enrichment_short_circuit")),
+        "fundamental_budget_seconds": _round_float(run_stats.get("fundamental_budget_seconds")),
+        "capital_flow_budget_seconds": _round_float(run_stats.get("capital_flow_budget_seconds")),
+        "capital_flow_fetch_skipped_count": int(run_stats.get("capital_flow_fetch_skipped_count") or 0),
     }
 
 
@@ -180,32 +225,72 @@ def main() -> int:
     day_dir = Path(args.output_dir) / snapshot_date.isoformat()
 
     logger.info("trend leader benchmark start: snapshot_date=%s limit=%s max_workers=%s", snapshot_date, args.limit, args.max_workers)
-    baseline = _run_scan_mode(
-        label="baseline",
-        limit=args.limit,
-        max_workers=max(1, int(args.max_workers)),
-        fallback_top_n=max(0, int(args.fallback_top_n)),
-        exclude_st=bool(args.exclude_st),
-        exclude_kcb=bool(args.exclude_kcb),
-        exclude_cyb=bool(args.exclude_cyb),
-        universe_codes_file=str(args.universe_codes_file or ""),
-        scan_prefilter_enabled=False,
-        prefetch_realtime_quotes=False,
-        quote_seed_enabled=False,
-    )
-    optimized = _run_scan_mode(
-        label="optimized",
-        limit=args.limit,
-        max_workers=max(1, int(args.max_workers)),
-        fallback_top_n=max(0, int(args.fallback_top_n)),
-        exclude_st=bool(args.exclude_st),
-        exclude_kcb=bool(args.exclude_kcb),
-        exclude_cyb=bool(args.exclude_cyb),
-        universe_codes_file=str(args.universe_codes_file or ""),
-        scan_prefilter_enabled=True,
-        prefetch_realtime_quotes=bool(max(1, int(args.max_workers)) == 1),
-        quote_seed_enabled=True,
-    )
+    if bool(args.compare_hotpath_round):
+        baseline = _run_scan_mode(
+            label="hotpath_control",
+            limit=args.limit,
+            max_workers=max(1, int(args.max_workers)),
+            fallback_top_n=max(0, int(args.fallback_top_n)),
+            exclude_st=bool(args.exclude_st),
+            exclude_kcb=bool(args.exclude_kcb),
+            exclude_cyb=bool(args.exclude_cyb),
+            universe_codes_file=str(args.universe_codes_file or ""),
+            scan_prefilter_enabled=True,
+            prefetch_realtime_quotes=bool(max(1, int(args.max_workers)) == 1),
+            quote_seed_enabled=True,
+            dragon_service_lazy_init_enabled=False,
+            tighten_non_trend_enrichment_short_circuit=False,
+            fundamental_budget_seconds=args.fundamental_budget_seconds,
+            capital_flow_budget_seconds=args.capital_flow_budget_seconds,
+        )
+        optimized = _run_scan_mode(
+            label="hotpath_optimized",
+            limit=args.limit,
+            max_workers=max(1, int(args.max_workers)),
+            fallback_top_n=max(0, int(args.fallback_top_n)),
+            exclude_st=bool(args.exclude_st),
+            exclude_kcb=bool(args.exclude_kcb),
+            exclude_cyb=bool(args.exclude_cyb),
+            universe_codes_file=str(args.universe_codes_file or ""),
+            scan_prefilter_enabled=True,
+            prefetch_realtime_quotes=bool(max(1, int(args.max_workers)) == 1),
+            quote_seed_enabled=True,
+            dragon_service_lazy_init_enabled=True,
+            tighten_non_trend_enrichment_short_circuit=True,
+            fundamental_budget_seconds=args.fundamental_budget_seconds,
+            capital_flow_budget_seconds=args.capital_flow_budget_seconds,
+        )
+    else:
+        baseline = _run_scan_mode(
+            label="baseline",
+            limit=args.limit,
+            max_workers=max(1, int(args.max_workers)),
+            fallback_top_n=max(0, int(args.fallback_top_n)),
+            exclude_st=bool(args.exclude_st),
+            exclude_kcb=bool(args.exclude_kcb),
+            exclude_cyb=bool(args.exclude_cyb),
+            universe_codes_file=str(args.universe_codes_file or ""),
+            scan_prefilter_enabled=False,
+            prefetch_realtime_quotes=False,
+            quote_seed_enabled=False,
+            fundamental_budget_seconds=args.fundamental_budget_seconds,
+            capital_flow_budget_seconds=args.capital_flow_budget_seconds,
+        )
+        optimized = _run_scan_mode(
+            label="optimized",
+            limit=args.limit,
+            max_workers=max(1, int(args.max_workers)),
+            fallback_top_n=max(0, int(args.fallback_top_n)),
+            exclude_st=bool(args.exclude_st),
+            exclude_kcb=bool(args.exclude_kcb),
+            exclude_cyb=bool(args.exclude_cyb),
+            universe_codes_file=str(args.universe_codes_file or ""),
+            scan_prefilter_enabled=True,
+            prefetch_realtime_quotes=bool(max(1, int(args.max_workers)) == 1),
+            quote_seed_enabled=True,
+            fundamental_budget_seconds=args.fundamental_budget_seconds,
+            capital_flow_budget_seconds=args.capital_flow_budget_seconds,
+        )
     report = build_benchmark_report(
         snapshot_date=snapshot_date.isoformat(),
         baseline=baseline,

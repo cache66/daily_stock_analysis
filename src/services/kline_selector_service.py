@@ -20,7 +20,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 from threading import local
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 
@@ -150,6 +150,547 @@ def _compute_listed_days(list_date_value: Any, *, as_of_date: Optional[date]) ->
     if delta_days < 0:
         return None
     return int(delta_days)
+
+
+def _safe_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric):
+        return None
+    return numeric
+
+
+def _apply_scan_universe_filters(
+    universe: pd.DataFrame,
+    *,
+    whitelist_codes: Optional[Set[str]] = None,
+    exclude_st: bool = False,
+    exclude_kcb: bool = False,
+    exclude_cyb: bool = False,
+) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    if universe.empty:
+        return universe.copy(), {
+            "before": 0,
+            "after": 0,
+            "removed_invalid_code": 0,
+            "removed_whitelist": 0,
+            "removed_st": 0,
+            "removed_kcb": 0,
+            "removed_cyb": 0,
+        }
+
+    filtered = universe.copy()
+    if "code" not in filtered.columns:
+        raise ValueError("universe dataframe missing required 'code' column")
+
+    filtered["_normalized_code"] = filtered["code"].apply(lambda value: normalize_stock_code(str(value or "").strip()))
+    before = len(filtered)
+    filtered = filtered[filtered["_normalized_code"].astype(str).str.fullmatch(r"\d{6}", na=False)]
+    after_valid = len(filtered)
+
+    after_whitelist = after_valid
+    if whitelist_codes is not None:
+        filtered = filtered[filtered["_normalized_code"].isin(whitelist_codes)]
+        after_whitelist = len(filtered)
+
+    after_st = after_whitelist
+    if exclude_st:
+        if "name" in filtered.columns:
+            filtered = filtered[~filtered["name"].apply(is_st_stock)]
+            after_st = len(filtered)
+        else:
+            logger.warning("scan universe has no name column; exclude_st is ignored")
+
+    after_kcb = after_st
+    if exclude_kcb:
+        filtered = filtered[~filtered["_normalized_code"].astype(str).str.startswith(("688", "689"), na=False)]
+        after_kcb = len(filtered)
+
+    after_cyb = after_kcb
+    if exclude_cyb:
+        filtered = filtered[~filtered["_normalized_code"].astype(str).str.startswith(("300", "301"), na=False)]
+        after_cyb = len(filtered)
+
+    filtered["code"] = filtered["_normalized_code"]
+    filtered = filtered.drop(columns=["_normalized_code"])
+    stats = {
+        "before": before,
+        "after": len(filtered),
+        "removed_invalid_code": before - after_valid,
+        "removed_whitelist": after_valid - after_whitelist,
+        "removed_st": after_whitelist - after_st,
+        "removed_kcb": after_st - after_kcb,
+        "removed_cyb": after_kcb - after_cyb,
+    }
+    return filtered.reset_index(drop=True), stats
+
+
+def _apply_scan_prefilters(
+    universe: pd.DataFrame,
+    *,
+    min_listed_days: Optional[int] = None,
+    min_change_pct_60d: Optional[float] = None,
+    min_turnover_rate: Optional[float] = None,
+    require_positive_change: bool = False,
+) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    if universe.empty:
+        return universe.copy(), {
+            "before": 0,
+            "after": 0,
+            "removed_listed_days": 0,
+            "removed_change_60d": 0,
+            "removed_turnover_rate": 0,
+            "removed_negative_change": 0,
+        }
+
+    filtered = universe.copy()
+    before = len(filtered)
+
+    after_listed_days = before
+    threshold_listed_days = max(0, int(min_listed_days)) if min_listed_days is not None else None
+    if threshold_listed_days is not None and "listed_days" in filtered.columns:
+        listed_days_series = pd.to_numeric(filtered["listed_days"], errors="coerce")
+        mask = listed_days_series.isna() | (listed_days_series >= threshold_listed_days)
+        filtered = filtered[mask]
+        after_listed_days = len(filtered)
+
+    after_change_60d = after_listed_days
+    threshold_60d = _safe_float(min_change_pct_60d)
+    if threshold_60d is not None and "change_pct_60d" in filtered.columns:
+        series_60d = pd.to_numeric(filtered["change_pct_60d"], errors="coerce")
+        mask = series_60d.isna() | (series_60d >= threshold_60d)
+        filtered = filtered[mask]
+        after_change_60d = len(filtered)
+
+    after_turnover = after_change_60d
+    threshold_turnover = _safe_float(min_turnover_rate)
+    if threshold_turnover is not None and "turnover_rate" in filtered.columns:
+        turnover_series = pd.to_numeric(filtered["turnover_rate"], errors="coerce")
+        mask = turnover_series.isna() | (turnover_series >= threshold_turnover)
+        filtered = filtered[mask]
+        after_turnover = len(filtered)
+
+    after_positive_change = after_turnover
+    if require_positive_change and "pct_change" in filtered.columns:
+        pct_change_series = pd.to_numeric(filtered["pct_change"], errors="coerce")
+        mask = pct_change_series.isna() | (pct_change_series > 0)
+        filtered = filtered[mask]
+        after_positive_change = len(filtered)
+
+    stats = {
+        "before": before,
+        "after": len(filtered),
+        "removed_listed_days": before - after_listed_days,
+        "removed_change_60d": after_listed_days - after_change_60d,
+        "removed_turnover_rate": after_change_60d - after_turnover,
+        "removed_negative_change": after_turnover - after_positive_change,
+    }
+    return filtered.reset_index(drop=True), stats
+
+
+def _column_has_numeric_values(universe: pd.DataFrame, column: str) -> bool:
+    if column not in universe.columns:
+        return False
+    series = pd.to_numeric(universe[column], errors="coerce")
+    return bool(series.notna().any())
+
+
+def _column_has_complete_numeric_values(universe: pd.DataFrame, column: str) -> bool:
+    if column not in universe.columns:
+        return False
+    series = pd.to_numeric(universe[column], errors="coerce")
+    return bool(not series.empty and series.notna().all())
+
+
+def _resolve_scan_prefilter_hydration_fields(
+    universe: pd.DataFrame,
+    *,
+    min_change_pct_60d: Optional[float] = None,
+    min_turnover_rate: Optional[float] = None,
+    require_positive_change: bool = False,
+) -> Set[str]:
+    if universe.empty:
+        return set()
+
+    requested_fields: Set[str] = set()
+    change_60d_required = _safe_float(min_change_pct_60d) is not None
+    has_change_60d = _column_has_numeric_values(universe, "change_pct_60d")
+    has_pct_change = _column_has_numeric_values(universe, "pct_change")
+
+    if _safe_float(min_turnover_rate) is not None and not _column_has_complete_numeric_values(universe, "turnover_rate"):
+        requested_fields.add("turnover_rate")
+
+    if require_positive_change and not has_pct_change:
+        requested_fields.add("pct_change")
+
+    if change_60d_required and not has_change_60d and not has_pct_change:
+        requested_fields.add("pct_change")
+
+    return requested_fields
+
+
+def _resolve_scan_prefilter_unsupported_fields(
+    universe: pd.DataFrame,
+    *,
+    min_change_pct_60d: Optional[float] = None,
+) -> Set[str]:
+    unsupported_fields: Set[str] = set()
+    if universe.empty:
+        return unsupported_fields
+    if _safe_float(min_change_pct_60d) is not None and not _column_has_numeric_values(universe, "change_pct_60d"):
+        unsupported_fields.add("change_pct_60d")
+    return unsupported_fields
+
+
+def _normalize_prefilter_quote_payload(payload: Any) -> Dict[str, Optional[float]]:
+    if payload is None:
+        return {}
+    if isinstance(payload, dict):
+        quote = payload
+    else:
+        quote = {
+            "price": getattr(payload, "price", None),
+            "change_pct": getattr(payload, "change_pct", None),
+            "turnover_rate": getattr(payload, "turnover_rate", None),
+            "total_mv": getattr(payload, "total_mv", None),
+            "amount": getattr(payload, "amount", None),
+            "volume_ratio": getattr(payload, "volume_ratio", None),
+            "change_60d": getattr(payload, "change_60d", None),
+        }
+    return {
+        "latest_price": _safe_float(quote.get("price") or quote.get("latest_price")),
+        "pct_change": _safe_float(quote.get("change_pct") or quote.get("pct_change")),
+        "turnover_rate": _safe_float(quote.get("turnover_rate")),
+        "total_mv": _safe_float(quote.get("total_mv") or quote.get("total_market_cap")),
+        "amount": _safe_float(quote.get("amount")),
+        "volume_ratio": _safe_float(quote.get("volume_ratio")),
+        "change_pct_60d": _safe_float(quote.get("change_60d") or quote.get("change_pct_60d")),
+    }
+
+
+def _hydrate_scan_prefilter_quote_fields(
+    universe: pd.DataFrame,
+    *,
+    manager: Any,
+    manager_factory: Optional[Callable[[], Any]] = None,
+    target_fields: Optional[Set[str]] = None,
+    quote_hydration_workers: int = 1,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    if universe.empty:
+        return universe.copy(), {
+            "requested_rows": 0,
+            "hydrated_rows": 0,
+            "requested_fields": "",
+            "worker_count": 0,
+            "filled_latest_price": 0,
+            "filled_pct_change": 0,
+            "filled_turnover_rate": 0,
+            "filled_total_mv": 0,
+            "filled_amount": 0,
+            "filled_volume_ratio": 0,
+            "filled_change_pct_60d": 0,
+        }
+
+    hydrated = universe.copy()
+    fill_columns = [
+        "latest_price",
+        "pct_change",
+        "turnover_rate",
+        "total_mv",
+        "amount",
+        "volume_ratio",
+        "change_pct_60d",
+    ]
+    allowed_fields = set(fill_columns) if target_fields is None else {field for field in target_fields if field in fill_columns}
+    for column in fill_columns:
+        if column not in hydrated.columns:
+            hydrated[column] = None
+
+    stats = {
+        "requested_rows": 0,
+        "hydrated_rows": 0,
+        "requested_fields": ",".join(sorted(allowed_fields)),
+        "worker_count": 0,
+        "filled_latest_price": 0,
+        "filled_pct_change": 0,
+        "filled_turnover_rate": 0,
+        "filled_total_mv": 0,
+        "filled_amount": 0,
+        "filled_volume_ratio": 0,
+        "filled_change_pct_60d": 0,
+    }
+    if not allowed_fields:
+        return hydrated.reset_index(drop=True), stats
+
+    pending_rows: List[Tuple[int, str]] = []
+    for row_idx, row in hydrated.iterrows():
+        code = _safe_text(row.get("code"))
+        if code and any(_safe_float(row.get(column)) is None for column in allowed_fields):
+            pending_rows.append((row_idx, code))
+    if not pending_rows:
+        return hydrated.reset_index(drop=True), stats
+
+    def _apply_quote(row_idx: int, quote: Dict[str, Optional[float]]) -> None:
+        if not quote:
+            return
+        stats["requested_rows"] += 1
+        row_filled = False
+        for column, stats_key in (
+            ("latest_price", "filled_latest_price"),
+            ("pct_change", "filled_pct_change"),
+            ("turnover_rate", "filled_turnover_rate"),
+            ("total_mv", "filled_total_mv"),
+            ("amount", "filled_amount"),
+            ("volume_ratio", "filled_volume_ratio"),
+            ("change_pct_60d", "filled_change_pct_60d"),
+        ):
+            if column not in allowed_fields:
+                continue
+            value = _safe_float(quote.get(column))
+            if value is None:
+                continue
+            existing_value = _safe_float(hydrated.at[row_idx, column])
+            if existing_value is not None:
+                continue
+            hydrated.at[row_idx, column] = value
+            stats[stats_key] += 1
+            row_filled = True
+        if row_filled:
+            stats["hydrated_rows"] += 1
+
+    def _fetch_quote(fetch_code: str) -> Dict[str, Optional[float]]:
+        try:
+            quote = _normalize_prefilter_quote_payload(manager.get_realtime_quote(fetch_code))
+        except Exception as exc:
+            logger.debug("scan prefilter quote hydration failed for %s: %s", fetch_code, exc)
+            return {}
+        return quote or {}
+
+    resolved_worker_count = min(max(1, int(quote_hydration_workers or 1)), len(pending_rows))
+    if resolved_worker_count <= 1 or len(pending_rows) <= 1:
+        stats["worker_count"] = 1
+        for row_idx, code in pending_rows:
+            _apply_quote(row_idx, _fetch_quote(code))
+        return hydrated.reset_index(drop=True), stats
+
+    worker_local_state = local()
+
+    def _get_worker_manager() -> Any:
+        if manager_factory is None:
+            return manager
+        worker_manager = getattr(worker_local_state, "manager", None)
+        if worker_manager is None:
+            worker_manager = manager_factory()
+            worker_local_state.manager = worker_manager
+        return worker_manager
+
+    def _fetch_quote_parallel(row_idx: int, fetch_code: str) -> Tuple[int, Dict[str, Optional[float]]]:
+        worker_manager = _get_worker_manager()
+        try:
+            quote = _normalize_prefilter_quote_payload(worker_manager.get_realtime_quote(fetch_code))
+        except Exception as exc:
+            logger.debug("scan prefilter quote hydration failed for %s: %s", fetch_code, exc)
+            return row_idx, {}
+        return row_idx, quote or {}
+
+    stats["worker_count"] = resolved_worker_count
+    hydrated_quotes: Dict[int, Dict[str, Optional[float]]] = {}
+    with ThreadPoolExecutor(max_workers=resolved_worker_count, thread_name_prefix="scan-prefilter") as executor:
+        future_map = {
+            executor.submit(_fetch_quote_parallel, row_idx, code): row_idx
+            for row_idx, code in pending_rows
+        }
+        for future in as_completed(future_map):
+            row_idx, quote = future.result()
+            hydrated_quotes[row_idx] = quote
+
+    for row_idx, _code in pending_rows:
+        _apply_quote(row_idx, hydrated_quotes.get(row_idx, {}))
+
+    return hydrated.reset_index(drop=True), stats
+
+
+def _should_apply_adaptive_positive_change(
+    universe: pd.DataFrame,
+    *,
+    min_change_pct_60d: Optional[float] = None,
+    require_positive_change: bool = False,
+) -> bool:
+    if universe.empty or require_positive_change:
+        return False
+    if _safe_float(min_change_pct_60d) is None:
+        return False
+
+    change_60d_series = (
+        pd.to_numeric(universe["change_pct_60d"], errors="coerce")
+        if "change_pct_60d" in universe.columns
+        else pd.Series(dtype="float64")
+    )
+    if change_60d_series.notna().any():
+        return False
+
+    pct_change_series = (
+        pd.to_numeric(universe["pct_change"], errors="coerce")
+        if "pct_change" in universe.columns
+        else pd.Series(dtype="float64")
+    )
+    return bool(pct_change_series.notna().any())
+
+
+def _pick_scan_prefilter_relaxed_buffer(
+    universe: pd.DataFrame,
+    *,
+    top_n: int,
+) -> pd.DataFrame:
+    if universe.empty or top_n <= 0:
+        return universe.head(0).copy()
+
+    ranked = universe.copy()
+    ranked["_pct_change"] = pd.to_numeric(ranked.get("pct_change"), errors="coerce").fillna(-9999.0)
+    ranked["_turnover_rate"] = pd.to_numeric(ranked.get("turnover_rate"), errors="coerce").fillna(-9999.0)
+    ranked["_volume_ratio"] = pd.to_numeric(ranked.get("volume_ratio"), errors="coerce").fillna(-9999.0)
+    ranked["_total_mv"] = pd.to_numeric(ranked.get("total_mv"), errors="coerce").fillna(float("inf"))
+    ranked = ranked.sort_values(
+        by=["_pct_change", "_turnover_rate", "_volume_ratio", "_total_mv", "code"],
+        ascending=[False, False, False, True, True],
+    )
+    return ranked.head(max(0, int(top_n))).drop(
+        columns=["_pct_change", "_turnover_rate", "_volume_ratio", "_total_mv"],
+        errors="ignore",
+    ).reset_index(drop=True)
+
+
+def _prepare_scan_prefilter_universe(
+    universe: pd.DataFrame,
+    *,
+    manager: Any,
+    manager_factory: Optional[Callable[[], Any]] = None,
+    cached_quote_universe: Optional[pd.DataFrame] = None,
+    hydrated_quote_cache_writer: Optional[Callable[[pd.DataFrame], None]] = None,
+    min_listed_days: Optional[int] = None,
+    min_change_pct_60d: Optional[float] = None,
+    min_turnover_rate: Optional[float] = None,
+    require_positive_change: bool = False,
+    relaxed_buffer_top_n: int = 40,
+    quote_hydration_workers: int = 1,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    if universe.empty:
+        return universe.copy(), {
+            "before": 0,
+            "after": 0,
+            "after_primary": 0,
+            "after_relaxed": 0,
+            "removed_listed_days": 0,
+            "removed_change_60d": 0,
+            "removed_turnover_rate": 0,
+            "removed_negative_change": 0,
+            "added_relaxed_buffer": 0,
+            "adaptive_positive_change_applied": False,
+            "quote_hydrated_rows": 0,
+            "quote_requested_rows": 0,
+            "quote_requested_fields": "",
+            "quote_missing_unsupported_fields": "",
+            "quote_worker_count": 0,
+        }
+
+    working = universe.copy()
+    if cached_quote_universe is not None and not cached_quote_universe.empty:
+        working = KlineSelectorService._merge_spot_quote_fields(working, cached_quote_universe)
+    hydration_stats = {
+        "requested_rows": 0,
+        "hydrated_rows": 0,
+        "requested_fields": "",
+        "worker_count": 0,
+    }
+    requested_quote_fields = _resolve_scan_prefilter_hydration_fields(
+        working,
+        min_change_pct_60d=min_change_pct_60d,
+        min_turnover_rate=min_turnover_rate,
+        require_positive_change=require_positive_change,
+    )
+    unsupported_quote_fields = _resolve_scan_prefilter_unsupported_fields(
+        working,
+        min_change_pct_60d=min_change_pct_60d,
+    )
+    if requested_quote_fields:
+        working, hydration_stats = _hydrate_scan_prefilter_quote_fields(
+            working,
+            manager=manager,
+            manager_factory=manager_factory,
+            target_fields=requested_quote_fields,
+            quote_hydration_workers=quote_hydration_workers,
+        )
+        if hydrated_quote_cache_writer is not None and int(hydration_stats.get("hydrated_rows") or 0) > 0:
+            try:
+                hydrated_quote_cache_writer(working.copy())
+            except Exception as exc:
+                logger.debug("failed to persist hydrated quote snapshot for reuse: %s", exc)
+
+    relaxed_universe, _relaxed_stats = _apply_scan_prefilters(
+        working,
+        min_listed_days=min_listed_days,
+        min_change_pct_60d=min_change_pct_60d,
+        min_turnover_rate=min_turnover_rate,
+        require_positive_change=False,
+    )
+    adaptive_positive_change = _should_apply_adaptive_positive_change(
+        working,
+        min_change_pct_60d=min_change_pct_60d,
+        require_positive_change=require_positive_change,
+    )
+    primary_universe, primary_stats = _apply_scan_prefilters(
+        working,
+        min_listed_days=min_listed_days,
+        min_change_pct_60d=min_change_pct_60d,
+        min_turnover_rate=min_turnover_rate,
+        require_positive_change=bool(require_positive_change or adaptive_positive_change),
+    )
+
+    final_universe = primary_universe.copy()
+    relaxed_buffer_count = 0
+    if adaptive_positive_change and relaxed_buffer_top_n > 0 and not relaxed_universe.empty:
+        primary_codes = {
+            _safe_text(code)
+            for code in primary_universe.get("code", pd.Series(dtype="object")).tolist()
+            if _safe_text(code)
+        }
+        relaxed_tail = relaxed_universe[
+            ~relaxed_universe["code"].map(lambda value: _safe_text(value) in primary_codes)
+        ].copy()
+        relaxed_buffer = _pick_scan_prefilter_relaxed_buffer(
+            relaxed_tail,
+            top_n=max(0, int(relaxed_buffer_top_n)),
+        )
+        relaxed_buffer_count = len(relaxed_buffer)
+        if not relaxed_buffer.empty:
+            final_universe = (
+                pd.concat([primary_universe, relaxed_buffer], ignore_index=True)
+                .drop_duplicates(subset=["code"], keep="first")
+                .reset_index(drop=True)
+            )
+
+    stats: Dict[str, Any] = {
+        **primary_stats,
+        "after": len(final_universe),
+        "after_primary": len(primary_universe),
+        "after_relaxed": len(relaxed_universe),
+        "added_relaxed_buffer": relaxed_buffer_count,
+        "adaptive_positive_change_applied": bool(adaptive_positive_change),
+        "quote_hydrated_rows": int(hydration_stats.get("hydrated_rows") or 0),
+        "quote_requested_rows": int(hydration_stats.get("requested_rows") or 0),
+        "quote_requested_fields": str(hydration_stats.get("requested_fields") or ""),
+        "quote_missing_unsupported_fields": ",".join(sorted(unsupported_quote_fields)),
+        "quote_worker_count": int(hydration_stats.get("worker_count") or 0),
+    }
+    return final_universe, stats
 
 
 @dataclass
@@ -328,6 +869,18 @@ class KlineSelectorRunResult:
     phase_metrics: Dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class KlinePreparedUniverseResult:
+    """Prepared universe and observability payload for a scan shell."""
+
+    base_universe_size: int
+    sharded_universe_size: int
+    prepared_universe_size: int
+    prepared_universe: pd.DataFrame
+    filter_stats: Dict[str, Any] = field(default_factory=dict)
+    prefilter_stats: Dict[str, Any] = field(default_factory=dict)
+
+
 class KlineSelectionRule(ABC):
     """Base class for composable K-line rules."""
 
@@ -497,8 +1050,11 @@ class KlineSelectorService:
 
     _spot_universe_cache: Optional[pd.DataFrame] = None
     _listing_metadata_cache: Optional[pd.DataFrame] = None
+    _spot_universe_reference_cache_memory: Optional[Dict[str, Any]] = None
     _spot_universe_reference_cache_ttl_seconds: int = 6 * 60 * 60
     _spot_universe_reference_cache_min_rows: int = 1000
+    _prefer_spot_universe_reference_cache: bool = False
+    _prefer_stale_spot_universe_reference_cache: bool = False
 
     def __init__(
         self,
@@ -545,6 +1101,7 @@ class KlineSelectorService:
             sleep_min=0.0,
             sleep_max=0.0,
             stock_history_source_priority=("tencent", "em"),
+            stock_history_retry_attempts=1,
         )
         # Keep Akshare as the first fast path inside this specialized manager.
         akshare_fetcher.priority = -2
@@ -563,6 +1120,7 @@ class KlineSelectorService:
         manager._daily_data_request_calendar_span_multiplier = 1.6
         manager._daily_data_include_derived_indicators = False
         manager._prefer_cached_history_when_covered = True
+        manager._skip_tushare_history_fallback_for_fast_scan = True
         return manager
 
     @staticmethod
@@ -618,10 +1176,52 @@ class KlineSelectorService:
         if self._universe_provider is not None:
             return self.get_a_share_universe(limit=limit, as_of_date=as_of_date)
 
+        cached_spot_reference = self._read_spot_universe_reference_cache()
+        fallback_spot_reference = cached_spot_reference
+        if fallback_spot_reference is None or fallback_spot_reference.empty:
+            fallback_spot_reference = self._read_spot_universe_reference_cache(allow_stale=True)
+        if bool(getattr(self, "_prefer_spot_universe_reference_cache", False)) and (
+            cached_spot_reference is not None and not cached_spot_reference.empty
+        ):
+            spot_universe = self._normalize_universe_dataframe(
+                cached_spot_reference.copy(),
+                as_of_date=as_of_date,
+            )
+            if not self._has_complete_listing_metadata(spot_universe):
+                spot_universe = self._merge_listing_metadata_if_available(
+                    spot_universe,
+                    as_of_date=as_of_date,
+                )
+            if limit is not None and limit > 0:
+                spot_universe = spot_universe.head(limit)
+            return spot_universe.reset_index(drop=True)
+        if bool(getattr(self, "_prefer_stale_spot_universe_reference_cache", False)) and (
+            fallback_spot_reference is not None and not fallback_spot_reference.empty
+        ):
+            spot_universe = self._normalize_universe_dataframe(
+                fallback_spot_reference.copy(),
+                as_of_date=as_of_date,
+            )
+            if not self._has_complete_listing_metadata(spot_universe):
+                spot_universe = self._merge_listing_metadata_if_available(
+                    spot_universe,
+                    as_of_date=as_of_date,
+                )
+            if limit is not None and limit > 0:
+                spot_universe = spot_universe.head(limit)
+            return spot_universe.reset_index(drop=True)
+
+        live_spot_attempts = 1 if fallback_spot_reference is not None and not fallback_spot_reference.empty else 2
         try:
-            spot_df = self._fetch_spot_universe_with_retry()
+            spot_df = self._fetch_spot_universe_with_retry(attempts=live_spot_attempts)
             self.__class__._spot_universe_cache = spot_df.copy()
             spot_universe = self._normalize_universe_dataframe(spot_df, as_of_date=as_of_date)
+            cached_spot_universe = cached_spot_reference
+            if cached_spot_universe is not None and not cached_spot_universe.empty:
+                spot_universe = self._merge_spot_quote_fields(
+                    spot_universe,
+                    cached_spot_universe,
+                )
             self._write_spot_universe_reference_cache(spot_universe)
         except Exception as exc:
             cached_spot_df = self.__class__._spot_universe_cache
@@ -635,24 +1235,24 @@ class KlineSelectorService:
                     as_of_date=as_of_date,
                 )
             else:
-                generic_universe = self.get_a_share_universe(limit=limit, as_of_date=as_of_date)
-                cached_spot_universe = self._read_spot_universe_reference_cache()
+                cached_spot_universe = fallback_spot_reference
                 if cached_spot_universe is not None and not cached_spot_universe.empty:
                     logger.warning(
-                        "K-line selector spot-enriched universe fallback to generic provider with cached spot quotes: %s",
+                        "K-line selector spot-enriched universe fallback to disk cached spot snapshot: %s",
                         exc,
                     )
-                    generic_universe = self._merge_spot_quote_fields(
-                        generic_universe,
-                        cached_spot_universe,
+                    spot_universe = self._normalize_universe_dataframe(
+                        cached_spot_universe.copy(),
+                        as_of_date=as_of_date,
                     )
                 else:
+                    generic_universe = self.get_a_share_universe(limit=limit, as_of_date=as_of_date)
                     logger.warning("K-line selector spot-enriched universe fallback to generic provider: %s", exc)
-                generic_universe = self._merge_listing_metadata_if_available(
-                    generic_universe,
-                    as_of_date=as_of_date,
-                )
-                return generic_universe.reset_index(drop=True)
+                    generic_universe = self._merge_listing_metadata_if_available(
+                        generic_universe,
+                        as_of_date=as_of_date,
+                    )
+                    return generic_universe.reset_index(drop=True)
 
         if spot_universe.empty:
             generic_universe = self.get_a_share_universe(limit=limit, as_of_date=as_of_date)
@@ -662,14 +1262,93 @@ class KlineSelectorService:
             )
             return generic_universe.reset_index(drop=True)
 
-        spot_universe = self._merge_listing_metadata_if_available(
-            spot_universe,
-            as_of_date=as_of_date,
-        )
+        if not self._has_complete_listing_metadata(spot_universe):
+            spot_universe = self._merge_listing_metadata_if_available(
+                spot_universe,
+                as_of_date=as_of_date,
+            )
 
         if limit is not None and limit > 0:
             spot_universe = spot_universe.head(limit)
         return spot_universe.reset_index(drop=True)
+
+    def prepare_scan_universe(
+        self,
+        *,
+        universe: pd.DataFrame,
+        prefilter: Optional[KlineSelectorPrefilter] = None,
+        whitelist_codes: Optional[Set[str]] = None,
+        exclude_st: bool = False,
+        exclude_kcb: bool = False,
+        exclude_cyb: bool = False,
+        shard_count: int = 1,
+        shard_index: int = 0,
+        cached_quote_universe: Optional[pd.DataFrame] = None,
+        hydrated_quote_cache_writer: Optional[Callable[[pd.DataFrame], None]] = None,
+        quote_hydration_workers: int = 1,
+        relaxed_buffer_top_n: int = 40,
+        as_of_date: Optional[date] = None,
+    ) -> KlinePreparedUniverseResult:
+        """Apply shared scan-shell preparation before deep per-stock evaluation."""
+        normalized_universe = self._normalize_universe_dataframe(universe, as_of_date=as_of_date)
+        base_universe_size = len(normalized_universe)
+
+        filtered_universe, filter_stats = _apply_scan_universe_filters(
+            normalized_universe,
+            whitelist_codes=whitelist_codes,
+            exclude_st=exclude_st,
+            exclude_kcb=exclude_kcb,
+            exclude_cyb=exclude_cyb,
+        )
+        sharded_universe = self.apply_universe_shard(
+            filtered_universe,
+            shard_count=shard_count,
+            shard_index=shard_index,
+        )
+        sharded_universe_size = len(sharded_universe)
+
+        if prefilter is None:
+            prepared_universe = sharded_universe.reset_index(drop=True)
+            prefilter_stats: Dict[str, Any] = {
+                "before": sharded_universe_size,
+                "after": sharded_universe_size,
+                "after_primary": sharded_universe_size,
+                "after_relaxed": sharded_universe_size,
+                "removed_listed_days": 0,
+                "removed_change_60d": 0,
+                "removed_turnover_rate": 0,
+                "removed_negative_change": 0,
+                "added_relaxed_buffer": 0,
+                "adaptive_positive_change_applied": False,
+                "quote_hydrated_rows": 0,
+                "quote_requested_rows": 0,
+                "quote_requested_fields": "",
+                "quote_missing_unsupported_fields": "",
+                "quote_worker_count": 0,
+            }
+        else:
+            prepared_universe, prefilter_stats = _prepare_scan_prefilter_universe(
+                sharded_universe,
+                manager=self.manager,
+                manager_factory=self._manager_factory,
+                cached_quote_universe=cached_quote_universe,
+                hydrated_quote_cache_writer=hydrated_quote_cache_writer,
+                min_listed_days=prefilter.min_listed_days,
+                min_change_pct_60d=prefilter.min_change_pct_60d,
+                min_turnover_rate=prefilter.min_turnover_rate,
+                require_positive_change=bool(prefilter.require_positive_change),
+                relaxed_buffer_top_n=relaxed_buffer_top_n,
+                quote_hydration_workers=quote_hydration_workers,
+            )
+
+        return KlinePreparedUniverseResult(
+            base_universe_size=base_universe_size,
+            sharded_universe_size=sharded_universe_size,
+            prepared_universe_size=len(prepared_universe),
+            prepared_universe=prepared_universe.reset_index(drop=True),
+            filter_stats=filter_stats,
+            prefilter_stats=prefilter_stats,
+        )
 
     @staticmethod
     def _get_spot_universe_reference_cache_paths() -> tuple[Path, Path]:
@@ -695,19 +1374,44 @@ class KlineSelectorService:
         try:
             csv_path.parent.mkdir(parents=True, exist_ok=True)
             universe.to_csv(csv_path, index=False, encoding="utf-8-sig")
+            written_at = datetime.now()
             meta_payload = {
-                "written_at": datetime.now().isoformat(),
+                "written_at": written_at.isoformat(),
                 "rows": row_count,
             }
             meta_path.write_text(json.dumps(meta_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            self.__class__._spot_universe_reference_cache_memory = {
+                "cache_key": (str(csv_path), str(meta_path)),
+                "written_at": written_at,
+                "rows": row_count,
+                "universe": universe.copy(),
+            }
         except Exception as exc:
             logger.debug("K-line selector failed to write spot reference cache: %s", exc)
 
-    def _read_spot_universe_reference_cache(self) -> pd.DataFrame:
+    def _read_spot_universe_reference_cache(self, *, allow_stale: bool = False) -> pd.DataFrame:
         csv_path, meta_path = self._get_spot_universe_reference_cache_paths()
         if not csv_path.exists():
             return pd.DataFrame()
         min_rows = max(1, int(getattr(self, "_spot_universe_reference_cache_min_rows", 1)))
+        cache_key = (str(csv_path), str(meta_path))
+        memory_cache = self.__class__._spot_universe_reference_cache_memory
+        if isinstance(memory_cache, dict) and memory_cache.get("cache_key") == cache_key:
+            cached_universe = memory_cache.get("universe")
+            cached_rows = int(memory_cache.get("rows") or 0)
+            written_at = memory_cache.get("written_at")
+            if isinstance(cached_universe, pd.DataFrame):
+                if cached_rows < min_rows:
+                    return pd.DataFrame()
+                if isinstance(written_at, datetime):
+                    age_seconds = (datetime.now() - written_at).total_seconds()
+                    if age_seconds > max(0, int(self._spot_universe_reference_cache_ttl_seconds)):
+                        if not allow_stale:
+                            self.__class__._spot_universe_reference_cache_memory = None
+                    else:
+                        return cached_universe.copy()
+                if allow_stale:
+                    return cached_universe.copy()
         try:
             if meta_path.exists():
                 meta_payload = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -724,8 +1428,9 @@ class KlineSelectorService:
                     written_at = datetime.fromisoformat(written_at_raw)
                     age_seconds = (datetime.now() - written_at).total_seconds()
                     if age_seconds > max(0, int(self._spot_universe_reference_cache_ttl_seconds)):
-                        return pd.DataFrame()
-            cached_universe = pd.read_csv(csv_path)
+                        if not allow_stale:
+                            return pd.DataFrame()
+            cached_universe = pd.read_csv(csv_path, dtype={"code": "string"})
             normalized_universe = self._normalize_universe_dataframe(cached_universe)
             if len(normalized_universe) < min_rows:
                 logger.info(
@@ -734,6 +1439,12 @@ class KlineSelectorService:
                     min_rows,
                 )
                 return pd.DataFrame()
+            self.__class__._spot_universe_reference_cache_memory = {
+                "cache_key": cache_key,
+                "written_at": written_at if "written_at" in locals() else datetime.now(),
+                "rows": int(len(normalized_universe)),
+                "universe": normalized_universe.copy(),
+            }
             return normalized_universe
         except Exception as exc:
             logger.debug("K-line selector failed to read spot reference cache: %s", exc)
@@ -781,6 +1492,20 @@ class KlineSelectorService:
             merged[column] = merged[column].where(merged[column].notna(), merged[spot_column])
             merged = merged.drop(columns=[spot_column])
         return merged.sort_values("code").reset_index(drop=True)
+
+    @staticmethod
+    def _has_complete_listing_metadata(universe: pd.DataFrame) -> bool:
+        if universe is None or universe.empty:
+            return False
+        if "listed_days" in universe.columns:
+            listed_days = pd.to_numeric(universe["listed_days"], errors="coerce")
+            if not listed_days.empty and listed_days.notna().all():
+                return True
+        if "list_date" in universe.columns:
+            list_dates = pd.to_datetime(universe["list_date"], errors="coerce")
+            if not list_dates.empty and list_dates.notna().all():
+                return True
+        return False
 
     def _fetch_spot_universe_with_retry(
         self,
@@ -1503,10 +2228,32 @@ class KlineSelectorService:
         if df is None or df.empty:
             return pd.DataFrame()
 
-        history = df.copy()
-        if "date" not in history.columns:
+        if "date" not in df.columns:
             return pd.DataFrame()
 
+        required_numeric_columns = ("close", "high")
+        optional_numeric_columns = ("open", "low", "pct_chg", "volume", "amount")
+        fast_path_eligible = bool(
+            pd.api.types.is_datetime64_any_dtype(df["date"])
+            and df["date"].notna().all()
+            and df["date"].is_monotonic_increasing
+            and all(
+                column in df.columns
+                and pd.api.types.is_numeric_dtype(df[column])
+                and df[column].notna().all()
+                for column in required_numeric_columns
+            )
+            and all(
+                column not in df.columns or pd.api.types.is_numeric_dtype(df[column])
+                for column in optional_numeric_columns
+            )
+        )
+        if fast_path_eligible:
+            history = df.copy(deep=False)
+            history["prev_close"] = history["close"].shift(1)
+            return history
+
+        history = df.copy()
         history["date"] = pd.to_datetime(history["date"], errors="coerce")
         history = history.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
         for column in ("open", "high", "low", "close", "pct_chg", "volume", "amount"):

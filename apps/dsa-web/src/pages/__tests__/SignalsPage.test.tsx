@@ -138,44 +138,6 @@ function buildEarningsResponse() {
   };
 }
 
-function buildCombinedResponse() {
-  return {
-    signalType: 'hundred_day_high_with_earnings',
-    signalDate: '2026-04-05',
-    signalDateFrom: null,
-    signalDateTo: null,
-    total: 1,
-    page: 1,
-    pageSize: 12,
-    compareSummary: [],
-    streakLeaderboard: [],
-    items: [
-      {
-        code: '600488',
-        name: '津药药业',
-        signalDate: '2026-04-05',
-        eventDate: '2026-04-04',
-        industry: '化学制药',
-        reasonSummary: '新高与业绩共振。',
-        industryLogic: '医药景气延续。',
-        newsLogic: '公告文本偏正向。',
-        technicalLogic: '新高延续。',
-        themeLabel: '创新药 / 医疗服务',
-        latestPreviousHitDate: null,
-        previousHitCount: 0,
-        daysSincePreviousHit: null,
-        isConsecutiveSignal: false,
-        close: 7.67,
-        latestHigh: 7.8,
-        windowHigh: 7.8,
-        yearStartDate: '2026-01-02',
-        yearStartClose: 4.14,
-        ytdReturnPct: 85.27,
-      },
-    ],
-  };
-}
-
 function buildCommodityResponse() {
   return {
     signalType: 'commodity_beneficiary__optical_fiber',
@@ -740,6 +702,8 @@ beforeEach(() => {
 
   it('refreshes with a stock code filter and can switch history item', async () => {
     render(<SignalsPage />);
+    expect(await screen.findByLabelText('signals-mode-short_term')).toBeInTheDocument();
+    expect(screen.getByLabelText('signals-mode-long_term')).toBeInTheDocument();
 
     expect((await screen.findAllByText('莱美药业')).length).toBeGreaterThan(0);
 
@@ -817,45 +781,57 @@ beforeEach(() => {
     });
   });
 
-  it('supports switching signal type to combined new-high-with-earnings', async () => {
-    getSnapshots
-      .mockResolvedValueOnce(buildSingleResponse())
-      .mockResolvedValue(buildCombinedResponse());
-    getHistory.mockResolvedValue(buildHistoryResponse('600488', '津药药业'));
-
+  it('filters signal-type dropdown options by mode', async () => {
     render(<SignalsPage />);
     expect((await screen.findAllByText('莱美药业')).length).toBeGreaterThan(0);
 
-    fireEvent.change(screen.getByLabelText('signal-type'), { target: { value: 'hundred_day_high_with_earnings' } });
+    const shortModeSelect = screen.getByLabelText('signal-type') as HTMLSelectElement;
+    const shortModeValues = Array.from(shortModeSelect.querySelectorAll('option')).map((option) => option.value);
+    expect(shortModeValues).toEqual(expect.arrayContaining([
+      'trend_leader_unified',
+      'earnings_surprise',
+      'hundred_day_high',
+    ]));
+    expect(shortModeValues).not.toContain('monthly_slow_rise');
+    expect(shortModeValues).not.toContain('dragon_head_candidate');
+    expect(shortModeValues).not.toContain('commodity_beneficiary__optical_fiber');
+
+    fireEvent.click(screen.getByLabelText('signals-mode-long_term'));
 
     await waitFor(() => {
-      expect(getSnapshots).toHaveBeenLastCalledWith(
-        {
-          signalType: 'hundred_day_high_with_earnings',
-          signalDate: expect.any(String),
-          signalDateFrom: undefined,
-          signalDateTo: undefined,
-          code: undefined,
-          codes: undefined,
-          page: 1,
-          pageSize: 12,
-        },
-        expect.objectContaining({ signal: expect.any(AbortSignal) }),
-      );
+      const longModeSelect = screen.getByLabelText('signal-type') as HTMLSelectElement;
+      const longModeValues = Array.from(longModeSelect.querySelectorAll('option')).map((option) => option.value);
+      expect(longModeValues).toEqual(expect.arrayContaining([
+        'monthly_slow_rise',
+        'dragon_head_candidate',
+        'commodity_beneficiary__optical_fiber',
+        'board_recognizability__board_semiconductor_1234567890',
+        'monthly_slow_rise_profile__balanced',
+      ]));
+      expect(longModeValues).not.toContain('trend_leader_unified');
+      expect(longModeValues).not.toContain('earnings_surprise');
+      expect(longModeValues).not.toContain('hundred_day_high');
+      expect(longModeValues).not.toContain('hundred_day_high_with_earnings');
     });
-
-    expect(await screen.findByText('新高且业绩快照')).toBeInTheDocument();
-    expect((await screen.findAllByText(/YTD 85\.27%/)).length).toBeGreaterThan(0);
-    expect(await screen.findByText(/事件日期 2026-04-04/)).toBeInTheDocument();
   });
 
-  it('renders quick signal type tabs for the four main strategy views', async () => {
+  it('renders short-term tabs by default and can switch to long-term tabs', async () => {
     render(<SignalsPage />);
+    expect(await screen.findByLabelText('signals-mode-short_term')).toBeInTheDocument();
+    expect(screen.getByLabelText('signals-mode-long_term')).toBeInTheDocument();
     expect(await screen.findByLabelText('signal-type-tab-hundred_day_high')).toBeInTheDocument();
     expect(screen.getByLabelText('signal-type-tab-earnings_surprise')).toBeInTheDocument();
     expect(screen.getByLabelText('signal-type-tab-trend_leader_unified')).toBeInTheDocument();
-    expect(screen.getByLabelText('signal-type-tab-monthly_slow_rise')).toBeInTheDocument();
+    expect(screen.queryByLabelText('signal-type-tab-monthly_slow_rise')).not.toBeInTheDocument();
     expect(await screen.findByLabelText('signal-type-total-count-hundred_day_high')).toHaveTextContent('总 2');
+
+    fireEvent.click(screen.getByLabelText('signals-mode-long_term'));
+    expect(await screen.findByLabelText('signal-type-tab-monthly_slow_rise')).toBeInTheDocument();
+    expect(screen.getByLabelText('signal-type-tab-dragon_head_candidate')).toBeInTheDocument();
+    expect(screen.getByLabelText('signal-type-tab-commodity_beneficiary__optical_fiber')).toBeInTheDocument();
+    expect(screen.getByLabelText('stock-code-filter')).toBeInTheDocument();
+    expect(screen.getByLabelText('ytd-filter')).toBeInTheDocument();
+    expect(screen.getByLabelText('streak-only')).toBeInTheDocument();
 
     getSnapshots.mockResolvedValue({
       ...buildMonthlySlowRiseResponse(),
@@ -880,6 +856,35 @@ beforeEach(() => {
     });
   });
 
+  it('falls back to short-term preferred signal when switching modes', async () => {
+    getSnapshots
+      .mockResolvedValueOnce(buildSingleResponse())
+      .mockResolvedValue(buildDragonHeadResponse());
+    getHistory.mockResolvedValue({
+      ...buildHistoryResponse('600001', '混合龙头'),
+      signalType: 'dragon_head_candidate',
+      items: [{ ...buildDragonHeadResponse().items[0] }],
+    });
+
+    render(<SignalsPage />);
+    fireEvent.click(await screen.findByLabelText('signals-mode-long_term'));
+    fireEvent.click(await screen.findByLabelText('signal-type-tab-dragon_head_candidate'));
+    expect(await screen.findByText('龙头专题快照')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText('signals-mode-short_term'));
+
+    await waitFor(() => {
+      expect(getSnapshots).toHaveBeenCalledWith(
+        expect.objectContaining({
+          signalType: 'trend_leader_unified',
+          page: 1,
+          pageSize: 12,
+        }),
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
+    });
+  });
+
   it('supports switching to a commodity beneficiary signal tab', async () => {
     getSnapshots
       .mockResolvedValueOnce(buildSingleResponse())
@@ -895,6 +900,7 @@ beforeEach(() => {
     });
 
     render(<SignalsPage />);
+    fireEvent.click(await screen.findByLabelText('signals-mode-long_term'));
     expect(await screen.findByLabelText('signal-type-tab-commodity_beneficiary__optical_fiber')).toBeInTheDocument();
 
     fireEvent.click(screen.getByLabelText('signal-type-tab-commodity_beneficiary__optical_fiber'));
@@ -918,7 +924,6 @@ beforeEach(() => {
     expect(await screen.findByText('光纤涨价快照')).toBeInTheDocument();
     expect((await screen.findAllByText('preform_and_materials')).length).toBeGreaterThan(0);
     expect((await screen.findAllByText('upstream')).length).toBeGreaterThan(0);
-    expect((await screen.findAllByText('direct_beneficiary')).length).toBeGreaterThan(0);
   });
 
   it('supports switching to a dragon-head signal tab', async () => {
@@ -936,6 +941,7 @@ beforeEach(() => {
     });
 
     render(<SignalsPage />);
+    fireEvent.click(await screen.findByLabelText('signals-mode-long_term'));
     expect(await screen.findByLabelText('signal-type-tab-dragon_head_candidate')).toBeInTheDocument();
 
     fireEvent.click(screen.getByLabelText('signal-type-tab-dragon_head_candidate'));
@@ -1017,6 +1023,7 @@ beforeEach(() => {
     });
 
     render(<SignalsPage />);
+    fireEvent.click(await screen.findByLabelText('signals-mode-long_term'));
     expect(await screen.findByLabelText('signal-type-tab-board_recognizability__board_semiconductor_1234567890')).toBeInTheDocument();
 
     fireEvent.click(screen.getByLabelText('signal-type-tab-board_recognizability__board_semiconductor_1234567890'));
@@ -1058,6 +1065,7 @@ beforeEach(() => {
     getHistory.mockResolvedValue(buildMonthlySlowRiseHistoryResponse());
 
     render(<SignalsPage />);
+    fireEvent.click(await screen.findByLabelText('signals-mode-long_term'));
     expect(await screen.findByLabelText('signal-type-tab-monthly_slow_rise_profile__balanced')).toBeInTheDocument();
 
     fireEvent.click(screen.getByLabelText('signal-type-tab-monthly_slow_rise_profile__balanced'));
@@ -1082,12 +1090,22 @@ beforeEach(() => {
     expect((await screen.findAllByText('月线慢牛·均衡')).length).toBeGreaterThan(0);
     expect(await screen.findByText(/收涨 75\.00% \| 抬低点 67\.00% \| 区间 38\.50%/)).toBeInTheDocument();
     expect(await screen.findByText(/Worst Drawdown/i)).toBeInTheDocument();
+    expect(screen.queryByTestId('monthly-slow-rise-compare')).not.toBeInTheDocument();
+    expect(await screen.findByLabelText('toggle-monthly-compare')).toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText('toggle-monthly-compare'));
     expect(await screen.findByTestId('monthly-slow-rise-compare')).toBeInTheDocument();
     expect(await screen.findByText('月线慢牛一键对比')).toBeInTheDocument();
     expect(await screen.findByText(/双档以上重合 1/)).toBeInTheDocument();
     expect((await screen.findAllByText('月线慢牛·严格')).length).toBeGreaterThan(0);
     expect((await screen.findAllByText('月线慢牛·宽松')).length).toBeGreaterThan(0);
 
+    fireEvent.click(screen.getByLabelText('toggle-monthly-compare'));
+    await waitFor(() => {
+      expect(screen.queryByTestId('monthly-slow-rise-compare')).not.toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByLabelText('toggle-monthly-compare'));
+    expect(await screen.findByTestId('monthly-slow-rise-compare')).toBeInTheDocument();
     fireEvent.click(screen.getByLabelText('monthly-compare-focus-monthly_slow_rise_profile__strict'));
 
     await waitFor(() => {

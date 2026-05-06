@@ -41,6 +41,10 @@ class SignalSnapshotService:
         "commodity_beneficiary__optical_fiber",
         "commodity_beneficiary__memory",
         "commodity_beneficiary__hard_disk",
+        "shortline_hub",
+        "shortline_top_pick",
+        "shortline_watchlist",
+        "shortline_high_risk_mover",
     ]
 
     def __init__(self, db_manager: Optional[DatabaseManager] = None) -> None:
@@ -830,6 +834,13 @@ class SignalSnapshotService:
                 or str(cause.get("reason_summary", "") or "").strip()
                 or None
             ),
+            "review_tier": str(metrics.get("review_tier", "") or "").strip() or None,
+            "composite_score": self._to_float(metrics.get("composite_score")),
+            "shortline_category": str(metrics.get("shortline_category", "") or "").strip() or None,
+            "confidence_label": str(metrics.get("confidence_label", "") or "").strip() or None,
+            "short_term_view": str(metrics.get("short_term_view", "") or "").strip() or None,
+            "tracking_appear_streak_days": self._to_int(metrics.get("tracking_appear_streak_days")),
+            "tracking_tier_transition": str(metrics.get("tracking_tier_transition", "") or "").strip() or None,
             "profile_name": (
                 str(metrics.get("profile_name", "") or "").strip()
                 or str(criteria.get("profile_name", "") or "").strip()
@@ -933,6 +944,26 @@ class SignalSnapshotService:
             return {
                 "group": "strategy",
                 "display_label": "业绩观察活跃",
+            }
+        if signal_type == "shortline_hub":
+            return {
+                "group": "shortline",
+                "display_label": "shortline_hub",
+            }
+        if signal_type == "shortline_top_pick":
+            return {
+                "group": "shortline",
+                "display_label": "shortline_top_pick",
+            }
+        if signal_type == "shortline_watchlist":
+            return {
+                "group": "shortline",
+                "display_label": "shortline_watchlist",
+            }
+        if signal_type == "shortline_high_risk_mover":
+            return {
+                "group": "shortline",
+                "display_label": "shortline_high_risk_mover",
             }
 
         if not self._is_board_recognizability_signal_type(signal_type) and not self._is_monthly_slow_rise_signal_type(signal_type):

@@ -7,7 +7,203 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
+> Use this file as the user-visible summary only.
+> Current default strategy baseline: [docs/LOCAL_STRATEGY_BASELINE.md](./LOCAL_STRATEGY_BASELINE.md)
+> Local strategy entry/catalog: [docs/LOCAL_STRATEGY_CATALOG.md](./LOCAL_STRATEGY_CATALOG.md)
+> Detailed internal change log and run evidence: [docs/AI_MODIFICATION_LOG.md](./AI_MODIFICATION_LOG.md)
+
 ## [Unreleased]
+- [修复] `run_shortline_hub.py` 现已把 `DatabaseManager` 正式注入 `ShortlineHubOrchestrator`；此前真实 CLI/进程链路里 `snapshot_driver_evidence` 实际一直拿到 `db_manager=None`，导致 `earnings_surprise / commodity_beneficiary__* / trend_leader_unified` 的硬逻辑快照虽已接入代码却未真正生效。修复后，`2026-05-04` 这类短线复盘已能把具备近几日业绩硬逻辑的样本从 `flow_only` 抬升到 `top_pick/watchlist`。
+- [修复] `select_trend_leader_candidates.py`、`select_earnings_surprise_candidates.py` 与 `collect_commodity_beneficiary_snapshots.py` 现在会把非交易日 `--snapshot-date` 自动回退到最近的 A 股交易日；像 `2026-05-04` 这类休市日会实际按 `2026-04-30` 产出上游快照，不再因硬跑休市日而错过可复用数据。
+- [改进] `shortline_hub` 的快照硬逻辑证据层已从“仅同日”扩展为“同日优先、近 3-5 个交易日回看兜底”；当 A 股休市日或当日尚未产出 snapshot 时，`earnings_surprise`、`commodity_beneficiary__*` 与保守 `trend_leader_unified` 的近期有效快照仍可把真有业绩/涨价/产业催化的票从 `flow_only` 抬升出来，证据同时会显式标注命中的 snapshot 日期。
+- [改进] `scripts/run-shortline-daily.ps1` 现已调整为先产出 `trend_leader_unified`、`earnings_surprise` 与 `commodity_beneficiary` 快照，再执行 `run_shortline_hub.py`；`-DryRun` 也会按同样顺序打印完整命令，确保短线日跑默认先补齐上游“硬逻辑库存”。
+- [改进] `shortline_hub` 新增同日快照“硬逻辑来源”接线：`driver_support` 现在会优先读取 `earnings_surprise`、`commodity_beneficiary__*` 与保守条件下的 `trend_leader_unified` 快照证据，再回退到解释文本关键词；真正有业绩/涨价/产业催化来源的短线票可从 `flow_only` 抬升为强逻辑驱动。
+- [改进] `shortline_hub` 新增“逻辑支撑层” `driver_support`：把强逻辑驱动、题材接力和纯资金接力分开处理，避免 `daily` 之类的英文片段误触发 `AI` 规则，也避免模板化“扩散/情绪锚点”被误抬成强产业突破；真实 `2026-05-04` 回放已收敛为 `review_tier_counts={"watchlist":5}`。
+- [新功能] 新增 `scripts/run-shortline-replay-validation.ps1`，把短线历史回放验收收口成固定三段：前一交易日基线、目标日 cold run、目标日 warm rerun；三段共用同一份 tracking history 与 explain cache，便于复核 `tracking_repeat_symbol_count`、`quality_verdict` 与 cache warm-up 是否按预期收敛。
+- [改进] `shortline_hub` 细化了 `WonderTrader` 的量能重建风险：当仅少量近期历史条目缺失 `volume`、但 `amount` 推导的放量比例与 snapshot `volume_ratio` 一致时，风险标签会降级为 `volume_ratio_validated_by_amount_history`，不再一律按 `volume_reconstructed_from_amount` 压到 `watchlist`；真实 `2026-05-04` 回放已从 `watchlist=5` 收敛到 `top_pick=4, watchlist=1`。
+- [修复] `shortline_hub` 的 `WonderTrader` 真实回放在节假日手工 `trade_date` 场景下，现会优先参考 AkShare 交易日历兜底非交易日判断；即使本地 `tushare_trade_cal_sse.csv` 误标或缺失，`2026-05-04` 这类休市日也不再把 `history_asof_*` 误升成 `high_risk_mover`。
+- [修复] `scripts/run_fast_review_bundle.py` 不再把共享 `--limit` 下传给 `hundred_day_high` 主筛选；新增 bundle 侧 `--hundred-day-output-limit`（默认 `30`，`0` 表示不裁剪）在载入结果后限制导出行数，避免快复盘误把百日新高输入 universe 压缩成 `no_rows`。
+- [改进] `shortline_runs_summary.json/.md`、`bundle_manifest.json` 与 `bundle_report.md` 现会显式落盘质量判定依据，包括 `tracking_history_ready`、`source_real_engine_expected_passed` 与顶层 `quality_failed_due_to`，便于直接判断 `degraded`/`quality_failed` 的来源。
+- [改进] `shortline review bundle` 顶层状态现兼容回退：`status` 恢复为旧的执行结果语义，新增 `overall_status` 表达 `quality_failed` 这类总体结论，便于旧脚本继续只认 `success/failed`，同时保留质量失败可见性。
+- [改进] `tracking_continuity_weak` 现在只会在 shortline 已具备跨日比较基础时触发；首日运行、只有同日样本或 tracking 冷启动场景不再被默认降级成连续性告警。
+- [改进] `shortline review bundle` 顶层状态语义已拆分为 `execution_status` 与 `status`：当步骤执行成功但 `quality_summary.verdict=fail` 时，`bundle_manifest.json` / `bundle_report.md` / pointer 会显式标记 `status=quality_failed`，避免被普通 `success` 掩盖。
+- [改进] `scripts/summarize_shortline_runs.py` 与 `scripts/run_shortline_review_bundle.py` 新增 `quality_profile` 与 `quality_summary`，现在可直接在 `shortline_runs_summary.json/.md`、`bundle_manifest.json` 和 `bundle_report.md` 看到 `pass/degraded/fail/off` 质量结论，以及失败项、告警项和排查建议。
+- [改进] `scripts/run-shortline-review-bundle.ps1` 现已补齐 wrapper 级 `-TrackingHistoryPath`，可直接从 PowerShell 入口透传共享 tracking history 文件到 `run_shortline_review_bundle.py` / `run_shortline_hub.py`，便于复用同一份跨日跟踪历史做 bundle 复盘验证。
+- [修复] `scripts/summarize_shortline_runs.py` 现已纳入 `shortline_review_bundle/*/shortline_run` 子目录，并按 `run_id` 只保留最新一份，避免 bundle 重跑后 `runs_summary` 遗漏当前短线子运行或重复统计同一 `run_id`。
+- [修复] `shortline_hub` 的 `WonderTrader` 真实桥接默认源优先级已调整为 `prefer_real_engine`；只有显式传入 `prefer_bridge_data` 时才优先读取本地 `bridge_data`，避免真实日常复盘被示例导出文件劫持。
+- [改进] `run_shortline_hub.py`、`run_shortline_review_bundle.py` 以及 `run-shortline-daily.ps1` / `run-shortline-fullcheck.ps1` / `run-shortline-review-bundle.ps1` 现已统一透传 `wt_source_mode`，同时 `shortline_report.md` 结果概览新增 `tracking_repeat_symbol_count / tracking_longest_streak_days / tracking_focus_symbols`。
+- [测试] 已完成真实串行验证：`2026-05-03` 与 `2026-05-04` 两次 `run-shortline-daily.ps1` 复盘均稳定命中 `scan_source_counts={"wondertrader_real_engine":5}`，并在 `2026-05-04` 正常识别 `tracking_repeat_symbol_count=5`、`tracking_longest_streak_days=2`。
+- [改进] `shortline review bundle` 根报告与 `bundle_manifest.json` 现在会显式汇总 `tracking_repeat_symbol_count` 和 `tracking_longest_streak_days`，便于先在 bundle 根目录判断连续跟踪情况。
+- [改进] `scripts/run_shortline_review_bundle.py` 与 `scripts/run-shortline-daily.ps1` 现已支持透传统一的 tracking history 路径，便于真实 `WonderTrader + FinGenius` 串行日跑复用同一份历史跟踪文件。
+- [测试] 已完成真实 `run-shortline-daily.ps1` 串行验证：`2026-05-02`/`2026-05-03` 与 `2026-05-03`/`2026-05-04` 两组样本均可落盘 tracking history；本次未出现自然重复股，主要因为上游候选源在 `wondertrader_real_engine` 与 `wondertrader_export` 之间切换。
+- [修复] `shortline_hub` 修正真实 `WonderTrader` 历史回放的 `trade_date` 对齐：回放前先截断到 `<= trade_date`，避免误报 `history_asof_*`，并将 `volume_reconstructed_from_amount` 从硬性降级调整为保留扣分的软风险，允许真实强势股在可接受数据质量下进入 `watchlist/top_pick`。
+- [修复] `shortline_hub` 继续收紧 `volume_reconstructed_from_amount` 的复盘分层：这类样本现在最多只进入 `watchlist`，不再直接升到 `top_pick`。
+- [改进] `shortline_hub` 现已真正接通历史跟踪闭环：同一股票跨日重复进入短线结果时，会写入 `tracking_appear_streak_days / tracking_last_seen_dates / tracking_tier_transition`，并同步落盘 `shortline_tracking_history.json/csv`；同日重跑不会重复抬高 streak。
+- [改进] `run_shortline_hub.py`、`run-shortline-daily.ps1`、`run-shortline-fullcheck.ps1` 与 `run-shortline-review-bundle.ps1` 现已打通 `explain cache` 入口；日常短线、fullcheck 与 bundle 默认共享 `data/runtime/shortline_hub/explain_cache/shortline_explain_cache.json`，真实复盘重跑时可直接复用同日解释结果。
+- [修复] `shortline fullcheck` 不再误复用 `daily/light` explain cache；`run_shortline_hub.py` 现会在 `--fg-enable-big-deal` 场景下自动切到 `explain_cache_mode=full`，`run-shortline-fullcheck.ps1` 也显式透传 `full` 模式，保证 `BigDealAnalysisTool` 真实执行。
+- [改进] `shortline_runs_summary.json/.md` 与 `shortline review bundle` 根层 `Runs Summary Runtime` 新增 recent-run 异常提醒，首版会标记 `cache_hit_ratio_low`、`parallel_workers_single` 与 `tool_errors_present`，便于快速发现解释链路退化。
+- [改进] `scripts/summarize_shortline_runs.py` 新增 shortline explain cache / 并发统计汇总，`shortline_runs_summary.json/.md` 现会输出最近几次 run 的 `explain_cache_hit_count`、`explain_cache_miss_count` 与 `explain_parallel_workers`，便于比较日常复盘与 fullcheck 的真实解释成本。
+- [改进] `shortline_hub` 的 `run_summary.json`、`shortline_report.md` 与 `shortline review bundle` 根摘要新增 explain cache / 并发统计，现可直接查看 `explain_cache_enabled`、`explain_cache_hit_count`、`explain_cache_miss_count` 与 `explain_parallel_workers`，更快判断当轮耗时主要来自缓存 miss 还是实时解释。
+- [改进] 新增 `scripts/shortline-wrapper-common.ps1` 作为短线 PowerShell 包装公共层，`run-shortline-review-bundle.ps1`、`run-shortline-daily.ps1` 与 `run-shortline-fullcheck.ps1` 现统一复用同一套解释器解析、路径检查与 dry-run 前置逻辑。
+- [改进] `run-shortline-daily.ps1` 与 `run-shortline-fullcheck.ps1` 新增 wrapper 级 `-DryRun`，可在不触发真实 `WonderTrader + FinGenius` 链路的情况下打印解析后的 `run_shortline_hub.py` 命令，便于安全验证短线入口包装层。
+- [改进] `run-shortline-daily.ps1` 与 `run-shortline-fullcheck.ps1` 现已与 `run-shortline-review-bundle.ps1` 统一解释器解析策略：优先解析 `py -3.10`，回退 `Get-Command python`，并让 `WonderTrader` 默认复用同一 repo 解释器，减少同机不同短线入口落到不同 Python 版本的偏差。
+- [改进] `shortline review bundle` 的解释器选择已收紧：Python 入口默认跟随当前 `sys.executable`，PowerShell 包装优先解析 `py -3.10`，并让 `WonderTrader` 默认复用同一解释器；同时修复包装脚本在空 `RunId` 下会透传空 `--run-id` 导致 dry-run 报错的问题。
+- [改进] `shortline review bundle` 的根报告章节顺序已调整为“先摘要、后明细”：默认先展示 `Shortline Runtime / Runs Summary Runtime / Fast Review Runtime`，再展示各子目录路径、治理指针和步骤日志，日常复盘更适合快速扫读。
+- [改进] `shortline review bundle` 的失败根摘要继续增强：`bundle_manifest.json` 与 `bundle_report.md` 现会直接给出失败 step 的 `stdout/stderr` 日志路径、excerpt 与 `pending_steps`，便于根目录快速判断故障位置和未执行链路。
+- [改进] `shortline review bundle` 的根报告继续补齐 `Shortline Runtime / Runs Summary Runtime` 两层紧凑摘要，现可直接看到本轮短线解释数量、分层分布、上游工具命中、最近 run 候选数与 `top_symbols`，减少再进入子目录翻 `run_summary.json` 的次数。
+- [改进] `shortline review bundle` 的父控制台日志已收敛：成功子步骤不再把整段 stdout/stderr 原样回放到 bundle 父进程，而是只输出 `stdout_lines / stderr_lines / stdout_log / stderr_log` 紧凑摘要，详细内容仍保留在 bundle 根目录 `logs/` 下。
+- [改进] `shortline review bundle` 的 `fast_review.runtime_summary` 继续补齐根层紧凑汇总，现会额外输出 `total_signal_count / total_signal_elapsed_sec / skipped_reason_counts`，便于直接从 bundle 根报告判断本轮信号是否产出候选以及跳过主因。
+- [改进] `shortline review bundle` 新增 `artifact_governance` 与统一 pointer 索引：每次运行都会在 `data/manual_runs/shortline_review_bundle_index/<trade_date>/<run_id>/bundle_pointer.json` 与 `.../latest.json` 写入指针，便于从固定位置回查 `latest / custom / smoke / dry_run` 各类输出目录。
+- [改进] `shortline review bundle` 的 `fast_review.runtime_summary` 现已稳定化，除 `signal_*_elapsed_sec` 外还会汇总 per-signal `count / csv_path`、总耗时与关键输出路径。
+- [改进] `shortline review bundle` 新增 `fast_review` 结构化运行摘要抽取：会从 step 日志中汇总 `include_signals / persist_snapshots / signal_*_elapsed_sec / skipped_signal` 到 `bundle_manifest.json` 与 `bundle_report.md`。
+- [改进] `shortline review bundle` 在子步骤失败时不再只抛异常退出；现在仍会落盘 `bundle_manifest.json`、`bundle_report.md` 和 step 日志，并附带 `failed_step / error_message / stderr_excerpt` 便于复盘。
+- [测试] 扩展 `tests/test_shortline_review_bundle.py`，覆盖 `fast_review` runtime summary 抽取与 step 失败时的 manifest/report 诊断留痕。
+- [改进] `scripts/run_shortline_review_bundle.py` 新增 bundle 控制面增强：支持独立控制 `fast_review` snapshot 持久化，并支持 `--dry-run` 只落命令与 manifest、不真正执行子步骤。
+- [改进] `shortline review bundle` 的 `bundle_manifest.json` 与 `bundle_report.md` 现会记录每一步的 `status / elapsed_ms / workdir / stdout_log_path / stderr_log_path`，日志统一落在 bundle 目录 `logs/` 下，便于定位哪一步变慢或失败。
+- [文档] 更新 `docs/architecture/2026-05-02-shortline-hub-single-machine-setup.md` 与 `docs/LOCAL_STRATEGY_CATALOG.md`，补充 bundle 的 dry-run、fast-review persist toggle 与 per-step telemetry 说明。
+- [新功能] 新增 `scripts/run_shortline_review_bundle.py` 与 `scripts/run-shortline-review-bundle.ps1` 单入口短线 bundle，按顺序编排真实 `shortline_hub` 日跑、`shortline_runs_summary` 汇总与 `fast_review` 短线观察，并固定落到 `data/manual_runs/shortline_review_bundle_latest/`。
+- [测试] 新增 `tests/test_shortline_review_bundle.py` 与 `tests/test_shortline_review_bundle_script.py`，覆盖短线 bundle 命令编排、manifest/report 产物与单机默认路径约束。
+- [修复] `shortline_hub` 的 snapshot 持久化改为按 `shortline_top_pick / shortline_watchlist / shortline_high_risk_mover` 三组做同日整批替换；重复手工重跑同一 `trade_date` 时，快复盘不再混入更早同日 run 的旧短线股票。
+- [修复] `scripts/run_fast_review_bundle.py` 的 `短线观察` 摘要在同日 shortline snapshot 只有 `high_risk_mover` 时，不再显示 `top_symbols: none`，而会回退展示高风险异动中的前几只股票。
+- [文档] `docs/architecture/2026-05-02-shortline-hub-single-machine-setup.md` 与 `docs/LOCAL_STRATEGY_CATALOG.md` 现已明确：单机 `WonderTrader` bridge 更推荐直接使用当前工程 Python 作为 `--wt-python-executable`，以稳定走通 `wondertrader_real_engine` 路径。
+- [新功能] `shortline_hub` 新增 `snapshot_sync` 持久化链路，`scripts/run_shortline_hub.py --persist-snapshot` 现可把 `top_pick / watchlist / high_risk_mover` 结果写入 `kline_signal_snapshot`。
+- [改进] `SignalSnapshotService` 与 `/api/v1/signals/kline-snapshot-counts` 现已默认纳入 `shortline_hub / shortline_top_pick / shortline_watchlist / shortline_high_risk_mover`，可直接查询短线快照计数。
+- [改进] `scripts/run_fast_review_bundle.py` 现会优先读取同日短线 snapshot，并在 `fast_review_summary.md` 自动附加 `短线观察` 摘要；若无 snapshot，则回退读取最近同日 `shortline_*` 的 `run_summary.json`。
+- [改进] `shortline_hub` 新增手工观察批量解释、同日 explain cache、历史跟踪字段与日报 `今日主方向 / 历史跟踪摘要` 层，便于连续日常复盘。
+- [测试] 新增 `shortline` snapshot sync、CLI persist、signals shortline counts、fast review shortline summary 的回归覆盖。
+- [改进] `shortline_hub` 的 `shortline_report.md` 继续收紧复盘分层展示：当候选全部落入 `high_risk_mover` 时，`今日最强` 不再重复展示同一批高风险名单，而是改为明确提示用户直接查看下方 `高风险异动`。
+- [改进] `shortline_hub` 的解释链路改为并行执行；在 `top_n=3` 的真实短线日跑中，`orchestrator_explain_elapsed_ms` 已从约 `108s` 收敛到约 `46s`，更适合每日复盘直接使用。
+- [改进] `shortline_hub` 新增 `board_core_rank / board_core_bonus`，并把“板块前排”信息写入短线日报；同板块多只候选同时出现时，真正的相对龙头会获得额外加分。
+- [改进] `shortline_hub` 收紧了短线分层打分与层级规则：`trigger_score` 现在做上限截断并重新加权，`volume_reconstructed_from_amount / missing_volume_history / history_asof_*` 等数据质量风险会显式压低层级；真实日跑中的高强度但数据质量存疑样本不再直接进入 `top_pick`。
+- [改进] `shortline_hub` 新增短线分层复盘能力：候选现在会自动打上 `涨停接力 / 放量突破 / 高换手博弈 / 板块龙头跟随 / 趋势强势跟随` 等短线类别，并计算综合分、同类排名与 `top_pick / watchlist / high_risk_mover` 复盘层级。
+- [改进] `shortline_report.md` 重构为更接近日常短线复盘的日报结构，新增 `今日最强 / 观察名单 / 高风险异动 / 明日观察点`，同时保留 `候选概览 / 候选明细 / 逐票说明`，便于直接盘后阅读。
+- [改进] 新增 `scripts/show_shortline_report.py`，用于在本机快速预览 `shortline_report.md`；交互终端下会优先用 UTF-8 输出，减少 PowerShell 中把正常报告误判成乱码的情况。
+- [改进] `scripts/check_shortline_bridge_setup.py` / `src/shortline_hub/bridge_check.py` 调整短线桥接健康判定：当 `bridge_data` 缺失但 `WonderTrader / FinGenius` 脚本 smoke 与整链路 orchestrator smoke 都通过时，整体状态不再误报为 `warning`。
+- [修复] `shortline_hub` 的 `WonderTrader` 实盘候选现在会对近期 `volume=0 但 amount>0` 的历史缓存行做基于 `amount/close` 的成交量重建，并在检测到 `amount` 掉成 `1/1000` 量级时自动补正，风险提示从笼统的 `missing_volume_history` 收敛为更准确的 `volume_reconstructed_from_amount`。
+- [改进] 新增 `scripts/summarize_shortline_runs.py`，可汇总最近 `shortline_*` 手工运行的候选数、解释耗时、上游工具命中与前几只样本代码，便于直接比较 daily / fullcheck 的稳定性与成本。
+- [修复] `shortline_hub` 的 `WonderTrader` 实盘候选在周末 `trade_date` 回放时不再误报 `history_asof_*`，保留真正有意义的 `missing_volume_history` 数据质量提示。
+- [改进] 新增 `scripts/run-shortline-daily.ps1` 与 `scripts/run-shortline-fullcheck.ps1` 两个短线同机编排快捷入口，默认复用已验证的 `WonderTrader + FinGenius(.venv311)` 路径，并分别固化日常轻量复盘与单票全量核验参数。
+- [改进] `shortline_hub` 现已明确推荐把 `FinGenius` 切到独立 `Python 3.11` 环境 `D:\bb\FinGenius\.venv311\Scripts\python.exe` 运行，并补齐了单机接入文档、最小依赖集与真实轻量/全量验证记录。
+- [改进] `shortline_hub` 的短线报告与 `FinGenius` bridge 文案已统一重写为可读中文，`shortline_report.md` 中的标题、指标名、风险说明和代理大单摘要不再出现仓内生成文本乱码。
+- [修复] 修正 `D:\bb\FinGenius\bridge\fg_explain_candidate.py` 薄包装后的真实 upstream 解析回退问题，外部 bridge 重新以本地 `D:\bb\FinGenius\upstream` 为工具根目录，可再次命中真实 `HotMoneyTool / ChipAnalysisTool / BigDealAnalysisTool`。
+- [文档] 重写 `scripts/bridges/README.md`，正式明确短线默认工作流：每日批量复盘走轻量模式，单票深挖或抽样核验再显式加 `--fg-enable-big-deal`。
+- [测试] 新增短线中文可读性回归，并完成一轮真实验证：轻量 `top_n=5` 跑出 `total_explain_elapsed_ms=166843`，两只 full 模式抽样都成功命中 `BigDealAnalysisTool`。
+- [改进] `shortline_hub` 的 `FinGenius` process mode 新增 `--fg-enable-big-deal` 开关；默认轻量模式不再强制调用最慢的 `BigDealAnalysisTool`，只跑 `HotMoneyTool + ChipAnalysisTool`，并用已抓到的数据代理生成 `big_deal_summary`。
+- [测试] 为 `FinGenius` 轻量/全量双模式补充合同回归，并完成真实 smoke；默认轻量模式下 `top_n=3` 的 `total_explain_elapsed_ms` 从 `229198ms` 降到 `101090ms`。
+- [改进] `shortline_hub` 的 `FinGenius` 批量解释产物新增 `upstream_tool_elapsed_ms`，并在 `run_summary.json`、`shortline_report.md` 中汇总各 upstream 工具耗时，便于直接定位 `HotMoney/Chip/BigDeal` 的真实慢点。
+- [改进] `shortline_hub` 现在会把 `FinGenius` 批量解释链路中的 `protocol_version / explanation_source / used_upstream_tools / tool_error_count / tool_errors / explain_elapsed_ms` 结构化落到 explanation、combined results、`run_summary.json` 与 `shortline_report.md`。
+- [测试] 为 `FinGenius` batch instrumentation 新增 bridge、adapter、orchestrator、CLI 合同回归，并完成一轮真实 `process mode` smoke：`data/manual_runs/shortline_fingenius_instrumented_smoke_20260503/`。
+- [改进] `scripts/bridges/shortline_fingenius_bridge_template.py` 与 `D:\bb\FinGenius\bridge\fg_explain_candidate.py` 现已支持 `bridge_data -> FinGenius upstream 单票工具(HotMoney/Chip/BigDeal) -> 启发式回退` 的解释顺序；同时兼容 UTF-8 BOM 请求文件，并在当前同机 Python 环境缺少 `loguru` 时自动注入轻量兼容层，让 `FinGenius` 单票真实工具解释可以直接跑通。
+- [改进] `shortline_hub` 的 `shortline_report.md` 继续补齐复盘展示层：逐票说明里现在会直接展示 `价格 / 当日涨幅 / 60日涨幅 / 成交额 / 换手 / 量比`，其中 `amount` 会按 `亿/万` 做轻量格式化，便于盘后快速阅读；原始 JSON 数值语义保持不变。
+- [改进] `shortline_hub` 的真实 WonderTrader 候选链路继续补齐了市场指标透传：真实引擎、仓内 process adapter、聚合结果以及外部 `D:\bb\WonderTrader\bridge\wt_export_candidates.py` 现在会保留 `change_pct_60d` 与 `amount`；同时当历史缓存最近多日 `volume=0.0` 但 `amount` 仍存在时，会显式打上 `missing_volume_history`，而不是伪造量能确认。
+- [改进] `shortline_hub` 的真实 WonderTrader 候选富化补上了 `price/latest snapshot` 回退逻辑：当预筛快照里的 `latest_price` 缺失或为 `0.0` 时，会自动回退到真实引擎信号收盘价/最新历史收盘价，避免真实候选继续输出 `price=0.0`。
+- [改进] `shortline_hub` 的真实 WonderTrader 信号规则继续向 WonderTrader 风格靠拢：在保留已验证可运行的股票 `CTA` 回测路径前提下，新增 `dual_thrust_breakout` 动态上轨突破分支；同时确认当前环境下 `ET_SEL + 股票` 原生回测仍会触发底层访问冲突，因此未强行切换到不稳定路径。
+- [改进] `shortline_hub` 的 WonderTrader 桥接现已优先支持真实 `wtpy` 引擎路径：当同日 `bridge_data` 不存在时，会自动从当前工程加载 `src/shortline_hub/wondertrader_real_engine.py`，按 `bridge_data -> real engine helper -> repo spot cache -> placeholder` 顺序生成候选，并在历史缓存未追平请求日期时附带 `history_asof_<date>` 风险标记。
+- [改进] 新增 `scripts/run_shortline_bridge_data_compare.py`，可自动写入一份 date-specific `bridge_data` 样本，并对照运行“bridge_data 模式”和“fallback 模式”，输出 `compare_summary.json` 与 `compare_report.md`，方便验证外部样本是否真的被当前 shortline 编排层消费。
+- [文档] `scripts/bridges/README.md` 与 `docs/architecture/2026-05-02-shortline-hub-single-machine-setup.md` 补充了 `bridge_data` 样本对照命令，降低同机半真实验证门槛。
+- [改进] `shortline_hub` 的 `shortline_report.md` 重写为更适合盘后复盘的结构，新增 `结果概览 / 复盘关注点 / 候选表 / 逐票说明`，并同步输出候选来源、板块/形态分布与风险标签汇总。
+- [改进] `scripts/check_shortline_bridge_setup.py` 与 `src/shortline_hub/bridge_check.py` 现在会标记本地 `bridge_data` 的新鲜度；超过 3 天未更新的本地导出文件会被标成 `warning`，帮助区分“可用但偏旧”和“刚更新”的桥接数据。
+- [改进] `scripts/bridges/shortline_wondertrader_bridge_template.py` 与 `D:\bb\WonderTrader\bridge\wt_export_candidates.py` 继续细化短线 `setup_tag`，新增 `涨停后高换手分歧`、`涨停后分歧承接`、`强势放量抢筹`、`高换手爆量博弈`、`板块核心跟涨` 等更贴近日常复盘的话术。
+- [文档] `scripts/bridges/README.md` 更新 shortline 桥接样例与 `bridge_data` 新鲜度约定，避免文档仍停留在旧的 `setup_tag` 示例。
+- [改进] `shortline_hub` 新增可选 `setup_tag` 字段；`scripts/bridges/shortline_wondertrader_bridge_template.py` 与 `D:\bb\WonderTrader\bridge\wt_export_candidates.py` 会基于 `trigger_type / change_pct / turnover_rate / volume_ratio` 打轻量短线形态标签，并同步透传到 `shortline_report.md` 与 `FinGenius` 解释层。
+- [改进] `shortline_hub` 将初版 `setup_tag` 进一步细化为 `涨停高换手`、`涨停强势延续`、`放量突破`、`强势突破跟进`、`高换手博弈`、`活跃换手拉升`、`活跃换手推进`、`板块跟涨`、`相对强势整理` 等更贴近日常复盘的话术。
+- [改进] `scripts/bridges/shortline_fingenius_bridge_template.py` 与 `D:\bb\FinGenius\bridge\fg_explain_candidate.py` 的启发式解释现在会使用真实 `board_name`，并写入 `hot_money_summary`、`risk_commentary` 与 `short_term_view`。
+- [改进] `scripts/bridges/shortline_wondertrader_bridge_template.py` 与 `D:\bb\WonderTrader\bridge\wt_export_candidates.py` 在 `spot cache` 缺少行业字段时，会回退读取 `data/cache/reference/tushare_stock_basic_list.csv` 补齐 `board_name`，避免长期停留在 `spot_cache` 占位值。
+- [改进] `D:\bb\FinGenius\bridge\fg_explain_candidate.py` 不再只有 placeholder 兜底；当 `bridge_data` 缺失时，会基于候选的 `trigger_type / trigger_score / change_pct / volume_ratio / turnover_rate / board_name / risk_flags` 自动生成启发式短线解释。
+- [改进] `D:\bb\WonderTrader\bridge\wt_export_candidates.py` 不再只有 placeholder 兜底；当 `bridge_data` 缺失时，会自动发现同级 `daily_stock_analysis/data/cache/reference/kline_selector_spot_universe.csv` 并基于真实 spot cache 做轻量候选筛选，输出 `scan_source=wondertrader_cache_scan`。
+- [改进] 新增 `scripts/check_shortline_bridge_setup.py` 与 `src/shortline_hub/bridge_check.py`，可统一检查 `D:\bb\WonderTrader` / `D:\bb\FinGenius` 的桥接脚本、`bridge_data`、单桥 smoke 与整链路 `process mode` smoke，便于短线编排在真实接线前先做环境自检。
+- [改进] `D:\bb\WonderTrader\bridge\` 与 `D:\bb\FinGenius\bridge\` 的外部桥接脚本现在支持优先读取 `bridge_data` 下的本地导出文件，找不到时才回退 placeholder，便于在真框架未接通前先跑半真实整链。
+- [修复] `shortline_hub --mode process` 修复了外部 `WonderTrader/FinGenius` 使用独立 `workdir` 时的相对 runtime 路径失效问题，当前工程现在可稳定调用 `D:\bb` 下的外部桥接脚本。
+- [改进] 在 `D:\bb\WonderTrader\bridge\` 与 `D:\bb\FinGenius\bridge\` 落地可直接调用的外部桥接骨架脚本，后续只需替换内部占位逻辑即可接入真实短线扫描与解释流程。
+- [改进] `shortline_hub` 现在额外导出聚合产物 `shortline_combined_results.json`，便于当前工程作为短线编排层直接沉淀“候选 + 解释”的最终结果。
+- [文档] 补充 `docs/architecture/2026-05-02-shortline-hub-single-machine-setup.md`、`scripts/bridges/README.md` 与 `data/templates/shortline_hub/*.json`，明确单机 `WonderTrader + FinGenius` 桥接接线方式与请求样例。
+- [改进] 新增 `scripts/bridges/shortline_wondertrader_bridge_template.py` 与 `scripts/bridges/shortline_fingenius_bridge_template.py`，作为 `shortline_hub --mode process` 的单机桥接模板脚本；后续可直接复制到本地 `WonderTrader` / `FinGenius` 目录并替换内部业务逻辑。
+- [改进] `shortline_hub` 新增单机 `process mode`：当前工程可通过本机外部脚本 + JSON 文件协议调用 `WonderTrader` 候选输出与 `FinGenius` 解释输出；默认仍保留 `stub` 模式，方便逐步替换真实业务脚本。
+- [新功能] 新增独立短线编排骨架 `src/shortline_hub/` 与 `scripts/run_shortline_hub.py`，用 stub 版 `WonderTrader` 候选输入和 `FinGenius` 解释输出先跑通协议、聚合和报告导出；当前尚未接入真实外部框架。
+- [文档] 补充 `board_cycle_scan` 当前定位说明：这条线暂按“半自动专题工具”维护，板块池与板块成分仍需人工介入，不作为全自动主策略入口。
+- [改进] 新增 `scripts/import_board_universe_seed.py` 与项目内官方板块成分 seed 路径 `data/board_cycle_scan_seed/board_universe.csv`；`scripts/select_board_cycle_candidates.py` 在未显式传 `--board-universe-file` 时会自动复用该 seed，并沿用 3 天人工维护口径。
+- [改进] 新增 `scripts/refresh_board_concept_pool.py` 与 `data_provider/tushare_fetcher.py` 中的 `get_board_concept_pool(...)`，用于基于 `Tushare THS/DC` 维护本地题材板块池缓存；默认 3 天有效，远端刷新失败但本地已有旧缓存时保持 fail-open 继续复用。
+- [改进] `board_cycle_scan` 新增扫描版本跟踪输出：每次运行除 `board_summary.*`、`board_stock_candidates.*` 外，还会生成 `board_change_summary.csv/md` 与 `board_tracking_history.csv`，自动对比上一轮同板块结果并标记 `label`、分数、龙头名单、业绩支撑数量是否发生更新。
+- [文档] 新增 `docs/local_strategies/topics/board_cycle_scan.md`，并同步更新 `docs/LOCAL_STRATEGY_CATALOG.md`、`docs/LOCAL_STRATEGY_BASELINE.md` 与 `docs/AI_MODIFICATION_LOG.md`，登记 `board_cycle_scan` 为按需运行的本地策略专题且不进入默认每日主链路。
+- [文档] 将 `board_cycle_scan` 的设计稿与实施计划迁入工程文档目录：新增 `docs/local_strategies/designs/2026-05-01-board_cycle_scan_design.md` 与 `docs/local_strategies/plans/2026-05-01-board_cycle_scan_implementation.md`，避免继续留在 `docs/superpowers/` 下形成双份入口。
+- [改进] `scripts/select_board_cycle_candidates.py` 现在会在板块成分股为空时，自动把上游拉取失败 warning 写入 `run_summary.txt` 与 `board_summary.md`，避免把 `board_cycle_label=idle`、`constituent_count=0` 和空候选误读成有效市场结论。
+- [改进] `board_cycle_scan` 新增 `--board-universe-file` 与 `--use-local-cache/--board-universe-cache-dir`，支持离线板块成分输入和远端失败后的本地缓存回退；同时新增 `leader_ratio`、`earnings_supported_ratio`、`board_reason_summary`、`board_rank`、`selection_reason` 等解释字段，并补齐一套可复跑的 `board_cycle_scan_golden_smoke_20260502` 离线 smoke 样本与产物。
+- [改进] 新增 `scripts/generate_board_universe_template.py` 与固定模板文件 `data/templates/board_cycle_scan/board_universe_template.csv`，用于先生成 `board_cycle_scan` 的本地输入骨架；当远端板块成分接口失败或为空时，仍会输出带 `needs_manual_fill` 占位行的可编辑 CSV，而不是直接失败。
+- [改进] `scripts/run_fast_review_bundle.py` 现在会为 `fast_review_strategy_focus.csv/md` 与 `fast_review_summary.md` 中的强势焦点股补充上涨原因摘要与标签，优先复用已有 `reason_summary / cause_tags`，缺失时再做轻量补算；该解释层增强当前不写回 snapshot。
+- [改进] `scripts/select_trend_leader_candidates.py` 现在会为 `trend_leader_unified` 显式开启 `stale spot reference cache` 优先复用；`src/services/kline_selector_service.py` 同步增加该 opt-in 快路径，使趋势快扫在本地 `spot` cache 已过 TTL 但结构完整时可直接进入扫描准备，而不再先等待 live `spot` 失败。`2026-04-29 limit=120` 同口径 smoke 中，`prep_universe_elapsed_sec` 已进一步收敛到 `9.77s`，总耗时约 `13.03s`。
+- [改进] `scripts/select_trend_leader_candidates.py` 的 `sector_rankings` 预热现在会优先请求 `prefer_stale_cache=True`；`data_provider/base.py` 同步为 `get_sector_rankings(...)` 增加该可选语义，使 `trend_leader_unified` 在板块排行 cache 过期但仍可用时直接复用本地结果，而不是先等待远端预热失败。`2026-04-29 limit=120` 同口径复跑中，`sector_rankings_prefetch_elapsed_sec` 已从约 `5.31s` 收敛到 `0.0005-0.0010s`。
+- [改进] `src/services/kline_selector_service.py` 现在允许 `trend_leader_unified` 在 live `spot` 失败时回退使用“已过 TTL 但结构完整”的本地 `spot` reference cache，仅作为失败兜底而非首选新鲜数据；同时当存在这类 disk cache 时，live `spot` 重试保持单次，避免 `prep_universe` 在降级路径上额外空耗。`2026-04-29 limit=120` 实跑中已命中 `disk cached spot snapshot` fallback，`fundamental_fetch≈0.46s`、`capital_profile≈0.35s`，当前剩余热点主要转向 `prep_universe≈18.98s` 与 `sector_rankings_prefetch≈5.31s`。
+- [改进] `trend_leader_unified` 快扫现在向 `get_earnings_fundamental_context(...)` 显式收窄到 `enabled_blocks=("financial",)`，不再默认抓取 `forecast/quick_report`；同时 `data_provider/base.py` 为窄 block profile 增加对旧宽 cache 的兼容复用。`2026-04-29 limit=120` 同口径热跑中，`fundamental_fetch` 约从 `17.52s` 进一步收敛到 `0.14s`，总耗时约从 `32.52s` 降到 `16.51s`。
+- [改进] `trend_leader_unified` 共享前筛现在只在 `pct_change` 整列都不可用时才触发行情补水；若列内已存在可用值，则不再为少量空值逐票补 `quote`。在 `2026-04-29` 同口径实测中，`prepare_scan_universe(...)` 的单次耗时约从 `19-22s` 收敛到 `5.37s`，`quote_requested_rows` 从 `146` 降到 `0`。
+- [改进] `trend_leader_unified` 快扫现在为 `earnings fundamental` 与 `capital_flow` 分别使用更紧的默认 budget（`0.6s / 0.45s`），并新增 `--fundamental-budget-seconds`、`--capital-flow-budget-seconds` 诊断参数与对应运行统计字段，用于收敛慢样本尾部耗时而不改变主信号入口。
+- [改进] `scripts/select_trend_leader_candidates.py` 为 `trend_leader_unified` 新增 `DragonHeadAnalysisService` 懒初始化，并将“边缘弱趋势 + 弱当日价量”样本更早短路出 `board/dragon/fundamental` 链路；`scripts/benchmark_trend_leader_v1.py` 同步新增 `--compare-hotpath-round` 诊断模式与 cache-sensitive 提示。
+- [改进] `scripts/select_trend_leader_candidates.py` 对 `trend_leader_unified` 的多 worker 主扫描关闭了单票内部 `fundamental/capital` 嵌套线程池；单 worker 仍保留内层并行，减少 `max_workers>1` 时的线程抖动与稳定性风险，并新增 `run_stats.candidate_inner_parallel_enrichment` 观测字段。
+- [修复] `scripts/select_hundred_day_high_candidates.py` 新增同目录运行保护：若同一个 `output_dir` 已有进行中的 `hundred_day_high` 任务，新的任务会基于 `hundred_day_high_run.lock` 直接 fail-fast，而不是继续与现有任务共享同一输出目录和 checkpoint。
+- [修复] `scripts/select_hundred_day_high_candidates.py` 不再默认把运行中 checkpoint 固定写到仓库根 `data/hundred_day_high_checkpoint.json`；未显式传 `--checkpoint-path` 时，现改为默认跟随各自 `output_dir` 落到 `hundred_day_high_checkpoint.json`，避免 `fast_review_bundle` 与手工 `hundred_day_high` 任务并发时互抢同一 checkpoint 文件。
+- [文档] 重整本地策略文档体系：`docs/local_strategies/` 收敛为 `core / supporting / topics` 三层结构，四条主策略中文主入口、`LOCAL_STRATEGY_CATALOG.md` 与 `LOCAL_STRATEGY_BASELINE.md` 全部按当前代码重写，项目自有策略专题统一迁入该目录；同时清理冗余长分析稿、`docs/superpowers/` 临时计划草稿与本地 UI 临时日志。
+- [改进] `scripts/select_hundred_day_high_candidates.py` 现在会对 `hundred_day_high` 入选后的 `breakout_quality` 180 日补强复用 `max_workers` 并发抓历史，并新增 `breakout_quality_parallel_enabled/workers/enrichment_elapsed_sec` 观测字段，在不改变信号口径的前提下压缩后处理墙钟时间。
+- [改进] `scripts/select_hundred_day_high_candidates.py` 将 `hundred_day_high` 的 `breakout_loose` 质量底线从 `breakout_quality_score>=0` 收紧到 `>=4`，优先剔除没有明显突破质量支撑的弱尾部样本，同时保持当前 `2026-04-29 limit=200` smoke 样本入选结果不变。
+- [改进] `scripts/select_earnings_surprise_candidates.py` 为默认快复盘 `earnings_surprise` 新增低深度弱事件预过滤与 `phase_timing_sec` 阶段耗时观测，`2026-04-29` 全市场复跑中 `evaluated_count` 从 `3560` 降到 `3490`，总耗时从约 `2159.20s` 降到约 `1833.01s`，并将 `fundamental_fetch / evaluate_candidate / capital_profile` 耗时写入业绩候选 Markdown 的 `Efficiency Summary`。
+- [改进] `scripts/run_fast_review_bundle.py` 现在会把 `trend_leader_unified_watchlist.csv` 仅接入 `fast_review_strategy_focus.csv/md` 与摘要“策略精简焦点”区，并新增 `--trend-watch-top-n` 透传到趋势脚本；这些 watch-only 样本不会进入 `fast_review_candidates.csv`、`fast_review_resonance.csv` 或 `/signals` 快照。
+- [改进] `scripts/select_trend_leader_candidates.py` 为 `trend_leader_unified` 增加 review-only `watchlist` sidecar：新增 `--watch-top-n`、`trend_leader_unified_watchlist.csv/txt/md` 与 `run_stats.watch_selected_count`，把被 strict 排除但仍有正分的非结构型样本单独导出，同时保持主结果、`/signals` 落库与快复盘聚合口径不变。
+- [修复] `src/services/trend_leader_strategy_service.py` 现在要求 `trend_leader_unified` 只有在真实 `breakout` 或 `pullback` 结构成立时才能进入 `selection_mode=strict`，避免 `trend_neutral` 的正分样本继续污染 strict 排名。
+- [改进] `src/services/kline_selector_service.py` 为 `spot` reference cache 增加进程内 memory 复用，避免 `trend_leader_unified` 同一轮准备阶段反复读取同一份 `kline_selector_spot_universe.csv`；同口径 `2026-04-28 limit=200` 诊断下，`prep_prefilter_elapsed_sec` 从约 `7.79s` 降到约 `0.25s`，总耗时降到约 `13.32s`。
+- [改进] `data_provider/base.py` 为 `DataFetcherManager.get_daily_data(...)` 增加短 TTL 的 history-failure disk cache，重复的同参 fresh-process rerun 会直接复用前一次超时/失败结果，不再反复等待单票 `20s` history timeout；同时补充 `tests/test_fetcher_logging.py` 回归覆盖跨 manager 失败缓存复用。
+- [改进] `scripts/select_trend_leader_candidates.py` 进一步收紧 `trend_leader_unified` 的弱趋势重型 enrichment 短路阈值：对非 breakout/non-pullback 且 `trend_template_score / trend_stage2_score / base_quality_score / return_20d` 均偏弱的样本，更早跳过 `earnings / boards / dragon / capital_flow` 相关抓取；`2026-04-28`、`limit=200` 的同口径诊断中，`capital_flow_fetch_skipped_count` 从 `21` 提升到 `34`，`selected_count` 保持 `20` 不变。
+- [改进] `data_provider/base.py` 为 `get_capital_flow_context(...)` 增加内存/磁盘缓存与 `cache_hit/cache_source` 观测字段，`src/services/capital_profile_service.py`、`scripts/select_trend_leader_candidates.py` 同步透传并汇总 `capital_flow_cache_hit_count/source_counts`；`trend_leader_unified` 100 只样本 cold/warm 对比中，`capital_profile` 阶段从约 `12.83s` 降至约 `0.18s`，总耗时从约 `83.62s` 降至约 `21.84s`。
+- [改进] `data_provider/base.py` 为 `get_earnings_fundamental_context(...)` 增加了 `cache_hit/cache_source` 观测字段，并把 `failed` 结果也纳入短 TTL 磁盘缓存；`scripts/select_trend_leader_candidates.py` 同步汇总 `fundamental_cache_hit_count` 与 `fundamental_cache_source_counts`，使 `trend_leader_unified` 可以直接区分 fundamentals 的 `memory / disk / fresh` 来源。实测在同口径 `limit=120` fresh-process 复跑中，第二次已达到 `fundamental_cache_hit_count=63`、`fundamental_fetch≈0.166s`。
+- [改进] `src/services/kline_selector_service.py` 的 `_prepare_history(...)` 现在会对 `DataFetcherManager.get_daily_data(...)` 已返回的标准化日线走 fast-path，避免 `trend_leader_unified`、`hundred_day_high`、`monthly_slow_rise` 等扫描链路重复执行 `to_datetime / to_numeric / sort`；同时更新 `tests/test_fundamental_context.py` 与 `tests/test_data_fetcher_market_cache.py`，把 earnings-fundamental / sector-rankings 的磁盘缓存测试隔离到临时目录，消除本地缓存污染导致的不稳定回归。
+- [改进] `trend_leader_unified` 进一步压缩深扫耗时：`fundamental_fetch` 与 `capital_profile` 现在在单候选内并行执行，trend 用 earnings context 仅请求 `financial + forecast + quick_report`，`capital_profile` 默认走 stock-only 资金流路径，不再为这条评分链路重复拉取 sector rankings。
+- [改进] `scripts/select_trend_leader_candidates.py` 为 `trend_leader_unified` 新增 `phase_timing_sec`、`sector_rankings_prefetch_status`、`sector_rankings_prefetch_elapsed_sec` 等运行观测字段，便于直接拆分 `history / fundamentals / capital / sector prewarm` 耗时。
+- [改进] `data_provider/base.py` 与 `data_provider/akshare_fetcher.py` 为 `get_sector_rankings(...)` 增加磁盘缓存，重复跑趋势复盘或诊断时可复用最近板块排行结果；`2026-04-29` 新进程诊断中 `sector_rankings_prefetch_elapsed_sec` 从约 `6.11s` 降到约 `0.0006s`。
+- [改进] `data_provider/fundamental_adapter.py` 为 `get_market_expectation_snapshot(...)` 增加磁盘缓存，并暴露 `cache_hit/cache_source`，降低 `earnings_surprise` 复盘层 `stock_profit_forecast_ths` 的重复请求。
+- [改进] `scripts/select_trend_leader_candidates.py` 为 `trend_leader_unified` 增加弱趋势样本的重型 enrichment 提前短路逻辑：明显弱结构样本会跳过 `earnings/boards/dragon/capital_flow` 相关抓取，并在 `run_stats` 暴露 `capital_flow_fetch_skipped_count` 便于观察命中规模。
+- [改进] `scripts/run_fast_review_bundle.py` 新增 `fast_review_earnings_focus.csv/md` 与摘要区“今日业绩焦点 15 只”，把 `earnings_surprise` 的业绩分、市场预期参考摘要、参考标签、事件日期和趋势共振集中到主复盘阅读区；`strategy_focus` 导出同步保留这些业绩预期字段。
+- [改进] `scripts/select_earnings_surprise_candidates.py` 为已选中的 `earnings_surprise` 候选补充同花顺 `stock_profit_forecast_ths` 市场预期快照（预测年度、机构数、EPS 均值/区间、行业均值），仅作复盘参考展示，不参与当前策略打分；`scripts/run_fast_review_bundle.py` 同步保留这些字段用于复盘导出。
+- [改进] `scripts/select_monthly_slow_rise_candidates.py` 默认接入 `KlineSelectorService.prepare_scan_universe(...)` 共享扫描壳，且 `scripts/run_fast_review_bundle.py` 新增可选 `monthly_slow_rise` 外部任务入口，支持把 `hundred_day_high / trend_leader / monthly_slow_rise` 三条扫描链在同一次快复盘中统一观测与汇总。
+- [文档] 新增 `docs/architecture/rqalpha-evaluation-layer-next-step.md`，把共享扫描壳收口后的下一阶段固定为 `RQAlpha` 风格的标准化评估层原型，优先服务 `monthly_slow_rise / earnings_surprise`。
+- [改进] `scripts/select_hundred_day_high_candidates.py` 默认接入 `KlineSelectorService.prepare_scan_universe(...)` 共享扫描壳，统一 universe 过滤、quote hydration、前筛与分片准备，并新增 `--disable-shared-scan-shell` 诊断开关。
+- [改进] `config/local_strategy_profile.json`、`scripts/run_fast_review_bundle.py` 与 `scripts/select_earnings_surprise_candidates.py` 将每日快复盘 `earnings_surprise` 默认口径收敛为 `latest_report_period + recent_event_max_age_days=7`，在保留全财报季模式的同时缩短 `2026-04-28` 全链路冷态耗时。
+- [修复] `data_provider/fundamental_adapter.py` 为 AkShare 基本面候选接口增加超时保护并缓存超时失败，避免 `earnings_surprise` 全市场快扫在基本面 endpoint 长时间无返回时卡死。
+- [改进] `scripts/select_earnings_surprise_candidates.py` 的全市场 `earnings_surprise` 快扫改用 `KlineSelectorService.build_fast_a_share_manager()`，避免资金画像/日线补充继续走默认全源无超时 fallback 链路导致复盘卡死。
+- [修复] `scripts/select_earnings_surprise_candidates.py` 将 `stock_yjbb_em` 正式财报公告纳入 `earnings_surprise` 近期事件目录，并在公告数据表夜间滞后但基础面块已拿到当前报告期正式财报金额/增速时启用实际财报兜底 overlay；`data_provider/fundamental_adapter.py` 同步解析 `stock_financial_abstract` 宽表，避免东山精密这类晚间正式财报被旧预告/快报事件漏判。
+- [改进] `scripts/run_fast_review_bundle.py` 新增 `fast_review_strategy_focus.csv/md` 与摘要焦点区，对 `trend_leader_unified` 候选按 `core/watch/low_priority` 分层，并把业绩、资金、板块强度及 `hundred_day_high` 交集纳入排序，减少快复盘大列表噪音。
+- [改进] `scripts/select_trend_leader_candidates.py` 将 `trend_leader_unified` 的单日回放 universe 准备日期改为使用 `--snapshot-date`，并新增诊断参数 `--disable-shared-scan-shell`，便于同口径对照共享扫描壳与旧准备路径。
+- [改进] `trend_leader_unified` 快扫现在优先复用有效的本地 `spot` reference cache，避免每轮单日回放先等待 live `spot`；2026-04-24 同参数验证中 `universe_elapsed_sec` 从约 `85.81s` 降到约 `21.34s`，总耗时从约 `4m47s` 降到约 `1m38s`。
+- [改进] `src/services/kline_selector_service.py` 新增共享扫描壳原型 `prepare_scan_universe(...)`，并让 `scripts/select_trend_leader_candidates.py` 优先走服务层统一的 universe 过滤、quote hydration、前筛与分片准备逻辑，为 `trend_leader_unified / hundred_day_high / monthly_slow_rise` 后续继续收口到同一扫描层铺路。
+- [测试] 更新 `tests/test_kline_selector_service.py` 与 `tests/test_trend_leader_signal_flow.py`，补充共享扫描壳准备结果与 `trend_leader_unified` 优先走服务层 scan setup 的回归覆盖。
+- [改进] `scripts/select_earnings_surprise_candidates.py` 修复 `earnings_surprise` 近期事件 overlay 被旧 `quick_report_*` 污染的问题，并将 `balanced` 档放宽为“质量确认或正向文本+增长阈值”可通过 watch，重复事件改为按档位冷却后可重入。
+- [改进] `scripts/select_trend_leader_candidates.py` 的 `trend_leader_unified` 预筛选阶段现在会先复用 `spot` 参考缓存补齐缺失的 `pct_change/turnover_rate` 等行情字段，再回退到逐票实时补全，减少重复短时行情请求并压缩慢日预处理耗时。
+- [改进] `src/services/kline_selector_service.py` 优化 `spot-enriched universe` 回退链路：disk `spot` 快照读取保留前导零代码，live `spot` 失败时优先直接回退本地 `spot` 快照，并在已有 disk cache 时将 live `spot` 重试从 2 次降为 1 次，缩短 `trend_leader_unified` 等全市场扫描的 universe 准备耗时。
+- [改进] `src/services/kline_selector_service.py` 在 `spot` 快照已自带完整 `list_date/listed_days` 时不再重复拉取 listing metadata；`scripts/select_trend_leader_candidates.py` 同时把“明显不可能凑够 120 个交易日”的新股在主扫描入队前提前跳过，减少 `trend_leader_unified` 的无效 history fetch 长尾。
+- [改进] `data_provider/base.py` 与 `src/services/kline_selector_service.py` 为 `trend_leader_unified` 快扫专用 manager 增加窄范围 history fallback 收缩：当 `AkshareFetcher` 已明确报出“所有渠道获取失败”且请求窗口仍是短历史快扫时，直接跳过后续 `TushareFetcher` 空转，减少尾部重复失败链路。
+- [改进] `data_provider/akshare_fetcher.py` 与 `src/services/kline_selector_service.py` 继续收紧 `trend_leader_unified` 快扫 history 链路：快扫专用 `AkshareFetcher` 的 history 内部重试从 `2` 次降到 `1` 次，减少 `EM` 传输失败时的尾部空耗，同时不影响普通 fetcher 默认重试策略。
+- [改进] `scripts/select_trend_leader_candidates.py` 优化 `trend_leader_unified` 主扫描入队判断：`listed_days` 现采用“直接淘汰 / 直接放行 / 灰区再补算 business-day”三段式短路，避免为 1800+ 候选重复执行 `pd.bdate_range(...)`，单日全市场验证中 `scan start -> scan queue prepared` 已从约 `80s` 收敛到约 `0.03s`。
+- [文档] `docs/LOCAL_STRATEGY_BASELINE.md` 新增 `trend_leader_unified` 最近一轮性能优化过程记录，明确本轮优化顺序、单日实跑结果与当前剩余瓶颈，便于后续继续沿同一路径收口。
+- [文档] 新增 `docs/architecture/external-capability-map-for-local-strategies.md`，按“数据 / 基本面 / 短线理解 / 新闻 / agent / 回测 / 研究自动化 / 工程结构”分层整理外部开源系统对本地 4 条主策略的可借力点，并补充源码深挖优先级与后续优化步骤。
+- [文档] `docs/architecture/external-capability-map-for-local-strategies.md` 进一步明确外部仓库源码深挖的首轮实操顺序为 `RD-Agent -> Qlib -> myhhub/stock -> FinGenius`，并补充每轮深挖的固定关注点与产出要求。
+- [文档] 新增 `docs/architecture/rd-agent-source-dive-outline.md`，基于 `microsoft/RD-Agent` 当前公开仓库结构整理首轮 quant 源码深挖提纲，明确 CLI/quant loop/通用循环/quant 场景/反馈闭环的阅读顺序与固定产出。
+- [文档] `docs/architecture/external-capability-map-for-local-strategies.md` 补充执行现实判断，明确外部能力研究应采用“总地图 + 单仓库深挖记录 + 集成决策”三层滚动沉淀，而不是一次性写完所有仓库的大全文档。
+- [文档] 新增 `docs/architecture/rd-agent-source-dive.md`，基于 `microsoft/RD-Agent` 的 `fin_quant` 入口、`RDLoop` 循环骨架、`QlibQuantScenario` 场景装配与 factor/model runner/feedback 链路，整理 `RD-Agent` 对本地 4 条主策略最值得借鉴的研究自动化能力与不适合直接迁移的部分。
+- [文档] 新增 `docs/architecture/qlib-source-dive.md`，基于 `microsoft/qlib` 的 workflow、benchmark config、`DatasetH`、`Alpha158/Alpha360`、recorder 与 task management 结构，整理 `Qlib` 对本地 4 条主策略最值得借鉴的统一因子层、数据集层、workflow 层与滚动实验能力。
+- [文档] 新增 `docs/architecture/myhhub-stock-source-dive.md`，基于 `myhhub/stock`（`InStock`）的 `breakthrough_platform`、`turtle_trade`、`backtrace_ma250`、`high_tight_flag`、`low_atr` 与 `CYQ` 筹码分布实现，整理其对 `trend_leader_unified / hundred_day_high` 最值得迁移的形态质量与筹码增强能力。
+- [文档] 新增 `docs/architecture/fingenius-source-dive.md`，基于 `HuaYaoAI/FinGenius` 的 `ResearchEnvironment / BattleEnvironment`、`hot_money / chip_analysis / big_deal_analysis` 结构，整理其对本地主策略最有价值的 A 股短线解释层、游资/大单/筹码维度拆分与两阶段分析组织方式。
+- [文档] `docs/architecture/external-capability-map-for-local-strategies.md` 回填 `myhhub/stock` 与 `FinGenius` 首轮正式深挖结论，并补上两份独立源码记录的跳转，形成 `RD-Agent -> Qlib -> myhhub/stock -> FinGenius` 的第一轮闭环。
+- [文档] 新增 `docs/architecture/tradingagents-cn-source-dive.md`，基于 `TradingAgents-CN` 的 `TradingAgentsGraph`、`GraphSetup`、`Propagator`、角色分层与数据源文档，整理其对本地框架最有价值的图式任务编排、中文产品壳与解释层组织方式。
+- [文档] 新增 `docs/architecture/openbb-source-dive.md`，基于 `OpenBB` 的 `Open Data Platform`、`Provider / Fetcher / Router / OBBject` 抽象、官方开发文档与 MCP 说明，整理其对本地框架最有价值的统一数据接入层与工具层能力。
+- [文档] `docs/architecture/external-capability-map-for-local-strategies.md` 回填 `TradingAgents-CN` 与 `OpenBB` 首轮正式深挖结论，并把后续默认深挖顺序固定为 `WonderTrader -> RQAlpha -> vn.py -> QUANTAXIS -> ai-hedge-fund`，避免后续再次重复定节奏。
+- [文档] `docs/architecture/external-capability-map-for-local-strategies.md` 进一步明确外部工程研究的默认节奏为“直接分析、直接记录、直接回填”，仅在高成本动作或高风险分叉时中断，减少重复确认和过程汇报。
+- [文档] 新增 `docs/architecture/wondertrader-source-dive.md`，基于 `WonderTrader` 的 `SEL` 选股引擎、`wtpy` Python 层与高性能数据/回测/执行分层，整理其对本地 4 条主策略最有价值的全市场扫描组织与执行层结构借鉴。
+- [文档] 新增 `docs/architecture/rqalpha-source-dive.md`，基于 `RQAlpha` 的 `mod` 架构、成本/风险/分析分层与官方回测文档，整理其对本地框架最有价值的标准化评估层与组合层参考。
+- [文档] 新增 `docs/architecture/vnpy-source-dive.md`，基于 `vn.py` 的插件生态、研究到执行桥接与 `vnpy.alpha` 结构，整理其对本地框架最有价值的模块边界、应用层与工作台组织方式。
+- [文档] 新增 `docs/architecture/quantaxis-source-dive.md`，基于 `QUANTAXIS` 的 A 股本地底座、任务化组织、统一账户与桥接层说明，整理其对本地框架最有价值的数据、日历与本地运行基础设施启发。
+- [文档] 新增 `docs/architecture/ai-hedge-fund-source-dive.md`，基于 `ai-hedge-fund` 的多 agent 角色分层、CLI/Web/Backtester 展示壳与官方风险声明，整理其对本地框架最有价值的解释层与展示层借鉴。
+- [文档] `docs/architecture/external-capability-map-for-local-strategies.md` 回填 `WonderTrader`、`RQAlpha`、`vn.py`、`QUANTAXIS` 与 `ai-hedge-fund` 首轮正式深挖结论，并把第二轮默认顺序从“待分析列表”升级为“已完成首轮闭环”的导航记录。
+- [文档] 新增 `docs/architecture/external-capability-integration-decision.md`，把 11 个外部仓库的首轮深挖结论收敛为可执行集成决策，明确“立即接入 / 延后实验 / 只参考不接”以及对本地 4 条主策略的接入顺序。
+- [文档] `docs/architecture/external-capability-map-for-local-strategies.md` 新增到 `external-capability-integration-decision.md` 的导航跳转，明确外部能力研究已从“能力地图”进入“集成决策”阶段。
+- [改进] `config/local_strategy_profile.json`、`scripts/run_fast_review_bundle.py` 与 `scripts/select_earnings_surprise_candidates.py` 同步优化 `earnings` 快复盘链路：默认 `earnings_max_workers=1`、`external_command_idle_timeout_sec=1800`，快复盘透传 `--earnings-capital-profile-ttl-seconds=86400`，并为 SQLite signal snapshot 写入补充轻量重试，降低长跑时的超时与锁冲突丢写。
+- [改进] `scripts/run_fast_review_bundle.py` 为 `earnings` 增加独立并发参数 `--earnings-max-workers`，修复其误复用 `hundred_day_max_workers` 的问题，并新增 `--earnings-capital-profile-ttl-seconds`（默认 86400）透传到业绩脚本以减少回填时重复 `capital_profile` 刷新。
+- [改进] `apps/dsa-web/src/pages/SignalsPage.tsx` 将 Signals 页面改为“短线模式/长线模式”双层展示：默认短线仅保留 `trend_leader_unified`、`earnings_surprise`、`hundred_day_high`，长线承载 `monthly_slow_rise` + `monthly_slow_rise_profile__*` + `dragon_head_candidate` + `commodity_beneficiary__*` + `board_recognizability__*`，并将月线档位对比区改为显式按钮展开/收起。
 - [文档] 重写 `docs/LOCAL_STRATEGY_BASELINE.md` 与 `docs/LOCAL_STRATEGY_CATALOG.md`，按“当前默认行为优先”重构本地策略文档结构，明确默认每日策略分层、入口脚本、`signal_type` 与关键参数口径。
 - [文档] 重写 `docs/TREND_LEADER_UNIFIED_STRATEGY.md`、`docs/EARNINGS_SURPRISE_TRACKING.md`、`docs/MONTHLY_SLOW_RISE_SCAN.md`，统一补齐策略条件、门槛、评分/拦截逻辑与 CLI 参数说明，减少历史叙述对当前口径的干扰。
 - [改进] `scripts/evaluate_signal_snapshot_performance.py` 将前瞻可用性判定升级为“交易日口径优先”：优先按 `stock_daily` 市场级交易日计数判断 `insufficient_forward_horizon`，仅在计数不可用时回退自然日判定，减少对本就不可达窗口的无效补数。

@@ -74,6 +74,36 @@ class _EmptyYfinanceFetcher(_EmptyFetcher):
     name = "YfinanceFetcher"
 
 
+class _AkshareHistoryFailureFetcher(BaseFetcher):
+    name = "AkshareFetcher"
+    priority = 0
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def _fetch_raw_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+        self.calls += 1
+        raise DataFetchError("Akshare 所有渠道获取失败: None")
+
+    def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
+        return df
+
+
+class _TrackingTushareFetcher(BaseFetcher):
+    name = "TushareFetcher"
+    priority = 1
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def _fetch_raw_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+        self.calls += 1
+        return _sample_df()
+
+    def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
+        return df
+
+
 def _history_rows(*dates: str) -> pd.DataFrame:
     rows = []
     base_price = 10.0
@@ -121,6 +151,22 @@ class _HangingFetcher(BaseFetcher):
     def _fetch_raw_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
         time.sleep(self.sleep_seconds)
         return _sample_df()
+
+    def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
+        return df
+
+
+class _AlwaysFailHistoryFetcher(BaseFetcher):
+    name = "AlwaysFailHistoryFetcher"
+    priority = 0
+
+    def __init__(self, error_message: str = "simulated history fetch failure"):
+        self.error_message = error_message
+        self.calls = []
+
+    def _fetch_raw_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+        self.calls.append((stock_code, start_date, end_date))
+        raise DataFetchError(self.error_message)
 
     def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
         return df
@@ -212,6 +258,28 @@ class TestFetcherLogging(unittest.TestCase):
 
         self.assertIn("[YfinanceFetcher] (empty_result) returned empty daily data", str(raised.exception))
 
+    def test_manager_can_skip_tushare_history_fallback_for_fast_scan(self):
+        akshare = _AkshareHistoryFailureFetcher()
+        tushare = _TrackingTushareFetcher()
+        manager = DataFetcherManager(fetchers=[akshare, tushare])
+        manager._skip_tushare_history_fallback_for_fast_scan = True
+        config = types.SimpleNamespace(
+            history_disk_cache_enabled=False,
+            history_disk_cache_dir=tempfile.mkdtemp(),
+            history_disk_cache_ttl_seconds=21600,
+            history_disk_cache_overlap_days=0,
+        )
+
+        with patch("src.config.get_config", return_value=config):
+            with self.assertLogs("data_provider.base", level="INFO") as captured:
+                with self.assertRaises(DataFetchError):
+                    manager.get_daily_data("688783", start_date="2025-09-14", end_date="2025-10-27", days=140)
+
+        log_text = "\n".join(captured.output)
+        self.assertEqual(akshare.calls, 1)
+        self.assertEqual(tushare.calls, 0)
+        self.assertIn("skip fast-scan Tushare history fallback", log_text)
+
     def test_efinance_logs_eastmoney_endpoint_on_remote_disconnect(self):
         fetcher = EfinanceFetcher()
         fake_efinance = types.SimpleNamespace(
@@ -292,6 +360,30 @@ class TestFetcherLogging(unittest.TestCase):
 
         self.assertEqual(call_count["value"], 2)
         self.assertEqual(len(df), 2)
+
+    def test_akshare_history_retry_attempts_can_be_reduced_for_fast_scan(self):
+        call_count = {"value": 0}
+
+        def _stock_zh_a_hist(**kwargs):
+            call_count["value"] += 1
+            raise requests.exceptions.ConnectionError("Remote end closed connection without response")
+
+        fake_akshare = types.SimpleNamespace(stock_zh_a_hist=_stock_zh_a_hist)
+        with patch(
+            "data_provider.akshare_fetcher.get_config",
+            return_value=types.SimpleNamespace(enable_eastmoney_patch=False),
+        ):
+            fetcher = AkshareFetcher(stock_history_source_priority=("em",))
+        fetcher._stock_history_retry_attempts = 1
+
+        with patch.dict(sys.modules, {"akshare": fake_akshare}):
+            with patch.object(fetcher, "_set_random_user_agent", return_value=None), patch.object(
+                fetcher, "_enforce_rate_limit", return_value=None
+            ), patch("data_provider.akshare_fetcher.time.sleep", return_value=None):
+                with self.assertRaises(requests.exceptions.ConnectionError):
+                    fetcher._fetch_stock_data_em("601006", start_date="2026-03-06", end_date="2026-03-07")
+
+        self.assertEqual(call_count["value"], 1)
 
     def test_manager_history_cache_hits_disk_before_fetcher(self):
         fetcher = _HistoryCacheFetcher()
@@ -544,6 +636,45 @@ class TestFetcherLogging(unittest.TestCase):
 
         self.assertIn("timeout", str(raised.exception).lower())
         self.assertLess(elapsed, 0.15)
+
+    def test_manager_history_failure_cache_reuses_failed_result_across_manager_instances(self):
+        cache_dir = tempfile.mkdtemp()
+        config = types.SimpleNamespace(
+            history_disk_cache_enabled=True,
+            history_disk_cache_dir=cache_dir,
+            history_disk_cache_ttl_seconds=21600,
+            history_disk_cache_overlap_days=0,
+        )
+        start_date = "2026-03-01"
+        end_date = "2026-03-08"
+
+        first_fetcher = _AlwaysFailHistoryFetcher("first history failure")
+        first_manager = DataFetcherManager(fetchers=[first_fetcher])
+        first_manager._history_failed_disk_cache_ttl_seconds = 1800
+
+        second_fetcher = _AlwaysFailHistoryFetcher("second manager should not hit remote")
+        second_manager = DataFetcherManager(fetchers=[second_fetcher])
+        second_manager._history_failed_disk_cache_ttl_seconds = 1800
+
+        with patch("src.config.get_config", return_value=config):
+            with self.assertRaises(DataFetchError) as first_error:
+                first_manager.get_daily_data(
+                    "601006",
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+
+            with self.assertRaises(DataFetchError) as second_error:
+                second_manager.get_daily_data(
+                    "601006",
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+
+        self.assertIn("first history failure", str(first_error.exception))
+        self.assertIn("first history failure", str(second_error.exception))
+        self.assertEqual(first_fetcher.calls, [("601006", start_date, end_date)])
+        self.assertEqual(second_fetcher.calls, [])
 
 
 if __name__ == "__main__":

@@ -232,10 +232,14 @@ class MonthlySlowRiseSelectorTestCase(unittest.TestCase):
         )
         criteria = MonthlySlowRiseCriteria()
 
-        run_result = scan_monthly_slow_rise_candidates(
-            criteria=criteria,
-            service=service,
-        )
+        with patch(
+            "scripts.select_monthly_slow_rise_candidates.AkshareFundamentalAdapter.get_fundamental_bundle",
+            return_value={},
+        ):
+            run_result = scan_monthly_slow_rise_candidates(
+                criteria=criteria,
+                service=service,
+            )
 
         self.assertEqual([item.stock_code for item in run_result.selected], ["600001"])
         metrics = run_result.selected[0].metrics
@@ -275,10 +279,14 @@ class MonthlySlowRiseSelectorTestCase(unittest.TestCase):
         )
         criteria = MonthlySlowRiseCriteria()
 
-        run_result = scan_monthly_slow_rise_candidates(
-            criteria=criteria,
-            service=service,
-        )
+        with patch(
+            "scripts.select_monthly_slow_rise_candidates.AkshareFundamentalAdapter.get_fundamental_bundle",
+            return_value={},
+        ):
+            run_result = scan_monthly_slow_rise_candidates(
+                criteria=criteria,
+                service=service,
+            )
 
         self.assertEqual(len(run_result.selected), 0)
         self.assertEqual(len(run_result.failed), 1)
@@ -315,7 +323,11 @@ class MonthlySlowRiseSelectorTestCase(unittest.TestCase):
             ),
         )
         criteria = MonthlySlowRiseCriteria()
-        run_result = scan_monthly_slow_rise_candidates(criteria=criteria, service=service)
+        with patch(
+            "scripts.select_monthly_slow_rise_candidates.AkshareFundamentalAdapter.get_fundamental_bundle",
+            return_value={},
+        ):
+            run_result = scan_monthly_slow_rise_candidates(criteria=criteria, service=service)
 
         df = build_selected_dataframe(run_result)
         self.assertIn("monthly_positive_ratio", df.columns)
@@ -383,7 +395,11 @@ class MonthlySlowRiseSelectorTestCase(unittest.TestCase):
             ),
         )
 
-        run_result = scan_monthly_slow_rise_candidates(criteria=MonthlySlowRiseCriteria(), service=service)
+        with patch(
+            "scripts.select_monthly_slow_rise_candidates.AkshareFundamentalAdapter.get_fundamental_bundle",
+            return_value={},
+        ):
+            run_result = scan_monthly_slow_rise_candidates(criteria=MonthlySlowRiseCriteria(), service=service)
 
         self.assertEqual([item.stock_code for item in run_result.selected], ["600004"])
         metrics = run_result.selected[0].metrics
@@ -618,6 +634,106 @@ class MonthlySlowRiseSelectorTestCase(unittest.TestCase):
         self.assertEqual(captured["scan_kwargs"]["as_of_date"], pd.Timestamp("2026-04-22").date())
         self.assertEqual(captured["scan_kwargs"]["prefilter"].min_listed_days, 240)
         self.assertEqual(captured["scan_kwargs"]["universe"]["code"].tolist(), ["600888"])
+
+    def test_scan_monthly_slow_rise_prefers_shared_prepare_scan_universe(self):
+        captured: dict[str, object] = {}
+        expected_run_result = KlineSelectorRunResult(
+            criteria=MonthlySlowRiseCriteria(),
+            universe_size=1,
+            evaluated_count=0,
+            skipped_market_cap_count=0,
+            skipped_prefilter_count=0,
+            skipped_listed_days_count=0,
+            universe_codes=["600888"],
+            selected=[],
+            failed=[],
+        )
+
+        class _FakeService:
+            manager = None
+
+            def get_spot_enriched_a_share_universe(self, *, limit=None, as_of_date=None):
+                captured["limit"] = limit
+                captured["spot_as_of_date"] = as_of_date
+                return pd.DataFrame(
+                    [
+                        {"code": "600888", "name": "monthly_case", "listed_days": 900},
+                        {"code": "600001", "name": "ST sample", "listed_days": 900},
+                    ]
+                )
+
+            def prepare_scan_universe(self, **kwargs):
+                captured["prepare_kwargs"] = kwargs
+                return type(
+                    "Prepared",
+                    (),
+                    {
+                        "prepared_universe": pd.DataFrame(
+                            [{"code": "600888", "name": "monthly_case", "listed_days": 900}]
+                        ),
+                        "base_universe_size": 2,
+                        "sharded_universe_size": 1,
+                        "prepared_universe_size": 1,
+                        "filter_stats": {
+                            "before": 2,
+                            "after": 1,
+                            "removed_invalid_code": 0,
+                            "removed_whitelist": 0,
+                            "removed_st": 1,
+                            "removed_kcb": 0,
+                            "removed_cyb": 0,
+                        },
+                        "prefilter_stats": {
+                            "before": 1,
+                            "after": 1,
+                            "after_primary": 1,
+                            "after_relaxed": 1,
+                            "removed_listed_days": 0,
+                            "removed_change_60d": 0,
+                            "removed_turnover_rate": 0,
+                            "removed_negative_change": 0,
+                            "added_relaxed_buffer": 0,
+                            "adaptive_positive_change_applied": False,
+                            "quote_hydrated_rows": 0,
+                            "quote_requested_rows": 0,
+                            "quote_requested_fields": "",
+                            "quote_missing_unsupported_fields": "",
+                            "quote_worker_count": 0,
+                        },
+                    },
+                )()
+
+            def scan_market(self, **kwargs):
+                captured["scan_kwargs"] = kwargs
+                return expected_run_result
+
+        run_result = scan_monthly_slow_rise_candidates(
+            criteria=MonthlySlowRiseCriteria(),
+            limit=5,
+            max_workers=3,
+            shard_count=2,
+            shard_index=1,
+            prefilter=KlineSelectorPrefilter(min_listed_days=240, exclude_st=True),
+            service=_FakeService(),
+            snapshot_date=pd.Timestamp("2026-04-22").date(),
+        )
+
+        self.assertIs(run_result, expected_run_result)
+        self.assertEqual(captured["limit"], 5)
+        self.assertEqual(captured["spot_as_of_date"], pd.Timestamp("2026-04-22").date())
+        self.assertEqual(captured["prepare_kwargs"]["as_of_date"], pd.Timestamp("2026-04-22").date())
+        self.assertEqual(captured["prepare_kwargs"]["shard_count"], 2)
+        self.assertEqual(captured["prepare_kwargs"]["shard_index"], 1)
+        self.assertEqual(captured["prepare_kwargs"]["quote_hydration_workers"], 3)
+        self.assertTrue(captured["prepare_kwargs"]["exclude_st"])
+        self.assertEqual(captured["scan_kwargs"]["as_of_date"], pd.Timestamp("2026-04-22").date())
+        self.assertIsNone(captured["scan_kwargs"]["prefilter"])
+        self.assertEqual(captured["scan_kwargs"]["shard_count"], 1)
+        self.assertEqual(captured["scan_kwargs"]["shard_index"], 0)
+        self.assertEqual(captured["scan_kwargs"]["universe"]["code"].tolist(), ["600888"])
+        self.assertEqual(run_result.skipped_prefilter_count, 1)
+        self.assertTrue(run_result.phase_metrics["shared_scan_shell_enabled"])
+        self.assertEqual(run_result.phase_metrics["scan_shell_filter_stats"]["removed_st"], 1)
 
     def test_scan_monthly_slow_rise_collects_phase_metrics(self):
         evaluation = MagicMock()

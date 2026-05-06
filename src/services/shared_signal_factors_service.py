@@ -102,6 +102,7 @@ class SharedSignalFactorsService:
         quote_data: Optional[Any] = None,
         daily_df: Optional[Any] = None,
         capital_flow_context: Optional[Dict[str, Any]] = None,
+        capital_flow_budget_seconds: Optional[float] = None,
     ) -> Dict[str, Any]:
         return self.capital_profile_service.build_stock_profile(
             stock_code,
@@ -111,6 +112,7 @@ class SharedSignalFactorsService:
             quote_data=quote_data,
             daily_df=daily_df,
             capital_flow_context=capital_flow_context,
+            capital_flow_budget_seconds=capital_flow_budget_seconds,
         )
 
     @staticmethod

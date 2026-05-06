@@ -4,10 +4,11 @@ Tests for the isolated K-line selector service.
 """
 
 import math
+import json
 import sys
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -92,6 +93,8 @@ class TestKlineSelectorService(unittest.TestCase):
     def tearDown(self) -> None:
         KlineSelectorService._spot_universe_cache = None
         KlineSelectorService._listing_metadata_cache = None
+        if hasattr(KlineSelectorService, "_spot_universe_reference_cache_memory"):
+            KlineSelectorService._spot_universe_reference_cache_memory = None
 
     def test_fetch_universe_dataframe_prefers_tushare_before_akshare_spot(self):
         service = KlineSelectorService()
@@ -162,6 +165,90 @@ class TestKlineSelectorService(unittest.TestCase):
         self.assertEqual(str(universe.loc[0, "list_date"].date()), "2022-03-15")
         self.assertEqual(int(universe.loc[0, "listed_days"]), 1499)
         self.assertEqual(str(universe.loc[1, "list_date"].date()), "2001-08-27")
+
+    def test_prepare_history_skips_reparsing_for_prepared_manager_output(self):
+        history = pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-04-01", "2026-04-02", "2026-04-03"]),
+                "open": [10.0, 10.3, 10.5],
+                "high": [10.2, 10.6, 10.8],
+                "low": [9.9, 10.1, 10.4],
+                "close": [10.1, 10.5, 10.7],
+                "pct_chg": [0.5, 3.96, 1.9],
+                "volume": [1000.0, 1200.0, 1300.0],
+                "amount": [10000.0, 12600.0, 13910.0],
+            }
+        )
+
+        with patch(
+            "src.services.kline_selector_service.pd.to_datetime",
+            side_effect=AssertionError("should not reparse prepared history"),
+        ), patch(
+            "src.services.kline_selector_service.pd.to_numeric",
+            side_effect=AssertionError("should not renormalize prepared history"),
+        ):
+            prepared = KlineSelectorService._prepare_history(history)
+
+        self.assertEqual(prepared["date"].tolist(), history["date"].tolist())
+        self.assertTrue(pd.isna(prepared.loc[0, "prev_close"]))
+        self.assertAlmostEqual(float(prepared.loc[1, "prev_close"]), 10.1, places=6)
+        self.assertAlmostEqual(float(prepared.loc[2, "prev_close"]), 10.5, places=6)
+
+    def test_prepare_scan_universe_applies_filters_and_prefilter_stats(self):
+        service = KlineSelectorService()
+        universe = pd.DataFrame(
+            [
+                {"code": "600001", "name": "正常股", "pct_change": 1.0, "turnover_rate": 2.0},
+                {"code": "688001", "name": "科创股", "pct_change": 1.0, "turnover_rate": 2.0},
+                {"code": "600002", "name": "*ST测试", "pct_change": 1.0, "turnover_rate": 2.0},
+            ]
+        )
+
+        result = service.prepare_scan_universe(
+            universe=universe,
+            prefilter=KlineSelectorPrefilter(require_positive_change=True),
+            exclude_st=True,
+            exclude_kcb=True,
+        )
+
+        self.assertEqual(result.base_universe_size, 3)
+        self.assertEqual(result.sharded_universe_size, 1)
+        self.assertEqual(result.prepared_universe_size, 1)
+        self.assertEqual(result.prepared_universe["code"].tolist(), ["600001"])
+        self.assertEqual(result.filter_stats["removed_st"], 1)
+        self.assertEqual(result.filter_stats["removed_kcb"], 1)
+        self.assertEqual(result.prefilter_stats["after"], 1)
+
+    def test_prepare_scan_universe_skips_pct_change_hydration_when_partial_values_already_exist(self):
+        class PartialQuoteManager:
+            def __init__(self):
+                self.requested_codes = []
+
+            def get_realtime_quote(self, stock_code: str):
+                self.requested_codes.append(stock_code)
+                raise AssertionError(f"pct_change hydration should be skipped for {stock_code}")
+
+        manager = PartialQuoteManager()
+        service = KlineSelectorService(manager=manager)
+        universe = pd.DataFrame(
+            [
+                {"code": "600001", "name": "alpha", "pct_change": 1.2, "turnover_rate": 1.1},
+                {"code": "600002", "name": "beta", "pct_change": None, "turnover_rate": 1.3},
+            ]
+        )
+
+        result = service.prepare_scan_universe(
+            universe=universe,
+            prefilter=KlineSelectorPrefilter(
+                min_change_pct_60d=3.0,
+                require_positive_change=True,
+            ),
+        )
+
+        self.assertEqual(manager.requested_codes, [])
+        self.assertEqual(result.prefilter_stats["quote_requested_rows"], 0)
+        self.assertEqual(result.prefilter_stats["quote_hydrated_rows"], 0)
+        self.assertEqual(result.prepared_universe["code"].tolist(), ["600001", "600002"])
 
     def test_get_spot_enriched_a_share_universe_retries_once_before_success(self):
         service = KlineSelectorService()
@@ -236,6 +323,135 @@ class TestKlineSelectorService(unittest.TestCase):
         self.assertEqual(first["code"].tolist(), ["600519"])
         self.assertEqual(second["code"].tolist(), ["600519"])
 
+    def test_get_spot_enriched_a_share_universe_reuses_cached_quote_fields_when_new_spot_snapshot_is_sparse(self):
+        service = KlineSelectorService()
+        rich_spot_df = pd.DataFrame(
+            {
+                "code": ["600519"],
+                "name": ["maotai"],
+                "total_mv": [220_000_000_000.0],
+                "latest_price": [1800.0],
+                "pct_change": [2.5],
+                "turnover_rate": [1.3],
+            }
+        )
+        sparse_spot_df = pd.DataFrame(
+            {
+                "code": ["600519"],
+                "name": ["maotai"],
+                "total_mv": [220_000_000_000.0],
+                "latest_price": [1801.0],
+                "pct_change": [None],
+                "turnover_rate": [None],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cache_csv = Path(tmp_dir) / "spot_cache.csv"
+            cache_meta = Path(tmp_dir) / "spot_cache.json"
+            with patch.object(
+                service,
+                "_fetch_universe_from_akshare_spot",
+                side_effect=[rich_spot_df, sparse_spot_df],
+            ), patch.object(
+                service,
+                "_fetch_listing_dates_dataframe",
+                return_value=pd.DataFrame(),
+            ), patch.object(
+                service,
+                "_get_spot_universe_reference_cache_paths",
+                return_value=(cache_csv, cache_meta),
+                create=True,
+            ), patch.object(
+                service,
+                "_spot_universe_reference_cache_min_rows",
+                1,
+                create=True,
+            ):
+                first = service.get_spot_enriched_a_share_universe(as_of_date=date(2026, 4, 22))
+                KlineSelectorService._spot_universe_cache = None
+                second = service.get_spot_enriched_a_share_universe(as_of_date=date(2026, 4, 22))
+
+        self.assertEqual(first["code"].tolist(), ["600519"])
+        self.assertEqual(second["code"].tolist(), ["600519"])
+        self.assertEqual(float(second.iloc[0]["latest_price"]), 1801.0)
+        self.assertEqual(float(second.iloc[0]["pct_change"]), 2.5)
+        self.assertEqual(float(second.iloc[0]["turnover_rate"]), 1.3)
+
+    def test_read_spot_universe_reference_cache_preserves_leading_zero_codes(self):
+        service = KlineSelectorService()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cache_csv = Path(tmp_dir) / "spot_cache.csv"
+            cache_meta = Path(tmp_dir) / "spot_cache.json"
+            pd.DataFrame(
+                {
+                    "code": ["000001", "001201", "600519"],
+                    "name": ["pingan", "dongrui", "maotai"],
+                    "pct_change": [1.2, 2.3, 3.4],
+                    "turnover_rate": [0.8, 1.5, 0.9],
+                }
+            ).to_csv(cache_csv, index=False, encoding="utf-8-sig")
+            cache_meta.write_text(
+                json.dumps({"written_at": datetime.now().isoformat(), "rows": 3}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            with patch.object(
+                service,
+                "_get_spot_universe_reference_cache_paths",
+                return_value=(cache_csv, cache_meta),
+                create=True,
+            ), patch.object(
+                service,
+                "_spot_universe_reference_cache_min_rows",
+                1,
+                create=True,
+            ):
+                cached = service._read_spot_universe_reference_cache()
+
+        self.assertEqual(cached["code"].tolist(), ["000001", "001201", "600519"])
+
+    def test_read_spot_universe_reference_cache_reuses_memory_copy_within_process(self):
+        service = KlineSelectorService()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cache_csv = Path(tmp_dir) / "spot_cache.csv"
+            cache_meta = Path(tmp_dir) / "spot_cache.json"
+            pd.DataFrame(
+                {
+                    "code": ["000001", "600519"],
+                    "name": ["pingan", "maotai"],
+                    "pct_change": [1.2, 3.4],
+                    "turnover_rate": [0.8, 0.9],
+                }
+            ).to_csv(cache_csv, index=False, encoding="utf-8-sig")
+            cache_meta.write_text(
+                json.dumps({"written_at": datetime.now().isoformat(), "rows": 2}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            with patch.object(
+                service,
+                "_get_spot_universe_reference_cache_paths",
+                return_value=(cache_csv, cache_meta),
+                create=True,
+            ), patch.object(
+                service,
+                "_spot_universe_reference_cache_min_rows",
+                1,
+                create=True,
+            ), patch(
+                "src.services.kline_selector_service.pd.read_csv",
+                wraps=pd.read_csv,
+            ) as read_csv_mock:
+                first = service._read_spot_universe_reference_cache()
+                second = service._read_spot_universe_reference_cache()
+
+        self.assertEqual(read_csv_mock.call_count, 1)
+        self.assertEqual(first["code"].tolist(), ["000001", "600519"])
+        self.assertEqual(second["code"].tolist(), ["000001", "600519"])
+
     def test_get_spot_enriched_a_share_universe_merges_disk_cached_spot_quotes_on_generic_fallback(self):
         service = KlineSelectorService()
         spot_df = pd.DataFrame(
@@ -292,6 +508,313 @@ class TestKlineSelectorService(unittest.TestCase):
         self.assertEqual(float(second.iloc[0]["latest_price"]), 1800.0)
         self.assertEqual(float(second.iloc[0]["pct_change"]), 2.5)
         self.assertEqual(float(second.iloc[0]["turnover_rate"]), 1.3)
+
+    def test_get_spot_enriched_a_share_universe_uses_disk_cached_spot_snapshot_before_generic_fallback(self):
+        service = KlineSelectorService()
+        cached_spot_df = pd.DataFrame(
+            {
+                "code": ["000001", "600519"],
+                "name": ["pingan", "maotai"],
+                "list_date": ["1991-04-03", "2001-08-27"],
+                "listed_days": [10000, 9000],
+                "latest_price": [12.3, 1800.0],
+                "pct_change": [1.2, 2.5],
+                "turnover_rate": [0.8, 1.3],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cache_csv = Path(tmp_dir) / "spot_cache.csv"
+            cache_meta = Path(tmp_dir) / "spot_cache.json"
+            cached_spot_df.to_csv(cache_csv, index=False, encoding="utf-8-sig")
+            cache_meta.write_text(
+                json.dumps({"written_at": datetime.now().isoformat(), "rows": 2}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            with patch.object(
+                service,
+                "_fetch_universe_from_akshare_spot",
+                side_effect=RuntimeError("offline"),
+            ), patch.object(
+                service,
+                "get_a_share_universe",
+                side_effect=AssertionError("generic fallback should not be used when disk spot snapshot exists"),
+            ), patch.object(
+                service,
+                "_fetch_listing_dates_dataframe",
+                return_value=pd.DataFrame(),
+            ), patch.object(
+                service,
+                "_get_spot_universe_reference_cache_paths",
+                return_value=(cache_csv, cache_meta),
+                create=True,
+            ), patch.object(
+                service,
+                "_spot_universe_reference_cache_min_rows",
+                1,
+                create=True,
+            ):
+                universe = service.get_spot_enriched_a_share_universe(as_of_date=date(2026, 4, 22))
+
+        self.assertEqual(universe["code"].tolist(), ["000001", "600519"])
+        self.assertEqual(float(universe.iloc[0]["pct_change"]), 1.2)
+        self.assertEqual(float(universe.iloc[1]["turnover_rate"]), 1.3)
+
+    def test_get_spot_enriched_a_share_universe_can_prefer_disk_reference_cache(self):
+        service = KlineSelectorService()
+        service._prefer_spot_universe_reference_cache = True
+        cached_spot_df = pd.DataFrame(
+            {
+                "code": ["000001", "600519"],
+                "name": ["pingan", "maotai"],
+                "list_date": ["1991-04-03", "2001-08-27"],
+                "listed_days": [10000, 9000],
+                "latest_price": [12.3, 1800.0],
+                "pct_change": [1.2, 2.5],
+                "turnover_rate": [0.8, 1.3],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cache_csv = Path(tmp_dir) / "spot_cache.csv"
+            cache_meta = Path(tmp_dir) / "spot_cache.json"
+            cached_spot_df.to_csv(cache_csv, index=False, encoding="utf-8-sig")
+            cache_meta.write_text(
+                json.dumps({"written_at": datetime.now().isoformat(), "rows": 2}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            with patch.object(
+                service,
+                "_fetch_universe_from_akshare_spot",
+                side_effect=RuntimeError("live spot should not be fetched when disk reference is preferred"),
+            ) as spot_mock, patch.object(
+                service,
+                "_fetch_listing_dates_dataframe",
+                return_value=pd.DataFrame(),
+            ), patch.object(
+                service,
+                "_get_spot_universe_reference_cache_paths",
+                return_value=(cache_csv, cache_meta),
+                create=True,
+            ), patch.object(
+                service,
+                "_spot_universe_reference_cache_min_rows",
+                1,
+                create=True,
+            ):
+                universe = service.get_spot_enriched_a_share_universe(as_of_date=date(2026, 4, 22))
+
+        self.assertEqual(spot_mock.call_count, 0)
+        self.assertEqual(universe["code"].tolist(), ["000001", "600519"])
+        self.assertEqual(float(universe.iloc[0]["pct_change"]), 1.2)
+        self.assertEqual(float(universe.iloc[1]["turnover_rate"]), 1.3)
+
+    def test_get_spot_enriched_a_share_universe_can_prefer_stale_disk_reference_cache(self):
+        service = KlineSelectorService()
+        service._prefer_spot_universe_reference_cache = True
+        service._prefer_stale_spot_universe_reference_cache = True
+        cached_spot_df = pd.DataFrame(
+            {
+                "code": ["000001", "600519"],
+                "name": ["pingan", "maotai"],
+                "list_date": ["1991-04-03", "2001-08-27"],
+                "listed_days": [10000, 9000],
+                "latest_price": [12.3, 1800.0],
+                "pct_change": [1.2, 2.5],
+                "turnover_rate": [0.8, 1.3],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cache_csv = Path(tmp_dir) / "spot_cache.csv"
+            cache_meta = Path(tmp_dir) / "spot_cache.json"
+            stale_written_at = datetime(2026, 4, 21, 9, 30, 0)
+            cached_spot_df.to_csv(cache_csv, index=False, encoding="utf-8-sig")
+            cache_meta.write_text(
+                json.dumps({"written_at": stale_written_at.isoformat(), "rows": 2}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            with patch.object(
+                service,
+                "_fetch_universe_from_akshare_spot",
+                side_effect=RuntimeError("live spot should not be fetched when stale disk reference is preferred"),
+            ) as spot_mock, patch.object(
+                service,
+                "_fetch_listing_dates_dataframe",
+                side_effect=AssertionError("listing metadata should not be fetched when stale preferred snapshot is complete"),
+            ), patch.object(
+                service,
+                "_get_spot_universe_reference_cache_paths",
+                return_value=(cache_csv, cache_meta),
+                create=True,
+            ), patch.object(
+                service,
+                "_spot_universe_reference_cache_min_rows",
+                1,
+                create=True,
+            ), patch.object(
+                service,
+                "_spot_universe_reference_cache_ttl_seconds",
+                1,
+                create=True,
+            ):
+                universe = service.get_spot_enriched_a_share_universe(as_of_date=date(2026, 4, 22))
+
+        self.assertEqual(spot_mock.call_count, 0)
+        self.assertEqual(universe["code"].tolist(), ["000001", "600519"])
+        self.assertEqual(float(universe.iloc[0]["pct_change"]), 1.2)
+        self.assertEqual(float(universe.iloc[1]["turnover_rate"]), 1.3)
+
+    def test_get_spot_enriched_a_share_universe_skips_second_live_retry_when_disk_cache_exists(self):
+        service = KlineSelectorService()
+        cached_spot_df = pd.DataFrame(
+            {
+                "code": ["000001"],
+                "name": ["pingan"],
+                "pct_change": [1.2],
+                "turnover_rate": [0.8],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cache_csv = Path(tmp_dir) / "spot_cache.csv"
+            cache_meta = Path(tmp_dir) / "spot_cache.json"
+            cached_spot_df.to_csv(cache_csv, index=False, encoding="utf-8-sig")
+            cache_meta.write_text(
+                json.dumps({"written_at": datetime.now().isoformat(), "rows": 1}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            with patch.object(
+                service,
+                "_fetch_universe_from_akshare_spot",
+                side_effect=RuntimeError("offline"),
+            ) as spot_mock, patch.object(
+                service,
+                "_fetch_listing_dates_dataframe",
+                return_value=pd.DataFrame(),
+            ), patch.object(
+                service,
+                "_get_spot_universe_reference_cache_paths",
+                return_value=(cache_csv, cache_meta),
+                create=True,
+            ), patch.object(
+                service,
+                "_spot_universe_reference_cache_min_rows",
+                1,
+                create=True,
+            ):
+                universe = service.get_spot_enriched_a_share_universe(as_of_date=date(2026, 4, 22))
+
+        self.assertEqual(spot_mock.call_count, 1)
+        self.assertEqual(universe["code"].tolist(), ["000001"])
+
+    def test_get_spot_enriched_a_share_universe_uses_stale_disk_cache_for_failure_fallback(self):
+        service = KlineSelectorService()
+        cached_spot_df = pd.DataFrame(
+            {
+                "code": ["000001", "600519"],
+                "name": ["pingan", "maotai"],
+                "list_date": ["1991-04-03", "2001-08-27"],
+                "listed_days": [10000, 9000],
+                "latest_price": [12.3, 1800.0],
+                "pct_change": [1.2, 2.5],
+                "turnover_rate": [0.8, 1.3],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cache_csv = Path(tmp_dir) / "spot_cache.csv"
+            cache_meta = Path(tmp_dir) / "spot_cache.json"
+            stale_written_at = datetime(2026, 4, 21, 9, 30, 0)
+            cached_spot_df.to_csv(cache_csv, index=False, encoding="utf-8-sig")
+            cache_meta.write_text(
+                json.dumps({"written_at": stale_written_at.isoformat(), "rows": 2}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            with patch.object(
+                service,
+                "_fetch_universe_from_akshare_spot",
+                side_effect=RuntimeError("offline"),
+            ) as spot_mock, patch.object(
+                service,
+                "get_a_share_universe",
+                side_effect=AssertionError("generic fallback should not be used when stale disk spot snapshot exists"),
+            ), patch.object(
+                service,
+                "_fetch_listing_dates_dataframe",
+                side_effect=AssertionError("listing metadata should not be fetched when stale spot snapshot is complete"),
+            ), patch.object(
+                service,
+                "_get_spot_universe_reference_cache_paths",
+                return_value=(cache_csv, cache_meta),
+                create=True,
+            ), patch.object(
+                service,
+                "_spot_universe_reference_cache_min_rows",
+                1,
+                create=True,
+            ), patch.object(
+                service,
+                "_spot_universe_reference_cache_ttl_seconds",
+                1,
+                create=True,
+            ):
+                universe = service.get_spot_enriched_a_share_universe(as_of_date=date(2026, 4, 22))
+
+        self.assertEqual(spot_mock.call_count, 1)
+        self.assertEqual(universe["code"].tolist(), ["000001", "600519"])
+        self.assertEqual(float(universe.iloc[0]["pct_change"]), 1.2)
+        self.assertEqual(float(universe.iloc[1]["turnover_rate"]), 1.3)
+
+    def test_get_spot_enriched_a_share_universe_skips_listing_metadata_fetch_when_spot_snapshot_is_already_complete(self):
+        service = KlineSelectorService()
+        cached_spot_df = pd.DataFrame(
+            {
+                "code": ["000001", "600519"],
+                "name": ["pingan", "maotai"],
+                "list_date": ["1991-04-03", "2001-08-27"],
+                "listed_days": [10000, 9000],
+                "pct_change": [1.2, 2.5],
+                "turnover_rate": [0.8, 1.3],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cache_csv = Path(tmp_dir) / "spot_cache.csv"
+            cache_meta = Path(tmp_dir) / "spot_cache.json"
+            cached_spot_df.to_csv(cache_csv, index=False, encoding="utf-8-sig")
+            cache_meta.write_text(
+                json.dumps({"written_at": datetime.now().isoformat(), "rows": 2}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            with patch.object(
+                service,
+                "_fetch_universe_from_akshare_spot",
+                side_effect=RuntimeError("offline"),
+            ), patch.object(
+                service,
+                "_fetch_listing_dates_dataframe",
+                side_effect=AssertionError("listing metadata should not be fetched when spot snapshot is complete"),
+            ), patch.object(
+                service,
+                "_get_spot_universe_reference_cache_paths",
+                return_value=(cache_csv, cache_meta),
+                create=True,
+            ), patch.object(
+                service,
+                "_spot_universe_reference_cache_min_rows",
+                1,
+                create=True,
+            ):
+                universe = service.get_spot_enriched_a_share_universe(as_of_date=date(2026, 4, 22))
+
+        self.assertEqual(universe["code"].tolist(), ["000001", "600519"])
 
     def test_get_spot_enriched_a_share_universe_merges_listing_metadata_on_generic_fallback(self):
         service = KlineSelectorService()

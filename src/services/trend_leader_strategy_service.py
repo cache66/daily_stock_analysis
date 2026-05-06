@@ -288,8 +288,10 @@ class TrendLeaderStrategyService:
             near_new_high=near_new_high,
         )
         overall_score = hybrid_score
+        has_trend_structure = is_breakout_candidate or is_pullback_candidate
         passed = (
             (not hard_blocked)
+            and has_trend_structure
             and (breakout_score > 0.0 or pullback_score > 0.0)
             and overall_score > 0.0
         )

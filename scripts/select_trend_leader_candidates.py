@@ -26,9 +26,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from data_provider.base import is_st_stock, normalize_stock_code
+from src.core.trading_calendar import get_effective_trading_date
 from src.services.capital_profile_service import CapitalProfileService
 from src.services.dragon_head_analysis_service import DragonHeadAnalysisService
-from src.services.kline_selector_service import KlineSelectorService
+from src.services.kline_selector_service import KlineSelectorPrefilter, KlineSelectorService
 from src.services.shared_signal_factors_service import SharedSignalFactorsService
 from src.services.trend_leader_strategy_service import TrendLeaderStrategyService
 from src.storage import DatabaseManager
@@ -39,6 +40,7 @@ SIGNAL_TYPE = "trend_leader_unified"
 DEFAULT_HISTORY_LOOKBACK_DAYS = 365
 RUN_SUMMARY_CODE = "TL_SUMMARY"
 DEFAULT_FALLBACK_TOP_N = 20
+DEFAULT_WATCH_TOP_N = 20
 DEFAULT_CHECKPOINT_EVERY = 50
 DEFAULT_ENRICH_TOP_N = 20
 DEFAULT_PROGRESS_EVERY = 25
@@ -47,6 +49,8 @@ DEFAULT_SCAN_PREFILTER_MIN_CHANGE_PCT_60D = 3.0
 DEFAULT_SCAN_PREFILTER_MIN_TURNOVER_RATE = 0.8
 DEFAULT_SCAN_PREFILTER_RELAXED_BUFFER_TOP_N = 40
 MIN_TREND_SCAN_HISTORY_DAYS = 120
+DEFAULT_FAST_FUNDAMENTAL_BUDGET_SECONDS = 0.6
+DEFAULT_FAST_CAPITAL_FLOW_BUDGET_SECONDS = 0.45
 # The current trend/capital scoring path only needs about 120 trading days
 # plus a small buffer for moving averages and provider normalization gaps.
 TREND_SCAN_HISTORY_FETCH_DAYS = 140
@@ -76,6 +80,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "严格硬筛当日 0 命中时，自动输出观察池 TopN 候选。"
             f"0 表示关闭，默认 {DEFAULT_FALLBACK_TOP_N}。"
+        ),
+    )
+    parser.add_argument(
+        "--watch-top-n",
+        type=int,
+        default=DEFAULT_WATCH_TOP_N,
+        help=(
+            "严格结果之外额外导出 watchlist TopN 候选。"
+            f"0 表示关闭，默认 {DEFAULT_WATCH_TOP_N}。"
         ),
     )
     parser.add_argument("--output-dir", default=str(PROJECT_ROOT / "data"), help="导出目录，默认 data/。")
@@ -187,6 +200,29 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Quote-level prefilter: require positive day change when pct_change is available.",
     )
+    parser.add_argument(
+        "--disable-shared-scan-shell",
+        action="store_true",
+        help="Disable service-level shared scan shell for diagnostics.",
+    )
+    parser.add_argument(
+        "--fundamental-budget-seconds",
+        type=float,
+        default=DEFAULT_FAST_FUNDAMENTAL_BUDGET_SECONDS,
+        help=(
+            "Fast-scan earnings fundamental budget in seconds. "
+            f"Default {DEFAULT_FAST_FUNDAMENTAL_BUDGET_SECONDS}."
+        ),
+    )
+    parser.add_argument(
+        "--capital-flow-budget-seconds",
+        type=float,
+        default=DEFAULT_FAST_CAPITAL_FLOW_BUDGET_SECONDS,
+        help=(
+            "Fast-scan capital-flow budget in seconds. "
+            f"Default {DEFAULT_FAST_CAPITAL_FLOW_BUDGET_SECONDS}."
+        ),
+    )
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return parser.parse_args()
 
@@ -200,12 +236,14 @@ def configure_logging(level: str) -> None:
 
 def parse_snapshot_date(value: Optional[Any]) -> date:
     if value is None or str(value).strip() == "":
-        return date.today()
+        return get_effective_trading_date("cn")
     if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, date):
-        return value
-    return date.fromisoformat(str(value).strip())
+        parsed = value.date()
+    elif isinstance(value, date):
+        parsed = value
+    else:
+        parsed = date.fromisoformat(str(value).strip())
+    return get_effective_trading_date("cn", current_time=datetime.combine(parsed, datetime.min.time()))
 
 
 def _normalize_code_token(value: Any) -> str:
@@ -419,17 +457,17 @@ def _resolve_scan_prefilter_hydration_fields(
     requested_fields: Set[str] = set()
     change_60d_required = _safe_float(min_change_pct_60d) is not None
     has_change_60d = _column_has_numeric_values(universe, "change_pct_60d")
-    has_complete_pct_change = _column_has_complete_numeric_values(universe, "pct_change")
+    has_pct_change = _column_has_numeric_values(universe, "pct_change")
 
     if _safe_float(min_turnover_rate) is not None and not _column_has_complete_numeric_values(universe, "turnover_rate"):
         requested_fields.add("turnover_rate")
 
-    if require_positive_change and not has_complete_pct_change:
+    if require_positive_change and not has_pct_change:
         requested_fields.add("pct_change")
 
     # When 60d change is unavailable, pct_change can still unlock the adaptive
     # positive-change fallback; change_pct_60d itself is not reliably quote-backed.
-    if change_60d_required and not has_change_60d and not has_complete_pct_change:
+    if change_60d_required and not has_change_60d and not has_pct_change:
         requested_fields.add("pct_change")
 
     return requested_fields
@@ -694,6 +732,7 @@ def _prepare_scan_prefilter_universe(
     *,
     manager: Any,
     manager_factory: Optional[Callable[[], Any]] = None,
+    cached_quote_universe: Optional[pd.DataFrame] = None,
     hydrated_quote_cache_writer: Optional[Callable[[pd.DataFrame], None]] = None,
     min_listed_days: Optional[int] = None,
     min_change_pct_60d: Optional[float] = None,
@@ -722,6 +761,8 @@ def _prepare_scan_prefilter_universe(
         }
 
     working = universe.copy()
+    if cached_quote_universe is not None and not cached_quote_universe.empty:
+        working = KlineSelectorService._merge_spot_quote_fields(working, cached_quote_universe)
     hydration_stats = {
         "requested_rows": 0,
         "hydrated_rows": 0,
@@ -860,8 +901,39 @@ def _is_unscannable_history_candidate(
     min_history_days: int = MIN_TREND_SCAN_HISTORY_DAYS,
     as_of_date: Optional[date] = None,
 ) -> bool:
+    required_history_days = max(1, int(min_history_days))
     listed_days = _resolve_effective_listed_days(row_data, as_of_date=as_of_date)
-    return listed_days is not None and listed_days < max(1, int(min_history_days))
+    if listed_days is not None:
+        if listed_days < required_history_days:
+            return True
+        # Fast-scan optimization:
+        # - `listed_days` is calendar-day based, while the actual history requirement is closer to trading days.
+        # - For clear "old enough" names, skip the expensive business-day recomputation.
+        # - Keep a conservative buffer for weekends + exchange holidays so recent IPO edge cases
+        #   still fall back to the precise business-day lower-bound check.
+        minimum_safe_calendar_days = int(math.ceil(required_history_days * 7.0 / 5.0)) + 10
+        if listed_days >= minimum_safe_calendar_days:
+            return False
+
+    list_date_value = row_data.get("list_date")
+    if list_date_value in (None, ""):
+        return False
+
+    try:
+        list_date = pd.to_datetime(list_date_value, errors="coerce")
+    except Exception:
+        return False
+    if list_date is None or pd.isna(list_date):
+        return False
+
+    resolved_as_of_date = as_of_date or date.today()
+    try:
+        business_days_since_listing = len(
+            pd.bdate_range(list_date.date(), resolved_as_of_date)
+        )
+    except Exception:
+        return False
+    return business_days_since_listing < required_history_days
 
 
 def _resolve_primary_board_name(boards: List[Dict[str, Any]]) -> str:
@@ -1294,6 +1366,58 @@ def build_trend_payload(history: pd.DataFrame) -> Dict[str, Any]:
     }
 
 
+def _should_skip_capital_flow_fetch_for_trend_payload(
+    trend_payload: Dict[str, Any],
+    *,
+    quote_data: Optional[Dict[str, Any]] = None,
+    tighten_weak_non_pattern: bool = True,
+) -> bool:
+    if not isinstance(trend_payload, dict) or not trend_payload:
+        return False
+    if bool(trend_payload.get("is_breakout_candidate")) or bool(trend_payload.get("is_pullback_candidate")):
+        return False
+
+    trend_template_score = _safe_float(trend_payload.get("trend_template_score")) or 0.0
+    trend_stage2_score = _safe_float(trend_payload.get("trend_stage2_score")) or 0.0
+    base_quality_score = _safe_float(trend_payload.get("base_quality_score")) or 0.0
+    return_20d = _safe_float(trend_payload.get("return_20d")) or 0.0
+    near_new_high = bool(trend_payload.get("near_new_high"))
+    distance_to_high_pct = _safe_float(trend_payload.get("distance_to_high_pct"))
+    pullback_depth_pct = _safe_float(trend_payload.get("pullback_depth_pct")) or 0.0
+
+    weak_non_pattern = (
+        trend_template_score < 14.0
+        and trend_stage2_score <= 9.0
+        and base_quality_score < 9.0
+        and return_20d < 6.0
+    )
+    if (not near_new_high) and weak_non_pattern:
+        return True
+
+    if not tighten_weak_non_pattern or near_new_high:
+        return False
+
+    quote_change_pct = _safe_float((quote_data or {}).get("change_pct"))
+    quote_turnover_rate = _safe_float((quote_data or {}).get("turnover_rate"))
+    marginal_non_pattern = (
+        trend_template_score < 16.0
+        and trend_stage2_score <= 10.0
+        and base_quality_score < 10.0
+        and return_20d < 8.0
+    )
+    weak_quote_tape = (
+        quote_change_pct is not None
+        and quote_change_pct <= 0.5
+        and quote_turnover_rate is not None
+        and quote_turnover_rate < 2.0
+    )
+    weak_position = (
+        (distance_to_high_pct is None or distance_to_high_pct > 8.0)
+        and pullback_depth_pct >= 6.0
+    )
+    return marginal_non_pattern and weak_quote_tape and weak_position
+
+
 def build_selected_dataframe(results: List[Dict[str, Any]]) -> pd.DataFrame:
     if not results:
         return pd.DataFrame(columns=["code", "name", "primary_profile", "overall_score"])
@@ -1554,6 +1678,49 @@ def _pick_fallback_pool(
                 break
 
     return picked[:top_n]
+
+
+def _pick_watch_pool(
+    all_results: List[Dict[str, Any]],
+    *,
+    top_n: int,
+    excluded_codes: Optional[set[str]] = None,
+) -> List[Dict[str, Any]]:
+    if top_n <= 0 or not all_results:
+        return []
+
+    excluded = {str(code).strip() for code in (excluded_codes or set()) if str(code).strip()}
+    ranked = build_selected_dataframe(all_results).to_dict(orient="records")
+    watch_rows: List[Dict[str, Any]] = []
+
+    for item in ranked:
+        code = str(item.get("code") or "").strip()
+        if not code or code in excluded:
+            continue
+        if str(item.get("leader_type") or "").strip().lower() == "pseudo_leader":
+            continue
+        if bool(item.get("is_breakout_candidate")) or bool(item.get("is_pullback_candidate")):
+            continue
+        if float(item.get("overall_score") or 0.0) <= 0.0:
+            continue
+        risk_flags = [
+            str(flag).strip().lower()
+            for flag in (item.get("risk_flags") if isinstance(item.get("risk_flags"), list) else [])
+            if str(flag).strip()
+        ]
+        if any(flag in BOARD_EARNINGS_HARD_RISK_GATES for flag in risk_flags):
+            continue
+        marked = _mark_selection_mode(item, mode="watch")
+        marked["watch_reason"] = "trend_structure_missing"
+        marked["strict_core_hit"] = False
+        marked["risk_flags"] = list(risk_flags)
+        if "trend_watch_pool" not in marked["risk_flags"]:
+            marked["risk_flags"].append("trend_watch_pool")
+        watch_rows.append(marked)
+        if len(watch_rows) >= top_n:
+            break
+
+    return watch_rows
 
 
 def _build_board_earnings_risk_map(all_results: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -2038,10 +2205,52 @@ def persist_result(
     )
 
 
+def _invoke_optional_budget_loader(
+    loader: Callable[..., Any],
+    code: str,
+    budget_seconds: Optional[float],
+    **kwargs: Any,
+) -> Any:
+    if budget_seconds is None:
+        try:
+            return loader(code, **kwargs)
+        except TypeError as exc:
+            if not kwargs or not any(key in str(exc) for key in kwargs):
+                raise
+            return loader(code)
+    try:
+        return loader(code, budget_seconds=budget_seconds, **kwargs)
+    except TypeError as exc:
+        if "budget_seconds" not in str(exc) and not any(key in str(exc) for key in kwargs):
+            raise
+        if kwargs:
+            try:
+                return loader(code, **kwargs)
+            except TypeError as nested_exc:
+                if not any(key in str(nested_exc) for key in kwargs):
+                    raise
+        return loader(code)
+
+
+def _invoke_optional_sector_rankings_loader(
+    loader: Callable[..., Any],
+    top_n: int,
+    *,
+    prefer_stale_cache: bool,
+) -> Any:
+    try:
+        return loader(top_n, prefer_stale_cache=prefer_stale_cache)
+    except TypeError as exc:
+        if "prefer_stale_cache" not in str(exc):
+            raise
+        return loader(top_n)
+
+
 def _evaluate_trend_leader_candidate(
     *,
     manager: Any,
-    dragon_service: DragonHeadAnalysisService,
+    dragon_service: Optional[DragonHeadAnalysisService],
+    dragon_service_factory: Optional[Callable[[], DragonHeadAnalysisService]] = None,
     capital_service: CapitalProfileService,
     strategy_service: TrendLeaderStrategyService,
     shared_factors_service: Optional[SharedSignalFactorsService] = None,
@@ -2050,13 +2259,28 @@ def _evaluate_trend_leader_candidate(
     total_mv: Optional[float],
     quote_seed: Optional[Dict[str, Any]] = None,
     scan_context: Optional[Dict[str, Any]] = None,
+    parallelize_enrichment: bool = True,
+    tighten_non_trend_enrichment_short_circuit: bool = True,
+    fundamental_budget_seconds: Optional[float] = DEFAULT_FAST_FUNDAMENTAL_BUDGET_SECONDS,
+    capital_flow_budget_seconds: Optional[float] = DEFAULT_FAST_CAPITAL_FLOW_BUDGET_SECONDS,
 ) -> Optional[Dict[str, Any]]:
+    phase_timing_sec: Dict[str, float] = {
+        "history_fetch": 0.0,
+        "quote_fetch": 0.0,
+        "fundamental_fetch": 0.0,
+        "board_fetch": 0.0,
+        "dragon_analysis": 0.0,
+        "capital_profile": 0.0,
+        "score_candidate": 0.0,
+    }
     try:
+        history_fetch_started_at = time.perf_counter()
         history_df, _history_source = manager.get_daily_data(
             code,
             days=TREND_SCAN_HISTORY_FETCH_DAYS,
         )
     except Exception as exc:
+        phase_timing_sec["history_fetch"] = round(time.perf_counter() - history_fetch_started_at, 6)
         logger.debug("trend leader history fetch failed for %s: %s", code, exc)
         return None
 
@@ -2070,8 +2294,10 @@ def _evaluate_trend_leader_candidate(
             )
             history = KlineSelectorService._prepare_history(refreshed_df)
         except Exception as exc:
+            phase_timing_sec["history_fetch"] = round(time.perf_counter() - history_fetch_started_at, 6)
             logger.debug("trend leader history force refresh failed for %s: %s", code, exc)
             return None
+    phase_timing_sec["history_fetch"] = round(time.perf_counter() - history_fetch_started_at, 6)
     if history.empty or len(history) < MIN_TREND_SCAN_HISTORY_DAYS:
         return None
 
@@ -2097,35 +2323,22 @@ def _evaluate_trend_leader_candidate(
             if value is not None
         } or None
     if quote_data is None:
+        quote_fetch_started_at = time.perf_counter()
         try:
             quote_data = manager.get_realtime_quote(code)
         except Exception as exc:
             logger.debug("trend leader quote fetch failed for %s: %s", code, exc)
             quote_data = None
+        phase_timing_sec["quote_fetch"] = round(time.perf_counter() - quote_fetch_started_at, 6)
+
+    skip_non_trend_enrichment = _should_skip_capital_flow_fetch_for_trend_payload(
+        trend_payload,
+        quote_data=quote_data,
+        tighten_weak_non_pattern=tighten_non_trend_enrichment_short_circuit,
+    )
 
     if total_mv is None and isinstance(quote_data, dict):
         total_mv = _safe_float(quote_data.get("total_mv"))
-
-    earnings_context_loader = getattr(manager, "get_earnings_fundamental_context", None)
-    try:
-        if callable(earnings_context_loader):
-            fundamental_context = earnings_context_loader(code)
-        else:
-            fundamental_context = manager.get_fundamental_context(code)
-    except Exception as exc:
-        logger.debug("trend leader fundamental fetch failed for %s: %s", code, exc)
-        fundamental_context = {}
-    if not isinstance(fundamental_context, dict):
-        fundamental_context = {}
-
-    try:
-        boards = manager.get_belong_boards(code)
-    except Exception as exc:
-        logger.debug("trend leader belong boards fetch failed for %s: %s", code, exc)
-        boards = []
-    board_payload = _normalize_board_payload(boards)
-    primary_board_name = _resolve_primary_board_name(board_payload)
-    board_names = _resolve_board_names_text(board_payload)
 
     resolved_shared_factors_service = shared_factors_service
     if resolved_shared_factors_service is None:
@@ -2138,43 +2351,129 @@ def _evaluate_trend_leader_candidate(
             logger.debug("trend leader shared factors init failed for %s: %s", code, exc)
             resolved_shared_factors_service = None
 
-    try:
-        dragon_payload = dragon_service.analyze_stock(
-            code,
-            stock_name=name,
-            market_hint="cn",
-            quote_data=quote_data,
-            daily_context=prefetched_daily_context,
-            fundamental_context=fundamental_context,
-            boards=board_payload,
-            scan_context=scan_context,
-        )
-    except Exception as exc:
-        logger.debug("trend leader dragon analyze failed for %s: %s", code, exc)
-        dragon_payload = {}
+    resolved_dragon_service = dragon_service
 
-    try:
-        if resolved_shared_factors_service is not None:
-            capital_payload = resolved_shared_factors_service.build_capital_factors(
+    def _load_non_capital_enrichment() -> Tuple[Dict[str, Any], List[Dict[str, Any]], Dict[str, Any]]:
+        nonlocal resolved_dragon_service
+        if skip_non_trend_enrichment:
+            return {}, [], {}
+
+        earnings_context_loader = getattr(manager, "get_earnings_fundamental_context", None)
+        fundamental_fetch_started_at = time.perf_counter()
+        try:
+            if callable(earnings_context_loader):
+                fundamental_context = _invoke_optional_budget_loader(
+                    earnings_context_loader,
+                    code,
+                    fundamental_budget_seconds,
+                    enabled_blocks=("financial",),
+                )
+            else:
+                fundamental_context = _invoke_optional_budget_loader(
+                    manager.get_fundamental_context,
+                    code,
+                    fundamental_budget_seconds,
+                )
+        except Exception as exc:
+            logger.debug("trend leader fundamental fetch failed for %s: %s", code, exc)
+            fundamental_context = {}
+        phase_timing_sec["fundamental_fetch"] = round(time.perf_counter() - fundamental_fetch_started_at, 6)
+        if not isinstance(fundamental_context, dict):
+            fundamental_context = {}
+
+        board_fetch_started_at = time.perf_counter()
+        try:
+            boards = manager.get_belong_boards(code)
+        except Exception as exc:
+            logger.debug("trend leader belong boards fetch failed for %s: %s", code, exc)
+            boards = []
+        phase_timing_sec["board_fetch"] = round(time.perf_counter() - board_fetch_started_at, 6)
+
+        board_payload = _normalize_board_payload(boards)
+        dragon_analysis_started_at = time.perf_counter()
+        try:
+            if resolved_dragon_service is None:
+                if callable(dragon_service_factory):
+                    resolved_dragon_service = dragon_service_factory()
+                else:
+                    resolved_dragon_service = DragonHeadAnalysisService(
+                        manager=manager,
+                        enable_news_search=False,
+                        enable_business_profile=False,
+                        fast_mode=True,
+                    )
+            dragon_payload = resolved_dragon_service.analyze_stock(
                 code,
                 stock_name=name,
-                latest_price=latest_close,
-                total_market_cap=total_mv,
+                market_hint="cn",
                 quote_data=quote_data,
-                daily_df=history,
+                daily_context=prefetched_daily_context,
+                fundamental_context=fundamental_context,
+                boards=board_payload,
+                scan_context=scan_context,
             )
+        except Exception as exc:
+            logger.debug("trend leader dragon analyze failed for %s: %s", code, exc)
+            dragon_payload = {}
+        phase_timing_sec["dragon_analysis"] = round(time.perf_counter() - dragon_analysis_started_at, 6)
+        return fundamental_context, boards, dragon_payload
+
+    def _load_capital_payload() -> Tuple[Dict[str, Any], bool]:
+        capital_profile_started_at = time.perf_counter()
+        capital_flow_context = None
+        capital_flow_fetch_skipped = bool(skip_non_trend_enrichment)
+        if capital_flow_fetch_skipped:
+            capital_flow_context = {
+                "status": "skipped",
+                "data": {"stock_flow": {}},
+            }
+        try:
+            if resolved_shared_factors_service is not None:
+                capital_payload = resolved_shared_factors_service.build_capital_factors(
+                    code,
+                    stock_name=name,
+                    latest_price=latest_close,
+                    total_market_cap=total_mv,
+                    quote_data=quote_data,
+                    daily_df=history,
+                    capital_flow_context=capital_flow_context,
+                    capital_flow_budget_seconds=capital_flow_budget_seconds,
+                )
+            else:
+                capital_payload = capital_service.build_stock_profile(
+                    code,
+                    stock_name=name,
+                    latest_price=latest_close,
+                    total_market_cap=total_mv,
+                    quote_data=quote_data,
+                    daily_df=history,
+                    capital_flow_context=capital_flow_context,
+                    capital_flow_budget_seconds=capital_flow_budget_seconds,
+                )
+        except Exception as exc:
+            logger.debug("trend leader capital profile failed for %s: %s", code, exc)
+            capital_payload = {}
+            capital_flow_fetch_skipped = False
+        phase_timing_sec["capital_profile"] = round(time.perf_counter() - capital_profile_started_at, 6)
+        return capital_payload, capital_flow_fetch_skipped
+
+    if skip_non_trend_enrichment:
+        fundamental_context, boards, dragon_payload = {}, [], {}
+        capital_payload, capital_flow_fetch_skipped = _load_capital_payload()
+    else:
+        if parallelize_enrichment:
+            with ThreadPoolExecutor(max_workers=2) as enrichment_executor:
+                non_capital_future = enrichment_executor.submit(_load_non_capital_enrichment)
+                capital_future = enrichment_executor.submit(_load_capital_payload)
+                fundamental_context, boards, dragon_payload = non_capital_future.result()
+                capital_payload, capital_flow_fetch_skipped = capital_future.result()
         else:
-            capital_payload = capital_service.build_stock_profile(
-                code,
-                stock_name=name,
-                latest_price=latest_close,
-                total_market_cap=total_mv,
-                quote_data=quote_data,
-                daily_df=history,
-            )
-    except Exception as exc:
-        logger.debug("trend leader capital profile failed for %s: %s", code, exc)
-        capital_payload = {}
+            fundamental_context, boards, dragon_payload = _load_non_capital_enrichment()
+            capital_payload, capital_flow_fetch_skipped = _load_capital_payload()
+
+    board_payload = _normalize_board_payload(boards)
+    primary_board_name = _resolve_primary_board_name(board_payload)
+    board_names = _resolve_board_names_text(board_payload)
 
     shared_bundle_payload = _build_shared_factor_bundle_payload(
         fundamental_context=fundamental_context,
@@ -2193,6 +2492,7 @@ def _evaluate_trend_leader_candidate(
     earnings_payload = build_earnings_payload(fundamental_context)
     earnings_payload.update(quality_overlay_payload)
     earnings_payload.update(industry_strength_payload)
+    score_candidate_started_at = time.perf_counter()
     result = strategy_service.score_candidate(
         stock_code=code,
         stock_name=name,
@@ -2205,6 +2505,7 @@ def _evaluate_trend_leader_candidate(
         earnings_payload=earnings_payload,
         commodity_payload=None,
     )
+    phase_timing_sec["score_candidate"] = round(time.perf_counter() - score_candidate_started_at, 6)
     for key in (
         "quality_overlay_available",
         "quality_overlay_score",
@@ -2236,16 +2537,32 @@ def _evaluate_trend_leader_candidate(
     result["primary_board_name"] = primary_board_name or None
     result["board_names"] = board_names or None
     result["board_count"] = len(board_payload)
+    result["capital_flow_fetch_skipped"] = bool(capital_flow_fetch_skipped)
+    result["_fundamental_cache_hit"] = bool(fundamental_context.get("cache_hit")) if isinstance(fundamental_context, dict) else False
+    result["_fundamental_cache_source"] = (
+        str(fundamental_context.get("cache_source") or "").strip() or None
+        if isinstance(fundamental_context, dict)
+        else None
+    )
+    result["_capital_flow_cache_hit"] = bool(capital_payload.get("capital_flow_cache_hit")) if isinstance(capital_payload, dict) else False
+    result["_capital_flow_cache_source"] = (
+        str(capital_payload.get("capital_flow_cache_source") or "").strip() or None
+        if isinstance(capital_payload, dict)
+        else None
+    )
+    result["_phase_timing_sec"] = dict(phase_timing_sec)
     return result
 
 
 def scan_trend_leader_candidates_with_stats(
     *,
+    snapshot_date: Optional[date] = None,
     limit: Optional[int] = None,
     max_workers: int = 1,
     shard_count: int = 1,
     shard_index: int = 0,
     fallback_top_n: int = DEFAULT_FALLBACK_TOP_N,
+    watch_top_n: int = DEFAULT_WATCH_TOP_N,
     checkpoint_path: Optional[Path] = None,
     checkpoint_every: int = DEFAULT_CHECKPOINT_EVERY,
     resume: bool = False,
@@ -2264,6 +2581,11 @@ def scan_trend_leader_candidates_with_stats(
     scan_prefilter_min_turnover_rate: Optional[float] = DEFAULT_SCAN_PREFILTER_MIN_TURNOVER_RATE,
     scan_prefilter_require_positive_change: bool = False,
     quote_seed_enabled: bool = True,
+    shared_scan_shell_enabled: bool = True,
+    dragon_service_lazy_init_enabled: bool = True,
+    tighten_non_trend_enrichment_short_circuit: bool = True,
+    fundamental_budget_seconds: Optional[float] = DEFAULT_FAST_FUNDAMENTAL_BUDGET_SECONDS,
+    capital_flow_budget_seconds: Optional[float] = DEFAULT_FAST_CAPITAL_FLOW_BUDGET_SECONDS,
 ) -> Dict[str, Any]:
     if max_workers <= 0:
         raise ValueError("max_workers must be > 0")
@@ -2277,53 +2599,87 @@ def scan_trend_leader_candidates_with_stats(
         raise ValueError("progress_every must be >= 0")
 
     selector = KlineSelectorService(manager_factory=KlineSelectorService.build_fast_a_share_manager)
+    selector._prefer_spot_universe_reference_cache = True
+    selector._prefer_stale_spot_universe_reference_cache = True
     shared_manager = selector.manager
     worker_local_state = local()
+    scan_date = snapshot_date or date.today()
     started_at = time.perf_counter()
     universe_fetch_started_at = time.perf_counter()
-    universe = selector.get_spot_enriched_a_share_universe(limit=limit, as_of_date=date.today())
+    universe = selector.get_spot_enriched_a_share_universe(limit=limit, as_of_date=scan_date)
     universe_fetch_elapsed_sec = time.perf_counter() - universe_fetch_started_at
     whitelist_codes = _load_universe_code_whitelist(universe_codes_file)
-    universe, filter_stats = _apply_universe_filters(
-        universe,
-        whitelist_codes=whitelist_codes,
-        exclude_st=bool(exclude_st),
-        exclude_kcb=bool(exclude_kcb),
-        exclude_cyb=bool(exclude_cyb),
-    )
     prefilter_started_at = time.perf_counter()
-    if scan_prefilter_enabled:
-        universe, scan_prefilter_stats = _prepare_scan_prefilter_universe(
-            universe,
-            manager=shared_manager,
-            manager_factory=KlineSelectorService.build_fast_a_share_manager,
-            hydrated_quote_cache_writer=selector._write_spot_universe_reference_cache,
+    scan_prefilter = (
+        KlineSelectorPrefilter(
             min_listed_days=scan_prefilter_min_listed_days,
             min_change_pct_60d=scan_prefilter_min_change_pct_60d,
             min_turnover_rate=scan_prefilter_min_turnover_rate,
             require_positive_change=bool(scan_prefilter_require_positive_change),
-            quote_hydration_workers=max_workers,
         )
+        if scan_prefilter_enabled
+        else None
+    )
+    use_shared_scan_shell = bool(shared_scan_shell_enabled) and hasattr(selector, "prepare_scan_universe")
+    if use_shared_scan_shell:
+        prepared_universe = selector.prepare_scan_universe(
+            universe=universe,
+            prefilter=scan_prefilter,
+            whitelist_codes=whitelist_codes,
+            exclude_st=bool(exclude_st),
+            exclude_kcb=bool(exclude_kcb),
+            exclude_cyb=bool(exclude_cyb),
+            shard_count=shard_count,
+            shard_index=shard_index,
+            cached_quote_universe=selector._read_spot_universe_reference_cache() if hasattr(selector, "_read_spot_universe_reference_cache") else None,
+            hydrated_quote_cache_writer=selector._write_spot_universe_reference_cache if hasattr(selector, "_write_spot_universe_reference_cache") else None,
+            quote_hydration_workers=max_workers,
+            as_of_date=scan_date,
+        )
+        universe = prepared_universe.prepared_universe
+        filter_stats = dict(prepared_universe.filter_stats)
+        scan_prefilter_stats = dict(prepared_universe.prefilter_stats)
     else:
-        scan_prefilter_stats = {
-            "before": len(universe),
-            "after": len(universe),
-            "after_primary": len(universe),
-            "after_relaxed": len(universe),
-            "removed_listed_days": 0,
-            "removed_change_60d": 0,
-            "removed_turnover_rate": 0,
-            "removed_negative_change": 0,
-            "added_relaxed_buffer": 0,
-            "adaptive_positive_change_applied": False,
-            "quote_hydrated_rows": 0,
-            "quote_requested_rows": 0,
-            "quote_requested_fields": "",
-            "quote_missing_unsupported_fields": "",
-            "quote_worker_count": 0,
-        }
+        universe, filter_stats = _apply_universe_filters(
+            universe,
+            whitelist_codes=whitelist_codes,
+            exclude_st=bool(exclude_st),
+            exclude_kcb=bool(exclude_kcb),
+            exclude_cyb=bool(exclude_cyb),
+        )
+        if scan_prefilter_enabled:
+            universe, scan_prefilter_stats = _prepare_scan_prefilter_universe(
+                universe,
+                manager=shared_manager,
+                manager_factory=KlineSelectorService.build_fast_a_share_manager,
+                cached_quote_universe=selector._read_spot_universe_reference_cache(),
+                hydrated_quote_cache_writer=selector._write_spot_universe_reference_cache,
+                min_listed_days=scan_prefilter_min_listed_days,
+                min_change_pct_60d=scan_prefilter_min_change_pct_60d,
+                min_turnover_rate=scan_prefilter_min_turnover_rate,
+                require_positive_change=bool(scan_prefilter_require_positive_change),
+                quote_hydration_workers=max_workers,
+            )
+        else:
+            scan_prefilter_stats = {
+                "before": len(universe),
+                "after": len(universe),
+                "after_primary": len(universe),
+                "after_relaxed": len(universe),
+                "removed_listed_days": 0,
+                "removed_change_60d": 0,
+                "removed_turnover_rate": 0,
+                "removed_negative_change": 0,
+                "added_relaxed_buffer": 0,
+                "adaptive_positive_change_applied": False,
+                "quote_hydrated_rows": 0,
+                "quote_requested_rows": 0,
+                "quote_requested_fields": "",
+                "quote_missing_unsupported_fields": "",
+                "quote_worker_count": 0,
+            }
     prefilter_elapsed_sec = time.perf_counter() - prefilter_started_at
-    if shard_count > 1:
+    if shard_count > 1 and not use_shared_scan_shell:
         universe = selector.apply_universe_shard(
             universe,
             shard_count=shard_count,
@@ -2406,19 +2762,34 @@ def scan_trend_leader_candidates_with_stats(
 
     shared_scan_context: Dict[str, Any] = {}
     sector_rankings_prefetched = False
+    sector_rankings_prefetch_status = "skipped"
+    sector_rankings_prefetch_error = ""
+    sector_rankings_prefetch_elapsed_sec = 0.0
     if universe_codes:
+        sector_rankings_started_at = time.perf_counter()
         try:
-            prefetched_sector_rankings = shared_manager.get_sector_rankings(10)
+            prefetched_sector_rankings = _invoke_optional_sector_rankings_loader(
+                shared_manager.get_sector_rankings,
+                10,
+                prefer_stale_cache=True,
+            )
             if isinstance(prefetched_sector_rankings, tuple) and len(prefetched_sector_rankings) == 2:
                 shared_scan_context["sector_rankings"] = prefetched_sector_rankings
                 sector_rankings_prefetched = True
+                sector_rankings_prefetch_status = "available"
                 logger.info(
                     "trend leader scan context prepared: sector_rankings_top=%s sector_rankings_bottom=%s",
                     len(prefetched_sector_rankings[0] or []),
                     len(prefetched_sector_rankings[1] or []),
                 )
+            else:
+                sector_rankings_prefetch_status = "empty"
         except Exception as exc:
+            sector_rankings_prefetch_status = "failed"
+            sector_rankings_prefetch_error = str(exc)
             logger.debug("trend leader sector ranking prewarm failed, continue without scan_context: %s", exc)
+        finally:
+            sector_rankings_prefetch_elapsed_sec = round(time.perf_counter() - sector_rankings_started_at, 6)
 
     strict_selected: List[Dict[str, Any]] = []
     all_results: List[Dict[str, Any]] = []
@@ -2465,36 +2836,52 @@ def scan_trend_leader_candidates_with_stats(
     safe_progress_every = max(0, int(progress_every))
 
     def _get_worker_services(
-    ) -> Tuple[Any, DragonHeadAnalysisService, CapitalProfileService, SharedSignalFactorsService, TrendLeaderStrategyService]:
+    ) -> Tuple[
+        Any,
+        CapitalProfileService,
+        SharedSignalFactorsService,
+        TrendLeaderStrategyService,
+        Callable[[], DragonHeadAnalysisService],
+    ]:
         cached = getattr(worker_local_state, "services", None)
         if cached is None:
             worker_manager = shared_manager
             if max_workers > 1:
                 worker_manager = KlineSelectorService.build_fast_a_share_manager()
             capital_service = CapitalProfileService(manager=worker_manager)
+            def _get_or_create_dragon_service() -> DragonHeadAnalysisService:
+                dragon = getattr(worker_local_state, "dragon_service", None)
+                if dragon is None:
+                    dragon = DragonHeadAnalysisService(
+                        manager=worker_manager,
+                        enable_news_search=False,
+                        enable_business_profile=False,
+                        fast_mode=True,
+                    )
+                    worker_local_state.dragon_service = dragon
+                return dragon
             cached = (
-                DragonHeadAnalysisService(
-                    manager=worker_manager,
-                    enable_news_search=False,
-                    enable_business_profile=False,
-                    fast_mode=True,
-                ),
                 capital_service,
                 SharedSignalFactorsService(
                     manager=worker_manager,
                     capital_profile_service=capital_service,
                 ),
                 TrendLeaderStrategyService(),
+                _get_or_create_dragon_service,
             )
             cached = (worker_manager, *cached)
             worker_local_state.services = cached
         return cached
 
     def _evaluate_scan_row(scan_row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        worker_manager, dragon_service, capital_service, shared_factors_service, strategy_service = _get_worker_services()
+        worker_manager, capital_service, shared_factors_service, strategy_service, dragon_service_factory = _get_worker_services()
+        eager_dragon_service = None
+        if not dragon_service_lazy_init_enabled:
+            eager_dragon_service = dragon_service_factory()
         return _evaluate_trend_leader_candidate(
             manager=worker_manager,
-            dragon_service=dragon_service,
+            dragon_service=eager_dragon_service,
+            dragon_service_factory=dragon_service_factory,
             capital_service=capital_service,
             shared_factors_service=shared_factors_service,
             strategy_service=strategy_service,
@@ -2503,11 +2890,15 @@ def scan_trend_leader_candidates_with_stats(
             total_mv=_safe_float(scan_row.get("total_mv")),
             quote_seed=scan_row.get("quote_seed") if isinstance(scan_row.get("quote_seed"), dict) else None,
             scan_context=shared_scan_context or None,
+            parallelize_enrichment=max_workers <= 1,
+            tighten_non_trend_enrichment_short_circuit=tighten_non_trend_enrichment_short_circuit,
+            fundamental_budget_seconds=fundamental_budget_seconds,
+            capital_flow_budget_seconds=capital_flow_budget_seconds,
         )
 
     pending_rows: List[Dict[str, Any]] = []
     skipped_unscannable_history = 0
-    scan_as_of_date = date.today()
+    scan_as_of_date = scan_date
     for scan_idx, row in enumerate(universe.itertuples(index=False), start=1):
         code = str(getattr(row, "code", "") or "").strip()
         if not code:
@@ -2619,6 +3010,7 @@ def scan_trend_leader_candidates_with_stats(
             "evaluated" if result is not None else "skipped",
         )
 
+    scan_eval_started_at = time.perf_counter()
     if pending_total == 0:
         logger.info("trend leader scan pending queue empty after resume filtering.")
     elif max_workers == 1 or pending_total == 1:
@@ -2659,10 +3051,21 @@ def scan_trend_leader_candidates_with_stats(
                     completed_remaining=completed,
                     remaining_total=pending_total,
                 )
+    scan_eval_elapsed_sec = round(time.perf_counter() - scan_eval_started_at, 6)
 
     selected: List[Dict[str, Any]] = list(strict_selected)
     if not selected and fallback_top_n > 0:
         selected = _pick_fallback_pool(all_results, top_n=max(0, int(fallback_top_n)))
+    selected_codes = {
+        str(item.get("code") or "").strip()
+        for item in selected
+        if isinstance(item, dict) and str(item.get("code") or "").strip()
+    }
+    watchlist = _pick_watch_pool(
+        all_results,
+        top_n=max(0, int(watch_top_n)),
+        excluded_codes=selected_codes,
+    )
     board_risk_map = _build_board_earnings_risk_map(all_results)
     _apply_board_earnings_risk_warnings(selected, board_risk_map=board_risk_map)
     risky_selected_count = sum(
@@ -2676,6 +3079,7 @@ def scan_trend_leader_candidates_with_stats(
             risky_selected_count,
             len(selected),
         )
+    post_select_enrichment_started_at = time.perf_counter()
     _apply_post_select_enrichment(
         selected=selected,
         manager=shared_manager,
@@ -2684,6 +3088,7 @@ def scan_trend_leader_candidates_with_stats(
         enrich_top_n=max(0, int(enrich_top_n)),
         progress_every=safe_progress_every,
     )
+    post_select_enrichment_elapsed_sec = round(time.perf_counter() - post_select_enrichment_started_at, 6)
 
     if checkpoint_file is not None:
         _save_scan_checkpoint(
@@ -2705,11 +3110,59 @@ def scan_trend_leader_candidates_with_stats(
     )
     selected_rows = build_selected_dataframe(selected).to_dict(orient="records")
     elapsed_seconds = round(time.perf_counter() - started_at, 4)
+    capital_flow_fetch_skipped_count = sum(
+        1 for item in all_results if bool(item.get("capital_flow_fetch_skipped"))
+    )
     fallback_selected_count = sum(
         1 for item in selected_rows if str(item.get("selection_mode") or "").strip().lower() == "fallback"
     )
+    watch_selected_count = len(watchlist)
+    phase_timing_keys = (
+        "history_fetch",
+        "quote_fetch",
+        "fundamental_fetch",
+        "board_fetch",
+        "dragon_analysis",
+        "capital_profile",
+        "score_candidate",
+    )
+    phase_timing_sec = {key: 0.0 for key in phase_timing_keys}
+    evaluated_result_count = 0
+    fundamental_cache_hit_count = 0
+    fundamental_cache_source_counts: Dict[str, int] = {}
+    capital_flow_cache_hit_count = 0
+    capital_flow_cache_source_counts: Dict[str, int] = {}
+    for item in all_results:
+        if not isinstance(item, dict):
+            continue
+        if bool(item.get("_fundamental_cache_hit")):
+            fundamental_cache_hit_count += 1
+        fundamental_cache_source = str(item.get("_fundamental_cache_source") or "").strip()
+        if fundamental_cache_source:
+            fundamental_cache_source_counts[fundamental_cache_source] = (
+                fundamental_cache_source_counts.get(fundamental_cache_source, 0) + 1
+            )
+        if bool(item.get("_capital_flow_cache_hit")):
+            capital_flow_cache_hit_count += 1
+        capital_flow_cache_source = str(item.get("_capital_flow_cache_source") or "").strip()
+        if capital_flow_cache_source:
+            capital_flow_cache_source_counts[capital_flow_cache_source] = (
+                capital_flow_cache_source_counts.get(capital_flow_cache_source, 0) + 1
+            )
+        phase_payload = item.get("_phase_timing_sec")
+        if not isinstance(phase_payload, dict):
+            continue
+        evaluated_result_count += 1
+        for key in phase_timing_keys:
+            phase_timing_sec[key] += float(phase_payload.get(key) or 0.0)
+    phase_timing_sec = {key: round(value, 6) for key, value in phase_timing_sec.items()}
+    avg_candidate_eval_elapsed_sec = round(
+        (sum(phase_timing_sec.values()) / evaluated_result_count) if evaluated_result_count > 0 else 0.0,
+        6,
+    )
     return {
         "selected": selected_rows,
+        "watchlist": build_selected_dataframe(watchlist).to_dict(orient="records"),
         "run_stats": {
             "elapsed_seconds": elapsed_seconds,
             "total_universe": total_universe,
@@ -2718,6 +3171,8 @@ def scan_trend_leader_candidates_with_stats(
             "strict_selected_count": len(strict_selected),
             "selected_count": len(selected_rows),
             "fallback_selected_count": fallback_selected_count,
+            "watch_selected_count": watch_selected_count,
+            "capital_flow_fetch_skipped_count": capital_flow_fetch_skipped_count,
             "skipped_unscannable_history": int(skipped_unscannable_history),
             "filter_stats": dict(filter_stats),
             "scan_prefilter_stats": dict(scan_prefilter_stats),
@@ -2731,9 +3186,26 @@ def scan_trend_leader_candidates_with_stats(
             "scan_prefilter_quote_hydrated_rows": int(scan_prefilter_stats.get("quote_hydrated_rows") or 0),
             "prep_universe_elapsed_sec": round(universe_fetch_elapsed_sec, 4),
             "prep_prefilter_elapsed_sec": round(prefilter_elapsed_sec, 4),
+            "sector_rankings_prefetch_elapsed_sec": round(sector_rankings_prefetch_elapsed_sec, 6),
+            "scan_eval_elapsed_sec": round(scan_eval_elapsed_sec, 6),
+            "post_select_enrichment_elapsed_sec": round(post_select_enrichment_elapsed_sec, 6),
+            "phase_timing_sec": phase_timing_sec,
+            "avg_candidate_eval_elapsed_sec": avg_candidate_eval_elapsed_sec,
+            "fundamental_cache_hit_count": int(fundamental_cache_hit_count),
+            "fundamental_cache_source_counts": dict(fundamental_cache_source_counts),
+            "capital_flow_cache_hit_count": int(capital_flow_cache_hit_count),
+            "capital_flow_cache_source_counts": dict(capital_flow_cache_source_counts),
             "prefetch_realtime_quotes": bool(prefetch_realtime_quotes),
             "sector_rankings_prefetched": bool(sector_rankings_prefetched),
+            "sector_rankings_prefetch_status": sector_rankings_prefetch_status,
+            "sector_rankings_prefetch_error": sector_rankings_prefetch_error or None,
             "quote_seed_enabled": bool(quote_seed_enabled),
+            "shared_scan_shell_enabled": bool(use_shared_scan_shell),
+            "candidate_inner_parallel_enrichment": bool(max_workers <= 1),
+            "dragon_service_lazy_init_enabled": bool(dragon_service_lazy_init_enabled),
+            "tighten_non_trend_enrichment_short_circuit": bool(tighten_non_trend_enrichment_short_circuit),
+            "fundamental_budget_seconds": _safe_float(fundamental_budget_seconds),
+            "capital_flow_budget_seconds": _safe_float(capital_flow_budget_seconds),
             "max_workers": max(1, int(max_workers)),
             "fallback_top_n": max(0, int(fallback_top_n)),
             "shard_count": max(1, int(shard_count)),
@@ -2744,11 +3216,13 @@ def scan_trend_leader_candidates_with_stats(
 
 def scan_trend_leader_candidates(
     *,
+    snapshot_date: Optional[date] = None,
     limit: Optional[int] = None,
     max_workers: int = 1,
     shard_count: int = 1,
     shard_index: int = 0,
     fallback_top_n: int = DEFAULT_FALLBACK_TOP_N,
+    watch_top_n: int = DEFAULT_WATCH_TOP_N,
     checkpoint_path: Optional[Path] = None,
     checkpoint_every: int = DEFAULT_CHECKPOINT_EVERY,
     resume: bool = False,
@@ -2767,13 +3241,20 @@ def scan_trend_leader_candidates(
     scan_prefilter_min_turnover_rate: Optional[float] = DEFAULT_SCAN_PREFILTER_MIN_TURNOVER_RATE,
     scan_prefilter_require_positive_change: bool = False,
     quote_seed_enabled: bool = True,
+    shared_scan_shell_enabled: bool = True,
+    dragon_service_lazy_init_enabled: bool = True,
+    tighten_non_trend_enrichment_short_circuit: bool = True,
+    fundamental_budget_seconds: Optional[float] = DEFAULT_FAST_FUNDAMENTAL_BUDGET_SECONDS,
+    capital_flow_budget_seconds: Optional[float] = DEFAULT_FAST_CAPITAL_FLOW_BUDGET_SECONDS,
 ) -> List[Dict[str, Any]]:
     payload = scan_trend_leader_candidates_with_stats(
+        snapshot_date=snapshot_date,
         limit=limit,
         max_workers=max_workers,
         shard_count=shard_count,
         shard_index=shard_index,
         fallback_top_n=fallback_top_n,
+        watch_top_n=watch_top_n,
         checkpoint_path=checkpoint_path,
         checkpoint_every=checkpoint_every,
         resume=resume,
@@ -2792,11 +3273,21 @@ def scan_trend_leader_candidates(
         scan_prefilter_min_turnover_rate=scan_prefilter_min_turnover_rate,
         scan_prefilter_require_positive_change=scan_prefilter_require_positive_change,
         quote_seed_enabled=quote_seed_enabled,
+        shared_scan_shell_enabled=shared_scan_shell_enabled,
+        dragon_service_lazy_init_enabled=dragon_service_lazy_init_enabled,
+        tighten_non_trend_enrichment_short_circuit=tighten_non_trend_enrichment_short_circuit,
+        fundamental_budget_seconds=fundamental_budget_seconds,
+        capital_flow_budget_seconds=capital_flow_budget_seconds,
     )
     return [item for item in payload.get("selected", []) if isinstance(item, dict)]
 
 
-def export_results(results: List[Dict[str, Any]], *, output_dir: Path) -> None:
+def export_results(
+    results: List[Dict[str, Any]],
+    *,
+    output_dir: Path,
+    watchlist: Optional[List[Dict[str, Any]]] = None,
+) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     df = build_selected_dataframe(results)
     csv_path = output_dir / "trend_leader_unified_candidates.csv"
@@ -2808,6 +3299,36 @@ def export_results(results: List[Dict[str, Any]], *, output_dir: Path) -> None:
     )
     logger.info("已导出 trend leader 结果 CSV: %s", csv_path)
     logger.info("已导出 trend leader 结果 TXT: %s", txt_path)
+    watch_df = build_selected_dataframe(watchlist or [])
+    watch_csv_path = output_dir / "trend_leader_unified_watchlist.csv"
+    watch_txt_path = output_dir / "trend_leader_unified_watchlist.txt"
+    watch_md_path = output_dir / "trend_leader_unified_watchlist.md"
+    watch_df.to_csv(watch_csv_path, index=False, encoding="utf-8-sig")
+    watch_txt_path.write_text(
+        ("\n".join(watch_df["code"].astype(str).tolist()) + "\n") if not watch_df.empty else "",
+        encoding="utf-8",
+    )
+    if watch_df.empty:
+        watch_md_content = "# Trend Leader Watchlist\n\n暂无候选。\n"
+    else:
+        rows = []
+        for item in watch_df.to_dict(orient="records"):
+            code = str(item.get("code") or "").strip()
+            name = str(item.get("name") or "").strip()
+            score = float(item.get("overall_score") or 0.0)
+            reason = str(item.get("watch_reason") or "").strip() or "-"
+            rows.append(f"| {code} | {name} | {score:.1f} | {reason} |")
+        watch_md_content = (
+            "# Trend Leader Watchlist\n\n"
+            "| code | name | overall_score | watch_reason |\n"
+            "| --- | --- | ---: | --- |\n"
+            + "\n".join(rows)
+            + "\n"
+        )
+    watch_md_path.write_text(watch_md_content, encoding="utf-8")
+    logger.info("已导出 trend leader watchlist CSV: %s", watch_csv_path)
+    logger.info("已导出 trend leader watchlist TXT: %s", watch_txt_path)
+    logger.info("已导出 trend leader watchlist MD: %s", watch_md_path)
 
 
 def main() -> int:
@@ -2819,7 +3340,7 @@ def main() -> int:
     logger.info(
         (
             "开始运行 trend leader unified: snapshot_date=%s, limit=%s, signal_type=%s, "
-            "max_workers=%s, shard=%s/%s, fallback_top_n=%s, persist=%s, resume=%s, checkpoint=%s, "
+            "max_workers=%s, shard=%s/%s, fallback_top_n=%s, watch_top_n=%s, persist=%s, resume=%s, checkpoint=%s, "
             "second_stage_news=%s, second_stage_business=%s, enrich_top_n=%s, progress_every=%s"
         ),
         snapshot_date.isoformat(),
@@ -2829,6 +3350,7 @@ def main() -> int:
         max(0, int(args.shard_index)),
         max(1, int(args.shard_count)),
         max(0, int(args.fallback_top_n)),
+        max(0, int(args.watch_top_n)),
         not args.skip_db_persist,
         bool(args.resume),
         str(args.checkpoint_path or ""),
@@ -2841,7 +3363,7 @@ def main() -> int:
         (
             "trend leader universe filter config: exclude_st=%s exclude_kcb=%s exclude_cyb=%s "
             "universe_codes_file=%s scan_prefilter_enabled=%s min_listed_days=%s min_change_60d=%s min_turnover=%s "
-            "require_positive_change=%s"
+            "require_positive_change=%s fundamental_budget_seconds=%s capital_flow_budget_seconds=%s"
         ),
         bool(args.exclude_st),
         bool(args.exclude_kcb),
@@ -2852,15 +3374,19 @@ def main() -> int:
         _safe_float(args.scan_prefilter_min_change_pct_60d),
         _safe_float(args.scan_prefilter_min_turnover_rate),
         bool(args.scan_prefilter_require_positive_change),
+        _safe_float(args.fundamental_budget_seconds),
+        _safe_float(args.capital_flow_budget_seconds),
     )
     if int(args.shard_count) > 1 and not bool(args.skip_db_persist):
         raise ValueError("shard 模式请加 --skip-db-persist，避免分片结果互相覆盖；汇总后再统一入库。")
-    selected = scan_trend_leader_candidates(
+    payload = scan_trend_leader_candidates_with_stats(
+        snapshot_date=snapshot_date,
         limit=args.limit,
         max_workers=max(1, int(args.max_workers)),
         shard_count=max(1, int(args.shard_count)),
         shard_index=max(0, int(args.shard_index)),
         fallback_top_n=max(0, int(args.fallback_top_n)),
+        watch_top_n=max(0, int(args.watch_top_n)),
         checkpoint_path=Path(args.checkpoint_path) if args.checkpoint_path else None,
         checkpoint_every=max(1, int(args.checkpoint_every)),
         resume=bool(args.resume),
@@ -2878,8 +3404,13 @@ def main() -> int:
         scan_prefilter_min_change_pct_60d=_safe_float(args.scan_prefilter_min_change_pct_60d),
         scan_prefilter_min_turnover_rate=_safe_float(args.scan_prefilter_min_turnover_rate),
         scan_prefilter_require_positive_change=bool(args.scan_prefilter_require_positive_change),
+        shared_scan_shell_enabled=not bool(args.disable_shared_scan_shell),
+        fundamental_budget_seconds=_safe_float(args.fundamental_budget_seconds),
+        capital_flow_budget_seconds=_safe_float(args.capital_flow_budget_seconds),
     )
-    export_results(selected, output_dir=Path(args.output_dir))
+    selected = [item for item in payload.get("selected", []) if isinstance(item, dict)]
+    watchlist = [item for item in payload.get("watchlist", []) if isinstance(item, dict)]
+    export_results(selected, output_dir=Path(args.output_dir), watchlist=watchlist)
 
     if not args.skip_db_persist:
         db = DatabaseManager.get_instance()

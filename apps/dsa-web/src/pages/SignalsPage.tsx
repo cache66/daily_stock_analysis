@@ -128,6 +128,7 @@ function isRequestCanceled(error: unknown): boolean {
 type SortOption = 'latestHighDesc' | 'previousHitCountDesc' | 'closeDesc' | 'ytdReturnDesc' | 'eventDateDesc' | 'signalDateDesc' | 'codeAsc';
 type StreakGroupBy = 'none' | 'theme' | 'industry';
 type YtdFilterOption = 'all' | 'gt0' | 'gt20' | 'gt50';
+type SignalViewMode = 'short_term' | 'long_term';
 type ActionStatus = {
   type: 'success' | 'error';
   message: string;
@@ -283,6 +284,23 @@ const BASE_SIGNAL_TYPE_OPTIONS = [
   { value: 'commodity_beneficiary__hard_disk', label: '硬盘涨价' },
 ];
 
+const SHORT_TERM_SIGNAL_OPTIONS = [
+  { value: 'trend_leader_unified', label: '强趋势龙头总榜' },
+  { value: 'earnings_surprise', label: '业绩超预期' },
+  { value: 'hundred_day_high', label: '百日新高' },
+] as const;
+
+const LONG_TERM_CORE_SIGNAL_OPTIONS = [
+  { value: 'monthly_slow_rise', label: '月线慢牛' },
+  { value: 'dragon_head_candidate', label: '龙头专题' },
+] as const;
+
+const LONG_TERM_TOPIC_SIGNAL_OPTIONS = [
+  { value: 'commodity_beneficiary__optical_fiber', label: '光纤涨价' },
+  { value: 'commodity_beneficiary__memory', label: '内存涨价' },
+  { value: 'commodity_beneficiary__hard_disk', label: '硬盘涨价' },
+] as const;
+
 function isCommoditySignalType(signalType: string): boolean {
   return signalType.startsWith('commodity_beneficiary__');
 }
@@ -331,6 +349,17 @@ function showsEventDate(signalType: string): boolean {
 
 function isEarningsSignalType(signalType: string): boolean {
   return signalType === 'earnings_surprise';
+}
+
+function isShortTermSignalType(signalType: string): boolean {
+  return SHORT_TERM_SIGNAL_OPTIONS.some((option) => option.value === signalType);
+}
+
+function isLongTermSignalType(signalType: string): boolean {
+  return LONG_TERM_CORE_SIGNAL_OPTIONS.some((option) => option.value === signalType)
+    || LONG_TERM_TOPIC_SIGNAL_OPTIONS.some((option) => option.value === signalType)
+    || isBoardRecognizabilitySignalType(signalType)
+    || isMonthlySlowRiseSignalType(signalType);
 }
 
 function summarizeTopBuckets(counter: Map<string, number>, limit = 2): string {
@@ -393,6 +422,7 @@ function buildEmptySnapshotListResponse(params: {
 
 const SignalsPage: React.FC = () => {
   const [signalType, setSignalType] = useState('hundred_day_high');
+  const [signalViewMode, setSignalViewMode] = useState<SignalViewMode>('short_term');
   const [dateMode, setDateMode] = useState<'single' | 'range'>('single');
   const [signalDate, setSignalDate] = useState(getTodayIsoDate);
   const [signalDateFrom, setSignalDateFrom] = useState(getTodayIsoDate);
@@ -417,6 +447,7 @@ const SignalsPage: React.FC = () => {
   const [selectedItem, setSelectedItem] = useState<SignalSnapshotListItem | null>(null);
   const [historyData, setHistoryData] = useState<SignalSnapshotHistoryResponse | null>(null);
   const [monthlyCompareData, setMonthlyCompareData] = useState<MonthlyCompareResponseMap | null>(null);
+  const [showMonthlyComparePanel, setShowMonthlyComparePanel] = useState(false);
   const [isLoadingMonthlyCompare, setIsLoadingMonthlyCompare] = useState(false);
   const [monthlyCompareError, setMonthlyCompareError] = useState<ParsedApiError | null>(null);
   const [isLoadingList, setIsLoadingList] = useState(false);
@@ -473,13 +504,34 @@ const SignalsPage: React.FC = () => {
     };
   }, [boardRecognizabilityOptions, monthlySlowRiseOptions]);
 
-  const signalTypeOptions = useMemo(
+  const shortTermSignalOptions = useMemo(
+    () => SHORT_TERM_SIGNAL_OPTIONS.map((option) => ({ value: option.value, label: option.label })),
+    [],
+  );
+
+  const longTermCoreSignalOptions = useMemo(
+    () => LONG_TERM_CORE_SIGNAL_OPTIONS.map((option) => ({ value: option.value, label: option.label })),
+    [],
+  );
+
+  const longTermTopicSignalOptions = useMemo(
+    () => LONG_TERM_TOPIC_SIGNAL_OPTIONS.map((option) => ({ value: option.value, label: option.label })),
+    [],
+  );
+
+  const longTermSignalOptions = useMemo(
     () => [
-      ...BASE_SIGNAL_TYPE_OPTIONS,
+      ...longTermCoreSignalOptions,
+      ...longTermTopicSignalOptions,
       ...monthlySlowRiseOptions.map((option) => ({ value: option.value, label: option.label })),
       ...boardRecognizabilityOptions.map((option) => ({ value: option.value, label: option.label })),
     ],
-    [boardRecognizabilityOptions, monthlySlowRiseOptions],
+    [boardRecognizabilityOptions, longTermCoreSignalOptions, longTermTopicSignalOptions, monthlySlowRiseOptions],
+  );
+
+  const signalTypeOptions = useMemo(
+    () => (signalViewMode === 'short_term' ? shortTermSignalOptions : longTermSignalOptions),
+    [longTermSignalOptions, shortTermSignalOptions, signalViewMode],
   );
 
   const signalMeta = signalTypeMetaMap[signalType] ?? signalTypeMetaMap.hundred_day_high;
@@ -506,7 +558,9 @@ const SignalsPage: React.FC = () => {
     return counts;
   }, [countData]);
 
-  const shouldShowMonthlyCompare = isMonthlySlowRiseSignalType(signalType) && monthlySlowRiseOptions.length >= 2;
+  const isMonthlyCompareContext = signalViewMode === 'long_term'
+    && isMonthlySlowRiseSignalType(signalType);
+  const shouldShowMonthlyCompare = isMonthlyCompareContext && showMonthlyComparePanel;
 
   const loadMonthlyCompare = async (force = false) => {
     if (!shouldShowMonthlyCompare) {
@@ -889,7 +943,7 @@ const SignalsPage: React.FC = () => {
   useEffect(() => {
     void loadMonthlyCompare();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [signalType, signalDate, signalDateFrom, signalDateTo, dateMode, appliedCodeFilter, activeLinkedCodes.join(','), monthlySlowRiseOptions.map((option) => option.value).join('|')]);
+  }, [signalType, signalDate, signalDateFrom, signalDateTo, dateMode, appliedCodeFilter, activeLinkedCodes.join(','), monthlySlowRiseOptions.map((option) => option.value).join('|'), signalViewMode, showMonthlyComparePanel]);
 
   useEffect(() => {
     setCompareSummaryExpanded(false);
@@ -1161,6 +1215,24 @@ const SignalsPage: React.FC = () => {
     signalType,
   ]);
 
+  const resolveFallbackSignalType = (mode: SignalViewMode): string => {
+    const options = mode === 'short_term' ? shortTermSignalOptions : longTermSignalOptions;
+    if (mode === 'short_term') {
+      for (const preferred of ['trend_leader_unified', 'earnings_surprise', 'hundred_day_high']) {
+        if (options.some((option) => option.value === preferred)) {
+          return preferred;
+        }
+      }
+    } else if (options.some((option) => option.value === 'monthly_slow_rise')) {
+      return 'monthly_slow_rise';
+    }
+    return options[0]?.value ?? 'hundred_day_high';
+  };
+
+  const isSignalTypeVisibleInMode = (targetSignalType: string, mode: SignalViewMode): boolean => {
+    return mode === 'short_term' ? isShortTermSignalType(targetSignalType) : isLongTermSignalType(targetSignalType);
+  };
+
   const handleSignalTypeChange = (nextSignalType: string) => {
     setSignalType(nextSignalType);
     setSortBy('latestHighDesc');
@@ -1175,6 +1247,18 @@ const SignalsPage: React.FC = () => {
     setAppliedCodeFilter('');
     setActionStatus(null);
     setLinkedSelectionContext(null);
+    setShowMonthlyComparePanel(false);
+  };
+
+  const handleSignalViewModeChange = (nextMode: SignalViewMode) => {
+    if (nextMode === signalViewMode) {
+      return;
+    }
+    setSignalViewMode(nextMode);
+    setShowMonthlyComparePanel(false);
+    if (!isSignalTypeVisibleInMode(signalType, nextMode)) {
+      handleSignalTypeChange(resolveFallbackSignalType(nextMode));
+    }
   };
 
   const handleShiftDate = (deltaDays: number) => {
@@ -1325,13 +1409,37 @@ const SignalsPage: React.FC = () => {
           description={signalMeta.description}
           actions={(
             <>
-              <div className="grid min-w-[360px] grid-cols-1 gap-2 rounded-[28px] border border-border/60 bg-card/55 p-2 shadow-soft-card sm:grid-cols-4">
+              <div className="inline-flex items-center gap-1 rounded-2xl border border-border/60 bg-card/45 p-1 shadow-soft-card">
+                <Button
+                  size="sm"
+                  variant={signalViewMode === 'short_term' ? 'secondary' : 'ghost'}
+                  onClick={() => handleSignalViewModeChange('short_term')}
+                  aria-label="signals-mode-short_term"
+                >
+                  短线模式
+                </Button>
+                <Button
+                  size="sm"
+                  variant={signalViewMode === 'long_term' ? 'secondary' : 'ghost'}
+                  onClick={() => handleSignalViewModeChange('long_term')}
+                  aria-label="signals-mode-long_term"
+                >
+                  长线模式
+                </Button>
+              </div>
+              <div className={`grid min-w-[360px] grid-cols-1 gap-2 rounded-[28px] border border-border/60 bg-card/55 p-2 shadow-soft-card ${
+                signalViewMode === 'short_term' ? 'sm:grid-cols-3' : 'sm:grid-cols-3 lg:grid-cols-4'
+              }`}>
                 {[
                   { value: 'trend_leader_unified', label: '强趋势龙头' },
-                  { value: 'hundred_day_high', label: '百日新高' },
                   { value: 'earnings_surprise', label: '业绩超预期' },
+                  { value: 'hundred_day_high', label: '百日新高' },
                   { value: 'monthly_slow_rise', label: '月线慢牛' },
-                ].map((option) => (
+                ].filter((option) => (
+                  signalViewMode === 'short_term'
+                    ? isShortTermSignalType(option.value)
+                    : option.value === 'monthly_slow_rise'
+                )).map((option) => (
                   <button
                     key={option.value}
                     type="button"
@@ -1382,8 +1490,12 @@ const SignalsPage: React.FC = () => {
                   </button>
                 ))}
               </div>
-              <div className="grid min-w-[360px] grid-cols-1 gap-2 rounded-[28px] border border-border/50 bg-card/35 p-2 shadow-soft-card sm:grid-cols-3">
-                {BASE_SIGNAL_TYPE_OPTIONS.filter((option) => isCommoditySignalType(option.value) || isDragonHeadSignalType(option.value)).map((option) => (
+              {signalViewMode === 'long_term' ? (
+                <div className="grid min-w-[360px] grid-cols-1 gap-2 rounded-[28px] border border-border/50 bg-card/35 p-2 shadow-soft-card sm:grid-cols-3">
+                {BASE_SIGNAL_TYPE_OPTIONS.filter((option) => (
+                  option.value === 'dragon_head_candidate'
+                    || isCommoditySignalType(option.value)
+                )).map((option) => (
                   <button
                     key={option.value}
                     type="button"
@@ -1433,8 +1545,9 @@ const SignalsPage: React.FC = () => {
                     </div>
                   </button>
                 ))}
-              </div>
-              {monthlySlowRiseOptions.length > 0 ? (
+                </div>
+              ) : null}
+              {signalViewMode === 'long_term' && monthlySlowRiseOptions.length > 0 ? (
                 <div className="grid min-w-[360px] grid-cols-1 gap-2 rounded-[28px] border border-border/50 bg-card/30 p-2 shadow-soft-card sm:grid-cols-3">
                   {monthlySlowRiseOptions.map((option) => (
                     <button
@@ -1488,7 +1601,7 @@ const SignalsPage: React.FC = () => {
                   ))}
                 </div>
               ) : null}
-              {boardRecognizabilityOptions.length > 0 ? (
+              {signalViewMode === 'long_term' && boardRecognizabilityOptions.length > 0 ? (
                 <div className="grid min-w-[360px] grid-cols-1 gap-2 rounded-[28px] border border-border/50 bg-card/30 p-2 shadow-soft-card sm:grid-cols-3">
                   {boardRecognizabilityOptions.map((option) => (
                     <button
@@ -1725,6 +1838,18 @@ const SignalsPage: React.FC = () => {
                 质量信号 {earningsStrategySummary.qualitySignalCount}/{filteredAndSortedItems.length}
               </p>
             </div>
+          </div>
+        ) : null}
+
+        {isMonthlyCompareContext ? (
+          <div className="rounded-2xl border border-border/60 bg-card/35 px-4 py-3 shadow-soft-card">
+            <Button
+              variant={showMonthlyComparePanel ? 'secondary' : 'ghost'}
+              onClick={() => setShowMonthlyComparePanel((prev) => !prev)}
+              aria-label="toggle-monthly-compare"
+            >
+              {showMonthlyComparePanel ? '收起月线档位对比' : '查看月线档位对比'}
+            </Button>
           </div>
         ) : null}
 

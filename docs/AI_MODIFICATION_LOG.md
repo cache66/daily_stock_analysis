@@ -1,5 +1,4574 @@
 # AI Modification Log
 
+## 2026-05-06 (shortline CLI db-manager injection for snapshot-backed driver evidence)
+
+- Scope: fix the real `shortline_hub` process/CLI path so snapshot-backed hard-logic evidence actually reaches the orchestrator during real replays.
+- Why:
+  - Investigation after the `2026-05-04` replay showed a contradiction:
+    - direct calls to `load_snapshot_driver_evidence(...)` could already find recent `earnings_surprise` rows for several real candidates
+    - but the real `run_shortline_hub.py --mode process` output still showed `driver_type_mix={"flow_only":5}`
+  - Root cause: `scripts/run_shortline_hub.py` built `ShortlineHubOrchestrator(...)` without passing `db_manager`, so `load_snapshot_driver_evidence(...)` always received `None` in the real CLI path.
+- Changes:
+  - Updated `scripts/run_shortline_hub.py`
+    - `_build_orchestrator(...)` now injects `DatabaseManager.get_instance()` into `ShortlineHubOrchestrator`
+  - Updated `tests/test_shortline_hub_cli.py`
+    - added regression coverage proving the CLI builder injects `db_manager`
+- Verification:
+  - Red:
+    - `py -3.10 -m pytest tests/test_shortline_hub_cli.py -q -k db_manager`
+      - failed before implementation with `assert None is <object ...>`
+  - Green:
+    - `py -3.10 -m pytest tests/test_shortline_hub_cli.py -q -k db_manager`
+      - result: `1 passed`
+    - `py -3.10 -m pytest tests/test_shortline_hub_cli.py tests/test_shortline_snapshot_driver_support.py tests/test_shortline_driver_support.py -q`
+      - result: `23 passed`
+    - `py -3.10 -m py_compile scripts/run_shortline_hub.py tests/test_shortline_hub_cli.py`
+      - passed
+    - real replay:
+      - `py -3.10 scripts/run_shortline_hub.py --mode process --trade-date 2026-05-04 --top-n 5 --run-id shortline_nontrade_day_replay_after_db_fix_20260506 ...`
+      - result changed from `review_tier_counts={"watchlist":5}, driver_type_mix={"flow_only":5}` to `review_tier_counts={"top_pick":4,"watchlist":1}, driver_type_mix={"earnings_driver":4,"flow_only":1}`
+
+## 2026-05-06 (non-trading-day snapshot date fallback for shortline upstreams)
+
+- Scope: fix the `2026-05-04` holiday replay gap at the upstream snapshot-producer layer so A-share non-trading-day runs resolve to the latest valid CN trading session instead of hard-using the holiday date.
+- Why:
+  - The user-facing expectation was correct: when a manual daily run targets `2026-05-04`, the A-share upstream snapshot scripts should effectively run on `2026-04-30`, because `2026-05-04` was not a CN trading day.
+  - Before this fix, `select_trend_leader_candidates.py`, `select_earnings_surprise_candidates.py`, and `collect_commodity_beneficiary_snapshots.py` all parsed `--snapshot-date` with plain `date.fromisoformat(...)` and did not call the shared trading-calendar fallback.
+  - That meant upstreams were not reusing the latest trading-day data automatically; the issue was not that all data sources were empty, but that the scripts were pinned to a holiday `snapshot_date`.
+- Changes:
+  - Updated `scripts/select_trend_leader_candidates.py`
+    - `parse_snapshot_date(...)` now resolves explicit and implicit dates through `get_effective_trading_date("cn", ...)`
+  - Updated `scripts/select_earnings_surprise_candidates.py`
+    - same non-trading-day fallback now applies to the earnings snapshot producer
+  - Updated `scripts/collect_commodity_beneficiary_snapshots.py`
+    - same non-trading-day fallback now applies to commodity-beneficiary snapshot persistence
+  - Added `tests/test_snapshot_date_resolution.py`
+    - covers `2026-05-04 -> 2026-04-30` fallback for all three upstream scripts
+    - also covers preserving an explicit valid trading day
+- Verification:
+  - Red:
+    - `py -3.10 -m pytest tests/test_snapshot_date_resolution.py -q`
+      - failed before implementation because all three scripts returned the raw holiday date instead of the latest CN trading session
+  - Green:
+    - `py -3.10 -m pytest tests/test_snapshot_date_resolution.py -q`
+      - result: `4 passed`
+    - `py -3.10 -m py_compile scripts/select_trend_leader_candidates.py scripts/select_earnings_surprise_candidates.py scripts/collect_commodity_beneficiary_snapshots.py tests/test_snapshot_date_resolution.py`
+      - passed
+    - direct parse check:
+      - `select_trend_leader_candidates.parse_snapshot_date("2026-05-04") -> 2026-04-30`
+      - `select_earnings_surprise_candidates.parse_snapshot_date("2026-05-04") -> 2026-04-30`
+      - `collect_commodity_beneficiary_snapshots.parse_snapshot_date("2026-05-04") -> 2026-04-30`
+    - regression safety:
+      - `py -3.10 -m pytest tests/test_shortline_daily_scripts.py tests/test_shortline_snapshot_driver_support.py tests/test_shortline_driver_support.py -q`
+      - result: `15 passed`
+
+## 2026-05-05 (shortline recent snapshot fallback and daily ordering)
+
+- Scope: continue the shortline hard-logic uplift follow-up by solving the real replay gap discovered on `2026-05-04`: same-day snapshots were often absent on holiday / non-trading-day runs, so `shortline_hub` needed recent-trade-day fallback; in parallel, the daily wrapper needed to pre-run upstream snapshot producers before shortline aggregation.
+- Why:
+  - Real replay on `2026-05-04` showed the new hard-evidence wiring was functioning, but the当天 local snapshot inventory for `earnings_surprise` / `trend_leader_unified` / `commodity_beneficiary__*` was empty, leaving all five names in `flow_only`.
+  - The root problem was not classification logic anymore, but snapshot availability timing and non-same-day reuse.
+- Changes:
+  - Updated `src/shortline_hub/snapshot_driver_evidence.py`
+    - same-day evidence still has highest priority
+    - missing symbols now fall back to recent snapshot rows within the latest `3-5` trade-day-equivalent snapshot window
+    - commodity signal-type discovery now scans a recent date range instead of same day only
+    - snapshot evidence strings now include the actual hit date, e.g. `snapshot:earnings_surprise@2026-04-30`
+  - Updated `scripts/run-shortline-daily.ps1`
+    - daily replay now pre-runs:
+      - `select_trend_leader_candidates.py --snapshot-date <TradeDate> --signal-type trend_leader_unified`
+      - `select_earnings_surprise_candidates.py --snapshot-date <TradeDate> --strategy-profile balanced`
+      - `collect_commodity_beneficiary_snapshots.py --snapshot-date <TradeDate> --commodities optical_fiber,memory,hard_disk`
+    - only after those three steps does it call `run_shortline_hub.py`
+    - wrapper `-DryRun` now prints the same four-step order for inspection
+  - Updated regression coverage:
+    - `tests/test_shortline_snapshot_driver_support.py`
+      - added recent-snapshot fallback cases for `earnings_surprise`
+      - added recent-snapshot fallback cases for `commodity_beneficiary__memory`
+    - `tests/test_shortline_daily_scripts.py`
+      - added ordering assertions that upstream snapshot scripts execute before `run_shortline_hub.py`
+- Verification:
+  - Red:
+    - `py -3.10 -m pytest tests/test_shortline_snapshot_driver_support.py -q`
+      - failed as expected because recent snapshot fallback was not yet implemented
+    - `py -3.10 -m pytest tests/test_shortline_daily_scripts.py -q`
+      - failed as expected because `run-shortline-daily.ps1` still launched `run_shortline_hub.py` directly
+  - Green:
+    - `py -3.10 -m pytest tests/test_shortline_snapshot_driver_support.py tests/test_shortline_driver_support.py tests/test_shortline_daily_scripts.py tests/test_shortline_hub_cli.py -q`
+      - result: `24 passed`
+    - `py -3.10 -m pytest tests/test_shortline_daily_review_layers.py -q -k "flow_only or industry_breakout or theme_relay or driver_report_case or reconstructed_volume_soft_penalty_can_stay_on_watchlist or amount_validated_reconstructed_volume_can_stay_top_pick"`
+      - result: `5 passed`
+    - `py -3.10 -m py_compile src/shortline_hub/snapshot_driver_evidence.py scripts/run_shortline_hub.py tests/test_shortline_snapshot_driver_support.py tests/test_shortline_daily_scripts.py`
+      - passed
+    - wrapper dry-run:
+      - `powershell -ExecutionPolicy Bypass -File .\scripts\run-shortline-daily.ps1 -TradeDate 2026-05-04 -TopN 5 -RunId shortline_daily_dryrun_20260505 -DryRun`
+      - confirmed printed order is `trend_leader_unified -> earnings_surprise -> commodity_beneficiary -> run_shortline_hub`
+
+## 2026-05-05 (shortline snapshot-backed hard driver evidence)
+
+- Scope: continue strengthening shortline hard-logic sources so real earnings / price-cycle / industry-catalyst names can be lifted out of `flow_only` even when the explanation text itself is generic.
+- Changes:
+  - Added `src/shortline_hub/snapshot_driver_evidence.py`
+    - loads same-day snapshot evidence for current shortline symbols from:
+      - `earnings_surprise`
+      - `commodity_beneficiary__*`
+      - conservative `trend_leader_unified`
+    - maps those structured snapshots into deterministic `driver_type / driver_confidence / driver_support_score / driver_evidence`
+  - Updated `src/shortline_hub/driver_support.py`
+    - `classify_driver_support(...)` now accepts optional `external_evidence`
+    - snapshot-backed hard evidence is prioritized over explanation-text keyword fallback
+  - Updated `src/shortline_hub/orchestrator.py`
+    - new optional `db_manager` injection point
+    - loads same-day snapshot-backed hard evidence before ranking
+    - applies snapshot evidence per symbol when classifying driver support
+  - Updated tests:
+    - `tests/test_shortline_driver_support.py`
+    - `tests/test_shortline_snapshot_driver_support.py`
+- Why:
+  - the previous driver-support layer only read `FinGenius` explanation text, so real hard logic already captured by local strategy snapshots could still be lost if the shortline commentary stayed generic
+  - this repo already has stronger structured evidence than the shortline explanation layer for earnings surprise, commodity pass-through, and part of the trend leader path; not reusing it left too many true catalyst names stuck in `flow_only`
+- Verification:
+  - Red:
+    - `py -3.10 -m pytest tests/test_shortline_driver_support.py tests/test_shortline_snapshot_driver_support.py -q`
+      - failed before implementation because `classify_driver_support()` did not accept `external_evidence`, and `ShortlineHubOrchestrator` had no snapshot-backed driver-evidence wiring
+  - Green:
+    - `py -3.10 -m pytest tests/test_shortline_driver_support.py tests/test_shortline_snapshot_driver_support.py -q`
+      - result: `11 passed`
+    - `py -3.10 -m pytest tests/test_shortline_daily_review_layers.py -q -k "flow_only or industry_breakout or theme_relay or driver_report_case or reconstructed_volume_soft_penalty_can_stay_on_watchlist or amount_validated_reconstructed_volume_can_stay_top_pick"`
+      - result: `5 passed`
+    - `py -3.10 -m py_compile src/shortline_hub/driver_support.py src/shortline_hub/snapshot_driver_evidence.py src/shortline_hub/orchestrator.py tests/test_shortline_driver_support.py tests/test_shortline_snapshot_driver_support.py`
+
+## 2026-05-05 (shortline driver support layer)
+
+- Scope: add a deterministic logic-support layer for `shortline_hub`, so shortline candidates can be separated into stronger logic-driven setups, weak theme relay, and pure flow-only cases.
+- Changes:
+  - Added `src/shortline_hub/driver_support.py`
+    - deterministic classifier now derives `driver_type / driver_confidence / driver_support_score / driver_evidence` from existing shortline explanation fields
+    - strong logic only recognizes explicit earnings and price-cycle signals first
+    - industry-breakout now requires stronger组合证据，而不是把 `daily` 这类英文片段里的 `AI` 子串当成有效信号
+    - weak theme relay 现在只认显式 `题材 / 主线 / 映射`，不再把模板化的“继续扩散”直接算成逻辑支撑
+  - Updated `src/shortline_hub/orchestrator.py`
+    - writes driver-support fields back into each combined result
+    - only strong logic drivers can compete for `top_pick`; weak theme relay and flow-only cases stay on `watchlist`
+  - Updated `src/shortline_hub/report_builder.py` and `src/shortline_hub/snapshot_sync.py`
+    - expose `driver_type / driver_confidence / driver_support_score / driver_evidence` in report and snapshot payloads
+  - Updated tests:
+    - `tests/test_shortline_driver_support.py`
+    - `tests/test_shortline_hub_orchestrator.py`
+    - `tests/test_shortline_daily_review_layers.py`
+    - `tests/test_shortline_snapshot_sync.py`
+- Why:
+  - the first real replay showed `AI` was being matched inside the English word `daily`, so generic template text was being promoted as `industry_breakout_driver`
+  - the new layer is meant to answer the user-facing question more honestly: this票到底是“有硬逻辑支撑”、还是“题材接力”、还是“纯资金接力”
+- Verification:
+  - Target tests:
+    - `py -3.10 -m pytest tests/test_shortline_driver_support.py tests/test_shortline_hub_orchestrator.py tests/test_shortline_daily_review_layers.py tests/test_shortline_snapshot_sync.py -q`
+      - result: `39 passed`
+  - Compile:
+    - `py -3.10 -m py_compile src/shortline_hub/driver_support.py src/shortline_hub/orchestrator.py src/shortline_hub/report_builder.py src/shortline_hub/schemas.py src/shortline_hub/snapshot_sync.py tests/test_shortline_driver_support.py tests/test_shortline_hub_orchestrator.py tests/test_shortline_daily_review_layers.py tests/test_shortline_snapshot_sync.py`
+  - Real replay:
+    - `py -3.10 scripts/run_shortline_hub.py --mode process --trade-date 2026-05-04 --top-n 5 --run-id shortline_driver_support_verify_20260505_v3 --output-dir data/manual_runs/shortline_driver_support_verify_20260505_v3 --wt-python-executable C:\\Users\\wenjin227\\AppData\\Local\\Programs\\Python\\Python310\\python.exe --wt-script-path D:\\bb\\WonderTrader\\bridge\\wt_export_candidates.py --wt-workdir D:\\bb\\WonderTrader --wt-source-mode prefer_real_engine --fg-python-executable D:\\bb\\FinGenius\\.venv311\\Scripts\\python.exe --fg-script-path D:\\bb\\FinGenius\\bridge\\fg_explain_candidate.py --fg-workdir D:\\bb\\FinGenius --log-level INFO --persist-snapshot --enable-explain-cache --explain-cache-path data/runtime/shortline_hub/explain_cache/shortline_driver_support_verify_20260505.json --explain-cache-mode light --tracking-history-path data/runtime/shortline_hub/tracking/validation_real_fix_20260503_20260504.json`
+      - result: `review_tier_counts={"watchlist":5}`, `driver_type_mix={"flow_only":5}`, `explain_cache_hit_count=5`
+
+## 2026-05-05 (shortline replay validation wrapper)
+
+- Scope: package the recommended `baseline -> cold -> warm` historical shortline replay checklist into one reusable PowerShell entrypoint.
+- Changes:
+  - Added `scripts/run-shortline-replay-validation.ps1`
+    - defaults to the recommended `2026-04-29 -> 2026-04-30 -> 2026-04-30 warm rerun` flow
+    - calls `run-shortline-review-bundle.ps1` three times in sequence
+    - reuses one shared `tracking_history_path` and one shared `explain_cache_path` across all three phases
+    - forwards wrapper-level `RepoPythonExecutable / WonderTraderPythonExecutable / FinGeniusPythonExecutable / SkipShortlinePersistSnapshot / SkipFastReviewPersistSnapshots / DryRun`
+  - Updated `tests/test_shortline_review_bundle_script.py`
+    - added regression coverage for the new replay-validation wrapper and its shared cache/tracking wiring
+  - Updated docs:
+    - `docs/CHANGELOG.md`
+    - `docs/LOCAL_STRATEGY_CATALOG.md`
+- Why:
+  - the manual three-command checklist was already stable enough, but it was easy to mistype paths or accidentally mix replay runs with the live `2026-05-03/2026-05-04` tracking and cache files
+  - a dedicated wrapper reduces operator error and makes future historical shortline acceptance checks repeatable
+- Verification:
+  - Red:
+    - `py -3.10 -m pytest tests/test_shortline_review_bundle_script.py -q`
+      - result: failed before implementation because `scripts/run-shortline-replay-validation.ps1` did not exist
+  - Green:
+    - `py -3.10 -m pytest tests/test_shortline_review_bundle_script.py -q`
+    - `powershell -ExecutionPolicy Bypass -File .\scripts\run-shortline-replay-validation.ps1 -DryRun`
+
+## 2026-05-05 (shortline reconstructed-volume risk refinement)
+
+- Scope: stop treating all amount-reconstructed volume cases as the same shortline risk tier.
+- Changes:
+  - Updated `src/shortline_hub/wondertrader_real_engine.py`
+    - added `amount`-ratio validation helpers for recent daily history
+    - when only a minority of recent rows needed `volume` reconstruction and the repaired history's `amount` expansion matches snapshot `volume_ratio`, the risk flag now becomes `volume_ratio_validated_by_amount_history`
+    - full-history or majority-history reconstructed cases still keep `volume_reconstructed_from_amount`
+  - Updated tests:
+    - `tests/test_wondertrader_real_engine.py`
+      - added regression for the “recent minority reconstruction + amount ratio matches snapshot” case
+    - `tests/test_shortline_daily_review_layers.py`
+      - added regression that the validated flag no longer blocks `top_pick`
+  - Updated docs:
+    - `docs/CHANGELOG.md`
+    - `docs/LOCAL_STRATEGY_CATALOG.md`
+- Why:
+  - root-cause evidence from the real `2026-05-04` run showed the remaining 5/5 watchlist compression was not one uniform problem:
+    - `300083 / 300632 / 688256 / 688400` only had the latest `9` rows reconstructed
+    - `688655` had effectively full-history reconstructed volume
+  - the first group also showed exact agreement between history `amount`-ratio and snapshot `volume_ratio`, so they were materially different from the full-history low-confidence case and should not share the same review-tier cap
+- Verification:
+  - Red:
+    - `py -3.10 -m pytest tests/test_wondertrader_real_engine.py -q -k downgrades_recent_reconstructed_volume`
+      - result: failed before implementation because the candidate still emitted `volume_reconstructed_from_amount`
+  - Green:
+    - `py -3.10 -m pytest tests/test_wondertrader_real_engine.py tests/test_shortline_daily_review_layers.py -q`
+      - result: `26 passed`
+    - `py -3.10 -m py_compile src/shortline_hub/wondertrader_real_engine.py tests/test_wondertrader_real_engine.py tests/test_shortline_daily_review_layers.py`
+    - real replay:
+      - `py -3.10 scripts/run_shortline_hub.py --mode process --trade-date 2026-05-04 --top-n 5 --run-id shortline_real_volume_validation_20260505 --output-dir data/manual_runs/shortline_real_volume_validation_20260505 --wt-python-executable C:\\Users\\wenjin227\\AppData\\Local\\Programs\\Python\\Python310\\python.exe --wt-script-path D:\\bb\\WonderTrader\\bridge\\wt_export_candidates.py --wt-workdir D:\\bb\\WonderTrader --wt-runtime-dir data/runtime/shortline_hub/wondertrader --wt-source-mode prefer_real_engine --fg-python-executable D:\\bb\\FinGenius\\.venv311\\Scripts\\python.exe --fg-script-path D:\\bb\\FinGenius\\bridge\\fg_explain_candidate.py --fg-workdir D:\\bb\\FinGenius --fg-runtime-dir data/runtime/shortline_hub/fingenius --log-level INFO --persist-snapshot --enable-explain-cache --explain-cache-path data/runtime/shortline_hub/explain_cache/shortline_explain_cache_volume_validation_20260505.json --explain-cache-mode light --tracking-history-path data/runtime/shortline_hub/tracking/validation_real_fix_20260503_20260504.json`
+      - result:
+        - `risk_flag_counts={"volume_ratio_validated_by_amount_history":4,"volume_reconstructed_from_amount":1}`
+        - `review_tier_counts={"top_pick":4,"watchlist":1}`
+
+## 2026-05-05 (shortline holiday calendar fallback hardening)
+
+- Scope: remove false `history_asof_*` high-risk downgrades when shortline real replays are run on manual holiday dates.
+- Changes:
+  - Updated `src/shortline_hub/wondertrader_real_engine.py`
+    - added a local AkShare trade-date cache at `data/cache/reference/akshare_trade_dates_sina.csv`
+    - `WonderTrader` real-engine holiday detection now prefers the AkShare trading-date set when it covers the requested date
+    - retained the old local `tushare_trade_cal_sse.csv` path as a fallback when AkShare is unavailable
+  - Updated `tests/test_wondertrader_real_engine.py`
+    - added a regression where local `tushare_trade_cal_sse.csv` misleadingly marks `2026-05-01` as open and omits `2026-05-04`
+    - asserted that a more reliable AkShare trade-date source still suppresses `history_asof_2026-04-30` on the holiday replay
+  - Updated `docs/CHANGELOG.md` and `docs/LOCAL_STRATEGY_CATALOG.md`
+    - recorded the new holiday-calendar fallback and its shortline replay impact
+- Why:
+  - real evidence showed the local `tushare_trade_cal_sse.csv` cache was not authoritative in this environment:
+    - it stopped at `20260502`
+    - it incorrectly marked `20260501` as `is_open=1`
+  - the `2026-05-04` real replay was therefore a false high-risk downgrade, not a true “engine lagged on a trading day” case
+- Verification:
+  - Red:
+    - `py -3.10 -m pytest tests/test_wondertrader_real_engine.py -q -k local_calendar_is_misleading`
+      - result: failed before implementation with `history_asof_2026-04-30` still present
+  - Green:
+    - `py -3.10 -m pytest tests/test_wondertrader_real_engine.py -q -k "local_calendar_is_misleading or cached_holiday_trade_date or weekend_trade_date or truncates_history_to_trade_date or volume_reconstructed_from_amount"`
+      - result: `4 passed`
+    - `py -3.10 -m pytest tests/test_shortline_daily_review_layers.py -q -k "reconstructed_volume_soft_penalty_can_stay_on_watchlist or real_style_risk_case"`
+      - result: `1 passed`
+    - `py -3.10 scripts/run_shortline_hub.py --mode process --trade-date 2026-05-04 --top-n 5 --run-id shortline_real_risk_fix_verify_20260505_v2 --output-dir data/manual_runs/shortline_real_risk_fix_verify_20260505_v2 --wt-python-executable C:\\Users\\wenjin227\\AppData\\Local\\Programs\\Python\\Python310\\python.exe --wt-script-path D:\\bb\\WonderTrader\\bridge\\wt_export_candidates.py --wt-workdir D:\\bb\\WonderTrader --wt-runtime-dir data/runtime/shortline_hub/wondertrader --wt-source-mode prefer_real_engine --fg-python-executable D:\\bb\\FinGenius\\.venv311\\Scripts\\python.exe --fg-script-path D:\\bb\\FinGenius\\bridge\\fg_explain_candidate.py --fg-workdir D:\\bb\\FinGenius --fg-runtime-dir data/runtime/shortline_hub/fingenius --log-level INFO --persist-snapshot --enable-explain-cache --explain-cache-path data/runtime/shortline_hub/explain_cache/shortline_explain_cache.json --explain-cache-mode light --tracking-history-path data/runtime/shortline_hub/tracking/validation_real_fix_20260503_20260504.json`
+      - result: `run_summary.json` changed from `review_tier_counts={"high_risk_mover":5}` with `history_asof_2026-04-30=5` to `review_tier_counts={"watchlist":5}` with only `volume_reconstructed_from_amount=5`
+
+## 2026-05-04 (fast review hundred_day_high output-limit semantics)
+
+- Scope: fix the fast-review bundle limit semantics so small shared `--limit` values do not falsely empty `hundred_day_high`.
+- Changes:
+  - Updated `scripts/run_fast_review_bundle.py`
+    - stopped forwarding the shared `--limit` into `select_hundred_day_high_candidates.py`
+    - added bundle-side `--hundred-day-output-limit` with default `30`
+    - clipped only loaded `hundred_day_high` rows before unified/resonance/focus exports
+  - Updated `tests/test_fast_review_daily_bundle.py`
+    - asserted shared `--limit` is still forwarded to `earnings` / `monthly_slow_rise` / `trend_leader`
+    - asserted `hundred_day_high` no longer receives shared `--limit`
+    - added a main-path regression that `35` mocked `hundred_day_high` rows become `10` exported rows when `--hundred-day-output-limit 10`
+- Why:
+  - real validation on `2026-05-04` showed `select_hundred_day_high_candidates.py` can produce `168` rows with no shared limit, so the observed `fast review` `no_rows` case was caused by bundle control semantics rather than strategy emptiness.
+- Verification:
+  - Prior TDD checkpoint:
+    - `py -3.10 -m pytest tests/test_fast_review_daily_bundle.py -q -k "build_commands_forward_skip_db_persist or apply_signal_output_limits_clips_hundred_day_only"`
+      - failed before implementation, then passed after wiring the bundle-side limit helper
+  - Current regression:
+    - `py -3.10 -m pytest tests/test_fast_review_daily_bundle.py -q -k main_clips_hundred_day_outputs_at_bundle_layer`
+      - result: `1 passed`
+    - `py -3.10 -m pytest tests/test_fast_review_daily_bundle.py -q`
+      - result: `36 passed`
+    - `py -3.10 -m py_compile scripts/run_fast_review_bundle.py tests/test_fast_review_daily_bundle.py`
+
+## 2026-05-04 (shortline quality observability follow-up)
+
+- Scope: make existing quality verdicts directly explainable from artifacts instead of forcing users to reverse-engineer why a run became `degraded` or `quality_failed`.
+- Changes:
+  - Updated `scripts/summarize_shortline_runs.py`
+    - each run `quality_summary` now includes `signals.tracking_history_ready`
+    - `latest_run_quality` naturally carries the same signal
+  - Updated `scripts/run_shortline_review_bundle.py`
+    - bundle-level `quality_summary` now includes:
+      - `signals.tracking_history_ready`
+      - `signals.source_real_engine_expected_passed`
+    - top-level manifest now includes `quality_failed_due_to`
+    - root report now prints:
+      - `quality_failed_due_to`
+      - `tracking_history_ready`
+      - `source_real_engine_expected_passed`
+  - Updated tests:
+    - `tests/test_shortline_runs_summary.py`
+      - added assertions for `signals.tracking_history_ready`
+    - `tests/test_shortline_review_bundle.py`
+      - added assertions for `quality_failed_due_to`
+      - added assertions for bundle `signals.*` fields and report rendering
+- Verification:
+  - Red:
+    - `py -3.10 -m pytest tests/test_shortline_runs_summary.py tests/test_shortline_review_bundle.py -q`
+      - failed as expected because verdict outputs still lacked explicit quality-basis fields
+  - Green:
+    - `py -3.10 -m pytest tests/test_shortline_runs_summary.py tests/test_shortline_review_bundle.py -q`
+      - result: `23 passed`
+    - `py -3.10 -m py_compile scripts/summarize_shortline_runs.py scripts/run_shortline_review_bundle.py`
+
+## 2026-05-04 (shortline bundle status compatibility follow-up)
+
+- Scope: restore top-level bundle status compatibility after introducing `quality_failed`, so older consumers that only recognize `success/failed` keep working.
+- Changes:
+  - Updated `scripts/run_shortline_review_bundle.py`
+    - restored top-level `status` to legacy execution-result semantics
+    - added top-level `overall_status` for the combined conclusion
+    - retained `execution_status` as the explicit execution state
+    - pointer payload now also writes `overall_status`
+    - root report now shows `status / execution_status / overall_status / quality_verdict`
+  - Updated `tests/test_shortline_review_bundle.py`
+    - success case now asserts `overall_status=success`
+    - quality failure case now asserts:
+      - `status=success`
+      - `overall_status=quality_failed`
+    - failure case now asserts `overall_status=failed`
+- Verification:
+  - Red:
+    - `py -3.10 -m pytest tests/test_shortline_review_bundle.py -q`
+      - failed as expected because `overall_status` did not exist and quality failures still rewrote top-level `status`
+  - Green:
+    - `py -3.10 -m pytest tests/test_shortline_review_bundle.py -q`
+      - result: `18 passed`
+    - `py -3.10 -m pytest tests/test_shortline_review_bundle.py tests/test_shortline_runs_summary.py -q`
+    - `py -3.10 -m py_compile scripts/run_shortline_review_bundle.py`
+
+## 2026-05-04 (shortline tracking history readiness follow-up)
+
+- Scope: reduce false-positive `tracking_continuity_weak` warnings when shortline tracking history is not yet mature enough for cross-day comparison.
+- Changes:
+  - Updated `scripts/summarize_shortline_runs.py`
+    - added internal `tracking_history_ready` gating per run entry
+    - `tracking_continuity_weak` now only fires when the current run has at least one earlier distinct `trade_date` in scope
+  - Updated `scripts/run_shortline_review_bundle.py`
+    - added the same readiness gating at bundle quality level
+    - bundle-local tracking warning now depends on current `trade_date` having an earlier distinct date in `runs_summary.trade_date_counts`
+  - Updated tests:
+    - `tests/test_shortline_runs_summary.py`
+      - same-day samples no longer expect automatic tracking warning
+      - added cross-day regression where the second day still warns
+    - `tests/test_shortline_review_bundle.py`
+      - added regression that bundle skips tracking warning when history is not ready
+- Verification:
+  - Red:
+    - `py -3.10 -m pytest tests/test_shortline_runs_summary.py tests/test_shortline_review_bundle.py -q`
+      - failed as expected because tracking warning still fired without enough history context
+  - Green:
+    - `py -3.10 -m pytest tests/test_shortline_runs_summary.py tests/test_shortline_review_bundle.py -q`
+      - result: `23 passed`
+    - `py -3.10 -m py_compile scripts/summarize_shortline_runs.py scripts/run_shortline_review_bundle.py`
+
+## 2026-05-04 (shortline bundle status risk follow-up)
+
+- Scope: remove the ambiguity where bundle step execution could succeed while top-level `status=success` still hid `quality_summary.verdict=fail`.
+- Changes:
+  - Updated `scripts/run_shortline_review_bundle.py`
+    - added top-level `execution_status`
+    - upgraded top-level `status` to combined semantics:
+      - `failed`
+      - `quality_failed`
+      - `success`
+    - artifact governance pointer payload now also writes `execution_status`
+    - root `bundle_report.md` now shows `execution_status` beside `status` and `quality_verdict`
+  - Updated `tests/test_shortline_review_bundle.py`
+    - added regression that a source-drift quality failure now yields `execution_status=success` and `status=quality_failed`
+    - updated pointer coverage to assert `execution_status`
+- Verification:
+  - Red:
+    - `py -3.10 -m pytest tests/test_shortline_review_bundle.py -q`
+      - failed as expected because `execution_status` did not exist and quality failures still left top-level status ambiguous
+  - Green:
+    - `py -3.10 -m pytest tests/test_shortline_review_bundle.py -q`
+      - result: `17 passed`
+    - `py -3.10 -m pytest tests/test_shortline_runs_summary.py tests/test_shortline_review_bundle.py -q`
+    - `py -3.10 -m py_compile scripts/run_shortline_review_bundle.py`
+
+## 2026-05-04 (shortline quality guardrails for runs summary and bundle)
+
+- Scope: add a lightweight quality verdict layer on top of existing shortline telemetry, without touching candidate-selection logic.
+- Changes:
+  - Updated `scripts/summarize_shortline_runs.py`
+    - added `--quality-profile` with `standard / strict / off`
+    - each summarized run now includes `quality_summary`
+    - aggregate payload now includes `quality_verdict_counts` and `latest_run_quality`
+    - markdown summary now prints latest quality verdict and failed/warning checks
+  - Updated `scripts/run_shortline_review_bundle.py`
+    - added bundle-level `--quality-profile`
+    - runs-summary child command now forwards `--quality-profile`
+    - bundle manifest now includes top-level `quality_summary`
+    - bundle report root now shows `quality_verdict / failed_checks / warning_checks / recommendations`
+  - Updated tests:
+    - `tests/test_shortline_runs_summary.py`
+      - added TDD coverage for `off` and `strict`
+      - added assertions for `quality_summary`, `quality_verdict_counts`, and markdown rendering
+    - `tests/test_shortline_review_bundle.py`
+      - added assertions for `--quality-profile` passthrough
+      - added bundle-level `quality_summary` coverage
+      - added regression for non-real-engine source failure under `prefer_real_engine`
+- Verification:
+  - Red:
+    - `py -3.10 -m pytest tests/test_shortline_runs_summary.py -q`
+      - failed as expected because `quality_verdict_counts` and `evaluate_run_quality(...)` did not exist yet
+    - `py -3.10 -m pytest tests/test_shortline_review_bundle.py -q`
+      - failed as expected because `--quality-profile` was not forwarded and bundle-level `quality_summary` did not exist yet
+  - Green:
+    - `py -3.10 -m pytest tests/test_shortline_runs_summary.py -q`
+      - result: `4 passed`
+    - `py -3.10 -m pytest tests/test_shortline_review_bundle.py -q`
+      - result: `16 passed`
+    - `py -3.10 -m pytest tests/test_shortline_runs_summary.py tests/test_shortline_review_bundle.py -q`
+    - `py -3.10 -m py_compile scripts/summarize_shortline_runs.py scripts/run_shortline_review_bundle.py`
+
+## 2026-05-04 (shortline review bundle wrapper tracking-history passthrough)
+
+- Scope: close the last wrapper-level gap after real bundle verification by letting the PowerShell bundle entrypoint reuse an explicit tracking history file, just like the daily wrapper already can.
+- Changes:
+  - Updated `scripts/run-shortline-review-bundle.ps1`
+    - added wrapper-level `-TrackingHistoryPath`
+    - default path remains `data/runtime/shortline_hub/tracking/shortline_tracking_history.json`
+    - the wrapper now forwards `--tracking-history-path` into `run_shortline_review_bundle.py`
+  - Updated `tests/test_shortline_review_bundle_script.py`
+    - added regression coverage for the new wrapper parameter and command passthrough
+  - Updated docs:
+    - `docs/CHANGELOG.md`
+    - `docs/LOCAL_STRATEGY_CATALOG.md`
+    - `docs/architecture/2026-05-02-shortline-hub-single-machine-setup.md`
+- Verification:
+  - Red:
+    - `py -3.10 -m pytest tests/test_shortline_review_bundle_script.py -q`
+      - failed as expected because `run-shortline-review-bundle.ps1` did not yet expose `TrackingHistoryPath`
+  - Green:
+    - `py -3.10 -m pytest tests/test_shortline_review_bundle_script.py -q`
+      - result: `1 passed`
+    - `powershell -ExecutionPolicy Bypass -File .\scripts\run-shortline-review-bundle.ps1 -DryRun -TradeDate 2026-05-04 -TopN 1 -TrackingHistoryPath .\data\runtime\shortline_hub\tracking\validation_real_fix_20260503_20260504.json -OutputDir .\data\manual_runs\shortline_review_bundle_dryrun_tracking_20260504`
+      - result: exit code `0`
+      - observed `bundle_manifest.json` shortline command now contains:
+        - `--tracking-history-path`
+        - `D:\bb\daily_stock_analysis\data\runtime\shortline_hub\tracking\validation_real_fix_20260503_20260504.json`
+
+## 2026-05-04 (shortline bundle tracking summary and real daily serial validation)
+
+- Scope: finish the two pending shortline tasks together.
+  - expose tracking summary directly in the `shortline review bundle` root report
+  - run real `run-shortline-daily.ps1` serial validation against the live `WonderTrader + FinGenius` chain using a shared tracking history file
+- Changes:
+  - Updated `scripts/run_shortline_review_bundle.py`
+    - added bundle-level `--tracking-history-path`
+    - shortline child command now forwards `--tracking-history-path` into `run_shortline_hub.py`
+    - `bundle_manifest.json` now records `tracking_repeat_symbol_count` and `tracking_longest_streak_days`
+    - `bundle_report.md` root `Shortline Runtime` section now shows compact tracking summary
+  - Updated `scripts/run-shortline-daily.ps1`
+    - added wrapper-level `-TrackingHistoryPath`
+    - real daily replay now can reuse an explicit shared tracking history file across serial runs
+  - Updated tests:
+    - `tests/test_shortline_review_bundle.py`
+      - added regressions for bundle manifest/report tracking summary
+      - added command passthrough assertion for `--tracking-history-path`
+- Verification:
+  - Red:
+    - `py -3.10 -m pytest tests/test_shortline_review_bundle.py -k "tracking or shortline_and_runs_compact_summaries or runs_daily_summary_and_fast_review or absolute_output_paths" -q`
+      - failed as expected because bundle manifest/report did not yet surface tracking summary and the shortline child command did not yet carry `--tracking-history-path`
+  - Green:
+    - `py -3.10 -m pytest tests/test_shortline_review_bundle.py -k "tracking or shortline_and_runs_compact_summaries or runs_daily_summary_and_fast_review or absolute_output_paths" -q`
+      - result: `3 passed, 12 deselected`
+    - real serial validation:
+      - `powershell -ExecutionPolicy Bypass -File .\scripts\run-shortline-daily.ps1 -TradeDate 2026-05-02 -TopN 5 -RunId shortline_daily_real_tracking_seq_day1_20260502 -OutputDir data\manual_runs\shortline_daily_real_tracking_seq_day1_20260502 -TrackingHistoryPath data\runtime\shortline_hub\tracking\validation_real_seq_20260502_20260503.json -ExplainCachePath data\runtime\shortline_hub\explain_cache\validation_real_seq_cache.json -LogLevel INFO`
+      - `powershell -ExecutionPolicy Bypass -File .\scripts\run-shortline-daily.ps1 -TradeDate 2026-05-03 -TopN 5 -RunId shortline_daily_real_tracking_seq_day2_20260503 -OutputDir data\manual_runs\shortline_daily_real_tracking_seq_day2_20260503 -TrackingHistoryPath data\runtime\shortline_hub\tracking\validation_real_seq_20260502_20260503.json -ExplainCachePath data\runtime\shortline_hub\explain_cache\validation_real_seq_cache.json -LogLevel INFO`
+      - `powershell -ExecutionPolicy Bypass -File .\scripts\run-shortline-daily.ps1 -TradeDate 2026-05-03 -TopN 5 -RunId shortline_daily_real_tracking_seq_day2b_20260503 -OutputDir data\manual_runs\shortline_daily_real_tracking_seq_day2b_20260503 -TrackingHistoryPath data\runtime\shortline_hub\tracking\validation_real_seq_20260503_20260504.json -ExplainCachePath data\runtime\shortline_hub\explain_cache\validation_real_seq_cache_20260503_20260504.json -LogLevel INFO`
+      - `powershell -ExecutionPolicy Bypass -File .\scripts\run-shortline-daily.ps1 -TradeDate 2026-05-04 -TopN 5 -RunId shortline_daily_real_tracking_seq_day3b_20260504 -OutputDir data\manual_runs\shortline_daily_real_tracking_seq_day3b_20260504 -TrackingHistoryPath data\runtime\shortline_hub\tracking\validation_real_seq_20260503_20260504.json -ExplainCachePath data\runtime\shortline_hub\explain_cache\validation_real_seq_cache_20260503_20260504.json -LogLevel INFO`
+      - artifacts confirm tracking history landed in:
+        - `data\runtime\shortline_hub\tracking\validation_real_seq_20260502_20260503.json`
+        - `data\runtime\shortline_hub\tracking\validation_real_seq_20260503_20260504.json`
+- Notes:
+  - The serial replay path is working, but the current upstream candidate source is not yet stable across dates.
+  - In this validation round, some days used `wondertrader_real_engine` while others fell back to `wondertrader_export`, so no natural repeated symbols appeared and both `tracking_repeat_symbol_count` results stayed `0`.
+  - This means tracking wiring is ready, and the next real bottleneck is upstream candidate-source consistency rather than bundle/report plumbing.
+
+## 2026-05-04 (shortline real-engine trade-date alignment and softer reconstructed-volume tiering)
+
+- Scope: fix two shortline daily-review issues together.
+  - real `WonderTrader` replay should not consume bars later than the requested `trade_date`
+  - `volume_reconstructed_from_amount` should remain a score penalty, but should no longer hard-demote every candidate into `high_risk_mover`
+- Changes:
+  - Updated `src/shortline_hub/wondertrader_real_engine.py`
+    - added trade-date truncation for history rows before replay/export
+    - real-engine loader and local export fallback metrics now both use the truncated history slice
+    - this removes false-positive `history_asof_*` on historical replay days and keeps `price/amount` aligned to the replay date
+  - Updated `src/shortline_hub/orchestrator.py`
+    - split hard data-quality demotion from soft data-quality penalty
+    - `missing_volume_history` remains hard-demotion
+    - `volume_reconstructed_from_amount` now keeps the existing score penalty but no longer unconditionally forces `high_risk_mover`
+  - Updated tests:
+    - `tests/test_wondertrader_real_engine.py`
+      - added regression that real-engine export must truncate history to `<= trade_date`
+    - `tests/test_shortline_daily_review_layers.py`
+      - updated the old reconstructed-volume demotion expectation
+      - added watchlist/top-pick regressions for reconstructed-volume-only candidates
+      - kept the all-high-risk report path covered via `missing_volume_history`
+- Verification:
+  - Red:
+    - `py -3.10 -m pytest tests/test_wondertrader_real_engine.py::test_export_candidates_via_real_wondertrader_truncates_history_to_trade_date tests/test_shortline_daily_review_layers.py::test_shortline_reconstructed_volume_keeps_real_style_limit_up_as_top_pick tests/test_shortline_daily_review_layers.py::test_shortline_reconstructed_volume_soft_penalty_can_stay_on_watchlist -q`
+      - failed first because replay export still used post-trade-date history rows, and reconstructed-volume candidates were still hard-demoted to `high_risk_mover`
+  - Green:
+    - `py -3.10 -m pytest tests/test_wondertrader_real_engine.py::test_export_candidates_via_real_wondertrader_truncates_history_to_trade_date tests/test_shortline_daily_review_layers.py::test_shortline_reconstructed_volume_keeps_real_style_limit_up_as_top_pick tests/test_shortline_daily_review_layers.py::test_shortline_reconstructed_volume_soft_penalty_can_stay_on_watchlist tests/test_shortline_daily_review_layers.py::test_shortline_report_avoids_duplicate_today_strongest_when_all_candidates_are_high_risk -q`
+      - result: `4 passed`
+    - `py -3.10 -m pytest tests/test_shortline_hub_orchestrator.py tests/test_shortline_hub_cli.py tests/test_shortline_review_bundle.py tests/test_shortline_review_bundle_script.py tests/test_shortline_daily_scripts.py tests/test_shortline_runs_summary.py tests/test_fast_review_daily_bundle.py tests/test_wondertrader_real_engine.py tests/test_shortline_daily_review_layers.py -q`
+      - result: `93 passed`
+    - `py -3.10 -m py_compile src/shortline_hub/wondertrader_real_engine.py src/shortline_hub/orchestrator.py`
+      - passed
+  - Real validation:
+    - `powershell -ExecutionPolicy Bypass -File .\\scripts\\run-shortline-daily.ps1 -TradeDate 2026-04-29 -TopN 3 -RunId shortline_daily_fixcheck_20260429 -OutputDir data/manual_runs/shortline_daily_fixcheck_20260429 -ExplainCachePath data/runtime/shortline_hub/explain_cache/validation_fixcheck_20260429.json -LogLevel INFO`
+      - result: exit code `0`
+      - observed `run_summary.json`:
+        - `risk_flag_counts={"volume_reconstructed_from_amount": 3}`
+        - no `history_asof_*`
+        - `review_tier_counts={"top_pick": 3}`
+      - observed `shortline_combined_results.json`:
+        - all candidates carry `engine_asof=2026-04-29`
+    - `powershell -ExecutionPolicy Bypass -File .\\scripts\\run-shortline-daily.ps1 -TradeDate 2026-05-03 -TopN 3 -RunId shortline_daily_fixcheck_20260503 -OutputDir data/manual_runs/shortline_daily_fixcheck_20260503 -ExplainCachePath data/runtime/shortline_hub/explain_cache/validation_fixcheck_20260503.json -LogLevel INFO`
+      - result: exit code `0`
+      - observed `run_summary.json`:
+        - `review_tier_counts={"top_pick": 3}`
+        - `high_risk_mover_count=0`
+      - observed `shortline_combined_results.json`:
+        - weekend replay keeps `engine_asof=2026-04-30`
+        - no false `history_asof_*` risk flags are emitted for the weekend trade date
+
+## 2026-05-04 (shortline tracking history wiring)
+
+- Scope: finish the shortline tracking loop that already had helper/report placeholders but was not yet wired into the real `run_shortline_hub.py -> orchestrator -> artifacts` flow.
+- Why:
+  - `tracking.py` and report sections already existed, but current runs still emitted `tracking_appear_streak_days=0`, so `历史跟踪摘要` was effectively dead.
+  - The user frequently reruns the same trade date manually, so same-day reruns must not artificially inflate repeated-appearance streaks.
+- Changes:
+  - Updated [`src/shortline_hub/tracking.py`](d:\bb\daily_stock_analysis\src\shortline_hub\tracking.py):
+    - `merge_tracking_history(...)` now ignores same-day rows when computing the previous streak baseline
+    - tracking rows now carry `last_seen_dates`
+    - added runtime helpers for `load_tracking_history(...)`, `build_tracking_rows_from_results(...)`, `update_tracking_history(...)`, and JSON/CSV persistence
+  - Updated [`src/shortline_hub/orchestrator.py`](d:\bb\daily_stock_analysis\src\shortline_hub\orchestrator.py):
+    - `run(...)` now accepts optional `tracking_history_rows`
+    - after category/rank/tier classification, current combined results are enriched with `tracking_appear_streak_days / tracking_last_seen_dates / tracking_tier_transition`
+  - Updated [`src/shortline_hub/schemas.py`](d:\bb\daily_stock_analysis\src\shortline_hub\schemas.py):
+    - `ShortlineRunResult.summary_dict()` now emits `tracking_repeat_symbol_count` and `tracking_longest_streak_days`
+  - Updated [`src/shortline_hub/report_builder.py`](d:\bb\daily_stock_analysis\src\shortline_hub\report_builder.py):
+    - `write_shortline_artifacts(...)` now supports extra tracking sidecars: `shortline_tracking_history.json/csv`
+  - Updated [`scripts/run_shortline_hub.py`](d:\bb\daily_stock_analysis\scripts\run_shortline_hub.py):
+    - added `--tracking-history-path`
+    - default runtime path is now `data/runtime/shortline_hub/tracking/shortline_tracking_history.json`
+    - each run loads previous tracking history, enriches current results, updates the cumulative history, and writes both runtime + output-dir tracking sidecars
+  - Added / updated tests:
+    - [`tests/test_shortline_hub_tracking.py`](d:\bb\daily_stock_analysis\tests\test_shortline_hub_tracking.py)
+    - [`tests/test_shortline_hub_orchestrator.py`](d:\bb\daily_stock_analysis\tests\test_shortline_hub_orchestrator.py)
+    - [`tests/test_shortline_hub_cli.py`](d:\bb\daily_stock_analysis\tests\test_shortline_hub_cli.py)
+- Verification:
+  - Red:
+    - `py -3.10 -m pytest tests/test_shortline_hub_tracking.py::test_merge_tracking_history_same_day_rerun_does_not_inflate_streak tests/test_shortline_hub_orchestrator.py::test_shortline_orchestrator_applies_tracking_history_to_combined_results tests/test_shortline_hub_cli.py::test_shortline_hub_cli_persists_and_reuses_tracking_history -q`
+      - failed first with:
+        - same-day rerun streak still became `3`
+        - `ShortlineHubOrchestrator.run()` did not accept `tracking_history_rows`
+        - CLI second run still emitted `tracking_appear_streak_days == 0`
+  - Green:
+    - `py -3.10 -m pytest tests/test_shortline_hub_tracking.py::test_merge_tracking_history_same_day_rerun_does_not_inflate_streak tests/test_shortline_hub_orchestrator.py::test_shortline_orchestrator_applies_tracking_history_to_combined_results tests/test_shortline_hub_cli.py::test_shortline_hub_cli_persists_and_reuses_tracking_history -q`
+      - result: `3 passed`
+    - `py -3.10 -m pytest tests/test_shortline_hub_tracking.py tests/test_shortline_watchlist_loader.py tests/test_shortline_hub_orchestrator.py tests/test_shortline_hub_cli.py tests/test_shortline_daily_review_layers.py tests/test_signal_snapshot_service.py tests/test_signal_snapshot_api.py -k "shortline or tracking or watchlist" -q`
+      - result: `37 passed, 34 deselected`
+    - `py -3.10 -m py_compile src/shortline_hub/tracking.py src/shortline_hub/orchestrator.py src/shortline_hub/schemas.py src/shortline_hub/report_builder.py scripts/run_shortline_hub.py`
+      - passed
+    - sequential local smoke:
+      - `py -3.10 scripts/run_shortline_hub.py --trade-date 2026-05-02 --top-n 1 --manual-watchlist --symbols 300083 --run-id shortline_tracking_smoke_seq_day1 --output-dir data/manual_runs/shortline_tracking_smoke_seq_day1 --tracking-history-path data/runtime/shortline_hub/tracking/validation_tracking_smoke_seq.json --log-level INFO`
+      - `py -3.10 scripts/run_shortline_hub.py --trade-date 2026-05-03 --top-n 1 --manual-watchlist --symbols 300083 --run-id shortline_tracking_smoke_seq_day2 --output-dir data/manual_runs/shortline_tracking_smoke_seq_day2 --tracking-history-path data/runtime/shortline_hub/tracking/validation_tracking_smoke_seq.json --log-level INFO`
+      - observed artifacts:
+        - [`data/manual_runs/shortline_tracking_smoke_seq_day2/shortline_combined_results.json`](d:\bb\daily_stock_analysis\data\manual_runs\shortline_tracking_smoke_seq_day2\shortline_combined_results.json)
+          - `tracking_appear_streak_days=2`
+          - `tracking_last_seen_dates=["2026-05-02","2026-05-03"]`
+        - [`data/manual_runs/shortline_tracking_smoke_seq_day2/run_summary.json`](d:\bb\daily_stock_analysis\data\manual_runs\shortline_tracking_smoke_seq_day2\run_summary.json)
+          - `tracking_repeat_symbol_count=1`
+          - `tracking_longest_streak_days=2`
+        - [`data/runtime/shortline_hub/tracking/validation_tracking_smoke_seq.json`](d:\bb\daily_stock_analysis\data\runtime\shortline_hub\tracking\validation_tracking_smoke_seq.json)
+          - contains both 2026-05-02 and 2026-05-03 rows for `300083`
+- Notes:
+  - This round intentionally keeps tracking history as local JSON/CSV files rather than introducing a new DB table.
+  - The current rule is: cross-day repeats raise the streak, same-day reruns replace that day’s tracking rows but do not increment the streak again.
+
+## 2026-05-04 (shortline reconstructed-volume cap at watchlist)
+
+- Scope: tighten the shortline daily review tiering again so reconstructed-volume samples stay visible, but cannot headline the report as `top_pick`.
+- Why:
+  - The previous soft-risk change prevented `volume_reconstructed_from_amount` from becoming `high_risk_mover`, but real daily runs still showed these names could be promoted back into `top_pick`.
+  - For盘后复盘, reconstructed volume is good enough for observation, but still too noisy for the strongest bucket.
+- Changes:
+  - Updated [`src/shortline_hub/orchestrator.py`](d:\bb\daily_stock_analysis\src\shortline_hub\orchestrator.py)
+    - in `_classify_review_tier(...)`, `volume_reconstructed_from_amount` now returns `watchlist` before the `top_pick` promotion branch
+    - preserved the existing hard-risk handling for `missing_volume_history` and `history_asof_*`
+  - Updated [`tests/test_shortline_daily_review_layers.py`](d:\bb\daily_stock_analysis\tests\test_shortline_daily_review_layers.py)
+    - renamed the reconstructed-volume regression to assert the sample caps at `watchlist`
+    - kept the soft-penalty watchlist regression so the sample still stays visible instead of dropping to `high_risk_mover`
+- Verification:
+  - Red:
+    - `py -3.10 -m pytest tests/test_shortline_daily_review_layers.py::test_shortline_reconstructed_volume_caps_real_style_limit_up_at_watchlist tests/test_shortline_daily_review_layers.py::test_shortline_reconstructed_volume_soft_penalty_can_stay_on_watchlist -q`
+      - failed first because the implementation still promoted the reconstructed-volume sample to `top_pick`
+  - Green:
+    - `py -3.10 -m pytest tests/test_shortline_daily_review_layers.py::test_shortline_reconstructed_volume_caps_real_style_limit_up_at_watchlist tests/test_shortline_daily_review_layers.py::test_shortline_reconstructed_volume_soft_penalty_can_stay_on_watchlist -q`
+      - result: `2 passed`
+    - `py -3.10 -m pytest tests/test_shortline_hub_orchestrator.py tests/test_shortline_hub_cli.py tests/test_shortline_review_bundle.py tests/test_shortline_review_bundle_script.py tests/test_shortline_daily_scripts.py tests/test_shortline_runs_summary.py tests/test_fast_review_daily_bundle.py tests/test_wondertrader_real_engine.py tests/test_shortline_daily_review_layers.py -q`
+      - result: `93 passed`
+    - `powershell -ExecutionPolicy Bypass -File .\\scripts\\run-shortline-daily.ps1 -TradeDate 2026-05-03 -TopN 3 -RunId shortline_daily_watchlistcap_20260503 -OutputDir data/manual_runs/shortline_daily_watchlistcap_20260503 -ExplainCachePath data/runtime/shortline_hub/explain_cache/validation_watchlistcap_20260503.json -LogLevel INFO`
+      - completed successfully
+      - `run_summary.json` shows `review_tier_counts={"watchlist": 3}`, `top_pick_count=0`, `high_risk_mover_count=0`
+      - `shortline_report.md` reflects `观察名单=3`
+- Notes:
+  - This is a tiering refinement only; it does not change explanation caching, upstream tool selection, or score penalty magnitude.
+  - The intended rule is now: reconstructed-volume candidates can stay in `watchlist`, but they cannot headline the daily report as `top_pick`.
+
+## 2026-05-04 (shortline explain cache entrypoint wiring)
+
+- Scope: move shortline explain cache from report-only observability into real runtime entrypoints, so repeated same-day daily/fullcheck/bundle runs can actually reuse cached explanations.
+- Changes:
+  - Updated `scripts/run_shortline_hub.py`
+    - added `--enable-explain-cache`
+    - added `--disable-explain-cache`
+    - added `--explain-cache-path`
+    - added `--explain-cache-mode`
+    - now instantiates `ShortlineExplainCache` and passes it into `ShortlineHubOrchestrator`
+  - Updated `scripts/run_shortline_review_bundle.py`
+    - added bundle-level explain-cache flags
+    - shortline child command now forwards explain-cache args into `run_shortline_hub.py`
+  - Updated wrapper entrypoints:
+    - `scripts/run-shortline-daily.ps1`
+    - `scripts/run-shortline-fullcheck.ps1`
+    - `scripts/run-shortline-review-bundle.ps1`
+    - all now default to the shared cache file:
+      - `data/runtime/shortline_hub/explain_cache/shortline_explain_cache.json`
+  - Updated tests:
+    - `tests/test_shortline_hub_cli.py`
+      - added parse-args coverage for explain-cache flags
+      - added process-mode cache reuse regression
+    - `tests/test_shortline_daily_scripts.py`
+      - locked explain-cache args in daily/fullcheck wrappers
+    - `tests/test_shortline_review_bundle.py`
+      - locked bundle shortline command explain-cache passthrough
+    - `tests/test_shortline_review_bundle_script.py`
+      - locked explain-cache args in bundle PowerShell wrapper
+  - Updated docs:
+    - `docs/LOCAL_STRATEGY_CATALOG.md`
+    - `docs/architecture/2026-05-02-shortline-hub-single-machine-setup.md`
+    - `docs/CHANGELOG.md`
+- Verification:
+  - Red:
+    - `py -3.10 -m pytest tests/test_shortline_hub_cli.py -k "explain_cache or parse_args_supports_explain_cache_flags" tests/test_shortline_daily_scripts.py tests/test_shortline_review_bundle_script.py tests/test_shortline_review_bundle.py -k "explain_cache or fixed_single_machine_defaults or uses_py311_fingenius_runtime or enables_big_deal" -q`
+      - failed first because CLI and wrappers did not yet expose explain-cache flags, and `run_summary.json` still showed `explain_cache_enabled=false`
+  - Green:
+    - `py -3.10 -m pytest tests/test_shortline_hub_cli.py tests/test_shortline_daily_scripts.py tests/test_shortline_review_bundle_script.py tests/test_shortline_review_bundle.py -q`
+      - result: `24 passed`
+  - Follow-up fix during real validation:
+    - observed that `run-shortline-fullcheck.ps1` still reused the same `light` cache key as daily runs, so `--fg-enable-big-deal` could be short-circuited by a previous light-cache hit
+    - updated `scripts/run_shortline_hub.py`
+      - default `explain_cache_mode` is now `auto`
+      - resolves to `full` when `--fg-enable-big-deal` is enabled, otherwise `light`
+    - updated `scripts/run-shortline-fullcheck.ps1`
+      - now explicitly passes `--explain-cache-mode full`
+    - updated tests:
+      - `tests/test_shortline_hub_cli.py`
+        - added regression that `big_deal` mode must not reuse `light` cache
+      - `tests/test_shortline_daily_scripts.py`
+        - now locks `run-shortline-fullcheck.ps1` to `--explain-cache-mode full`
+    - verification:
+      - Red:
+        - `py -3.10 -m pytest tests/test_shortline_hub_cli.py::test_shortline_hub_cli_big_deal_mode_does_not_reuse_light_cache tests/test_shortline_daily_scripts.py::test_shortline_fullcheck_script_enables_big_deal -q`
+          - first failed because fullcheck wrapper still used `light`
+      - Green:
+        - `py -3.10 -m pytest tests/test_shortline_hub_cli.py::test_shortline_hub_cli_big_deal_mode_does_not_reuse_light_cache tests/test_shortline_daily_scripts.py::test_shortline_fullcheck_script_enables_big_deal -q`
+          - result: `2 passed`
+      - real verification:
+        - `powershell -ExecutionPolicy Bypass -File .\\scripts\\run-shortline-fullcheck.ps1 -TradeDate 2026-05-03 -TopN 1 -RunId shortline_fullcheck_cachewire_fixed_20260503 -OutputDir data/manual_runs/shortline_fullcheck_cachewire_fixed_20260503 -ExplainCachePath data/runtime/shortline_hub/explain_cache/validation_cache_20260503.json -LogLevel INFO`
+          - result: exit code `0`
+          - observed `run_summary.json`:
+            - `explain_cache_mode=full`
+            - `explain_cache_hit_count=0`
+            - `used_upstream_tools` includes `BigDealAnalysisTool`
+
+## 2026-05-04 (shortline runs summary anomalies and bundle passthrough)
+
+- Scope: finish the recent-run summary layer by adding lightweight anomaly labels and surfacing them at bundle root.
+  - keep the logic heuristic and local to summary/reporting
+  - do not change shortline candidate or explanation behavior
+- Changes:
+  - Updated `scripts/summarize_shortline_runs.py`
+    - per-run entries now compute:
+      - `anomalies`
+    - current anomaly rules:
+      - `cache_hit_ratio_low`
+        - emitted when cache is enabled and `hit_count < miss_count`
+      - `parallel_workers_single`
+        - emitted when `explain_cache_miss_count >= 2` and `explain_parallel_workers <= 1`
+      - `tool_errors_present`
+        - emitted when `tool_error_count > 0`
+    - aggregate payload now includes:
+      - `anomaly_counts`
+      - `latest_run_anomalies`
+    - markdown now renders:
+      - aggregate anomaly counts
+      - latest run anomalies
+      - per-run anomaly column
+  - Updated `scripts/run_shortline_review_bundle.py`
+    - `runs_summary` section in manifest now also carries:
+      - `cache_enabled_run_count`
+      - `total_explain_cache_hits`
+      - `total_explain_cache_misses`
+      - `max_explain_parallel_workers`
+      - `anomaly_counts`
+      - `latest_run_anomalies`
+    - bundle root report `## Runs Summary Runtime` now prints the same fields
+  - Updated tests:
+    - `tests/test_shortline_runs_summary.py`
+      - locks anomaly aggregation and markdown rendering
+    - `tests/test_shortline_review_bundle.py`
+      - locks runs summary cache/anomaly passthrough at bundle root
+  - Updated docs:
+    - `docs/LOCAL_STRATEGY_CATALOG.md`
+    - `docs/architecture/2026-05-02-shortline-hub-single-machine-setup.md`
+    - `docs/CHANGELOG.md`
+- Verification:
+  - Red:
+    - `py -3.10 -m pytest tests/test_shortline_runs_summary.py tests/test_shortline_review_bundle.py -k "shortline_runs_summary_cli_writes_markdown_and_json or shortline_review_bundle_main_runs_daily_summary_and_fast_review" -q`
+      - failed first because `anomaly_counts` and recent-run cache passthrough were missing
+  - Green:
+    - `py -3.10 -m pytest tests/test_shortline_runs_summary.py tests/test_shortline_review_bundle.py -k "shortline_runs_summary_cli_writes_markdown_and_json or shortline_review_bundle_main_runs_daily_summary_and_fast_review" -q`
+      - result: `2 passed, 14 deselected`
+
+## 2026-05-04 (shortline runs summary cache/parallel aggregation)
+
+- Scope: extend recent-run aggregation for shortline daily/fullcheck comparison without changing any shortline candidate or explanation logic.
+  - expose cache hit/miss and parallel-worker stats in `shortline_runs_summary`
+- Changes:
+  - Updated `scripts/summarize_shortline_runs.py`
+    - per-run entries now include:
+      - `explain_cache_enabled`
+      - `explain_cache_mode`
+      - `explain_cache_hit_count`
+      - `explain_cache_miss_count`
+      - `explain_parallel_workers`
+    - aggregate payload now includes:
+      - `cache_enabled_run_count`
+      - `total_explain_cache_hits`
+      - `total_explain_cache_misses`
+      - `max_explain_parallel_workers`
+    - markdown output now adds:
+      - aggregate cache/worker lines
+      - per-run `cache_hits/cache_misses`
+      - per-run `workers`
+  - Updated `tests/test_shortline_runs_summary.py`
+    - locked JSON aggregation for cache hits/misses and max workers
+    - locked markdown rendering for cache columns and aggregate cache lines
+  - Updated docs:
+    - `docs/architecture/2026-05-02-shortline-hub-single-machine-setup.md`
+    - `docs/LOCAL_STRATEGY_CATALOG.md`
+    - `docs/CHANGELOG.md`
+- Verification:
+  - Red:
+    - `py -3.10 -m pytest tests/test_shortline_runs_summary.py -q`
+      - failed first because `shortline_runs_summary.json` had no `cache_enabled_run_count`
+  - Green:
+    - `py -3.10 -m pytest tests/test_shortline_runs_summary.py -q`
+      - result: `1 passed`
+
+## 2026-05-04 (shortline cache/parallel runtime observability)
+
+- Scope: continue improving shortline daily observability without changing candidate selection or FinGenius explanation logic.
+  - expose explain cache hit/miss facts
+  - expose current explain parallel worker count
+  - bubble these facts into daily report and bundle root summary
+- Changes:
+  - Updated `src/shortline_hub/schemas.py`
+    - extended `ShortlineRunResult` with:
+      - `explain_cache_enabled`
+      - `explain_cache_mode`
+      - `explain_cache_hit_count`
+      - `explain_cache_miss_count`
+      - `explain_parallel_workers`
+    - `summary_dict()` now emits the same fields into `run_summary.json`
+  - Updated `src/shortline_hub/orchestrator.py`
+    - `_explain_candidates(...)` now returns both explanations and run-level cache/parallel stats
+    - records:
+      - cached explanation hit count
+      - uncached miss count
+      - actual worker count used for uncached explanation fan-out
+    - `run()` now persists those stats into `ShortlineRunResult`
+  - Updated `src/shortline_hub/report_builder.py`
+    - `shortline_report.md` `FinGenius Explain Summary` now prints:
+      - `cache: enabled=..., mode=..., hits=..., misses=...`
+      - `parallel_workers: ...`
+  - Updated `scripts/run_shortline_review_bundle.py`
+    - bundle manifest `shortline_run` now carries:
+      - `explain_cache_enabled`
+      - `explain_cache_mode`
+      - `explain_cache_hit_count`
+      - `explain_cache_miss_count`
+      - `explain_parallel_workers`
+    - bundle root report `## Shortline Runtime` now renders the same cache/parallel summary
+  - Updated tests:
+    - `tests/test_shortline_hub_orchestrator.py`
+      - added regression coverage for one cached + two uncached candidates
+      - locks `explain_cache_*` stats and `explain_parallel_workers`
+      - locks report rendering of cache/parallel summary
+    - `tests/test_shortline_review_bundle.py`
+      - locks bundle manifest/report passthrough of cache/parallel summary
+  - Updated docs:
+    - `docs/LOCAL_STRATEGY_CATALOG.md`
+    - `docs/architecture/2026-05-02-shortline-hub-single-machine-setup.md`
+    - `docs/CHANGELOG.md`
+- Verification:
+  - Red:
+    - `py -3.10 -m pytest tests/test_shortline_hub_orchestrator.py tests/test_shortline_review_bundle.py -k "cache_and_parallel or shortline_review_bundle_main_runs_daily_summary_and_fast_review" -q`
+      - failed first because `summary_dict()` and bundle manifest had no `explain_cache_*` fields
+  - Green:
+    - `py -3.10 -m pytest tests/test_shortline_hub_orchestrator.py tests/test_shortline_review_bundle.py -k "cache_and_parallel or shortline_review_bundle_main_runs_daily_summary_and_fast_review" -q`
+      - result: `2 passed, 25 deselected`
+
+## 2026-05-04 (shortline bundle fast-review runtime summary and failure diagnostics)
+
+- Scope: continue hardening the `shortline review bundle` control plane without touching shortline strategy logic.
+  - add a structured view of internal `fast_review` runtime
+  - keep failure evidence even when a child step aborts mid-bundle
+- Changes:
+  - Updated `scripts/run_shortline_review_bundle.py`
+    - parses `fast_review.stdout.log` into structured `runtime_summary`
+    - currently extracts:
+      - `include_signals`
+      - `persist_snapshots`
+      - `signal_*_elapsed_sec`
+      - per-signal `count / csv_path`
+      - `skipped_signal`
+      - `skipped_signals_count`
+      - `skipped_reason_counts`
+      - selected output paths like `summary_md` / `latest_md`
+      - `total_signal_elapsed_sec`
+      - `total_signal_count`
+    - added bundle artifact governance index
+      - writes `artifact_governance` into manifest/report
+      - writes pointer files under:
+        - `data/manual_runs/shortline_review_bundle_index/<trade_date>/<run_id>/bundle_pointer.json`
+        - `data/manual_runs/shortline_review_bundle_index/latest.json`
+    - writes that summary into:
+      - `bundle_manifest.json`
+      - `bundle_report.md`
+    - step execution is now failure-aware:
+      - a failed step is marked as `status=failed`
+      - later steps remain `pending`
+      - bundle still writes `bundle_manifest.json` and `bundle_report.md`
+      - bundle-level failure section now includes:
+        - `failed_step`
+        - `error_message`
+        - `stdout/stderr` excerpts
+    - parent bundle logger no longer replays full child stdout/stderr to the console
+      - on successful child steps, it now prints only a compact capture summary:
+        - command
+        - stdout/stderr line counts
+        - stdout/stderr log paths
+      - this avoids flooding the parent console with full fast-review logs and mixed encoding noise
+    - root bundle manifest/report now also expose compact summaries for upstream shortline legs
+      - `shortline_run` now carries:
+        - `explanation_count`
+        - `top_pick_count / watchlist_count / high_risk_mover_count`
+        - `scan_source_counts`
+        - `review_tier_counts`
+        - `upstream_tool_hit_counts`
+        - `total_explain_elapsed_ms`
+        - `orchestrator_explain_elapsed_ms`
+      - `runs_summary` now carries:
+        - `trade_date_counts`
+        - `upstream_tool_counts`
+        - `latest_run_candidate_count`
+        - `latest_run_total_explain_elapsed_ms`
+        - `latest_run_top_symbols`
+        - `latest_run_used_upstream_tools`
+      - `bundle_report.md` now renders:
+        - `## Shortline Runtime`
+        - `## Runs Summary Runtime`
+    - failure summary at bundle root is now more actionable
+      - `manifest["failure"]` now also carries:
+        - `stdout_log_path`
+        - `stderr_log_path`
+        - `pending_steps`
+      - `bundle_report.md` `## Failed Step` now shows:
+        - failed step name
+        - error message
+        - stdout/stderr log paths
+        - stdout/stderr excerpts
+        - pending step list
+    - reordered root `bundle_report.md` sections for quicker daily scanning
+      - runtime summary sections now come first:
+        - `Shortline Runtime`
+        - `Runs Summary Runtime`
+        - `Fast Review Runtime`
+      - then detail/path sections:
+        - `Shortline`
+        - `Runs Summary`
+        - `Fast Review`
+      - and finally:
+        - `Artifact Governance`
+        - `Steps`
+    - default repo interpreter selection is now explicit
+      - `--repo-python-executable` default now follows `sys.executable`
+      - `--wt-python-executable` default now also follows the same repo interpreter
+      - this avoids child bundle steps drifting to another `python` on machines where PATH changed
+  - Updated `scripts/run-shortline-review-bundle.ps1`
+    - added `Resolve-RepoPythonExecutable`
+      - prefer `py -3.10 -c "import sys; print(sys.executable)"`
+      - fallback to `Get-Command python`
+    - if WT executable is not explicitly set, it now reuses the resolved repo interpreter
+    - `--run-id` is now only appended when non-empty, fixing dry-run argument parsing with blank run ids
+  - Updated `scripts/run-shortline-daily.ps1`
+    - wrapper now uses the same `Resolve-RepoPythonExecutable` strategy
+    - prefers `py -3.10`, falls back to `Get-Command python`
+    - WT executable defaults to the same resolved repo interpreter
+    - added wrapper-level `-DryRun`
+      - resolves Python paths
+      - materializes `run_shortline_hub.py` command
+      - prints command and exits without touching the real shortline chain
+  - Updated `scripts/run-shortline-fullcheck.ps1`
+    - wrapper now uses the same `Resolve-RepoPythonExecutable` strategy
+    - prefers `py -3.10`, falls back to `Get-Command python`
+    - WT executable defaults to the same resolved repo interpreter
+    - added wrapper-level `-DryRun`
+      - resolves Python paths
+      - materializes `run_shortline_hub.py` command including `--fg-enable-big-deal`
+      - prints command and exits without touching the real shortline chain
+  - Added `scripts/shortline-wrapper-common.ps1`
+    - centralizes `Resolve-RepoPythonExecutable`
+    - now shared by:
+      - `run-shortline-review-bundle.ps1`
+      - `run-shortline-daily.ps1`
+      - `run-shortline-fullcheck.ps1`
+    - reduces drift risk across shortline wrapper entrypoints
+  - Updated `tests/test_shortline_review_bundle.py`
+    - added regression coverage for:
+      - `fast_review` runtime summary extraction
+      - artifact governance pointer emission
+      - failure manifest/report emission on mid-bundle abort
+      - parent logger should not replay raw child stdout/stderr content on success
+      - root report should render compact shortline/runs summary sections
+      - failure report should show log paths and pending steps
+      - root report section order should keep runtime sections ahead of detail sections
+      - bundle command defaults should follow current interpreter when repo python is omitted
+  - Updated `tests/test_shortline_review_bundle_script.py`
+    - locked wrapper expectations for:
+      - `py -3.10` resolution path
+      - WT reuse of repo interpreter
+      - conditional `--run-id`
+  - Updated `tests/test_shortline_daily_scripts.py`
+    - locked wrapper expectations for:
+      - `py -3.10` resolution path
+      - WT reuse of repo interpreter
+      - `fullcheck` still enabling `--fg-enable-big-deal`
+      - wrapper-level `-DryRun`
+      - wrapper scripts dot-source the shared helper
+  - Updated docs:
+    - `docs/architecture/2026-05-02-shortline-hub-single-machine-setup.md`
+    - `docs/LOCAL_STRATEGY_CATALOG.md`
+    - `docs/CHANGELOG.md`
+- Verification:
+  - Red:
+    - `python -m pytest tests/test_shortline_review_bundle.py -q`
+      - failed first because:
+        - manifest had no `fast_review.runtime_summary`
+        - bundle failure still raised directly and did not emit manifest/report
+  - Green:
+    - `python -m pytest tests/test_shortline_review_bundle.py -q`
+      - result: `14 passed`
+    - `python -m pytest tests/test_shortline_review_bundle.py tests/test_shortline_review_bundle_script.py tests/test_shortline_daily_scripts.py tests/test_shortline_runs_summary.py tests/test_fast_review_daily_bundle.py -k "shortline_review_bundle or shortline_daily_script or shortline_runs_summary or shortline_focus or falls_back_to_high_risk_symbols" -q`
+      - result: `20 passed, 32 deselected`
+    - `python -m py_compile scripts/run_shortline_review_bundle.py`
+      - passed
+    - note:
+      - local `python` on this machine drifted to a Python 3.11 interpreter without `pytest`
+      - verification was therefore run with `py -3.10`
+    - `python scripts/run_shortline_review_bundle.py --trade-date 2026-05-03 --top-n 1 --dry-run --skip-fast-review-persist-snapshots --output-dir data/manual_runs/shortline_review_bundle_dryrun_20260503_r2 --log-level INFO`
+      - passed
+      - manifest shows all three steps as `dry_run`
+    - `python scripts/run_shortline_review_bundle.py --trade-date 2026-05-03 --top-n 1 --fast-review-limit 3 --skip-persist-snapshot --skip-fast-review-persist-snapshots --output-dir data/manual_runs/shortline_review_bundle_smoke_20260503_r7 --log-level INFO`
+      - passed
+      - manifest now includes:
+        - `fast_review.runtime_summary.signal_elapsed_sec={"hundred_day_high": 84.74}`
+        - `fast_review.runtime_summary.signals.hundred_day_high.count=0`
+        - `artifact_governance.pointer_json_path`
+      - bundle root also includes `logs/fast_review.stdout.log` and `logs/fast_review.stderr.log`
+    - `python scripts/run_shortline_review_bundle.py --trade-date 2026-05-03 --top-n 1 --fast-review-limit 3 --skip-persist-snapshot --skip-fast-review-persist-snapshots --output-dir data/manual_runs/shortline_review_bundle_smoke_20260503_r8 --log-level INFO`
+      - passed
+      - report/manifest now also surface compact runtime rollups:
+        - `fast_review.runtime_summary.total_signal_count=0`
+        - `fast_review.runtime_summary.total_signal_elapsed_sec=84.84`
+        - `fast_review.runtime_summary.skipped_reason_counts={"no_rows": 1}`
+    - `python scripts/run_shortline_review_bundle.py --trade-date 2026-05-03 --top-n 1 --fast-review-limit 3 --skip-persist-snapshot --skip-fast-review-persist-snapshots --output-dir data/manual_runs/shortline_review_bundle_smoke_20260503_r10 --log-level INFO`
+      - passed
+      - parent console now prints compact child-capture summaries instead of replaying the full child output stream
+    - `python scripts/run_shortline_review_bundle.py --trade-date 2026-05-03 --top-n 1 --fast-review-limit 3 --skip-persist-snapshot --skip-fast-review-persist-snapshots --output-dir data/manual_runs/shortline_review_bundle_smoke_20260503_r11 --log-level INFO`
+      - passed
+      - root report now includes:
+        - `Shortline Runtime`
+        - `Runs Summary Runtime`
+        - `latest_run_top_symbols: 300083, 688256, 688400`
+    - `py -3.10 scripts/run_shortline_review_bundle.py --trade-date 2026-05-03 --top-n 1 --fast-review-limit 3 --skip-persist-snapshot --skip-fast-review-persist-snapshots --output-dir data/manual_runs/shortline_review_bundle_smoke_20260503_r12 --log-level INFO`
+      - passed
+      - root report order now starts with runtime sections before output path sections
+    - `py -3.10 -m pytest tests/test_shortline_review_bundle.py tests/test_shortline_review_bundle_script.py -q`
+      - result: `16 passed`
+    - `py -3.10 -m pytest tests/test_shortline_review_bundle.py tests/test_shortline_review_bundle_script.py tests/test_shortline_daily_scripts.py tests/test_shortline_runs_summary.py tests/test_fast_review_daily_bundle.py -k "shortline_review_bundle or shortline_daily_script or shortline_runs_summary or shortline_focus or falls_back_to_high_risk_symbols" -q`
+      - result: `21 passed, 32 deselected`
+    - `py -3.10 -m py_compile scripts/run_shortline_review_bundle.py`
+      - passed
+    - `powershell -ExecutionPolicy Bypass -File .\scripts\run-shortline-review-bundle.ps1 -DryRun -TradeDate 2026-05-03 -TopN 1 -OutputDir data\manual_runs\shortline_review_bundle_dryrun_20260503_r13`
+      - passed
+      - dry-run manifest shows all repo child commands using:
+        - `C:\Users\wenjin227\AppData\Local\Programs\Python\Python310\python.exe`
+      - wrapper no longer fails on empty `RunId`
+    - `py -3.10 -m pytest tests/test_shortline_daily_scripts.py -q`
+      - result: `2 passed`
+    - `powershell -ExecutionPolicy Bypass -File .\scripts\run-shortline-daily.ps1 -DryRun -TradeDate 2026-05-03 -TopN 1`
+      - passed
+      - printed resolved Python 3.10 path plus materialized `run_shortline_hub.py` command
+    - `powershell -ExecutionPolicy Bypass -File .\scripts\run-shortline-fullcheck.ps1 -DryRun -TradeDate 2026-05-03 -TopN 1`
+      - passed
+      - printed resolved Python 3.10 path plus materialized `run_shortline_hub.py` command with `--fg-enable-big-deal`
+    - `powershell -ExecutionPolicy Bypass -File .\scripts\run-shortline-review-bundle.ps1 -DryRun -TradeDate 2026-05-03 -TopN 1 -OutputDir data\manual_runs\shortline_review_bundle_dryrun_20260503_r14`
+      - passed
+      - confirms shared helper extraction did not break bundle wrapper dry-run
+    - `py -3.10 -m pytest tests/test_shortline_daily_scripts.py tests/test_shortline_review_bundle.py tests/test_shortline_review_bundle_script.py tests/test_shortline_runs_summary.py tests/test_fast_review_daily_bundle.py -k "shortline_daily_scripts or shortline_review_bundle or shortline_runs_summary or shortline_focus or falls_back_to_high_risk_symbols" -q`
+      - result: `21 passed, 32 deselected`
+- Result:
+  - bundle can now answer “which fast-review leg was slow” without opening the full log
+  - bundle root report can now answer “whether this round produced rows, and why a signal was skipped” without reopening raw fast-review logs
+  - bundle failures now leave a readable root-level forensic summary instead of just an exception
+  - bundle parent CLI is now materially easier to read during real runs because child logs stay in files and only compact capture summaries are echoed
+  - bundle root report is now closer to a real daily landing page: shortline result shape, recent-run baseline, and fast-review outcome can all be skimmed from one file
+  - bundle failure path is now also closer to a daily operator page: when a mid-step abort happens, root report is enough to locate logs and know which downstream legs never ran
+  - bundle root report is now also ordered for scan speed: read runtime summaries first, then follow links/paths only if needed
+  - bundle entry path is now less sensitive to machine-local `python` drift because direct Python invocation and PowerShell wrapper both converge on the repo's intended interpreter
+  - the same interpreter convergence now applies to the older `daily` / `fullcheck` shortline wrappers, reducing the chance that different shortline entrypoints silently run under different Python versions on the same machine
+  - `daily` / `fullcheck` wrappers are now much easier to verify safely because they can print the fully resolved real command without launching the underlying chain
+  - wrapper maintenance is now cheaper because the interpreter resolution policy lives in one shared `.ps1` helper instead of three separate copies
+  - this round still stays entirely in the orchestration / observability layer
+
+## 2026-05-03 (shortline review bundle controls and telemetry)
+
+- Scope: harden the new shortline single-entry bundle at the orchestration layer instead of adding more strategy logic.
+  - add bundle-level control switches
+  - add per-step telemetry and log artifacts
+  - keep all changes localized to `run_shortline_review_bundle`
+- Changes:
+  - Updated `scripts/run_shortline_review_bundle.py`
+    - added `--skip-fast-review-persist-snapshots`
+    - added `--dry-run`
+    - fast review DB persist is now controlled independently from shortline snapshot persist
+    - introduced per-step execution metadata for:
+      - `shortline`
+      - `runs_summary`
+      - `fast_review`
+    - `bundle_manifest.json` now records:
+      - `steps.<name>.status`
+      - `steps.<name>.elapsed_ms`
+      - `steps.<name>.workdir`
+      - `steps.<name>.stdout_log_path`
+      - `steps.<name>.stderr_log_path`
+    - bundle step stdout/stderr now lands under bundle-local `logs/`
+  - Updated `scripts/run-shortline-review-bundle.ps1`
+    - added wrapper switches:
+      - `-SkipShortlinePersistSnapshot`
+      - `-SkipFastReviewPersistSnapshots`
+      - `-DryRun`
+  - Updated tests:
+    - `tests/test_shortline_review_bundle.py`
+      - added fast-review persist toggle coverage
+      - added dry-run manifest coverage
+      - added per-step telemetry/log coverage
+  - Updated docs:
+    - `docs/architecture/2026-05-02-shortline-hub-single-machine-setup.md`
+    - `docs/LOCAL_STRATEGY_CATALOG.md`
+    - `docs/CHANGELOG.md`
+- Verification:
+  - Red:
+    - `python -m pytest tests/test_shortline_review_bundle.py -q`
+      - failed first because:
+        - manifest had no `steps` section
+        - fast review command had no independent persist toggle
+        - dry-run still executed child steps
+        - telemetry/log contract was missing
+  - Green:
+    - `python -m pytest tests/test_shortline_review_bundle.py -q`
+      - result: `7 passed`
+    - `python -m pytest tests/test_shortline_review_bundle.py tests/test_shortline_review_bundle_script.py tests/test_shortline_daily_scripts.py tests/test_shortline_runs_summary.py tests/test_fast_review_daily_bundle.py -k "shortline_review_bundle or shortline_daily_script or shortline_runs_summary or shortline_focus or falls_back_to_high_risk_symbols" -q`
+      - result: `10 passed, 32 deselected`
+    - `python -m py_compile scripts/run_shortline_review_bundle.py`
+      - passed
+    - `python scripts/run_shortline_review_bundle.py --trade-date 2026-05-03 --top-n 1 --fast-review-limit 3 --skip-persist-snapshot --skip-fast-review-persist-snapshots --output-dir data/manual_runs/shortline_review_bundle_smoke_20260503_r4 --log-level INFO`
+      - passed
+      - bundle root: `data/manual_runs/shortline_review_bundle_smoke_20260503_r4`
+      - manifest shows `steps.shortline.status=success`
+      - manifest shows `steps.fast_review.status=success`
+      - bundle-local `logs/` created for per-step stdout/stderr
+- Result:
+  - shortline bundle now has a usable control plane for daily operation and debugging
+  - slow/failing child steps are now observable without opening three separate output roots
+  - this round still does not change shortline or fast-review strategy semantics; it strengthens orchestration only
+
+## 2026-05-03 (shortline single-entry review bundle)
+
+- Scope: add one stable daily shortline entry so one-machine usage no longer needs to manually chain three separate commands for:
+  - real `shortline_hub` process run
+  - recent shortline run summary
+  - fast review shortline observation attachment
+- Changes:
+  - Added `scripts/run_shortline_review_bundle.py`
+    - sequentially runs:
+      - `run_shortline_hub.py`
+      - `summarize_shortline_runs.py`
+      - `run_fast_review_bundle.py`
+    - writes a fixed latest bundle directory under `data/manual_runs/shortline_review_bundle_latest/`
+    - exports:
+      - `bundle_manifest.json`
+      - `bundle_report.md`
+  - Added `scripts/run-shortline-review-bundle.ps1`
+    - fixed single-machine wrapper for:
+      - `D:\bb\WonderTrader`
+      - `D:\bb\FinGenius`
+      - `D:\bb\FinGenius\.venv311\Scripts\python.exe`
+  - Updated docs:
+    - `docs/architecture/2026-05-02-shortline-hub-single-machine-setup.md`
+    - `docs/LOCAL_STRATEGY_CATALOG.md`
+- Verification:
+  - Red:
+    - `python -m pytest tests/test_shortline_review_bundle.py tests/test_shortline_review_bundle_script.py -q`
+      - failed first with missing `scripts.run_shortline_review_bundle` module and missing `scripts/run-shortline-review-bundle.ps1`
+    - real smoke on `data/manual_runs/shortline_review_bundle_smoke_20260503/`
+      - exposed two orchestration-only path bugs:
+        - child commands inherited relative `--output-dir`, so artifacts were written under `scripts/data/...`
+        - child `workdir` was `scripts/`, so `fast_review` resolved its default SQLite path to `scripts/data/stock_analysis.db`
+  - Green:
+    - `python -m pytest tests/test_shortline_review_bundle.py tests/test_shortline_review_bundle_script.py -q`
+      - result: `2 passed`
+    - `python -m pytest tests/test_shortline_review_bundle.py tests/test_shortline_review_bundle_script.py tests/test_shortline_daily_scripts.py tests/test_shortline_runs_summary.py tests/test_fast_review_daily_bundle.py -k "shortline_review_bundle or shortline_daily_script or shortline_runs_summary or shortline_focus or falls_back_to_high_risk_symbols" -q`
+      - result: `10 passed, 32 deselected`
+    - `python -m py_compile scripts/run_shortline_review_bundle.py`
+      - passed
+    - `python scripts/run_shortline_review_bundle.py --trade-date 2026-05-03 --top-n 1 --fast-review-limit 3 --skip-persist-snapshot --output-dir data/manual_runs/shortline_review_bundle_smoke_20260503_r3 --log-level INFO`
+      - passed
+      - bundle root: `data/manual_runs/shortline_review_bundle_smoke_20260503_r3`
+      - manifest now shows:
+        - `shortline_run.candidate_count=1`
+        - `runs_summary.run_count=12`
+        - `runs_summary.latest_run_id=shortline_persist_realwt_replace_20260503`
+      - `fast_review` now resolves DB back to project-root `data/stock_analysis.db`
+- Result:
+  - shortline same-machine daily usage now has a single stable entry
+  - output lookup is simplified to one fixed latest directory instead of three separate manual commands
+  - the bundle now normalizes child output paths and child working directory, so downstream scripts stay on the same repo-relative data/runtime/DB context as normal manual usage
+  - no new strategy logic was introduced; this is orchestration-layer consolidation only
+
+## 2026-05-03 (shortline same-day snapshot replacement)
+
+- Scope: fix the remaining same-day usability problem in shortline persistence:
+  - repeated manual runs on the same `trade_date` should not leave stale same-day shortline names in shared snapshot queries
+  - fast review should reflect the latest shortline run for that day, not an accumulation of earlier same-day runs
+- Changes:
+  - Updated `src/shortline_hub/snapshot_sync.py`
+    - shortline snapshot persistence now prefers `replace_signal_snapshots_for_date(...)`
+    - writes the three review groups independently:
+      - `shortline_top_pick`
+      - `shortline_watchlist`
+      - `shortline_high_risk_mover`
+    - empty groups are also actively replaced with `[]`, so stale same-day rows are cleared instead of preserved
+    - legacy fallback path still keeps row-by-row `upsert_signal_snapshot(...)` compatibility if the DB manager lacks the replace helper
+  - Updated `tests/test_shortline_snapshot_sync.py`
+    - added regression coverage for same-day group replacement behavior
+  - Updated docs:
+    - `docs/LOCAL_STRATEGY_CATALOG.md`
+    - `docs/architecture/2026-05-02-shortline-hub-single-machine-setup.md`
+    - now clarify that same-day shortline snapshot reruns are “latest run wins” per review group
+- Verification:
+  - Red:
+    - `python -m pytest tests/test_shortline_snapshot_sync.py -q`
+      - failed first because persistence still required `upsert_signal_snapshot(...)` and did not support grouped same-day replacement
+  - Green:
+    - `python -m pytest tests/test_shortline_snapshot_sync.py tests/test_shortline_hub_cli.py tests/test_fast_review_daily_bundle.py -k "shortline or persist_snapshot" -q`
+      - result: `8 passed`
+    - `python -m py_compile src/shortline_hub/snapshot_sync.py tests/test_shortline_snapshot_sync.py`
+      - passed
+    - `python scripts/run_shortline_hub.py --mode process --trade-date 2026-05-03 --top-n 3 --persist-snapshot --run-id shortline_persist_realwt_replace_20260503 --output-dir data/manual_runs/shortline_persist_realwt_replace_20260503 --wt-python-executable python --wt-script-path D:\bb\WonderTrader\bridge\wt_export_candidates.py --wt-workdir D:\bb\WonderTrader --wt-runtime-dir data/runtime/shortline_hub/wondertrader --fg-python-executable D:\bb\FinGenius\.venv311\Scripts\python.exe --fg-script-path D:\bb\FinGenius\bridge\fg_explain_candidate.py --fg-workdir D:\bb\FinGenius --fg-runtime-dir data/runtime/shortline_hub/fingenius --log-level INFO`
+      - passed; `persisted rows=3`
+    - `python scripts/run_fast_review_bundle.py --snapshot-date 2026-05-03 --include-signals hundred_day_high --limit 5 --skip-persist-snapshots --output-dir data/manual_runs/fast_review_shortline_check_20260503_r3 --log-level INFO`
+      - passed
+      - `fast_review_summary.md` now shows:
+        - `trade_date=2026-05-03 top_pick=0 watchlist=0 high_risk=3`
+        - `top_symbols: 300083 创世纪, 688256 寒武纪, 688400 凌云光`
+- Result:
+  - shortline snapshot queries now reflect the latest same-day run instead of accumulating earlier same-day manual attempts
+  - fast review shortline summary is now aligned with the latest persisted shortline state
+
+## 2026-05-03 (shortline real-engine verification and fast-review fallback fix)
+
+- Scope: close the remaining practical gap for tomorrow use:
+  - verify that `shortline_hub` can really run through `WonderTrader + FinGenius`
+  - stop `fast_review_summary.md` from losing useful symbol names when shortline results are all `high_risk_mover`
+- Changes:
+  - Updated `scripts/run_fast_review_bundle.py`
+    - `_build_shortline_summary_from_snapshots(...)` now reads symbols in priority order:
+      - `shortline_top_pick`
+      - `shortline_watchlist`
+      - `shortline_high_risk_mover`
+    - so `短线观察` keeps a usable symbol list even when the day has no `top_pick / watchlist`
+  - Updated `tests/test_fast_review_daily_bundle.py`
+    - added regression coverage for the `high_risk_mover` fallback case
+  - Updated docs:
+    - `docs/LOCAL_STRATEGY_CATALOG.md`
+    - `docs/architecture/2026-05-02-shortline-hub-single-machine-setup.md`
+    - clarified the preferred single-machine `WonderTrader` invocation path
+  - External environment note:
+    - installed `PyYAML` and `chardet` into `D:\bb\WonderTrader\wtpy\.venv`
+    - but the now-verified stable path is still to run the bridge with the repo Python (`--wt-python-executable python`)
+- Verification:
+  - Red:
+    - `python -m pytest tests/test_fast_review_daily_bundle.py -k "falls_back_to_high_risk_symbols" -q`
+      - failed first because `top_symbols` stayed empty when only `shortline_high_risk_mover` snapshots existed
+  - Green:
+    - `python -m pytest tests/test_fast_review_daily_bundle.py -k "shortline_focus or falls_back_to_high_risk_symbols" -q`
+      - result: `2 passed`
+    - `python scripts/run_shortline_hub.py --mode process --trade-date 2026-05-03 --top-n 3 --persist-snapshot --run-id shortline_persist_realwt_20260503 --output-dir data/manual_runs/shortline_persist_realwt_20260503 --wt-python-executable python --wt-script-path D:\bb\WonderTrader\bridge\wt_export_candidates.py --wt-workdir D:\bb\WonderTrader --wt-runtime-dir data/runtime/shortline_hub/wondertrader --fg-python-executable D:\bb\FinGenius\.venv311\Scripts\python.exe --fg-script-path D:\bb\FinGenius\bridge\fg_explain_candidate.py --fg-workdir D:\bb\FinGenius --fg-runtime-dir data/runtime/shortline_hub/fingenius --log-level INFO`
+      - passed; `run_summary.json` shows `scan_source_counts={"wondertrader_real_engine": 3}`
+      - `total_explain_elapsed_ms=194971`, `avg_explain_elapsed_ms=64990`
+    - `python scripts/run_fast_review_bundle.py --snapshot-date 2026-05-03 --include-signals hundred_day_high --limit 5 --skip-persist-snapshots --output-dir data/manual_runs/fast_review_shortline_check_20260503_r2 --log-level INFO`
+      - passed; generated `fast_review_summary.md` now shows
+        - `trade_date=2026-05-03 top_pick=0 watchlist=0 high_risk=5`
+        - `top_symbols: 688400 凌云光, 688256 寒武纪, 300083 创世纪, 300632 光莆股份, 688531 日联科技`
+- Result:
+  - `shortline_hub` is now verified on a real single-machine path with:
+    - `WonderTrader` real-engine candidates
+    - `FinGenius` upstream tool explanations
+    - snapshot persistence into the shared signal store
+    - fast-review-level summary consumption
+  - for the current DB state, the same `signal_date=2026-05-03` contains both an earlier cache-scan run and the later real-engine run, so the summary lists 5 unique high-risk names; this is expected for repeated same-day manual runs and not a query bug
+
+## 2026-05-03 (shortline snapshot / signals / fast review bridge-in)
+
+- Scope: continue the approved `shortline_hub v1` expansion and close the most practical integration gap:
+  - shortline run results can now persist into `kline_signal_snapshot`
+  - `/api/v1/signals` default counts can see the shortline signal families
+  - `fast_review_summary.md` can automatically attach a lightweight shortline focus section
+- Changes:
+  - Added `src/shortline_hub/snapshot_sync.py`
+    - maps `review_tier -> signal_type`
+    - persists per-stock shortline review rows into generic signal snapshots
+  - Updated `scripts/run_shortline_hub.py`
+    - added `--persist-snapshot`
+    - successful shortline runs can now write snapshots in fail-open mode
+  - Updated `src/services/signal_snapshot_service.py`
+    - added default shortline signal types
+    - count metadata now recognizes shortline groups
+    - list/history payloads now expose shortline fields such as `review_tier`, `composite_score`, and tracking metadata
+  - Updated `api/v1/schemas/signals.py`
+    - added shortline-facing response fields for snapshot query consumers
+  - Updated `scripts/run_fast_review_bundle.py`
+    - added shortline summary rendering helper
+    - fast review now prefers same-day shortline snapshots and falls back to recent same-day `shortline_*` `run_summary.json`
+  - Added / updated regression coverage:
+    - `tests/test_shortline_snapshot_sync.py`
+    - `tests/test_shortline_hub_cli.py`
+    - `tests/test_signal_snapshot_service.py`
+    - `tests/test_signal_snapshot_api.py`
+    - `tests/test_fast_review_daily_bundle.py`
+- Verification:
+  - Red:
+    - `python -m pytest tests/test_shortline_snapshot_sync.py -q`
+      - failed first with `ModuleNotFoundError: No module named 'src.shortline_hub.snapshot_sync'`
+    - `python -m pytest tests/test_signal_snapshot_service.py tests/test_signal_snapshot_api.py -k shortline -q`
+      - failed first because default counts did not include `shortline_top_pick`
+    - `python -m pytest tests/test_fast_review_daily_bundle.py -k shortline_focus_section -q`
+      - failed first with missing `append_shortline_focus_section`
+    - `python -m pytest tests/test_shortline_hub_cli.py -k persist_snapshot -q`
+      - failed first because CLI run did not persist any shortline snapshots
+  - Green:
+    - `python -m pytest tests/test_shortline_snapshot_sync.py tests/test_shortline_hub_cli.py tests/test_signal_snapshot_service.py tests/test_signal_snapshot_api.py tests/test_fast_review_daily_bundle.py -k "shortline or persist_snapshot" -q`
+      - result: `8 passed`
+    - `python -m py_compile src/shortline_hub/snapshot_sync.py scripts/run_shortline_hub.py scripts/run_fast_review_bundle.py src/services/signal_snapshot_service.py api/v1/schemas/signals.py tests/test_shortline_snapshot_sync.py tests/test_shortline_hub_cli.py`
+      - passed
+- Result:
+  - shortline daily output is no longer trapped inside manual artifact directories
+  - the repo now has a minimal end-to-end bridge from `shortline_hub` into shared snapshot query and fast-review consumption
+  - this remains fail-open and intentionally lightweight: if no shortline snapshot is present, fast review still completes normally
+
+## 2026-05-03 (shortline report dedup for all-high-risk daily replay)
+
+- Scope: finish one last tomorrow-facing readability fix in `shortline_hub` so the layered shortline report stops repeating the same names between `今日最强` and `高风险异动` when all candidates are risk-tier only.
+- Changes:
+  - Updated `src/shortline_hub/report_builder.py`
+    - tightened `今日最强` fallback logic
+    - when `top_pick` and `watchlist` are both empty:
+      - if there are no candidates, keep the section empty as before
+      - if all candidates are `high_risk_mover`, the section now renders a clear guidance line instead of re-listing the same names
+      - if mixed tiers exist but still no `top_pick`, the section now points users back to `观察名单` / `候选概览` rather than duplicating the candidate list
+  - Updated `tests/test_shortline_daily_review_layers.py`
+    - added regression coverage for the all-`high_risk_mover` report case
+    - verified the same names appear only under `高风险异动`, while `今日最强` shows a textual fallback
+- Verification:
+  - Red:
+    - `python -m pytest tests/test_shortline_daily_review_layers.py -k "duplicate_today_strongest" -q`
+    - failed as expected because `今日最强` still duplicated the high-risk candidate list
+  - Green:
+    - `python -m pytest tests/test_shortline_daily_review_layers.py -k "duplicate_today_strongest or layered_daily_review_sections" -q`
+    - result: `2 passed`
+    - `python -m pytest tests/test_shortline_daily_review_layers.py tests/test_shortline_text_readability.py tests/test_shortline_hub_orchestrator.py tests/test_shortline_bridge_templates.py tests/test_shortline_hub_cli.py tests/test_show_shortline_report.py -q`
+    - result: `36 passed`
+    - `python -m py_compile src/shortline_hub/report_builder.py`
+  - Real daily replay:
+    - `powershell -ExecutionPolicy Bypass -File .\scripts\run-shortline-daily.ps1 -TradeDate 2026-05-03 -TopN 3 -RunId shortline_daily_report_dedup_top3_20260503 -OutputDir data/manual_runs/shortline_daily_report_dedup_top3_20260503 -LogLevel INFO`
+    - result:
+      - `review_tier_counts={"high_risk_mover": 3}`
+      - `orchestrator_explain_elapsed_ms=43183`
+      - `total_explain_elapsed_ms=118151`
+      - report now shows:
+        - `今日最强`: `暂无可直接列为今日最强的标的；当前候选全部归入高风险异动，先看下方风险说明。`
+        - `高风险异动`: `300083 创世纪 / 688256 寒武纪 / 688400 凌云光`
+- Result:
+  - the shortline daily report is now less repetitive in the exact real-run shape most likely to appear tomorrow
+  - operators can distinguish “no clean strongest pick” from “there are candidates, but they are all risk-tagged”
+  - this is a presentation-layer fix only; it does not relax the current conservative risk demotion rules
+
+## 2026-05-03 (shortline board-core bonus + parallel explain path)
+
+- Scope: finish the most practical “tomorrow-ready” hardening for `shortline_hub` by improving both ranking core and runtime cost:
+  - give same-board leaders a distinct promotion path
+  - cut process-mode explain wall-clock time by parallelizing candidate explanation
+- Changes:
+  - Updated `src/shortline_hub/schemas.py`
+    - `ShortlineCombinedResult` now also carries:
+      - `board_core_rank`
+      - `board_core_bonus`
+  - Updated `src/shortline_hub/orchestrator.py`
+    - explanation stage now uses a small `ThreadPoolExecutor` fan-out in process/stub mode, instead of explaining all candidates strictly one by one
+    - added board-core ranking inside the same `board_name`
+    - when multiple candidates share the same board, the strongest relative leader now receives:
+      - `board_core_rank=1`
+      - positive `board_core_bonus`
+      - extra lift in final `composite_score`
+  - Updated `src/shortline_hub/report_builder.py`
+    - layered report now renders board-core hints in readable form:
+      - `板块前排#<rank>`
+      - detailed section also shows `板块核心: 第 <rank> 名 / 加分 <bonus>`
+  - Added / updated regression coverage:
+    - `tests/test_shortline_daily_review_layers.py`
+      - board-core bonus promotes the strongest same-board leader
+      - parallel explain path reduces wall-clock time versus old serial behavior
+- Verification:
+  - regression:
+    - `python -m pytest tests/test_shortline_daily_review_layers.py tests/test_shortline_text_readability.py tests/test_shortline_hub_orchestrator.py tests/test_shortline_bridge_templates.py tests/test_shortline_hub_cli.py -q`
+    - result: `34 passed`
+  - compile:
+    - `python -m py_compile src/shortline_hub/schemas.py src/shortline_hub/orchestrator.py src/shortline_hub/report_builder.py`
+  - real daily replay:
+    - `powershell -ExecutionPolicy Bypass -File .\scripts\run-shortline-daily.ps1 -TradeDate 2026-05-03 -TopN 3 -RunId shortline_daily_coreperf_top3_20260503`
+    - result:
+      - `orchestrator_explain_elapsed_ms=46604`
+      - previous calibrated top3 reference was about `108250ms`
+      - current run keeps full real `WonderTrader + FinGenius` process mode while materially reducing orchestration wall-clock time
+- Result:
+  - shortline daily replay is now materially faster in the part that users feel most directly: end-to-end explanation wait time
+  - ranking core now has a structural place to distinguish same-board leaders from same-board followers instead of flattening them
+  - tomorrow’s daily run can start from a more usable baseline without introducing new external dependencies or protocol changes
+
+## 2026-05-03 (shortline score/tier calibration against real runs)
+
+- Scope: calibrate the first round of `shortline_hub` layered review scoring using recent real runs, with emphasis on reducing false `top_pick` inflation and making data-quality-compromised momentum names surface as riskier review items.
+- Changes:
+  - Updated `src/shortline_hub/orchestrator.py`
+    - `composite_score` is no longer dominated by raw `trigger_score`
+    - `trigger_score` now contributes through a capped and reweighted path
+    - `change_pct / volume_ratio / turnover_rate / 60d trend / liquidity / confidence` were rebalanced to behave more like a review score instead of a raw momentum accumulator
+    - risk penalties are now more explicit:
+      - `volume_reconstructed_from_amount`
+      - `missing_volume_history`
+      - `history_asof_*`
+      - `earnings_pending`
+      - `high_volatility`
+    - review-tier logic now hard-demotes obvious data-quality-risk names out of `top_pick`
+  - Updated `src/shortline_hub/report_builder.py`
+    - `今日最强` fallback now prefers `watchlist` before falling all the way back to the full candidate list
+  - Added regression coverage:
+    - `tests/test_shortline_daily_review_layers.py`
+      - real-style `limit_up_momentum + volume_reconstructed_from_amount` sample is no longer allowed to stay in `top_pick`
+- Verification:
+  - regression:
+    - `python -m pytest tests/test_shortline_daily_review_layers.py tests/test_shortline_text_readability.py tests/test_shortline_hub_orchestrator.py tests/test_shortline_bridge_templates.py tests/test_shortline_hub_cli.py -q`
+    - result: `32 passed`
+  - compile:
+    - `python -m py_compile src/shortline_hub/orchestrator.py src/shortline_hub/report_builder.py`
+  - real daily replay after calibration:
+    - `powershell -ExecutionPolicy Bypass -File .\scripts\run-shortline-daily.ps1 -TradeDate 2026-05-03 -TopN 3 -RunId shortline_daily_calibrated_top3_20260503`
+    - result:
+      - `review_tier_counts={"high_risk_mover": 3}`
+      - `top_pick_count=0`
+      - `score_max=159.07`
+      - current reconstructed-volume limit-up cases are preserved for review but no longer marketed as clean highest-conviction picks
+- Result:
+  - first-pass daily layered review now behaves more conservatively on real A-share shortline samples where volume quality is repaired rather than pristine
+  - `top_pick` is harder to obtain and `high_risk_mover` is meaningfully more sensitive to data-quality risks
+  - the current calibration is usable, but the next tuning step should focus on introducing board-core/relative-leader bonuses so clean leaders can separate more clearly from generic strong movers
+
+## 2026-05-03 (shortline layered daily review)
+
+- Scope: move `shortline_hub` from a flat “strong stock + explanation dump” into a more usable daily shortline review format, with category, ranking, and review-layer output that can be read directly after market close.
+- Changes:
+  - Updated `src/shortline_hub/schemas.py`
+    - `ShortlineCombinedResult` now carries derived review fields:
+      - `shortline_category`
+      - `composite_score`
+      - `review_tier`
+      - `category_rank`
+    - `ShortlineRunResult.summary_dict()` now also exports:
+      - `shortline_category_counts`
+      - `review_tier_counts`
+      - `top_pick_count / watchlist_count / high_risk_mover_count`
+      - `score_min / score_max / score_avg`
+  - Updated `src/shortline_hub/orchestrator.py`
+    - after candidate + explanation merge, the orchestrator now derives:
+      - shortline category mapping
+      - composite score
+      - review tier
+      - per-category ranking
+    - current category mapping is intentionally lightweight and rule-based:
+      - `limit_up_momentum` / setup with `涨停` -> `涨停接力`
+      - breakout-style triggers / setup with `放量` or `突破` -> `放量突破`
+      - active-turnover style triggers / setup with `换手` -> `高换手博弈`
+      - relative-strength / board-core style setups -> `板块龙头跟随`
+      - remaining cases -> `趋势强势跟随`
+  - Updated `src/shortline_hub/report_builder.py`
+    - report now includes layered daily review sections:
+      - `今日最强`
+      - `观察名单`
+      - `高风险异动`
+      - `明日观察点`
+    - while preserving:
+      - `结果概览`
+      - `候选概览`
+      - `候选明细`
+      - `逐票说明`
+    - report-facing review tier labels are now rendered in Chinese even though internal summary JSON still keeps the stable machine values:
+      - `top_pick`
+      - `watchlist`
+      - `high_risk_mover`
+  - Added regression coverage:
+    - `tests/test_shortline_daily_review_layers.py`
+- Verification:
+  - regression:
+    - `python -m pytest tests/test_shortline_daily_review_layers.py tests/test_shortline_text_readability.py tests/test_shortline_hub_orchestrator.py tests/test_shortline_bridge_templates.py tests/test_shortline_hub_cli.py tests/test_show_shortline_report.py tests/test_shortline_bridge_check.py -q`
+    - result: `38 passed`
+  - compile:
+    - `python -m py_compile src/shortline_hub/schemas.py src/shortline_hub/orchestrator.py src/shortline_hub/report_builder.py`
+  - stub smoke:
+    - `python scripts/run_shortline_hub.py --mode stub --trade-date 2026-05-03 --top-n 3 --run-id shortline_stub_layered_20260503 --output-dir data/manual_runs/shortline_stub_layered_20260503`
+  - real process smoke:
+    - `powershell -ExecutionPolicy Bypass -File .\scripts\run-shortline-daily.ps1 -TradeDate 2026-05-03 -TopN 1 -RunId shortline_daily_layered_top1_20260503`
+    - result:
+      - report includes layered sections
+      - `shortline_category_counts` and `review_tier_counts` are written to `run_summary.json`
+      - top-1 real candidate was categorized into the layered daily review flow end-to-end
+- Result:
+  - `shortline_hub` is now closer to a practical shortline review framework instead of a flat orchestration demo
+  - daily outputs can now separate “strongest names”, “watchlist”, and “risk movers” without requiring a second manual pass
+  - current category/ranking logic remains intentionally lightweight and can be tuned further against real replay behavior without changing the external bridge protocol
+
+## 2026-05-03 (shortline report preview + bridge health status refinement)
+
+- Scope: reduce operator confusion in the current shortline same-machine workflow by separating “terminal display mojibake” from real file corruption, and by preventing bridge setup checks from over-warning when runtime smoke is already green.
+- Changes:
+  - Added:
+    - `scripts/show_shortline_report.py`
+  - Preview helper behavior:
+    - accepts a `shortline_report.md` path and optional `--lines`
+    - when running in an interactive terminal, it prefers UTF-8 stdout for easier local report viewing
+    - when stdout is being piped/captured, it keeps the default encoding to avoid Windows subprocess decode issues
+  - Updated `src/shortline_hub/bridge_check.py`
+    - `overall_status` is now `passed` when:
+      - local `bridge_data` files are missing, but
+      - bridge scripts exist, workdirs exist, and
+      - script smoke / orchestrator smoke are all green
+    - stale local `bridge_data` still remains a real `warning`
+  - Updated regression coverage:
+    - `tests/test_show_shortline_report.py`
+    - `tests/test_shortline_bridge_check.py`
+- Verification:
+  - regression:
+    - `python -m pytest tests/test_show_shortline_report.py tests/test_shortline_bridge_check.py -q`
+    - result: `7 passed`
+  - compile:
+    - `python -m py_compile scripts/show_shortline_report.py src/shortline_hub/bridge_check.py`
+  - real file inspection:
+    - re-read `data/manual_runs/shortline_daily_readability_recheck_20260503/shortline_report.md` through Python
+    - confirmed file content itself is readable Chinese and previous mojibake came from terminal display, not report generation
+- Result:
+  - operators now have a direct, low-friction way to preview shortline reports without relying on fragile shell rendering
+  - bridge setup checks no longer mislabel “no local bridge_data, but real runtime path is healthy” as a degraded state
+  - warning state is now more focused on genuinely stale local bridge cache rather than the absence of optional local export files
+
+## 2026-05-03 (shortline volume repair from amount)
+
+- Scope: address the current `missing_volume_history` issue in the shortline WonderTrader path by repairing corrupted recent history rows where `volume=0` but `amount>0`, instead of letting volume-related signals degrade silently.
+- Changes:
+  - Updated `src/shortline_hub/wondertrader_real_engine.py`
+    - added `repair_history_rows_from_amount(...)`
+    - when recent history rows have `volume=0` and `amount>0`, the loader now:
+      - uses older valid rows as calibration
+      - reconstructs `volume` from `amount / close`
+      - auto-detects the common recent corruption case where `amount` has dropped to `1/1000` scale and scales it back up before reconstruction
+    - repaired rows now carry internal markers:
+      - `_volume_reconstructed_from_amount`
+      - `_amount_scale_repaired`
+    - shortline candidate risk flags now distinguish:
+      - `volume_reconstructed_from_amount`
+      - `missing_volume_history`
+      instead of collapsing both cases into the same warning
+  - Added / updated regression coverage:
+    - `tests/test_wondertrader_real_engine.py`
+      - weekend replay no longer emits `history_asof_*`
+      - amount-driven volume reconstruction works
+      - repair is idempotent and preserves reconstruction flags
+- Verification:
+  - regression:
+    - `python -m pytest tests/test_wondertrader_real_engine.py tests/test_shortline_runs_summary.py -q`
+    - result: `11 passed`
+  - compile:
+    - `python -m py_compile src/shortline_hub/wondertrader_real_engine.py`
+  - real daily replay after repair:
+    - `powershell -ExecutionPolicy Bypass -File .\scripts\run-shortline-daily.ps1 -TradeDate 2026-05-03 -TopN 3 -RunId shortline_daily_volume_repair_flagcheck_20260503 -OutputDir data/manual_runs/shortline_daily_volume_repair_flagcheck_20260503 -LogLevel INFO`
+    - result:
+      - `risk_flag_counts={"volume_reconstructed_from_amount": 3}`
+      - no `missing_volume_history`
+      - repaired examples:
+        - `300083 volume_ratio=5.66 amount=4003210000.0`
+        - `688256 volume_ratio=1.64 amount=17884265000.0`
+        - `688400 volume_ratio=1.93 amount=40162770.0`
+- Result:
+  - shortline daily replay no longer treats the current 2026 history cache corruption as a generic hard failure
+  - volume-related features can now continue working on repaired rows
+  - operators still keep visibility that the recent volume was reconstructed rather than natively clean
+
+## 2026-05-03 (shortline run summary + weekend history flag refinement)
+
+- Scope: make the shortline process easier to review across multiple runs, while reducing misleading `history_asof_*` noise during weekend replay checks.
+- Changes:
+  - Added:
+    - `scripts/summarize_shortline_runs.py`
+  - New summary command now aggregates recent `data/manual_runs/shortline_*` outputs into:
+    - `shortline_runs_summary.json`
+    - `shortline_runs_summary.md`
+  - Summary fields include:
+    - recent run list
+    - `candidate_count`
+    - `total_explain_elapsed_ms / avg_explain_elapsed_ms`
+    - actual upstream tool usage
+    - top sample symbols
+  - Updated `src/shortline_hub/wondertrader_real_engine.py`
+    - `history_asof_*` is no longer added when `trade_date` itself falls on a weekend replay day
+    - `missing_volume_history` remains unchanged and is still treated as a real data-quality warning
+  - Updated docs:
+    - `docs/architecture/2026-05-02-shortline-hub-single-machine-setup.md`
+- Verification:
+  - regression:
+    - `python -m pytest tests/test_wondertrader_real_engine.py tests/test_shortline_runs_summary.py -q`
+    - result: `10 passed`
+  - compile:
+    - `python -m py_compile scripts/summarize_shortline_runs.py src/shortline_hub/wondertrader_real_engine.py`
+  - real summary command:
+    - `python scripts/summarize_shortline_runs.py --runs-root data/manual_runs --output-dir data/manual_runs/shortline_runs_summary_latest --limit 12`
+    - result: `run_count=12`
+  - real weekend replay check:
+    - `powershell -ExecutionPolicy Bypass -File .\scripts\run-shortline-daily.ps1 -TradeDate 2026-05-03 -TopN 1 -RunId shortline_daily_weekend_flag_check_20260503 -OutputDir data/manual_runs/shortline_daily_weekend_flag_check_20260503 -LogLevel INFO`
+    - result:
+      - `risk_flag_counts={"missing_volume_history": 1}`
+      - weekend replay no longer carries `history_asof_2026-04-30`
+- Result:
+  - shortline now has a direct “recent runs overview” entrypoint for comparing daily/fullcheck outcomes
+  - weekend replay no longer mixes “non-trading-day replay” with genuine history staleness warnings
+  - `missing_volume_history` remains visible as the main real data-quality flag for current WonderTrader history samples
+
+## 2026-05-03 (shortline daily helper scripts)
+
+- Scope: add one-click daily helper entrypoints for the existing same-machine shortline process so the verified `WonderTrader + FinGenius` path can be replayed without rewriting long CLI arguments each time.
+- Changes:
+  - Added:
+    - `scripts/run-shortline-daily.ps1`
+    - `scripts/run-shortline-fullcheck.ps1`
+  - Fixed PowerShell script structure:
+    - moved `param(...)` to the first executable block
+    - moved `$ErrorActionPreference = 'Stop'` below the parameter block
+  - Daily helper defaults:
+    - `trade_date=当天`
+    - `top_n=5`
+    - `run_id=shortline_daily_YYYYMMDD`
+    - `FinGenius` runtime pinned to `D:\bb\FinGenius\.venv311\Scripts\python.exe`
+    - lightweight mode by default, without `--fg-enable-big-deal`
+  - Full-check helper defaults:
+    - `trade_date=当天`
+    - `top_n=1`
+    - `run_id=shortline_fullcheck_YYYYMMDD`
+    - automatically enables `--fg-enable-big-deal`
+  - Both scripts now:
+    - validate required external paths before execution
+    - place run outputs under `data/manual_runs/<run_id>`
+    - place runtime artifacts under `data/runtime/shortline_hub/`
+  - Updated docs:
+    - `docs/architecture/2026-05-02-shortline-hub-single-machine-setup.md`
+- Verification:
+  - regression:
+    - `python -m pytest tests/test_shortline_daily_scripts.py -q`
+    - result: `2 passed`
+  - real daily helper smoke:
+    - `powershell -ExecutionPolicy Bypass -File .\scripts\run-shortline-daily.ps1 -TradeDate 2026-05-03 -TopN 1 -RunId shortline_daily_helper_smoke_20260503 -OutputDir data/manual_runs/shortline_daily_helper_smoke_20260503 -LogLevel INFO`
+    - result:
+      - `candidate_count=1`
+      - `explanation_source_counts={"upstream_tools": 1}`
+      - `used_upstream_tools=["HotMoneyTool","ChipAnalysisTool"]`
+      - `tool_error_count=0`
+  - real full-check helper smoke:
+    - `powershell -ExecutionPolicy Bypass -File .\scripts\run-shortline-fullcheck.ps1 -TradeDate 2026-05-03 -TopN 1 -RunId shortline_fullcheck_helper_smoke_20260503 -OutputDir data/manual_runs/shortline_fullcheck_helper_smoke_20260503 -LogLevel INFO`
+    - result:
+      - `candidate_count=1`
+      - `explanation_source_counts={"upstream_tools": 1}`
+      - `used_upstream_tools=["HotMoneyTool","ChipAnalysisTool","BigDealAnalysisTool"]`
+      - `tool_error_count=0`
+- Result:
+  - the shortline same-machine flow now has stable daily entrypoints for:
+    - lightweight batch replay
+    - full-mode spot check
+  - operators no longer need to manually reassemble the long `run_shortline_hub.py` command each day
+
+## 2026-05-03 (shortline FinGenius dedicated Python 3.11 runtime)
+
+- Scope: stabilize the shortline same-machine `FinGenius` path by moving it onto a dedicated `Python 3.11` runtime, verifying both lightweight batch mode and full-mode single-stock mode, then updating the operating docs.
+- Changes:
+  - Created dedicated external runtime:
+    - installed `Python 3.11.9`
+    - created `D:\bb\FinGenius\.venv311`
+  - Installed the minimal runtime dependency set needed by the current shortline bridge path:
+    - `pydantic~=2.10.6`
+    - `pandas~=2.2.3`
+    - `numpy`
+    - `requests~=2.32.3`
+    - `loguru~=0.7.3`
+    - `rich~=13.7.1`
+    - `efinance~=0.5.5.2`
+    - `akshare~=1.16.87`
+  - Confirmed `D:\bb\FinGenius\.venv311\Scripts\python.exe` can import:
+    - `HotMoneyTool`
+    - `ChipAnalysisTool`
+    - `BigDealAnalysisTool`
+  - Updated docs:
+    - `scripts/bridges/README.md`
+    - `docs/architecture/2026-05-02-shortline-hub-single-machine-setup.md`
+- Verification:
+  - import smoke:
+    - `D:\bb\FinGenius\.venv311\Scripts\python.exe -c "import sys; sys.path.insert(0, r'D:\bb\FinGenius\upstream'); from src.tool.hot_money import HotMoneyTool; from src.tool.chip_analysis import ChipAnalysisTool; from src.tool.big_deal_analysis import BigDealAnalysisTool; print('imports_ok')"`
+    - result: `imports_ok`
+  - direct full-mode single-stock bridge:
+    - `D:\bb\FinGenius\.venv311\Scripts\python.exe D:\bb\FinGenius\bridge\fg_explain_candidate.py data/manual_runs/shortline_fingenius_fullmode_spotcheck_300632_20260503/fg_request.json data/manual_runs/shortline_fingenius_fullmode_spotcheck_300632_py311_20260503/fg_output.json`
+  - lightweight batch replay through current repo orchestrator:
+    - `python scripts/run_shortline_hub.py --mode process --trade-date 2026-05-03 --top-n 5 --run-id shortline_daily_demo_fg_py311_20260503 --output-dir data/manual_runs/shortline_daily_demo_fg_py311_20260503 --wt-python-executable python --wt-script-path D:\bb\WonderTrader\bridge\wt_export_candidates.py --wt-workdir D:\bb\WonderTrader --wt-runtime-dir data/runtime/shortline_hub/wt_daily_demo_fg_py311_20260503 --fg-python-executable D:\bb\FinGenius\.venv311\Scripts\python.exe --fg-script-path D:\bb\FinGenius\bridge\fg_explain_candidate.py --fg-workdir D:\bb\FinGenius --fg-runtime-dir data/runtime/shortline_hub/fg_daily_demo_py311_20260503 --log-level INFO`
+  - full-mode orchestrator replay:
+    - `python scripts/run_shortline_hub.py --mode process --trade-date 2026-05-03 --top-n 1 --run-id shortline_fullmode_fg_py311_top1_20260503 --output-dir data/manual_runs/shortline_fullmode_fg_py311_top1_20260503 --wt-python-executable python --wt-script-path D:\bb\WonderTrader\bridge\wt_export_candidates.py --wt-workdir D:\bb\WonderTrader --wt-runtime-dir data/runtime/shortline_hub/wt_fullmode_fg_py311_top1_20260503 --fg-python-executable D:\bb\FinGenius\.venv311\Scripts\python.exe --fg-script-path D:\bb\FinGenius\bridge\fg_explain_candidate.py --fg-workdir D:\bb\FinGenius --fg-runtime-dir data/runtime/shortline_hub/fg_fullmode_py311_top1_20260503 --fg-enable-big-deal --log-level INFO`
+- Result:
+  - dedicated `Python 3.11` runtime is now usable for the real shortline `FinGenius` bridge path without changing the repo orchestration code
+  - lightweight batch replay:
+    - `run_id=shortline_daily_demo_fg_py311_20260503`
+    - `candidate_count=5`
+    - `explanation_source_counts={"upstream_tools": 5}`
+    - `used_upstream_tools=HotMoneyTool + ChipAnalysisTool`
+    - `tool_error_count=0`
+    - `total_explain_elapsed_ms=141016`
+    - `avg_explain_elapsed_ms=28203`
+  - full-mode orchestrator replay:
+    - `run_id=shortline_fullmode_fg_py311_top1_20260503`
+    - `used_upstream_tools=["HotMoneyTool","ChipAnalysisTool","BigDealAnalysisTool"]`
+    - `tool_error_count=0`
+    - `upstream_tool_elapsed_ms={"HotMoneyTool": 7866, "ChipAnalysisTool": 21125, "BigDealAnalysisTool": 50153}`
+    - `explain_elapsed_ms=80972`
+  - direct single-stock bridge replay also succeeded under the same dedicated interpreter:
+    - `data/manual_runs/shortline_fingenius_fullmode_spotcheck_300632_py311_20260503/fg_output.json`
+
+## 2026-05-03 (shortline FinGenius readability + daily workflow + real validation)
+
+- Scope: finish the shortline FinGenius batch round by fixing user-visible text readability, restoring the external bridge's real upstream path after wrapper refactor, documenting the daily default workflow, and re-running real validation.
+- Changes:
+  - Updated `src/shortline_hub/report_builder.py`
+    - rewrote report headings / labels / metric names into readable Chinese
+    - normalized amount formatting to `亿 / 万`
+    - added a default risk-note sentence so reports no longer read like broken placeholders
+  - Updated `src/shortline_hub/adapters/fingenius_adapter.py`
+    - rewrote stub summaries into readable Chinese
+  - Updated `scripts/bridges/shortline_fingenius_bridge_template.py`
+    - rewrote bridge-generated summaries, proxy `big_deal_summary`, heuristic fallback text, and risk/short-term commentary into readable Chinese
+    - kept upstream payload extraction tolerant to both current garbled keys and English keys
+  - Updated `D:\bb\FinGenius\bridge\fg_explain_candidate.py`
+    - fixed the thin-wrapper regression so the external bridge again uses local `D:\bb\FinGenius\upstream` as its runtime tool root instead of accidentally resolving against the repo bridge directory
+  - Updated `scripts/bridges/README.md`
+    - formalized the daily default workflow:
+      - batch replay = default lightweight mode
+      - single-stock deep dive / spot check = `--fg-enable-big-deal`
+  - Added readability regression:
+    - `tests/test_shortline_text_readability.py`
+  - Updated shortline regression expectations:
+    - `tests/test_shortline_hub_orchestrator.py`
+- Verification:
+  - `python -m pytest tests/test_shortline_text_readability.py -q`
+    - result: `2 passed`
+  - `python -m pytest tests/test_fingenius_bridge_loguru_fallback.py tests/test_fingenius_bridge_bom.py tests/test_shortline_text_readability.py tests/test_shortline_bridge_templates.py tests/test_shortline_hub_orchestrator.py tests/test_shortline_hub_cli.py tests/test_shortline_bridge_check.py tests/test_shortline_bridge_data_compare.py -q`
+    - result: `37 passed`
+  - `python -m py_compile src/shortline_hub/report_builder.py src/shortline_hub/adapters/fingenius_adapter.py scripts/bridges/shortline_fingenius_bridge_template.py D:\bb\FinGenius\bridge\fg_explain_candidate.py`
+  - real lightweight replay:
+    - `python scripts/run_shortline_hub.py --mode process --trade-date 2026-05-03 --top-n 5 --run-id shortline_fingenius_lightweight_top5_v2_20260503 --output-dir data/manual_runs/shortline_fingenius_lightweight_top5_v2_20260503 --wt-python-executable python --wt-script-path D:\bb\WonderTrader\bridge\wt_export_candidates.py --wt-workdir D:\bb\WonderTrader --wt-runtime-dir data/runtime/shortline_hub/wt_lightweight_top5_v2_20260503 --fg-python-executable python --fg-script-path D:\bb\FinGenius\bridge\fg_explain_candidate.py --fg-workdir D:\bb\FinGenius --fg-runtime-dir data/runtime/shortline_hub/fg_lightweight_top5_v2_20260503 --log-level INFO`
+  - real full-mode spot checks:
+    - `python D:\bb\FinGenius\bridge\fg_explain_candidate.py data/manual_runs/shortline_fingenius_fullmode_spotcheck_300632_20260503/fg_request.json data/manual_runs/shortline_fingenius_fullmode_spotcheck_300632_20260503/fg_output.json`
+    - `python D:\bb\FinGenius\bridge\fg_explain_candidate.py data/manual_runs/shortline_fingenius_fullmode_spotcheck_688531_20260503/fg_request.json data/manual_runs/shortline_fingenius_fullmode_spotcheck_688531_20260503/fg_output.json`
+- Result:
+  - real lightweight `top_n=5` now hits real upstream tools again:
+    - `explanation_source_counts={"upstream_tools": 5}`
+    - `used_upstream_tools=["HotMoneyTool","ChipAnalysisTool"]`
+    - `total_explain_elapsed_ms=166843`
+    - `avg_explain_elapsed_ms=33368`
+    - `upstream_tool_elapsed_totals_ms={"HotMoneyTool": 130218, "ChipAnalysisTool": 27787}`
+  - two full-mode spot checks both hit `BigDealAnalysisTool` successfully:
+    - `300632 光莆股份`
+      - `used_upstream_tools=["HotMoneyTool","ChipAnalysisTool","BigDealAnalysisTool"]`
+      - `upstream_tool_elapsed_ms={"HotMoneyTool": 26076, "ChipAnalysisTool": 5880, "BigDealAnalysisTool": 44219}`
+      - `explain_elapsed_ms=78424`
+    - `688531 日联科技`
+      - `used_upstream_tools=["HotMoneyTool","ChipAnalysisTool","BigDealAnalysisTool"]`
+      - `upstream_tool_elapsed_ms={"HotMoneyTool": 25928, "ChipAnalysisTool": 5878, "BigDealAnalysisTool": 32192}`
+      - `explain_elapsed_ms=65476`
+  - readability is fixed for the repo-generated labels and bridge-generated Chinese summaries; current real upstream sample still exposes some data-side limitations, but the orchestration layer text is no longer mojibake
+  - one practical observation remains unchanged:
+    - `HotMoneyTool` is still the main daily-cost component in lightweight mode
+    - `BigDealAnalysisTool` is still the main additional cost in full mode
+  - retained note:
+    - upstream still warns that Python `3.10.3` is unsupported and recommends `3.11-3.13`, but the current same-machine process path is still runnable
+
+## 2026-05-03 (shortline FinGenius lightweight big-deal gate)
+
+- Scope: reduce `FinGenius` batch explain latency by making `BigDealAnalysisTool` opt-in for process mode, while preserving a real full-mode path.
+- Changes:
+  - Updated `src/shortline_hub/adapters/fingenius_adapter.py`
+    - process request now writes `bridge_options.enable_big_deal`
+  - Updated `scripts/run_shortline_hub.py`
+    - added `--fg-enable-big-deal`
+  - Updated `scripts/bridges/shortline_fingenius_bridge_template.py`
+  - Updated `D:\bb\FinGenius\bridge\fg_explain_candidate.py`
+    - default bridge path now executes `HotMoneyTool + ChipAnalysisTool`
+    - `BigDealAnalysisTool` only runs when `enable_big_deal=true`
+    - disabled mode uses an already-fetched-data proxy for `big_deal_summary`
+  - Updated regression coverage:
+    - `tests/test_shortline_bridge_templates.py`
+    - `tests/test_shortline_hub_orchestrator.py`
+    - `tests/test_shortline_hub_cli.py`
+    - `tests/test_fingenius_bridge_loguru_fallback.py`
+  - Updated `scripts/bridges/README.md`
+- Verification:
+  - `python -m pytest tests/test_fingenius_bridge_loguru_fallback.py tests/test_fingenius_bridge_bom.py tests/test_shortline_bridge_templates.py tests/test_shortline_hub_orchestrator.py tests/test_shortline_hub_cli.py tests/test_shortline_bridge_check.py tests/test_shortline_bridge_data_compare.py -q`
+  - `python -m py_compile scripts/bridges/shortline_fingenius_bridge_template.py src/shortline_hub/adapters/fingenius_adapter.py src/shortline_hub/schemas.py src/shortline_hub/orchestrator.py src/shortline_hub/report_builder.py scripts/run_shortline_hub.py D:\bb\FinGenius\bridge\fg_explain_candidate.py`
+  - `python scripts/run_shortline_hub.py --mode process --trade-date 2026-05-03 --top-n 3 --run-id shortline_fingenius_lightweight_smoke_top3_20260503 --output-dir data/manual_runs/shortline_fingenius_lightweight_smoke_top3_20260503 --wt-python-executable python --wt-script-path D:\bb\WonderTrader\bridge\wt_export_candidates.py --wt-workdir D:\bb\WonderTrader --wt-runtime-dir data/runtime/shortline_hub/wt_lightweight_smoke_top3_20260503 --fg-python-executable python --fg-script-path D:\bb\FinGenius\bridge\fg_explain_candidate.py --fg-workdir D:\bb\FinGenius --fg-runtime-dir data/runtime/shortline_hub/fg_lightweight_smoke_top3_20260503`
+  - `python scripts/run_shortline_hub.py --mode process --trade-date 2026-05-03 --top-n 1 --run-id shortline_fingenius_fullmode_smoke_top1_20260503 --output-dir data/manual_runs/shortline_fingenius_fullmode_smoke_top1_20260503 --wt-python-executable python --wt-script-path D:\bb\WonderTrader\bridge\wt_export_candidates.py --wt-workdir D:\bb\WonderTrader --wt-runtime-dir data/runtime/shortline_hub/wt_fullmode_smoke_top1_20260503 --fg-python-executable python --fg-script-path D:\bb\FinGenius\bridge\fg_explain_candidate.py --fg-workdir D:\bb\FinGenius --fg-runtime-dir data/runtime/shortline_hub/fg_fullmode_smoke_top1_20260503 --fg-enable-big-deal`
+- Result:
+  - regression stayed green: `35 passed`
+  - lightweight real smoke (`top_n=3`) produced:
+    - `total_explain_elapsed_ms=101090`
+    - `avg_explain_elapsed_ms=33696`
+    - `upstream_tool_elapsed_totals_ms={"HotMoneyTool": 79080, "ChipAnalysisTool": 17127}`
+  - compared with previous instrumented top3 smoke:
+    - previous `total_explain_elapsed_ms=229198`
+    - new lightweight path is lower by `128108ms` (`~55.9%`)
+  - full-mode real smoke (`--fg-enable-big-deal`, `top_n=1`) still works:
+    - `used_upstream_tools=["HotMoneyTool","ChipAnalysisTool","BigDealAnalysisTool"]`
+    - `BigDealAnalysisTool=43636ms`
+
+## 2026-05-03 (shortline FinGenius batch instrumentation)
+
+- Scope: add explanation-source / tool-hit / elapsed metadata to the shortline FinGenius batch bridge and propagate it through the hub summary/report path.
+- Changes:
+  - Updated `scripts/bridges/shortline_fingenius_bridge_template.py`
+  - Updated `src/shortline_hub/schemas.py`
+  - Updated `src/shortline_hub/adapters/fingenius_adapter.py`
+  - Updated `src/shortline_hub/orchestrator.py`
+  - Updated `src/shortline_hub/report_builder.py`
+  - Added per-tool elapsed breakdown field: `upstream_tool_elapsed_ms`
+  - Updated bridge/orchestrator/CLI regression tests
+  - Updated `scripts/bridges/README.md`
+- Verification:
+  - `python -m pytest tests/test_shortline_bridge_templates.py -k "prefers_local_explanation_file or uses_real_upstream_tools_when_available or partial_upstream_tool_failures or falls_back_when_real_upstream_tools_fail" -q`
+  - `python -m pytest tests/test_shortline_hub_orchestrator.py tests/test_shortline_hub_cli.py -k "metadata or legacy_unknown or process_mode_uses_external_scripts" -q`
+  - `python -m pytest tests/test_fingenius_bridge_loguru_fallback.py tests/test_fingenius_bridge_bom.py tests/test_shortline_bridge_templates.py tests/test_shortline_hub_orchestrator.py tests/test_shortline_hub_cli.py tests/test_shortline_bridge_check.py tests/test_shortline_bridge_data_compare.py -q`
+  - `python -m py_compile scripts/bridges/shortline_fingenius_bridge_template.py src/shortline_hub/adapters/fingenius_adapter.py src/shortline_hub/schemas.py src/shortline_hub/orchestrator.py src/shortline_hub/report_builder.py`
+  - `python scripts/run_shortline_hub.py --mode process --trade-date 2026-05-03 --top-n 1 --run-id shortline_fingenius_instrumented_smoke_20260503 --output-dir data/manual_runs/shortline_fingenius_instrumented_smoke_20260503 --wt-python-executable python --wt-script-path D:\bb\WonderTrader\bridge\wt_export_candidates.py --wt-workdir D:\bb\WonderTrader --wt-runtime-dir data/runtime/shortline_hub/wt_instrumented_smoke_20260503 --fg-python-executable python --fg-script-path D:\bb\FinGenius\bridge\fg_explain_candidate.py --fg-workdir D:\bb\FinGenius --fg-runtime-dir data/runtime/shortline_hub/fg_instrumented_smoke_20260503`
+  - `python scripts/run_shortline_hub.py --mode process --trade-date 2026-05-03 --top-n 3 --run-id shortline_fingenius_instrumented_smoke_top3_20260503 --output-dir data/manual_runs/shortline_fingenius_instrumented_smoke_top3_20260503 --wt-python-executable python --wt-script-path D:\bb\WonderTrader\bridge\wt_export_candidates.py --wt-workdir D:\bb\WonderTrader --wt-runtime-dir data/runtime/shortline_hub/wt_instrumented_smoke_top3_20260503 --fg-python-executable python --fg-script-path D:\bb\FinGenius\bridge\fg_explain_candidate.py --fg-workdir D:\bb\FinGenius --fg-runtime-dir data/runtime/shortline_hub/fg_instrumented_smoke_top3_20260503`
+- Result:
+  - `32 passed` in full shortline regression
+  - real smoke produced `protocol_version=shortline_fg_v1`, `explanation_source=upstream_tools`, and non-empty upstream tool hits
+  - top3 real smoke produced:
+    - `total_explain_elapsed_ms=229198`
+    - `avg_explain_elapsed_ms=76399`
+    - `upstream_tool_elapsed_totals_ms={"HotMoneyTool": 78332, "ChipAnalysisTool": 17422, "BigDealAnalysisTool": 127610}`
+  - root-cause evidence shows current bottleneck is `BigDealAnalysisTool` first, `HotMoneyTool` second, not `ChipAnalysisTool`
+
+## 2026-05-02 (FinGenius single-stock real tool bridge path)
+
+- Scope: move the external `FinGenius` bridge from heuristic-only fallback into a real single-stock tool path, while keeping same-machine process-mode compatibility and graceful degradation.
+- Changes:
+  - Updated FinGenius bridge scripts:
+    - [`scripts/bridges/shortline_fingenius_bridge_template.py`](d:\bb\daily_stock_analysis\scripts\bridges\shortline_fingenius_bridge_template.py)
+    - `D:\bb\FinGenius\bridge\fg_explain_candidate.py`
+  - Bridge behavior is now:
+    - `bridge_data` local export match first
+    - then try real upstream `FinGenius` single-stock tools:
+      - `HotMoneyTool`
+      - `ChipAnalysisTool`
+      - `BigDealAnalysisTool`
+    - only fall back to candidate-driven heuristic explanation when upstream import or execution fails
+  - Added real-tool summary mapping into the existing 8-field shortline explanation contract:
+    - `hot_money_summary`
+    - `big_deal_summary`
+    - `chip_commentary`
+    - `sentiment_commentary`
+    - `risk_commentary`
+    - `short_term_view`
+    - `confidence_label`
+  - Added two compatibility guards for same-machine Windows process mode:
+    - request JSON now accepts `utf-8-sig`, avoiding PowerShell BOM crashes
+    - bridge injects a lightweight `loguru` compatibility shim before importing upstream tools, so current repo Python can load `FinGenius` upstream modules even when `loguru` is not installed
+  - Added regression coverage:
+    - [`tests/test_shortline_bridge_templates.py`](d:\bb\daily_stock_analysis\tests\test_shortline_bridge_templates.py)
+      - real upstream tool path
+      - upstream failure -> heuristic fallback path
+    - [`tests/test_fingenius_bridge_bom.py`](d:\bb\daily_stock_analysis\tests\test_fingenius_bridge_bom.py)
+      - UTF-8 BOM request compatibility
+    - [`tests/test_fingenius_bridge_loguru_fallback.py`](d:\bb\daily_stock_analysis\tests\test_fingenius_bridge_loguru_fallback.py)
+      - upstream import path without installed `loguru`
+- Verification:
+  - Red:
+    - `python -m pytest tests/test_shortline_bridge_templates.py -k "real_upstream_tools or falls_back_when_real_upstream_tools_fail" -q`
+      - first failed because the bridge still returned heuristic text instead of real upstream tool output
+    - `python -m pytest tests/test_fingenius_bridge_bom.py -q`
+      - then failed on `Unexpected UTF-8 BOM`
+    - `python -m pytest tests/test_fingenius_bridge_loguru_fallback.py -q`
+      - then failed because upstream import stopped at missing `loguru`, so the bridge fell back to heuristic output
+  - Green:
+    - `python -m pytest tests/test_fingenius_bridge_loguru_fallback.py tests/test_fingenius_bridge_bom.py tests/test_shortline_bridge_templates.py tests/test_shortline_hub_orchestrator.py tests/test_shortline_hub_cli.py tests/test_shortline_bridge_check.py tests/test_shortline_bridge_data_compare.py -q`
+      - result: `27 passed`
+    - direct external bridge smoke:
+      - `python D:\bb\FinGenius\bridge\fg_explain_candidate.py <request_json> <output_json>`
+      - observed:
+        - bridge now runs successfully with BOM request input
+        - output text includes real-tool wording such as `FinGenius 热点资金侧显示`
+        - current same-machine environment can reach real chip / capital tool output without requiring a separate upstream venv
+- Notes:
+  - The current machine still only has Python `3.10`, while upstream recommends `3.11-3.13`.
+  - So this is a pragmatic “real tool first” single-stock bridge, not the full upstream multi-agent / LLM research path.
+  - For the user’s current target, this is enough to support:
+    - single-stock real explanation now
+    - later batch orchestration on the same 8-field bridge contract
+    - future switch to dedicated `FinGenius` Python env via `--fg-python-executable` without changing current repo orchestration
+
+## 2026-05-02 (shortline report market metrics display)
+
+- Scope: finish the shortline replay readability follow-up by adding human-readable market metrics into the final Markdown report, without changing the raw JSON payload semantics.
+- Changes:
+  - Updated [`src/shortline_hub/report_builder.py`](d:\bb\daily_stock_analysis\src\shortline_hub\report_builder.py)
+    - normalized the report builder text structure into a clean UTF-8 version
+    - added market metric rendering in each candidate detail block:
+      - `price`
+      - `change_pct`
+      - `change_pct_60d`
+      - `amount`
+      - `turnover_rate`
+      - `volume_ratio`
+    - added lightweight amount formatting for readability:
+      - `>= 1e8` -> `xx.xx亿`
+      - `>= 1e4` -> `xx.xx万`
+      - otherwise keep the raw number display
+    - kept raw JSON outputs unchanged; only Markdown presentation changed
+  - Updated regression coverage:
+    - [`tests/test_shortline_hub_orchestrator.py`](d:\bb\daily_stock_analysis\tests\test_shortline_hub_orchestrator.py)
+      - added report assertion covering `60日涨幅` and formatted `成交额`
+- Verification:
+  - Red:
+    - `python -m pytest tests/test_shortline_hub_orchestrator.py -k extended_market_metrics -q`
+      - first failed because the report did not render `60日涨幅` / `成交额`
+  - Green:
+    - `python -m pytest tests/test_shortline_hub_orchestrator.py -q`
+      - result: `6 passed`
+    - `python -m pytest tests/test_shortline_hub_cli.py tests/test_shortline_bridge_templates.py tests/test_wondertrader_real_engine.py tests/test_shortline_hub_orchestrator.py -q`
+      - result: `26 passed`
+    - end-to-end real process smoke:
+      - [`data/manual_runs/shortline_real_engine_process_v6_20260503`](d:\bb\daily_stock_analysis\data\manual_runs\shortline_real_engine_process_v6_20260503)
+      - [`shortline_report.md`](d:\bb\daily_stock_analysis\data\manual_runs\shortline_real_engine_process_v6_20260503\shortline_report.md)
+      - observed: each candidate detail now includes formatted market metrics such as `60日涨幅` and `成交额`
+
+## 2026-05-02 (shortline real engine metrics propagation + missing volume flag)
+
+- Scope: finish the real WonderTrader candidate enrichment chain so the process-mode output is truthful about missing volume data and can retain backfilled market metrics end-to-end.
+- Changes:
+  - Updated [`src/shortline_hub/wondertrader_real_engine.py`](d:\bb\daily_stock_analysis\src\shortline_hub\wondertrader_real_engine.py)
+    - added history-side helpers for `change_pct_60d` backfill and `missing_volume_history` detection
+    - when recent history `volume` is all zero but `amount` still exists, candidates now keep `volume_ratio=0.0` and explicitly append `missing_volume_history` instead of pretending volume confirmation exists
+    - real-engine candidates now backfill:
+      - `amount` from latest history row
+      - `change_pct_60d` from 60-bar history change when snapshot cache is empty
+  - Updated shortline aggregation chain:
+    - [`src/shortline_hub/schemas.py`](d:\bb\daily_stock_analysis\src\shortline_hub\schemas.py)
+    - [`src/shortline_hub/adapters/wondertrader_adapter.py`](d:\bb\daily_stock_analysis\src\shortline_hub\adapters\wondertrader_adapter.py)
+    - [`src/shortline_hub/orchestrator.py`](d:\bb\daily_stock_analysis\src\shortline_hub\orchestrator.py)
+    - process-mode candidates / combined results now preserve `price`, `change_pct`, `change_pct_60d`, `amount`, `volume_ratio`, `turnover_rate`
+  - Updated WonderTrader bridge passthrough:
+    - [`scripts/bridges/shortline_wondertrader_bridge_template.py`](d:\bb\daily_stock_analysis\scripts\bridges\shortline_wondertrader_bridge_template.py)
+    - `D:\bb\WonderTrader\bridge\wt_export_candidates.py`
+    - bridge normalization and repo spot-cache fallback now both preserve `change_pct_60d` and `amount`
+  - Updated regression coverage:
+    - [`tests/test_wondertrader_real_engine.py`](d:\bb\daily_stock_analysis\tests\test_wondertrader_real_engine.py)
+    - [`tests/test_shortline_hub_orchestrator.py`](d:\bb\daily_stock_analysis\tests\test_shortline_hub_orchestrator.py)
+    - [`tests/test_shortline_bridge_templates.py`](d:\bb\daily_stock_analysis\tests\test_shortline_bridge_templates.py)
+- Verification:
+  - Red:
+    - `python -m pytest tests/test_wondertrader_real_engine.py -q`
+      - first failed on missing `amount` in exported real-engine candidate rows
+    - `python -m pytest tests/test_shortline_hub_orchestrator.py -q`
+      - then failed because `ShortlineCandidate` / `ShortlineCombinedResult` did not preserve `change_pct_60d` and `amount`
+    - `python -m pytest tests/test_shortline_bridge_templates.py -k real_engine_helper -q`
+      - then failed because the WonderTrader bridge template dropped `change_pct_60d`
+  - Green:
+    - `python -m pytest tests/test_wondertrader_real_engine.py tests/test_shortline_bridge_templates.py tests/test_shortline_bridge_check.py tests/test_shortline_hub_cli.py tests/test_shortline_bridge_data_compare.py tests/test_shortline_hub_orchestrator.py -q`
+      - result: `31 passed`
+    - end-to-end real process smoke:
+      - [`data/manual_runs/shortline_real_engine_process_v5_20260503`](d:\bb\daily_stock_analysis\data\manual_runs\shortline_real_engine_process_v5_20260503)
+      - [`shortline_combined_results.json`](d:\bb\daily_stock_analysis\data\manual_runs\shortline_real_engine_process_v5_20260503\shortline_combined_results.json)
+      - [`run_summary.json`](d:\bb\daily_stock_analysis\data\manual_runs\shortline_real_engine_process_v5_20260503\run_summary.json)
+      - observed:
+        - `scan_source_counts={"wondertrader_real_engine": 3}`
+        - `risk_flag_counts={"history_asof_2026-04-30": 3, "missing_volume_history": 3}`
+        - combined results now carry non-zero `price`, non-zero `change_pct_60d`, and non-zero `amount`
+- Notes:
+  - the current data limitation is upstream history quality, not the signal engine itself:
+    - sampled real history rows still contain `volume=0.0`
+    - but `amount` is available, so the system now marks the volume metric as unavailable rather than fabricating confirmation
+  - this makes the shortline output more honest for daily replay:
+    - usable `price`
+    - usable `amount`
+    - usable `change_pct_60d`
+    - explicit `missing_volume_history` when true volume expansion cannot be trusted
+
+## 2026-05-02 (shortline real engine rule refinement + stock price fallback)
+
+- Scope: continue the real WonderTrader bridge upgrade by handling two follow-ups:
+  - make the real-engine signal logic closer to WonderTrader stock breakout rules
+  - fix `price/latest snapshot` enrichment so real-engine candidates no longer degrade to `price=0.0`
+- Investigation:
+  - probed WonderTrader `ET_SEL` on stock backtest with minimal scripts
+  - result: even an almost-empty `SEL` stock strategy could reproduce a native access violation during `run_backtest`
+  - conclusion: current same-machine stock path should stay on the already-verified `ET_CTA` stock backtest route instead of forcing `ET_SEL`
+- Changes:
+  - Updated [`src/shortline_hub/wondertrader_real_engine.py`](d:\bb\daily_stock_analysis\src\shortline_hub\wondertrader_real_engine.py)
+    - kept the proven real stock `CTA` backtest path
+    - refined `compute_shortline_signal_from_history_rows(...)`
+      - added `dual_thrust_breakout` as a WonderTrader-style dynamic upper-bound breakout branch
+      - kept classic `momentum_breakout` for prior 20-day high breakouts, avoiding rule collision
+    - added numeric fallback helpers so candidate enrichment no longer treats `0.0` as automatically valid for:
+      - `price`
+      - `pct_change`
+      - `volume_ratio`
+    - candidate `price` now falls back to engine signal close / latest history close when the prefilter snapshot price is missing or zero
+  - Updated regression coverage:
+    - [`tests/test_wondertrader_real_engine.py`](d:\bb\daily_stock_analysis\tests\test_wondertrader_real_engine.py)
+      - added `dual_thrust_breakout` case
+      - added export test covering `price` fallback under the real-engine helper path
+- Verification:
+  - Red:
+    - `python -m pytest tests/test_wondertrader_real_engine.py -k sel_engine_and_price_fallback -q`
+      - first failed because the helper had been switched to `ET_SEL`, while the minimal fake import surface still reflected the prior `CTA` path
+    - native probe:
+      - minimal `ET_SEL + stock + extended loader` scripts in `D:\bb\WonderTrader\wtpy\demos\cta_stk_bt`
+      - result: reproducible access violation during `run_backtest`
+  - Green:
+    - `python -m py_compile src/shortline_hub/wondertrader_real_engine.py tests/test_wondertrader_real_engine.py scripts/bridges/shortline_wondertrader_bridge_template.py`
+      - result: passed
+    - `python -m pytest tests/test_wondertrader_real_engine.py tests/test_shortline_bridge_templates.py tests/test_shortline_bridge_check.py tests/test_shortline_hub_cli.py tests/test_shortline_bridge_data_compare.py -q`
+      - result: `25 passed`
+    - direct bridge smoke:
+      - `trade_date=2026-05-03`, `top_n=3`
+      - observed:
+        - `scan_sources=['wondertrader_real_engine']`
+        - `symbols=['300632', '688531', '688256']`
+        - `prices=[24.47, 120.6, 1699.96]`
+        - compared with previous run, `price` is no longer `0.0`
+    - end-to-end process smoke:
+      - [`data/manual_runs/shortline_real_engine_process_v2_20260503`](d:\bb\daily_stock_analysis\data\manual_runs\shortline_real_engine_process_v2_20260503)
+      - [`run_summary.json`](d:\bb\daily_stock_analysis\data\manual_runs\shortline_real_engine_process_v2_20260503\run_summary.json)
+      - result: `scan_source_counts={"wondertrader_real_engine": 3}`
+- Notes:
+  - the feasible production path today is:
+    - real WonderTrader stock `CTA` backtest
+    - repo history cache via extended loader
+    - WonderTrader-style breakout rule refinement
+    - snapshot field fallback on top
+  - `ET_SEL` remains a future option only if the upstream stock path can be proven stable in this environment
+
+## 2026-05-02 (shortline WonderTrader real engine bridge wiring)
+
+- Scope: replace the previous cache-first WonderTrader fallback path in `shortline_hub --mode process` with a real-engine-aware bridge order, while still preserving local `bridge_data` manual override and safe fallback behavior.
+- Changes:
+  - Added real engine helper module:
+    - [`src/shortline_hub/wondertrader_real_engine.py`](d:\bb\daily_stock_analysis\src\shortline_hub\wondertrader_real_engine.py)
+      - uses `wtpy` real `WtBtEngine`
+      - loads repo daily history through WonderTrader `BaseExtDataLoader`
+      - converts repo A-share history csv into `WTSBarStruct`
+      - prefilters candidates from `kline_selector_spot_universe.csv`
+      - emits `scan_source=wondertrader_real_engine`
+      - marks stale-history cases with `history_asof_<date>` in `risk_flags`
+  - Updated WonderTrader bridge priority:
+    - [`scripts/bridges/shortline_wondertrader_bridge_template.py`](d:\bb\daily_stock_analysis\scripts\bridges\shortline_wondertrader_bridge_template.py)
+    - `D:\bb\WonderTrader\bridge\wt_export_candidates.py`
+      - new order is now:
+        1. local `bridge_data`
+        2. repo real engine helper
+        3. repo `spot cache`
+        4. placeholder fallback
+      - bridge now tries to import `src.shortline_hub.wondertrader_real_engine` from the sibling `daily_stock_analysis` repo automatically
+  - Added regression coverage:
+    - [`tests/test_wondertrader_real_engine.py`](d:\bb\daily_stock_analysis\tests\test_wondertrader_real_engine.py)
+    - [`tests/test_shortline_bridge_templates.py`](d:\bb\daily_stock_analysis\tests\test_shortline_bridge_templates.py)
+      - new test covers: when repo helper exists, bridge template prefers `wondertrader_real_engine` over `spot cache`
+- Verification:
+  - Red:
+    - `python -m pytest tests/test_shortline_bridge_templates.py -k real_engine_helper -q`
+      - first failed because the bridge still returned cache/placeholder-style output instead of the injected real-engine helper result
+  - Green:
+    - `python -m py_compile src/shortline_hub/wondertrader_real_engine.py scripts/bridges/shortline_wondertrader_bridge_template.py tests/test_shortline_bridge_templates.py`
+      - result: passed
+    - `python -m pytest tests/test_wondertrader_real_engine.py tests/test_shortline_bridge_templates.py tests/test_shortline_bridge_check.py tests/test_shortline_hub_cli.py tests/test_shortline_bridge_data_compare.py -q`
+      - result: `23 passed`
+    - direct WonderTrader bridge smoke without same-date `bridge_data`:
+      - request: `trade_date=2026-05-03`, `top_n=3`
+      - observed:
+        - output count: `3`
+        - `scan_sources=['wondertrader_real_engine']`
+        - sample symbols: `300632, 688531, 688256`
+        - all rows carry `history_asof_2026-04-30`
+    - end-to-end process smoke:
+      - `python scripts/run_shortline_hub.py --mode process --trade-date 2026-05-03 --top-n 3 --run-id shortline_real_engine_process_20260503 --output-dir data/manual_runs/shortline_real_engine_process_20260503 --wt-python-executable python --wt-script-path D:\bb\WonderTrader\bridge\wt_export_candidates.py --wt-workdir D:\bb\WonderTrader --wt-runtime-dir data/runtime/shortline_hub/wondertrader_real_engine_process --fg-python-executable python --fg-script-path D:\bb\FinGenius\bridge\fg_explain_candidate.py --fg-workdir D:\bb\FinGenius --fg-runtime-dir data/runtime/shortline_hub/fingenius_real_engine_process`
+      - result: exit code `0`
+      - observed `run_summary.json` shows `scan_source_counts={"wondertrader_real_engine": 3}`
+- Notes:
+  - real engine is now actually reachable from the same-machine shortline flow
+  - but the current engine still depends on repo history cache freshness; if history lags the requested trade date, output will explicitly surface `history_asof_<date>` instead of pretending the signal is same-day fresh
+
+## 2026-05-02 (shortline bridge_data sample seeding + compare workflow)
+
+- Scope: add a small same-machine workflow for comparing “date-specific external `bridge_data` sample mode” against “no-sample fallback mode”, so the current shortline stack can show the practical difference between semi-real export input and cache/heuristic fallback.
+- Changes:
+  - Added compare script:
+    - [`scripts/run_shortline_bridge_data_compare.py`](d:\bb\daily_stock_analysis\scripts\run_shortline_bridge_data_compare.py)
+      - can optionally seed a date-specific `bridge_data` sample into:
+        - `D:\bb\WonderTrader\bridge\bridge_data\wt_candidates_<trade_date>.json`
+        - `D:\bb\FinGenius\bridge\bridge_data\fg_explanations_<trade_date>.json`
+      - runs one `process mode` shortline job against the seeded date
+      - runs a second `process mode` shortline job against a fallback date without local sample files
+      - writes:
+        - `bridge_data_run/`
+        - `fallback_run/`
+        - `compare_summary.json`
+        - `compare_report.md`
+  - Added regression coverage:
+    - [`tests/test_shortline_bridge_data_compare.py`](d:\bb\daily_stock_analysis\tests\test_shortline_bridge_data_compare.py)
+      - covers seeding sample data into temp external bridge dirs
+      - covers bridge-data run vs fallback run summary generation
+  - Updated usage docs:
+    - [`scripts/bridges/README.md`](d:\bb\daily_stock_analysis\scripts\bridges\README.md)
+    - [`docs/architecture/2026-05-02-shortline-hub-single-machine-setup.md`](d:\bb\daily_stock_analysis\docs\architecture\2026-05-02-shortline-hub-single-machine-setup.md)
+      - both now include a concrete compare command example
+- Verification:
+  - Red:
+    - `python -m pytest tests/test_shortline_bridge_data_compare.py -v`
+      - first would have failed because `scripts/run_shortline_bridge_data_compare.py` did not exist
+  - Green:
+    - `python -m py_compile scripts/run_shortline_bridge_data_compare.py`
+      - result: passed
+    - `python -m pytest tests/test_shortline_bridge_data_compare.py -v`
+      - result: `1 passed`
+    - `python scripts/run_shortline_bridge_data_compare.py --bridge-data-trade-date 2026-05-04 --fallback-trade-date 2026-05-03 --top-n 2 --seed-sample-data --output-dir data/manual_runs/shortline_bridge_data_compare_demo_20260502 --run-id-prefix shortline_compare_demo --wt-python-executable python --wt-script-path D:\bb\WonderTrader\bridge\wt_export_candidates.py --wt-workdir D:\bb\WonderTrader --wt-runtime-dir data/runtime/shortline_bridge_compare/wt_demo --fg-python-executable python --fg-script-path D:\bb\FinGenius\bridge\fg_explain_candidate.py --fg-workdir D:\bb\FinGenius --fg-runtime-dir data/runtime/shortline_bridge_compare/fg_demo`
+      - result: exit code `0`
+      - observed `compare_summary.json` shows:
+        - seeded run uses `wondertrader_export`
+        - fallback run uses `wondertrader_cache_scan`
+        - symbol sets are separated clearly in the diff block
+- Notes:
+  - This compare workflow is still a demo/verification layer, not a production research backtest.
+  - But it gives the current same-machine stack a much clearer way to prove whether external sample exports are actually being consumed, instead of relying on guesswork.
+
+## 2026-05-02 (shortline report readability + bridge_data freshness warning + setup_tag second refinement)
+
+- Scope: close the current shortline polishing round by making the final report easier to review, making bridge-data freshness visible, and refining the WonderTrader setup tags one step further without redesigning the bridge contract.
+- Changes:
+  - Updated report/output path:
+    - [`src/shortline_hub/schemas.py`](d:\bb\daily_stock_analysis\src\shortline_hub\schemas.py)
+      - `shortline_combined_results.json` now keeps `risk_flags`
+      - `run_summary.json` now also records `scan_source_counts / setup_tag_counts / risk_flag_counts`
+    - [`src/shortline_hub/orchestrator.py`](d:\bb\daily_stock_analysis\src\shortline_hub\orchestrator.py)
+      - now forwards candidate-side `risk_flags` into combined artifacts
+    - [`src/shortline_hub/report_builder.py`](d:\bb\daily_stock_analysis\src\shortline_hub\report_builder.py)
+      - rewrote the markdown report into a more review-facing layout:
+        - `结果概览`
+        - `复盘关注点`
+        - `候选表`
+        - `逐票说明`
+      - report now surfaces candidate source mix, board/setup/risk distribution, per-candidate review summaries, and direct tracking guidance
+  - Updated bridge freshness inspection:
+    - [`src/shortline_hub/bridge_check.py`](d:\bb\daily_stock_analysis\src\shortline_hub\bridge_check.py)
+      - now records `data_freshness_status / data_file_modified_at / data_file_age_days`
+      - local `bridge_data` older than 3 days is now marked as `stale`
+      - overall status remains `warning` instead of `failed` for stale or missing local export files
+  - Updated WonderTrader setup-tag rules:
+    - [`scripts/bridges/shortline_wondertrader_bridge_template.py`](d:\bb\daily_stock_analysis\scripts\bridges\shortline_wondertrader_bridge_template.py)
+    - `D:\bb\WonderTrader\bridge\wt_export_candidates.py`
+      - refined limit-up continuation wording into:
+        - `涨停后高换手分歧`
+        - `涨停后分歧承接`
+      - refined breakout / turnover / fallback wording into:
+        - `强势放量抢筹`
+        - `高换手爆量博弈`
+        - `板块核心跟涨`
+      - aligned placeholder fallback labels to the newer review-facing wording
+  - Updated bridge usage doc:
+    - [`scripts/bridges/README.md`](d:\bb\daily_stock_analysis\scripts\bridges\README.md)
+      - sample `setup_tag` now uses the new wording
+      - added the 3-day `bridge_data` freshness warning rule
+- Verification:
+  - Red:
+    - `python -m pytest tests/test_shortline_hub_orchestrator.py -k report_builder_renders_markdown_summary -v`
+      - first failed because the old report had no `结果概览 / 复盘关注点 / 逐票说明`
+    - `python -m pytest tests/test_shortline_bridge_templates.py -k high_turnover_explosive_push -v`
+      - first failed because the old WonderTrader setup tag still returned `高换手博弈`
+    - `python -m pytest tests/test_shortline_bridge_check.py -k stale_bridge_data_warning -v`
+      - first failed because stale local export files were still reported as `passed`
+  - Green:
+    - `python -m py_compile src/shortline_hub/schemas.py src/shortline_hub/orchestrator.py src/shortline_hub/report_builder.py src/shortline_hub/bridge_check.py scripts/bridges/shortline_wondertrader_bridge_template.py scripts/bridges/shortline_fingenius_bridge_template.py scripts/check_shortline_bridge_setup.py D:\bb\WonderTrader\bridge\wt_export_candidates.py D:\bb\FinGenius\bridge\fg_explain_candidate.py`
+      - result: passed
+    - `python -m pytest tests/test_shortline_bridge_templates.py tests/test_shortline_hub_orchestrator.py tests/test_shortline_bridge_check.py tests/test_shortline_hub_cli.py tests/test_shortline_hub_workdir_runtime.py -v`
+      - result: `21 passed`
+    - `python scripts/run_shortline_hub.py --mode process --trade-date 2026-05-03 --top-n 3 --run-id shortline_report_readability_v3 --output-dir data/manual_runs/shortline_report_readability_v3_20260503 --wt-python-executable python --wt-script-path D:\bb\WonderTrader\bridge\wt_export_candidates.py --wt-workdir D:\bb\WonderTrader --wt-runtime-dir data/runtime/shortline_hub/wondertrader_report_v3 --fg-python-executable python --fg-script-path D:\bb\FinGenius\bridge\fg_explain_candidate.py --fg-workdir D:\bb\FinGenius --fg-runtime-dir data/runtime/shortline_hub/fingenius_report_v3`
+      - result: exit code `0`
+      - observed report now contains `结果概览 / 复盘关注点 / 逐票说明`
+    - `python scripts/check_shortline_bridge_setup.py --trade-date 2026-05-03 --run-script-smoke --run-orchestrator-smoke --output-dir data/manual_runs/shortline_bridge_check_freshness_20260503`
+      - result: exit code `0`, `overall_status=warning`
+      - interpretation: both bridges and end-to-end orchestration passed; `warning` only reflects missing same-date local `bridge_data`
+- Notes:
+  - This round still keeps `shortline_hub` as a same-machine orchestration layer plus heuristic explanation layer.
+  - But the final artifacts are now much closer to “daily review output” instead of raw field dumps, and bridge freshness is no longer opaque.
+
+## 2026-05-02 (shortline setup_tag refined into more review-facing shortline patterns)
+
+- Scope: refine the initial `setup_tag` labels so they read closer to real shortline review language instead of staying at a too-generic first pass.
+- Changes:
+  - Updated WonderTrader setup-tag rules:
+    - [`scripts/bridges/shortline_wondertrader_bridge_template.py`](d:\bb\daily_stock_analysis\scripts\bridges\shortline_wondertrader_bridge_template.py)
+    - `D:\bb\WonderTrader\bridge\wt_export_candidates.py`
+      - refined `limit_up_momentum` from the coarse `涨停强加` into:
+        - `涨停高换手`
+        - `涨停强势延续`
+      - refined `momentum_breakout` into:
+        - `放量突破`
+        - `强势突破跟进`
+      - refined `active_turnover_push` into:
+        - `高换手博弈`
+        - `活跃换手拉升`
+        - `活跃换手推进`
+      - refined weak-end fallback into:
+        - `板块跟涨`
+        - `相对强势整理`
+    - Updated stub-side seed labels in:
+      - [`src/shortline_hub/adapters/wondertrader_adapter.py`](d:\bb\daily_stock_analysis\src\shortline_hub\adapters\wondertrader_adapter.py)
+  - Added/updated regression coverage:
+    - [`tests/test_shortline_bridge_templates.py`](d:\bb\daily_stock_analysis\tests\test_shortline_bridge_templates.py)
+      - repo spot-cache fallback test now expects `涨停强势延续` for a non-high-turnover limit-up sample and `放量突破` for the next ranked momentum-breakout sample
+      - added a dedicated `active_turnover_push -> 活跃换手拉升` cache-scan test
+      - existing FinGenius board-context test now also requires the setup tag to appear in explanation text
+- Verification:
+  - Red:
+    - `python -m pytest tests/test_shortline_bridge_templates.py -k uses_repo_spot_cache_when_no_bridge_data -v`
+      - first failed because the old output still returned the coarse setup tag
+    - `python -m pytest tests/test_shortline_bridge_templates.py -k labels_active_turnover_push_from_repo_spot_cache -v`
+      - first failed on the expected refined label before the new rule path was locked
+  - Green:
+    - `python -m py_compile src/shortline_hub/adapters/wondertrader_adapter.py scripts/bridges/shortline_wondertrader_bridge_template.py D:\bb\WonderTrader\bridge\wt_export_candidates.py`
+      - result: passed
+    - `python -m pytest tests/test_shortline_bridge_templates.py tests/test_shortline_hub_orchestrator.py tests/test_shortline_bridge_check.py tests/test_shortline_hub_cli.py tests/test_shortline_hub_workdir_runtime.py -v`
+      - result: `19 passed`
+    - `python scripts/run_shortline_hub.py --mode process --trade-date 2026-05-03 --top-n 3 --run-id shortline_cache_scan_with_setup_tags_v2 --output-dir data/manual_runs/shortline_cache_scan_with_setup_tags_v2_20260503 --wt-python-executable python --wt-script-path D:\bb\WonderTrader\bridge\wt_export_candidates.py --wt-workdir D:\bb\WonderTrader --wt-runtime-dir data/runtime/shortline_hub/wondertrader_setup_tags_v2 --fg-python-executable python --fg-script-path D:\bb\FinGenius\bridge\fg_explain_candidate.py --fg-workdir D:\bb\FinGenius --fg-runtime-dir data/runtime/shortline_hub/fingenius_setup_tags_v2`
+      - result: exit code `0`
+      - observed cache-scan candidates now show refined labels such as `涨停高换手`
+- Notes:
+  - This remains a lightweight ruleset, but the labels are now much closer to daily shortline review phrasing.
+  - The current same-machine report and FinGenius heuristic explanation therefore read more like a trader-facing summary and less like a raw trigger dump.
+
+## 2026-05-02 (shortline setup_tag classification flows from WonderTrader into report and FinGenius)
+
+- Scope: add a lightweight shortline setup classification layer on top of WonderTrader candidates, so the current same-machine stack can distinguish raw `trigger_type` from more readable review-facing setup tags such as breakout / limit-up continuation / turnover-driven push.
+- Changes:
+  - Updated repo-side candidate/report path:
+    - [`src/shortline_hub/schemas.py`](d:\bb\daily_stock_analysis\src\shortline_hub\schemas.py)
+      - added optional candidate field `setup_tag`
+      - added `setup_tag` into combined result payload
+    - [`src/shortline_hub/adapters/wondertrader_adapter.py`](d:\bb\daily_stock_analysis\src\shortline_hub\adapters\wondertrader_adapter.py)
+      - rewrote the adapter into clean UTF-8-safe source
+      - stub candidates now carry readable setup tags
+      - process adapter now reads optional `setup_tag` from external WonderTrader payload
+    - [`src/shortline_hub/orchestrator.py`](d:\bb\daily_stock_analysis\src\shortline_hub\orchestrator.py)
+      - now forwards `setup_tag` into combined artifacts
+    - [`src/shortline_hub/report_builder.py`](d:\bb\daily_stock_analysis\src\shortline_hub\report_builder.py)
+      - report table now renders a `setup_tag` column directly
+  - Updated WonderTrader bridges:
+    - [`scripts/bridges/shortline_wondertrader_bridge_template.py`](d:\bb\daily_stock_analysis\scripts\bridges\shortline_wondertrader_bridge_template.py)
+    - `D:\bb\WonderTrader\bridge\wt_export_candidates.py`
+      - local export payloads can now carry optional `setup_tag`
+      - repo spot-cache fallback now auto-derives readable setup tags from `trigger_type / change_pct / turnover_rate / volume_ratio`
+      - current classification is intentionally lightweight:
+        - `limit_up_momentum -> 涨停强加`
+        - `momentum_breakout -> 放量突破 / 强势突破`
+        - `active_turnover_push -> 高换手博弈 / 活跃换手推进`
+        - `strong_relative_strength -> 板块跟涨 / 相对强势`
+  - Updated FinGenius bridges:
+    - [`scripts/bridges/shortline_fingenius_bridge_template.py`](d:\bb\daily_stock_analysis\scripts\bridges\shortline_fingenius_bridge_template.py)
+    - `D:\bb\FinGenius\bridge\fg_explain_candidate.py`
+      - heuristic explanation now reads optional `setup_tag`
+      - when present, it is injected into `hot_money_summary` and `short_term_view`
+  - Updated protocol doc:
+    - [`scripts/bridges/README.md`](d:\bb\daily_stock_analysis\scripts\bridges\README.md)
+      - sample WonderTrader candidate payload now includes optional `setup_tag`
+  - Added regression coverage:
+    - [`tests/test_shortline_bridge_templates.py`](d:\bb\daily_stock_analysis\tests\test_shortline_bridge_templates.py)
+      - repo spot-cache fallback test now asserts `setup_tag`
+      - board-aware FinGenius explanation test now also asserts the setup tag is used in explanation text
+    - [`tests/test_shortline_hub_orchestrator.py`](d:\bb\daily_stock_analysis\tests\test_shortline_hub_orchestrator.py)
+      - report markdown test now asserts the `setup_tag` column is rendered
+- Verification:
+  - Red:
+    - `python -m pytest tests/test_shortline_bridge_templates.py -k uses_repo_spot_cache_when_no_bridge_data -v`
+      - first failed because WonderTrader candidate payload had no `setup_tag`
+    - `python -m pytest tests/test_shortline_hub_orchestrator.py -k report_builder_renders_markdown_summary -v`
+      - first failed because the markdown report had no `setup_tag` column
+    - `python -m pytest tests/test_shortline_bridge_templates.py -k uses_board_name_in_short_term_view -v`
+      - after adding `setup_tag` to test input, failed again because FinGenius explanation still ignored it
+  - Green:
+    - `python -m py_compile src/shortline_hub/schemas.py src/shortline_hub/orchestrator.py src/shortline_hub/report_builder.py src/shortline_hub/adapters/wondertrader_adapter.py scripts/bridges/shortline_wondertrader_bridge_template.py D:\bb\WonderTrader\bridge\wt_export_candidates.py scripts/bridges/shortline_fingenius_bridge_template.py D:\bb\FinGenius\bridge\fg_explain_candidate.py`
+      - result: passed
+    - `python -m pytest tests/test_shortline_bridge_templates.py tests/test_shortline_hub_orchestrator.py tests/test_shortline_bridge_check.py tests/test_shortline_hub_cli.py tests/test_shortline_hub_workdir_runtime.py -v`
+      - result: `18 passed`
+    - `python scripts/run_shortline_hub.py --mode process --trade-date 2026-05-03 --top-n 3 --run-id shortline_cache_scan_with_setup_tags --output-dir data/manual_runs/shortline_cache_scan_with_setup_tags_20260503 --wt-python-executable python --wt-script-path D:\bb\WonderTrader\bridge\wt_export_candidates.py --wt-workdir D:\bb\WonderTrader --wt-runtime-dir data/runtime/shortline_hub/wondertrader_setup_tags --fg-python-executable python --fg-script-path D:\bb\FinGenius\bridge\fg_explain_candidate.py --fg-workdir D:\bb\FinGenius --fg-runtime-dir data/runtime/shortline_hub/fingenius_setup_tags`
+      - result: exit code `0`
+      - observed candidate/report artifacts now show `setup_tag`, and explanation text also uses the setup label
+    - `python scripts/check_shortline_bridge_setup.py --trade-date 2026-05-03 --run-script-smoke --run-orchestrator-smoke --output-dir data/manual_runs/shortline_bridge_check_setup_tags_20260503`
+      - result: exit code `0`, `overall_status=warning`
+      - interpretation: bridge self-check and orchestrator smoke passed; warning still only means no matching local `bridge_data` files for that date
+- Notes:
+  - This is still a lightweight review-facing setup taxonomy, not a full native WonderTrader strategy ontology.
+  - But it gives the current single-machine stack a clearer intermediate layer between low-level trigger fields and human-readable shortline explanation.
+
+## 2026-05-02 (FinGenius heuristic explanation uses real board context in short-term view)
+
+- Scope: tighten the shortline FinGenius fallback explanation so real `board_name` / industry context is not only mentioned in sentiment commentary, but also flows into the actual short-term judgment text.
+- Changes:
+  - Updated repo template:
+    - [`scripts/bridges/shortline_fingenius_bridge_template.py`](d:\bb\daily_stock_analysis\scripts\bridges\shortline_fingenius_bridge_template.py)
+      - rewrote the bridge file into clean UTF-8-safe source
+      - keeps `bridge_data` explanation files as first priority
+      - when no local explanation exists, now distinguishes generic board names from real board names
+      - injects real `board_name` into `hot_money_summary / big_deal_summary / chip_commentary / risk_commentary / short_term_view`
+      - especially upgrades `short_term_view` from generic trigger-only phrasing to `board direction first, trigger follow-through second`
+  - Synced the same behavior into the external bridge:
+    - `D:\bb\FinGenius\bridge\fg_explain_candidate.py`
+      - same clean rewrite
+      - same board-aware heuristic explanation path
+  - Added regression coverage:
+    - [`tests/test_shortline_bridge_templates.py`](d:\bb\daily_stock_analysis\tests\test_shortline_bridge_templates.py)
+      - added a test that requires a real `board_name` to appear in `short_term_view`
+- Verification:
+  - Red:
+    - `python -m pytest tests/test_shortline_bridge_templates.py -k uses_board_name_in_short_term_view -v`
+      - first failed because `short_term_view` still only described trigger continuation and did not mention the board context
+  - Green:
+    - `python -m py_compile scripts/bridges/shortline_fingenius_bridge_template.py D:\bb\FinGenius\bridge\fg_explain_candidate.py`
+      - result: passed
+    - `python -m pytest tests/test_shortline_bridge_templates.py -k uses_board_name_in_short_term_view -v`
+      - result: `1 passed`
+    - `python -m pytest tests/test_shortline_bridge_templates.py tests/test_shortline_bridge_check.py tests/test_shortline_hub_orchestrator.py tests/test_shortline_hub_cli.py tests/test_shortline_hub_workdir_runtime.py -v`
+      - result: `18 passed`
+    - `python scripts/run_shortline_hub.py --mode process --trade-date 2026-05-03 --top-n 3 --run-id shortline_cache_scan_with_fg_board_context --output-dir data/manual_runs/shortline_cache_scan_with_fg_board_context_20260503 --wt-python-executable python --wt-script-path D:\bb\WonderTrader\bridge\wt_export_candidates.py --wt-workdir D:\bb\WonderTrader --wt-runtime-dir data/runtime/shortline_hub/wondertrader_cache_scan3 --fg-python-executable python --fg-script-path D:\bb\FinGenius\bridge\fg_explain_candidate.py --fg-workdir D:\bb\FinGenius --fg-runtime-dir data/runtime/shortline_hub/fingenius_board_context`
+      - result: exit code `0`
+      - observed explanation artifacts now place the real board direction directly into `short_term_view`
+- Notes:
+  - This is still a heuristic explanation layer, not true FinGenius native capital/seat reasoning.
+  - But with the earlier WonderTrader industry backfill in place, the fallback explanation is now much closer to a usable same-machine shortline review output.
+
+## 2026-05-02 (WonderTrader cache-scan board_name uses stock-basic industry fallback)
+
+- Scope: improve the shortline WonderTrader cache-scan fallback so candidate `board_name` is no longer stuck at generic `spot_cache` when the spot universe lacks industry fields.
+- Changes:
+  - Updated repo template:
+    - [`scripts/bridges/shortline_wondertrader_bridge_template.py`](d:\bb\daily_stock_analysis\scripts\bridges\shortline_wondertrader_bridge_template.py)
+      - now loads `data/cache/reference/tushare_stock_basic_list.csv`
+      - resolves `board_name` in this order: spot-row `industry` / `board_name` -> stock-basic `industry` map -> `spot_cache`
+      - rewrote the bridge file into clean UTF-8-safe source to remove broken encoded field-name fragments that could break script execution
+  - Synced the same behavior into the external bridge:
+    - `D:\bb\WonderTrader\bridge\wt_export_candidates.py`
+      - same industry fallback order
+      - same cleanup of broken encoded field-name fragments
+  - Added regression coverage:
+    - [`tests/test_shortline_bridge_templates.py`](d:\bb\daily_stock_analysis\tests\test_shortline_bridge_templates.py)
+      - the repo spot-cache fallback test now asserts `board_name` can be backfilled from `tushare_stock_basic_list.csv`
+- Verification:
+  - Red:
+    - `python -m pytest tests/test_shortline_bridge_templates.py -k uses_repo_spot_cache_when_no_bridge_data -v`
+      - first failed because the bridge still returned `board_name=spot_cache`
+  - Green:
+    - `python -m py_compile scripts/bridges/shortline_wondertrader_bridge_template.py D:\bb\WonderTrader\bridge\wt_export_candidates.py`
+      - result: passed
+    - `python -m pytest tests/test_shortline_bridge_templates.py -k uses_repo_spot_cache_when_no_bridge_data -v`
+      - result: `1 passed`
+    - `python -m pytest tests/test_shortline_bridge_templates.py tests/test_shortline_bridge_check.py tests/test_shortline_hub_orchestrator.py tests/test_shortline_hub_cli.py tests/test_shortline_hub_workdir_runtime.py -v`
+      - result: `17 passed`
+    - `python scripts/run_shortline_hub.py --mode process --trade-date 2026-05-03 --top-n 3 --run-id shortline_cache_scan_with_fg_heuristic --output-dir data/manual_runs/shortline_cache_scan_with_fg_heuristic_20260503 --wt-python-executable python --wt-script-path D:\bb\WonderTrader\bridge\wt_export_candidates.py --wt-workdir D:\bb\WonderTrader --wt-runtime-dir data/runtime/shortline_hub/wondertrader_cache_scan2 --fg-python-executable python --fg-script-path D:\bb\FinGenius\bridge\fg_explain_candidate.py --fg-workdir D:\bb\FinGenius --fg-runtime-dir data/runtime/shortline_hub/fingenius_heuristic`
+      - result: exit code `0`
+      - observed candidates now carry real industry-backed `board_name` values instead of generic `spot_cache`
+- Notes:
+  - This is still a fallback path, not true WonderTrader native board/theme tagging.
+  - But for the current same-machine stage, industry-backed `board_name` is materially more useful for downstream FinGenius explanation and manual review.
+
+## 2026-05-02 (FinGenius bridge uses candidate-driven heuristic explanation fallback)
+
+- Scope: replace the FinGenius bridge's pure placeholder fallback with a candidate-driven shortline explanation layer, so the external `fg_explain_candidate.py` can still return useful commentary even before a true FinGenius repo/agent stack is wired in.
+- Changes:
+  - Updated repo template:
+    - [`scripts/bridges/shortline_fingenius_bridge_template.py`](d:\bb\daily_stock_analysis\scripts\bridges\shortline_fingenius_bridge_template.py)
+      - still prefers `bridge_data` explanation files first
+      - when no local explanation exists, now derives commentary from `trigger_type / trigger_score / change_pct / volume_ratio / turnover_rate / board_name / risk_flags`
+      - replaces placeholder-only text with heuristic shortline commentary
+  - Synced the same behavior into the external bridge:
+    - `D:\bb\FinGenius\bridge\fg_explain_candidate.py`
+  - Updated docs:
+    - [`docs/architecture/2026-05-02-shortline-bridge-check.md`](d:\bb\daily_stock_analysis\docs\architecture\2026-05-02-shortline-bridge-check.md)
+    - `D:\bb\FinGenius\bridge\README_shortline_bridge.md`
+  - Added regression coverage:
+    - [`tests/test_shortline_bridge_templates.py`](d:\bb\daily_stock_analysis\tests\test_shortline_bridge_templates.py)
+      - added heuristic explanation fallback test
+- Verification:
+  - Red:
+    - `python -m pytest tests/test_shortline_bridge_templates.py -k "heuristic_explanation" -v`
+      - first failed because the bridge still returned placeholder-only explanation text
+  - Green:
+    - `python -m pytest tests/test_shortline_bridge_templates.py tests/test_shortline_bridge_check.py tests/test_shortline_hub_orchestrator.py tests/test_shortline_hub_cli.py tests/test_shortline_hub_workdir_runtime.py -v`
+      - result: `17 passed`
+    - `python -m py_compile scripts/bridges/shortline_fingenius_bridge_template.py D:\bb\FinGenius\bridge\fg_explain_candidate.py`
+      - result: passed
+    - external FinGenius single-script smoke without matching `bridge_data`:
+      - candidate: `2026-05-03-300083`
+      - result: exit code `0`
+      - observed output contains heuristic hot-money / chip / sentiment / risk commentary
+    - end-to-end process-mode smoke:
+      - `python scripts/run_shortline_hub.py --mode process --trade-date 2026-05-03 --top-n 3 --run-id shortline_cache_scan_with_fg_heuristic --output-dir data/manual_runs/shortline_cache_scan_with_fg_heuristic_20260503 --wt-python-executable python --wt-script-path D:\bb\WonderTrader\bridge\wt_export_candidates.py --wt-workdir D:\bb\WonderTrader --wt-runtime-dir data/runtime/shortline_hub/wondertrader_cache_scan2 --fg-python-executable python --fg-script-path D:\bb\FinGenius\bridge\fg_explain_candidate.py --fg-workdir D:\bb\FinGenius --fg-runtime-dir data/runtime/shortline_hub/fingenius_heuristic`
+      - result: exit code `0`
+      - observed explanation artifacts are no longer placeholder-only text
+    - bridge self-check:
+      - `python scripts/check_shortline_bridge_setup.py --trade-date 2026-05-03 --run-script-smoke --run-orchestrator-smoke --output-dir data/manual_runs/shortline_bridge_check_fg_heuristic_20260503`
+      - result: exit code `0`, `overall_status=warning`
+      - interpretation: smoke passed; warning only means that date has no local `bridge_data` files
+- Notes:
+  - This is still not real FinGenius multi-agent integration.
+  - But the external FinGenius bridge has now moved from placeholder-only fallback to a candidate-driven shortline explanation fallback, which is materially more useful for the current single-machine stage.
+
+## 2026-05-02 (WonderTrader bridge uses repo spot cache for real candidate fallback)
+
+- Scope: replace the WonderTrader bridge's pure placeholder fallback with a real same-machine candidate path, so the external `wt_export_candidates.py` can still export market-derived shortline candidates even before a true WonderTrader repo/engine is wired in.
+- Changes:
+  - Updated repo template:
+    - [`scripts/bridges/shortline_wondertrader_bridge_template.py`](d:\bb\daily_stock_analysis\scripts\bridges\shortline_wondertrader_bridge_template.py)
+      - now discovers sibling `daily_stock_analysis`
+      - reads `data/cache/reference/kline_selector_spot_universe.csv` when `bridge_data` is absent
+      - applies lightweight filters/sorting on `pct_change / turnover_rate / volume_ratio / change_pct_60d / amount`
+      - exports `scan_source=wondertrader_cache_scan`
+  - Synced the same behavior into the external bridge:
+    - `D:\bb\WonderTrader\bridge\wt_export_candidates.py`
+  - Added regression coverage:
+    - [`tests/test_shortline_bridge_templates.py`](d:\bb\daily_stock_analysis\tests\test_shortline_bridge_templates.py)
+      - added repo spot-cache fallback test
+  - Updated doc:
+    - [`docs/architecture/2026-05-02-shortline-bridge-check.md`](d:\bb\daily_stock_analysis\docs\architecture\2026-05-02-shortline-bridge-check.md)
+      - documents the new WonderTrader candidate-source priority
+- Verification:
+  - Red:
+    - `python -m pytest tests/test_shortline_bridge_templates.py -k "repo_spot_cache" -v`
+      - first failed because the bridge still returned placeholder rows
+  - Green:
+    - `python -m pytest tests/test_shortline_bridge_templates.py tests/test_shortline_bridge_check.py tests/test_shortline_hub_orchestrator.py tests/test_shortline_hub_cli.py tests/test_shortline_hub_workdir_runtime.py -v`
+      - result: `16 passed`
+    - `python -m py_compile scripts/bridges/shortline_wondertrader_bridge_template.py D:\bb\WonderTrader\bridge\wt_export_candidates.py`
+      - result: passed
+    - external WonderTrader single-script smoke without matching `bridge_data`:
+      - request: `trade_date=2026-05-03, top_n=3`
+      - result: exit code `0`
+      - observed output uses `scan_source=wondertrader_cache_scan`
+    - end-to-end process-mode smoke:
+      - `python scripts/run_shortline_hub.py --mode process --trade-date 2026-05-03 --top-n 3 --run-id shortline_wt_cache_scan_demo --output-dir data/manual_runs/shortline_wt_cache_scan_demo_20260503 --wt-python-executable python --wt-script-path D:\bb\WonderTrader\bridge\wt_export_candidates.py --wt-workdir D:\bb\WonderTrader --wt-runtime-dir data/runtime/shortline_hub/wondertrader_cache_scan --fg-python-executable python --fg-script-path D:\bb\FinGenius\bridge\fg_explain_candidate.py --fg-workdir D:\bb\FinGenius --fg-runtime-dir data/runtime/shortline_hub/fingenius_cache_scan`
+      - result: exit code `0`
+      - observed candidate artifacts use `scan_source=wondertrader_cache_scan`
+    - bridge self-check on a date without local `bridge_data`:
+      - `python scripts/check_shortline_bridge_setup.py --trade-date 2026-05-03 --run-script-smoke --run-orchestrator-smoke --output-dir data/manual_runs/shortline_bridge_check_cache_scan_20260503`
+      - result: exit code `0`, `overall_status=warning`
+      - interpretation: both bridges are runnable, but `bridge_data` files for that date are absent, so WonderTrader falls through to repo spot-cache scan and FinGenius falls through to placeholder explanation
+- Notes:
+  - This is still not real WonderTrader SEL integration.
+  - But the external WonderTrader bridge has now moved from placeholder-only fallback to a real market-cache-driven fallback, which is materially more useful for the current single-machine stage.
+
+## 2026-05-02 (shortline bridge setup doctor / self-check)
+
+- Scope: add a repo-side self-check entry for the same-machine shortline stack, so the current project can quickly diagnose whether `WonderTrader` / `FinGenius` bridge paths, sample data, single-script execution, and end-to-end orchestration are ready before real integration lands.
+- Changes:
+  - Added bridge check helper:
+    - [`src/shortline_hub/bridge_check.py`](d:\bb\daily_stock_analysis\src\shortline_hub\bridge_check.py)
+      - inspects external bridge script path / workdir / `bridge_data` presence
+      - can run single-script smoke for both bridges
+      - can run end-to-end `shortline_hub --mode process` smoke
+      - writes both json summary and markdown report
+  - Added CLI entry:
+    - [`scripts/check_shortline_bridge_setup.py`](d:\bb\daily_stock_analysis\scripts\check_shortline_bridge_setup.py)
+      - defaults to `D:\bb\WonderTrader` and `D:\bb\FinGenius`
+      - supports `--run-script-smoke`
+      - supports `--run-orchestrator-smoke`
+  - Added tests:
+    - [`tests/test_shortline_bridge_check.py`](d:\bb\daily_stock_analysis\tests\test_shortline_bridge_check.py)
+      - inspection summary output
+      - single bridge script smoke
+      - end-to-end orchestrator smoke
+  - Added usage doc:
+    - [`docs/architecture/2026-05-02-shortline-bridge-check.md`](d:\bb\daily_stock_analysis\docs\architecture\2026-05-02-shortline-bridge-check.md)
+      - documents the doctor flow: static check -> single bridge smoke -> end-to-end smoke
+- Verification:
+  - Red:
+    - `python -m pytest tests/test_shortline_bridge_check.py -v`
+      - first failed because `scripts.check_shortline_bridge_setup` did not exist
+      - then failed once with `TypeError: 'bool' object is not callable` due to `run_orchestrator_smoke` name collision
+      - then failed once more in the real `D:\bb` environment because single-script smoke passed relative request/output paths into external `workdir` processes
+  - Green:
+    - `python -m pytest tests/test_shortline_bridge_check.py -v`
+      - result: `4 passed`
+    - `python -m pytest tests/test_shortline_bridge_check.py tests/test_shortline_hub_orchestrator.py tests/test_shortline_hub_cli.py tests/test_shortline_bridge_templates.py tests/test_shortline_hub_workdir_runtime.py -v`
+      - result: `15 passed`
+    - `python scripts/check_shortline_bridge_setup.py --trade-date 2026-05-02 --run-script-smoke --run-orchestrator-smoke --output-dir data/manual_runs/shortline_bridge_check_live_20260502`
+      - result: exit code `0`, `overall_status=passed`
+- Notes:
+  - This self-check is not a replacement for real framework integration.
+  - It is an operations tool for the current intermediate stage: path check first, bridge smoke second, end-to-end orchestration third.
+
+## 2026-05-02 (bridge_data semi-real mode for external shortline bridges)
+
+- Scope: make the external `D:\bb\WonderTrader` and `D:\bb\FinGenius` bridge scripts usable before real repo-level integration exists, by letting them prefer manually prepared local export files over placeholder output.
+- Changes:
+  - Updated repo bridge templates:
+    - [`scripts/bridges/shortline_wondertrader_bridge_template.py`](d:\bb\daily_stock_analysis\scripts\bridges\shortline_wondertrader_bridge_template.py)
+      - now prefers `bridge_data/wt_candidates_<trade_date>.json`
+      - then `bridge_data/wt_candidates_latest.json`
+      - then csv variants with the same naming
+      - only falls back to placeholder rows when no local export exists
+    - [`scripts/bridges/shortline_fingenius_bridge_template.py`](d:\bb\daily_stock_analysis\scripts\bridges\shortline_fingenius_bridge_template.py)
+      - now prefers `bridge_data/fg_explanations_<trade_date>.json`
+      - then `bridge_data/fg_explanations_latest.json`
+      - supports either dict-by-`candidate_id` / dict-by-`symbol` / list payload
+      - only falls back to placeholder explanation when no matching local explanation exists
+  - Synced the same behavior into the external bridge skeletons:
+    - `D:\bb\WonderTrader\bridge\wt_export_candidates.py`
+    - `D:\bb\FinGenius\bridge\fg_explain_candidate.py`
+  - Added sample semi-real files:
+    - `D:\bb\WonderTrader\bridge\bridge_data\wt_candidates_2026-05-02.json`
+    - `D:\bb\FinGenius\bridge\bridge_data\fg_explanations_2026-05-02.json`
+  - Rewrote bridge usage docs:
+    - [`scripts/bridges/README.md`](d:\bb\daily_stock_analysis\scripts\bridges\README.md)
+    - [`docs/architecture/2026-05-02-shortline-hub-single-machine-setup.md`](d:\bb\daily_stock_analysis\docs\architecture\2026-05-02-shortline-hub-single-machine-setup.md)
+  - Added regression coverage:
+    - [`tests/test_shortline_bridge_templates.py`](d:\bb\daily_stock_analysis\tests\test_shortline_bridge_templates.py)
+      - added local candidate-export preference test
+      - added local explanation-file preference test
+- Verification:
+  - Red:
+    - `python -m pytest tests/test_shortline_bridge_templates.py -v`
+      - first failed because both template bridges still returned placeholder output even when local `bridge_data` files existed
+  - Green:
+    - `python -m pytest tests/test_shortline_bridge_templates.py -v`
+      - result: `4 passed`
+    - `python -m py_compile scripts/bridges/shortline_wondertrader_bridge_template.py scripts/bridges/shortline_fingenius_bridge_template.py D:\bb\WonderTrader\bridge\wt_export_candidates.py D:\bb\FinGenius\bridge\fg_explain_candidate.py`
+      - result: passed
+    - end-to-end semi-real smoke:
+      - `python scripts/run_shortline_hub.py --mode process --trade-date 2026-05-02 --top-n 2 --run-id shortline_bb_bridge_data_demo --output-dir data/manual_runs/shortline_bb_bridge_data_demo_20260502 --wt-python-executable python --wt-script-path D:\bb\WonderTrader\bridge\wt_export_candidates.py --wt-workdir D:\bb\WonderTrader --wt-runtime-dir data/runtime/shortline_hub/wondertrader --fg-python-executable python --fg-script-path D:\bb\FinGenius\bridge\fg_explain_candidate.py --fg-workdir D:\bb\FinGenius --fg-runtime-dir data/runtime/shortline_hub/fingenius`
+      - result: exit code `0`
+      - observed output:
+        - [`data/manual_runs/shortline_bb_bridge_data_demo_20260502/shortline_candidates.json`](d:\bb\daily_stock_analysis\data\manual_runs\shortline_bb_bridge_data_demo_20260502\shortline_candidates.json) uses `scan_source=wondertrader_export`
+        - [`data/manual_runs/shortline_bb_bridge_data_demo_20260502/shortline_explanations.json`](d:\bb\daily_stock_analysis\data\manual_runs\shortline_bb_bridge_data_demo_20260502\shortline_explanations.json) uses `sample real ...` explanation strings from `bridge_data`
+- Notes:
+  - This is still not real framework integration.
+  - But the bridge layer is now useful for a practical intermediate stage: manual export once, then let the current project orchestrate, aggregate, and report on those semi-real artifacts.
+
+## 2026-05-02 (external bridge skeletons under D:\bb + process workdir path fix)
+
+- Scope: move from repo-only bridge templates to real same-machine external skeletons under `D:\bb`, and fix a real process-mode bug exposed by external `workdir` usage.
+- Changes:
+  - Created external bridge skeletons outside the repo:
+    - `D:\bb\WonderTrader\bridge\wt_export_candidates.py`
+    - `D:\bb\WonderTrader\bridge\README_shortline_bridge.md`
+    - `D:\bb\FinGenius\bridge\fg_explain_candidate.py`
+    - `D:\bb\FinGenius\bridge\README_shortline_bridge.md`
+  - Updated [`src/shortline_hub/adapters/process_utils.py`](d:\bb\daily_stock_analysis\src\shortline_hub\adapters\process_utils.py)
+    - `build_runtime_paths(...)` now resolves `runtime_dir` to an absolute path before spawning child processes
+    - this fixes the case where `--wt-workdir/--fg-workdir` points to external directories while `--wt-runtime-dir/--fg-runtime-dir` is still relative
+  - Added regression coverage:
+    - [`tests/test_shortline_hub_workdir_runtime.py`](d:\bb\daily_stock_analysis\tests\test_shortline_hub_workdir_runtime.py)
+      - reproduces and locks the `external workdir + relative runtime dir` failure mode
+- Root cause:
+  - request/output json files were created under the parent process current working directory using relative paths
+  - but the external child process read the same relative paths after switching to its own `cwd`
+  - this made the request file invisible to the child process even though it had already been written
+- Verification:
+  - Red:
+    - `python -m pytest tests/test_shortline_hub_workdir_runtime.py -v`
+      - failed first with `FileNotFoundError` on `data\\runtime\\shortline_hub\\wt_external\\wondertrader_request_*.json`
+  - Green:
+    - `python -m pytest tests/test_shortline_hub_workdir_runtime.py -v`
+      - result: `1 passed`
+    - `python -m pytest tests/test_shortline_hub_orchestrator.py tests/test_shortline_hub_cli.py tests/test_shortline_bridge_templates.py tests/test_shortline_hub_workdir_runtime.py -v`
+      - result: `9 passed`
+    - `python -m py_compile src/shortline_hub/adapters/process_utils.py`
+      - result: passed
+    - external bridge single-script smoke:
+      - `python D:\bb\WonderTrader\bridge\wt_export_candidates.py D:\bb\daily_stock_analysis\data\templates\shortline_hub\wt_request_example.json D:\bb\WonderTrader\bridge\wt_output_example.json`
+      - `python D:\bb\FinGenius\bridge\fg_explain_candidate.py D:\bb\daily_stock_analysis\data\templates\shortline_hub\fg_request_example.json D:\bb\FinGenius\bridge\fg_output_example.json`
+      - result: both exit code `0`
+    - end-to-end process smoke with real external directories:
+      - `python scripts/run_shortline_hub.py --mode process --trade-date 2026-05-02 --top-n 2 --run-id shortline_bb_external_demo --output-dir data/manual_runs/shortline_bb_external_demo_20260502 --wt-python-executable python --wt-script-path D:\bb\WonderTrader\bridge\wt_export_candidates.py --wt-workdir D:\bb\WonderTrader --wt-runtime-dir data/runtime/shortline_hub/wondertrader --fg-python-executable python --fg-script-path D:\bb\FinGenius\bridge\fg_explain_candidate.py --fg-workdir D:\bb\FinGenius --fg-runtime-dir data/runtime/shortline_hub/fingenius`
+      - result: exit code `0`
+      - output dir:
+        - [`data/manual_runs/shortline_bb_external_demo_20260502`](d:\bb\daily_stock_analysis\data\manual_runs\shortline_bb_external_demo_20260502)
+- Notes:
+  - External scripts are still skeletons with placeholder outputs.
+  - The key difference is that they now live in the real target directories under `D:\bb`, so the next step is direct business-logic replacement instead of path planning.
+
+## 2026-05-02 (shortline hub combined artifact + single-machine handoff docs)
+
+- Scope: finish the current `shortline_hub` handoff layer, so single-machine usage has a stable combined artifact, setup docs, bridge README, and example request payloads.
+- Changes:
+  - Updated [`src/shortline_hub/report_builder.py`](d:\bb\daily_stock_analysis\src\shortline_hub\report_builder.py)
+    - now writes `shortline_combined_results.json`
+    - report footer text is neutralized so `process` mode is no longer described as stub-only
+  - Updated tests:
+    - [`tests/test_shortline_hub_cli.py`](d:\bb\daily_stock_analysis\tests\test_shortline_hub_cli.py)
+      - now asserts `shortline_combined_results.json` exists in both `stub` and `process` mode
+  - Added bridge/setup docs:
+    - [`scripts/bridges/README.md`](d:\bb\daily_stock_analysis\scripts\bridges\README.md)
+    - [`docs/architecture/2026-05-02-shortline-hub-single-machine-setup.md`](d:\bb\daily_stock_analysis\docs\architecture\2026-05-02-shortline-hub-single-machine-setup.md)
+  - Added example request payloads:
+    - [`data/templates/shortline_hub/wt_request_example.json`](d:\bb\daily_stock_analysis\data\templates\shortline_hub\wt_request_example.json)
+    - [`data/templates/shortline_hub/fg_request_example.json`](d:\bb\daily_stock_analysis\data\templates\shortline_hub\fg_request_example.json)
+- Verification:
+  - `python -m pytest tests/test_shortline_hub_orchestrator.py tests/test_shortline_hub_cli.py tests/test_shortline_bridge_templates.py -v`
+    - result: `8 passed`
+  - `python -m py_compile scripts/run_shortline_hub.py src/shortline_hub/report_builder.py scripts/bridges/shortline_wondertrader_bridge_template.py scripts/bridges/shortline_fingenius_bridge_template.py`
+    - result: passed
+  - process smoke:
+    - `python scripts/run_shortline_hub.py --mode process --trade-date 2026-05-02 --top-n 2 --run-id shortline_bridge_template_demo --output-dir data/manual_runs/shortline_bridge_template_demo_20260502 --wt-python-executable python --wt-script-path scripts/bridges/shortline_wondertrader_bridge_template.py --wt-runtime-dir data/runtime/shortline_hub/wondertrader_template --fg-python-executable python --fg-script-path scripts/bridges/shortline_fingenius_bridge_template.py --fg-runtime-dir data/runtime/shortline_hub/fingenius_template`
+    - result: exit code `0`
+    - verified output artifacts:
+      - [`data/manual_runs/shortline_bridge_template_demo_20260502/shortline_candidates.json`](d:\bb\daily_stock_analysis\data\manual_runs\shortline_bridge_template_demo_20260502\shortline_candidates.json)
+      - [`data/manual_runs/shortline_bridge_template_demo_20260502/shortline_explanations.json`](d:\bb\daily_stock_analysis\data\manual_runs\shortline_bridge_template_demo_20260502\shortline_explanations.json)
+      - [`data/manual_runs/shortline_bridge_template_demo_20260502/shortline_combined_results.json`](d:\bb\daily_stock_analysis\data\manual_runs\shortline_bridge_template_demo_20260502\shortline_combined_results.json)
+      - [`data/manual_runs/shortline_bridge_template_demo_20260502/shortline_report.md`](d:\bb\daily_stock_analysis\data\manual_runs\shortline_bridge_template_demo_20260502\shortline_report.md)
+      - [`data/manual_runs/shortline_bridge_template_demo_20260502/run_summary.json`](d:\bb\daily_stock_analysis\data\manual_runs\shortline_bridge_template_demo_20260502\run_summary.json)
+- Notes:
+  - The current demo still uses template bridge logic, not real `WonderTrader` or real `FinGenius` business logic.
+  - The artifact contract is now stable enough to hand over for external bridge implementation on the same machine.
+
+## How To Use This Log
+
+这份文档是“详细变更与证据库”，默认按日期倒序记录，适合回答下面几类问题：
+
+1. 某次策略改动到底改了什么；
+2. 当时跑了哪些验证命令；
+3. 有哪些真实实跑产物、耗时和结果；
+4. 风险、边界和回滚思路当时是怎么判断的。
+
+与其他三份文档的分工固定为：
+
+- 当前策略资产入口与阅读导航：[`docs/LOCAL_STRATEGY_CATALOG.md`](./LOCAL_STRATEGY_CATALOG.md)
+- 当前默认参数与基线口径：[`docs/LOCAL_STRATEGY_BASELINE.md`](./LOCAL_STRATEGY_BASELINE.md)
+- 用户可见变化扁平摘要：[`docs/CHANGELOG.md`](./CHANGELOG.md)
+
+维护约定：
+
+- 这里保留细节，不追求短；
+- 如果改动影响默认口径，同步更新 `LOCAL_STRATEGY_BASELINE.md`；
+- 如果改动影响入口、信号清单或阅读路径，同步更新 `LOCAL_STRATEGY_CATALOG.md`；
+- 如果改动是用户可见行为变化，同步在 `CHANGELOG.md` 的 `[Unreleased]` 追加单行条目。
+
+## 2026-05-02 (shortline hub orchestration skeleton)
+
+- Scope: add an isolated shortline orchestration skeleton inside the current project, so the repo can later orchestrate `WonderTrader` candidate output and `FinGenius` explanation output without immediately hard-integrating either framework.
+- Changes:
+  - Added isolated code directory:
+    - [`src/shortline_hub/__init__.py`](d:\bb\daily_stock_analysis\src\shortline_hub\__init__.py)
+    - [`src/shortline_hub/schemas.py`](d:\bb\daily_stock_analysis\src\shortline_hub\schemas.py)
+    - [`src/shortline_hub/orchestrator.py`](d:\bb\daily_stock_analysis\src\shortline_hub\orchestrator.py)
+    - [`src/shortline_hub/report_builder.py`](d:\bb\daily_stock_analysis\src\shortline_hub\report_builder.py)
+    - [`src/shortline_hub/adapters/wondertrader_adapter.py`](d:\bb\daily_stock_analysis\src\shortline_hub\adapters\wondertrader_adapter.py)
+    - [`src/shortline_hub/adapters/fingenius_adapter.py`](d:\bb\daily_stock_analysis\src\shortline_hub\adapters\fingenius_adapter.py)
+  - Added isolated CLI entry:
+    - [`scripts/run_shortline_hub.py`](d:\bb\daily_stock_analysis\scripts\run_shortline_hub.py)
+      - current version uses `StubWonderTraderAdapter`
+      - current version uses `StubFinGeniusAdapter`
+      - writes:
+        - `shortline_candidates.json`
+        - `shortline_explanations.json`
+        - `shortline_report.md`
+        - `run_summary.json`
+  - Added tests:
+    - [`tests/test_shortline_hub_orchestrator.py`](d:\bb\daily_stock_analysis\tests\test_shortline_hub_orchestrator.py)
+    - [`tests/test_shortline_hub_cli.py`](d:\bb\daily_stock_analysis\tests\test_shortline_hub_cli.py)
+  - Added independent tracking docs:
+    - [`docs/architecture/2026-05-02-shortline-hub-design.md`](d:\bb\daily_stock_analysis\docs\architecture\2026-05-02-shortline-hub-design.md)
+    - [`docs/architecture/2026-05-02-shortline-hub-implementation-plan.md`](d:\bb\daily_stock_analysis\docs\architecture\2026-05-02-shortline-hub-implementation-plan.md)
+    - [`docs/architecture/shortline-hub-tracking.md`](d:\bb\daily_stock_analysis\docs\architecture\shortline-hub-tracking.md)
+- Verification:
+  - Red:
+    - `python -m pytest tests/test_shortline_hub_orchestrator.py -v`
+      - failed first with `ModuleNotFoundError: No module named 'src.shortline_hub'`
+    - `python -m pytest tests/test_shortline_hub_cli.py -v`
+      - failed first with `ModuleNotFoundError: No module named 'scripts.run_shortline_hub'`
+  - Green:
+    - `python -m pytest tests/test_shortline_hub_orchestrator.py tests/test_shortline_hub_cli.py -v`
+      - result: `3 passed`
+    - `python -m py_compile scripts/run_shortline_hub.py src/shortline_hub/schemas.py src/shortline_hub/orchestrator.py src/shortline_hub/report_builder.py src/shortline_hub/adapters/wondertrader_adapter.py src/shortline_hub/adapters/fingenius_adapter.py`
+      - result: passed
+    - CLI smoke:
+      - `python scripts/run_shortline_hub.py --trade-date 2026-05-02 --top-n 2 --output-dir data/manual_runs/shortline_hub_smoke_20260502 --run-id shortline_hub_smoke_20260502`
+      - result: exit code `0`
+      - output dir:
+        - [`data/manual_runs/shortline_hub_smoke_20260502`](d:\bb\daily_stock_analysis\data\manual_runs\shortline_hub_smoke_20260502)
+  - Current status:
+    - real `WonderTrader` is not integrated yet
+    - real `FinGenius` is not integrated yet
+    - current value is protocol stabilization, isolated directory structure, and artifact shape verification
+
+## 2026-05-02 (shortline hub single-machine process adapters)
+
+- Scope: upgrade `shortline_hub` from stub-only mode to support single-machine external process invocation, so the current project can call local `WonderTrader` and `FinGenius` scripts via JSON file protocol.
+- Changes:
+  - Added process helper:
+    - [`src/shortline_hub/adapters/process_utils.py`](d:\bb\daily_stock_analysis\src\shortline_hub\adapters\process_utils.py)
+      - `ProcessAdapterConfig`
+      - request/output path generation
+      - JSON read/write helpers
+      - external python process runner
+  - Updated adapters:
+    - [`src/shortline_hub/adapters/wondertrader_adapter.py`](d:\bb\daily_stock_analysis\src\shortline_hub\adapters\wondertrader_adapter.py)
+      - added `WonderTraderProcessAdapter`
+    - [`src/shortline_hub/adapters/fingenius_adapter.py`](d:\bb\daily_stock_analysis\src\shortline_hub\adapters\fingenius_adapter.py)
+      - added `FinGeniusProcessAdapter`
+  - Updated CLI:
+    - [`scripts/run_shortline_hub.py`](d:\bb\daily_stock_analysis\scripts\run_shortline_hub.py)
+      - added `--mode stub|process`
+      - added external process config flags for both `WonderTrader` and `FinGenius`
+      - keeps backward-compatible stub default
+  - Updated tests:
+    - [`tests/test_shortline_hub_orchestrator.py`](d:\bb\daily_stock_analysis\tests\test_shortline_hub_orchestrator.py)
+      - added process adapter tests using local mock scripts
+    - [`tests/test_shortline_hub_cli.py`](d:\bb\daily_stock_analysis\tests\test_shortline_hub_cli.py)
+      - added `process mode` CLI test using local mock scripts
+  - Updated docs:
+    - [`docs/architecture/2026-05-02-shortline-hub-design.md`](d:\bb\daily_stock_analysis\docs\architecture\2026-05-02-shortline-hub-design.md)
+    - [`docs/architecture/shortline-hub-tracking.md`](d:\bb\daily_stock_analysis\docs\architecture\shortline-hub-tracking.md)
+- Verification:
+  - Red:
+    - `python -m pytest tests/test_shortline_hub_orchestrator.py -k "process_adapter" -v`
+      - failed first because `FinGeniusProcessAdapter` did not exist
+    - `python -m pytest tests/test_shortline_hub_cli.py -k "process_mode" -v`
+      - failed first because CLI still used stub path and did not honor process mode
+  - Green:
+    - `python -m pytest tests/test_shortline_hub_orchestrator.py -k "process_adapter" -v`
+      - result: `2 passed`
+    - `python -m pytest tests/test_shortline_hub_cli.py -k "process_mode" -v`
+      - result: `1 passed`
+    - `python -m pytest tests/test_shortline_hub_orchestrator.py tests/test_shortline_hub_cli.py -v`
+      - result: `6 passed`
+    - `python -m py_compile scripts/run_shortline_hub.py src/shortline_hub/adapters/process_utils.py src/shortline_hub/adapters/wondertrader_adapter.py src/shortline_hub/adapters/fingenius_adapter.py`
+      - result: passed
+
+## 2026-05-02 (shortline hub bridge script templates)
+
+- Scope: add repo-local bridge script templates that already match the `shortline_hub --mode process` JSON protocol, so the user can copy them into local `WonderTrader` / `FinGenius` directories and replace only the internal business logic.
+- Changes:
+  - Added bridge templates:
+    - [`scripts/bridges/shortline_wondertrader_bridge_template.py`](d:\bb\daily_stock_analysis\scripts\bridges\shortline_wondertrader_bridge_template.py)
+    - [`scripts/bridges/shortline_fingenius_bridge_template.py`](d:\bb\daily_stock_analysis\scripts\bridges\shortline_fingenius_bridge_template.py)
+  - Added tests:
+    - [`tests/test_shortline_bridge_templates.py`](d:\bb\daily_stock_analysis\tests\test_shortline_bridge_templates.py)
+  - Updated docs:
+    - [`docs/architecture/2026-05-02-shortline-hub-design.md`](d:\bb\daily_stock_analysis\docs\architecture\2026-05-02-shortline-hub-design.md)
+    - [`docs/architecture/shortline-hub-tracking.md`](d:\bb\daily_stock_analysis\docs\architecture\shortline-hub-tracking.md)
+- Verification:
+  - Red:
+    - `python -m pytest tests/test_shortline_bridge_templates.py -v`
+      - failed first because both bridge template scripts did not exist
+  - Green:
+    - `python -m pytest tests/test_shortline_bridge_templates.py -v`
+      - result: `2 passed`
+    - process smoke using template scripts:
+      - `python scripts/run_shortline_hub.py --mode process --trade-date 2026-05-02 --top-n 2 --run-id shortline_bridge_template_demo --output-dir data/manual_runs/shortline_bridge_template_demo_20260502 --wt-python-executable python --wt-script-path scripts/bridges/shortline_wondertrader_bridge_template.py --wt-runtime-dir data/runtime/shortline_hub/wondertrader_template --fg-python-executable python --fg-script-path scripts/bridges/shortline_fingenius_bridge_template.py --fg-runtime-dir data/runtime/shortline_hub/fingenius_template`
+      - result: exit code `0`
+      - output dir:
+        - [`data/manual_runs/shortline_bridge_template_demo_20260502`](d:\bb\daily_stock_analysis\data\manual_runs\shortline_bridge_template_demo_20260502)
+
+## 2026-05-02 (official local board universe seed + default board_cycle_scan entry)
+
+- Scope: promote a manually maintained local board-universe CSV into a project-owned official seed path, and let `board_cycle_scan` reuse it by default when no explicit `--board-universe-file` is passed.
+- Changes:
+  - Added script:
+    - [`scripts/import_board_universe_seed.py`](d:\bb\daily_stock_analysis\scripts\import_board_universe_seed.py)
+      - imports a maintained local board-universe CSV into the official seed path
+      - writes:
+        - `data/board_cycle_scan_seed/board_universe.csv`
+        - `data/board_cycle_scan_seed/board_universe_meta.json`
+        - `data/board_cycle_scan_seed/run_summary.txt`
+      - records `source_file / source_label / imported_at / expire_after_days / row_count / board_count`
+  - Updated script:
+    - [`scripts/select_board_cycle_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_board_cycle_candidates.py)
+      - adds built-in official seed discovery
+      - when `--board-universe-file` is omitted, it now prefers `data/board_cycle_scan_seed/board_universe.csv`
+      - writes `board_universe_file_mode=official_seed` into `run_summary.txt`
+      - warns when the official seed metadata shows it may be stale
+  - Added regression coverage:
+    - [`tests/test_import_board_universe_seed.py`](d:\bb\daily_stock_analysis\tests\test_import_board_universe_seed.py)
+    - [`tests/test_board_cycle_scan_script.py`](d:\bb\daily_stock_analysis\tests\test_board_cycle_scan_script.py)
+      - verifies official seed auto-discovery when explicit file is absent
+  - Updated docs:
+    - [`docs/local_strategies/topics/board_cycle_scan.md`](d:\bb\daily_stock_analysis\docs\local_strategies\topics\board_cycle_scan.md)
+    - [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md)
+    - [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md)
+- Verification:
+  - Red:
+    - `python -m pytest tests/test_import_board_universe_seed.py -v`
+      - failed first with `ModuleNotFoundError: No module named 'scripts.import_board_universe_seed'`
+    - `python -m pytest tests/test_board_cycle_scan_script.py -k "default_seed_file_when_explicit_file_missing" -v`
+      - failed first with missing `DEFAULT_BOARD_UNIVERSE_SEED_FILE`
+  - Green:
+    - `python -m pytest tests/test_import_board_universe_seed.py -v`
+      - result: `3 passed`
+    - `python -m pytest tests/test_board_cycle_scan_script.py -k "default_seed_file_when_explicit_file_missing" -v`
+      - result: `1 passed`
+    - `python -m pytest tests/test_board_cycle_scan_script.py tests/test_import_board_universe_seed.py -v`
+      - result: `13 passed`
+    - `python -m py_compile scripts/import_board_universe_seed.py scripts/select_board_cycle_candidates.py`
+      - result: passed
+    - import official seed:
+      - `python scripts/import_board_universe_seed.py --input-file data/manual_runs/board_cycle_scan_active_boards_20260502/board_universe_from_board_recognizability.csv --source-label recognizability_manual --output-dir data/board_cycle_scan_seed`
+      - result: exit code `0`
+      - current official seed:
+        - [`data/board_cycle_scan_seed/board_universe.csv`](d:\bb\daily_stock_analysis\data\board_cycle_scan_seed\board_universe.csv)
+        - [`data/board_cycle_scan_seed/board_universe_meta.json`](d:\bb\daily_stock_analysis\data\board_cycle_scan_seed\board_universe_meta.json)
+        - [`data/board_cycle_scan_seed/run_summary.txt`](d:\bb\daily_stock_analysis\data\board_cycle_scan_seed\run_summary.txt)
+      - observation:
+        - `row_count=36`
+        - `board_count=25`
+        - `expire_after_days=3`
+    - default-seed smoke:
+      - `python scripts/select_board_cycle_candidates.py --boards 半导体,通信设备 --board-type industry --limit-per-board 2 --output-dir data/manual_runs/board_cycle_scan_seed_default_smoke_20260502`
+      - result: exit code `0`
+      - output dir:
+        - [`data/manual_runs/board_cycle_scan_seed_default_smoke_20260502`](d:\bb\daily_stock_analysis\data\manual_runs\board_cycle_scan_seed_default_smoke_20260502)
+      - observation:
+        - `run_summary.txt` recorded `board_universe_file_mode=official_seed`
+        - `run_summary.txt` recorded `board_universe_file=d:\bb\daily_stock_analysis\data\board_cycle_scan_seed\board_universe.csv`
+        - board results used local file path with `board_reason_summary ... [source=file]`
+
+## 2026-05-02 (board_cycle_scan current status note)
+
+- Scope: record the current product decision for `board_cycle_scan`, so later discussions do not accidentally treat it as a finished automatic strategy.
+- Current judgment:
+  - `board_cycle_scan` is currently a semi-automatic topic tool
+  - board pool definition and board constituents still require manual maintenance
+  - the script side is responsible for scan / score / export / tracking / documentation only
+  - this line is suitable for manual review and board tracking, not for full-market automatic board discovery
+  - before a meaningfully better upstream board source exists, keep it at “usable half-finished tool” status
+- Docs updated:
+  - [`docs/local_strategies/topics/board_cycle_scan.md`](d:\bb\daily_stock_analysis\docs\local_strategies\topics\board_cycle_scan.md)
+  - [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md)
+  - [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md)
+- Verification:
+  - docs only, no code test required
+
+## 2026-05-02 (board concept pool refresh cache)
+
+- Scope: add a lightweight local board concept pool cache layer for `board_cycle_scan`, so board-pool acquisition is no longer tied to every scan run.
+- Changes:
+  - Added script:
+    - [`scripts/refresh_board_concept_pool.py`](d:\bb\daily_stock_analysis\scripts\refresh_board_concept_pool.py)
+      - supports `--source auto|ths|dc`
+      - supports `--expire-after-days` with default `3`
+      - supports `--force-refresh`
+      - writes:
+        - `board_concept_pool.csv`
+        - `board_concept_pool_meta.json`
+        - `run_summary.txt`
+      - keeps stale local cache when remote refresh fails
+  - Updated provider:
+    - [`data_provider/tushare_fetcher.py`](d:\bb\daily_stock_analysis\data_provider\tushare_fetcher.py)
+      - added `get_board_concept_pool(...)`
+      - added THS/DC board-pool frame normalization
+  - Added regression coverage:
+    - [`tests/test_refresh_board_concept_pool.py`](d:\bb\daily_stock_analysis\tests\test_refresh_board_concept_pool.py)
+      - first refresh writes csv + meta
+      - fresh cache skips remote refresh
+      - expired cache keeps stale local data on remote failure
+      - THS rows normalize into `board_name / board_code / board_source`
+  - Updated docs:
+    - [`docs/local_strategies/topics/board_cycle_scan.md`](d:\bb\daily_stock_analysis\docs\local_strategies\topics\board_cycle_scan.md)
+    - [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md)
+    - [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md)
+- Verification:
+  - Red:
+    - `python -m pytest tests/test_refresh_board_concept_pool.py -v`
+      - failed first with `ModuleNotFoundError: No module named 'scripts.refresh_board_concept_pool'`
+  - Green:
+    - `python -m pytest tests/test_refresh_board_concept_pool.py -v`
+      - result: `4 passed`
+    - `python -m py_compile scripts/refresh_board_concept_pool.py data_provider/tushare_fetcher.py tests/test_refresh_board_concept_pool.py`
+      - result: passed
+    - no-cache smoke:
+      - `python scripts/refresh_board_concept_pool.py --source auto --expire-after-days 3 --output-dir data/manual_runs/board_concept_pool_refresh_verify_20260502`
+      - result: exit code `1`
+      - observation:
+        - current environment can initialize `Tushare`
+        - but `trade_cal` lacks access permission
+        - `moneyflow_ind_ths` / `moneyflow_ind_dc` both hit frequency limits
+        - because this was a first-run/no-cache path, the script failed exactly as designed
+    - stale-cache fail-open smoke:
+      - seeded output dir: [`data/manual_runs/board_concept_pool_refresh_failopen_20260502`](d:\bb\daily_stock_analysis\data\manual_runs\board_concept_pool_refresh_failopen_20260502)
+      - command:
+        - `python scripts/refresh_board_concept_pool.py --source auto --expire-after-days 3 --output-dir data/manual_runs/board_concept_pool_refresh_failopen_20260502`
+      - result: exit code `0`
+      - observation:
+        - `run_summary.txt` recorded `status=stale_cache_retained`
+        - `board_concept_pool_meta.json` recorded `refresh_status=failed`
+        - existing `board_concept_pool.csv` remained usable with `board_count=2`
+
+## 2026-05-02 (board_cycle_scan tracking outputs + versioned smoke)
+
+- Scope: add a lightweight board-scan tracking layer so repeated runs can directly answer whether a board is actually updating, not just what the latest static result is.
+- Changes:
+  - Updated script:
+    - [`scripts/select_board_cycle_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_board_cycle_candidates.py)
+      - writes `board_change_summary.csv`
+      - writes `board_change_summary.md`
+      - writes `board_tracking_history.csv`
+      - auto-compares against the previous run in the same output dir, or the latest sibling run with overlapping `board_name`
+      - marks a board as updated when any of these change:
+        - `board_cycle_label`
+        - `abs(board_cycle_score_delta) >= 2.0`
+        - `top_leaders`
+        - `earnings_supported_count`
+  - Added regression coverage:
+    - [`tests/test_board_cycle_scan_tracking.py`](d:\bb\daily_stock_analysis\tests\test_board_cycle_scan_tracking.py)
+      - first run writes tracking baseline
+      - second run appends history and produces change summary
+      - small score drift under threshold stays `stable`
+  - Updated docs:
+    - [`docs/local_strategies/topics/board_cycle_scan.md`](d:\bb\daily_stock_analysis\docs\local_strategies\topics\board_cycle_scan.md)
+    - [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md)
+    - [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md)
+- Verification:
+  - `python -m pytest tests/test_board_cycle_scan_tracking.py -v`
+    - result: red first (`3 failed`, missing `board_change_summary_csv`), then green (`3 passed`)
+  - `python -m pytest tests/test_board_cycle_scan_script.py tests/test_board_cycle_scan_service.py tests/test_generate_board_universe_template.py tests/test_board_cycle_scan_tracking.py -v`
+    - result: `19 passed in 1.43s`
+  - `python -m py_compile scripts/generate_board_universe_template.py scripts/select_board_cycle_candidates.py src/services/board_cycle_scan_service.py`
+    - result: passed
+  - offline tracking smoke:
+    - command 1:
+      - `python scripts/select_board_cycle_candidates.py --boards 锂矿,猪肉 --board-type concept --board-universe-file data/manual_runs/board_cycle_scan_golden_smoke_20260502/board_universe.csv --output-dir data/manual_runs/board_cycle_scan_tracking_smoke_20260502/run_001`
+    - command 2:
+      - `python scripts/select_board_cycle_candidates.py --boards 锂矿,猪肉 --board-type concept --board-universe-file data/manual_runs/board_cycle_scan_golden_smoke_20260502/board_universe.csv --output-dir data/manual_runs/board_cycle_scan_tracking_smoke_20260502/run_002`
+    - process result:
+      - both commands exit code `0`
+      - run 2 output dir: [`data/manual_runs/board_cycle_scan_tracking_smoke_20260502/run_002`](d:\bb\daily_stock_analysis\data\manual_runs\board_cycle_scan_tracking_smoke_20260502\run_002)
+      - run 2 artifacts now include:
+        - [`board_change_summary.csv`](d:\bb\daily_stock_analysis\data\manual_runs\board_cycle_scan_tracking_smoke_20260502\run_002\board_change_summary.csv)
+        - [`board_change_summary.md`](d:\bb\daily_stock_analysis\data\manual_runs\board_cycle_scan_tracking_smoke_20260502\run_002\board_change_summary.md)
+        - [`board_tracking_history.csv`](d:\bb\daily_stock_analysis\data\manual_runs\board_cycle_scan_tracking_smoke_20260502\run_002\board_tracking_history.csv)
+      - `run_summary.txt` in `run_002` records:
+        - `previous_run_id=run_001`
+        - `updated_boards=0`
+      - `board_change_summary.csv` in `run_002` records:
+        - `锂矿`: `board_updated=False`, `update_reasons=stable`
+        - `猪肉`: `board_updated=False`, `update_reasons=stable`
+      - `board_tracking_history.csv` in `run_002` contains `4` rows, i.e. two boards across two runs
+- Notes:
+  - This layer is intentionally file-based and lightweight; no new snapshot table or service integration was added.
+  - Existing `board_summary.*` / `board_stock_candidates.*` outputs remain unchanged, so current consumers do not need migration.
+
+## 2026-05-02 (board_cycle_scan docs registration + local smoke)
+
+- Scope: document the new on-demand `board_cycle_scan` topic and attach one real local smoke run without changing strategy logic.
+- Changes:
+  - Added topic doc:
+    - [`docs/local_strategies/topics/board_cycle_scan.md`](d:\bb\daily_stock_analysis\docs\local_strategies\topics\board_cycle_scan.md)
+  - Moved engineering docs into project `docs/` tree:
+    - design: [`docs/local_strategies/designs/2026-05-01-board_cycle_scan_design.md`](d:\bb\daily_stock_analysis\docs\local_strategies\designs\2026-05-01-board_cycle_scan_design.md)
+    - implementation plan: [`docs/local_strategies/plans/2026-05-01-board_cycle_scan_implementation.md`](d:\bb\daily_stock_analysis\docs\local_strategies\plans\2026-05-01-board_cycle_scan_implementation.md)
+  - Updated local-strategy governance docs:
+    - [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md)
+    - [`docs/LOCAL_STRATEGY_BASELINE.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_BASELINE.md)
+    - [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md)
+    - [`docs/local_strategies/README.md`](d:\bb\daily_stock_analysis\docs\local_strategies\README.md)
+  - Existing implementation assets recorded by this doc entry:
+    - service: [`src/services/board_cycle_scan_service.py`](d:\bb\daily_stock_analysis\src\services\board_cycle_scan_service.py)
+    - script: [`scripts/select_board_cycle_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_board_cycle_candidates.py)
+    - tests:
+      - [`tests/test_board_cycle_scan_service.py`](d:\bb\daily_stock_analysis\tests\test_board_cycle_scan_service.py)
+      - [`tests/test_board_cycle_scan_script.py`](d:\bb\daily_stock_analysis\tests\test_board_cycle_scan_script.py)
+- Verification:
+  - `python -m py_compile scripts/select_board_cycle_candidates.py src/services/board_cycle_scan_service.py`
+    - result: passed
+  - `python -m pytest tests/test_board_cycle_scan_script.py tests/test_board_cycle_scan_service.py -v`
+    - result: `9 passed in 1.43s`
+  - smoke:
+    - command:
+      - `python scripts/select_board_cycle_candidates.py --boards 锂矿,白酒 --limit-per-board 20 --output-dir data/manual_runs/board_cycle_scan_smoke_20260501`
+    - process result:
+      - command exit code `0`
+      - output dir: [`data/manual_runs/board_cycle_scan_smoke_20260501`](d:\bb\daily_stock_analysis\data\manual_runs\board_cycle_scan_smoke_20260501)
+      - artifacts:
+        - [`board_summary.csv`](d:\bb\daily_stock_analysis\data\manual_runs\board_cycle_scan_smoke_20260501\board_summary.csv)
+        - [`board_summary.md`](d:\bb\daily_stock_analysis\data\manual_runs\board_cycle_scan_smoke_20260501\board_summary.md)
+        - [`board_stock_candidates.csv`](d:\bb\daily_stock_analysis\data\manual_runs\board_cycle_scan_smoke_20260501\board_stock_candidates.csv)
+        - [`board_stock_candidates.md`](d:\bb\daily_stock_analysis\data\manual_runs\board_cycle_scan_smoke_20260501\board_stock_candidates.md)
+        - [`run_summary.txt`](d:\bb\daily_stock_analysis\data\manual_runs\board_cycle_scan_smoke_20260501\run_summary.txt)
+    - observed runtime details:
+      - `run_summary.txt` recorded `board_type=auto`, `top_per_board=3`, `limit_per_board=20`, `boards=2`, `stock_candidates=0`
+      - `board_summary.csv` recorded:
+        - `锂矿`: `constituent_count=0`, `board_cycle_score=0.0`, `board_cycle_label=idle`
+        - `白酒`: `constituent_count=0`, `board_cycle_score=0.0`, `board_cycle_label=idle`
+    - warnings encountered during smoke:
+      - AkShare concept-board constituent fetch for `锂矿` ran, then auto fallback also tried industry constituents, and the board constituent load ended with `RemoteDisconnected('Remote end closed connection without response')`
+      - AkShare concept-board constituent fetch for `白酒` ran, then auto fallback also tried industry constituents, and the board constituent load ended with `RemoteDisconnected('Remote end closed connection without response')`
+    - interpretation:
+      - this smoke is a real execution success but not a data-success run
+      - the script remained fail-open and still wrote complete empty-result artifacts instead of crashing
+      - the resulting `idle / constituent_count=0 / stock_candidates=0` should be read as an upstream constituent-fetch failure marker for this run, not as a valid market conclusion for `锂矿/白酒`
+- Unverified / gaps:
+  - No non-empty constituent result was obtained in this smoke because both requested boards hit remote board-constituent connection failures.
+  - This turn did not validate richer board-cycle output on a healthy upstream response path.
+- Notes:
+  - `board_cycle_scan` is documented as an on-demand topic only; it is not added to the default daily `include_signals` chain.
+  - README was intentionally not updated because this is local-strategy topic governance rather than repo-homepage scope.
+
+## 2026-05-02 (board_cycle_scan empty-result warnings + retry smoke)
+
+- Scope: make empty board-constituent runs self-explanatory in artifacts, then rerun a real smoke with a different board pair.
+- Changes:
+  - Updated script behavior:
+    - [`scripts/select_board_cycle_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_board_cycle_candidates.py)
+      - when a board returns no usable constituent rows, the script now auto-writes warnings into `run_summary.txt` and `board_summary.md`
+  - Added regression coverage:
+    - [`tests/test_board_cycle_scan_script.py`](d:\bb\daily_stock_analysis\tests\test_board_cycle_scan_script.py)
+      - new test locks the warning-writing behavior for empty board constituent runs
+  - Updated docs:
+    - [`docs/local_strategies/topics/board_cycle_scan.md`](d:\bb\daily_stock_analysis\docs\local_strategies\topics\board_cycle_scan.md)
+    - [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md)
+    - [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md)
+- Verification:
+  - `python -m pytest tests/test_board_cycle_scan_script.py -k warning_when_board_constituents_are_empty -v`
+    - result: `1 passed`
+  - `python -m py_compile scripts/select_board_cycle_candidates.py src/services/board_cycle_scan_service.py`
+    - result: passed
+  - `python -m pytest tests/test_board_cycle_scan_script.py tests/test_board_cycle_scan_service.py -v`
+    - result: `10 passed in 0.97s`
+  - smoke retry:
+    - command:
+      - `python scripts/select_board_cycle_candidates.py --boards 锂矿,猪肉 --limit-per-board 20 --output-dir data/manual_runs/board_cycle_scan_smoke_20260502_lithium_pork`
+    - process result:
+      - command exit code `0`
+      - output dir: [`data/manual_runs/board_cycle_scan_smoke_20260502_lithium_pork`](d:\bb\daily_stock_analysis\data\manual_runs\board_cycle_scan_smoke_20260502_lithium_pork)
+      - artifacts:
+        - [`board_summary.csv`](d:\bb\daily_stock_analysis\data\manual_runs\board_cycle_scan_smoke_20260502_lithium_pork\board_summary.csv)
+        - [`board_summary.md`](d:\bb\daily_stock_analysis\data\manual_runs\board_cycle_scan_smoke_20260502_lithium_pork\board_summary.md)
+        - [`board_stock_candidates.csv`](d:\bb\daily_stock_analysis\data\manual_runs\board_cycle_scan_smoke_20260502_lithium_pork\board_stock_candidates.csv)
+        - [`board_stock_candidates.md`](d:\bb\daily_stock_analysis\data\manual_runs\board_cycle_scan_smoke_20260502_lithium_pork\board_stock_candidates.md)
+        - [`run_summary.txt`](d:\bb\daily_stock_analysis\data\manual_runs\board_cycle_scan_smoke_20260502_lithium_pork\run_summary.txt)
+    - observed runtime details:
+      - both `锂矿` and `猪肉` still returned empty constituent rows after upstream fetch attempts
+      - `board_summary.csv` recorded both boards as `constituent_count=0`, `board_cycle_label=idle`
+      - `run_summary.txt` now includes one `warning=` line per empty board
+      - `board_summary.md` now includes top-of-file `Note:` warnings for both boards
+    - warnings encountered during smoke:
+      - AkShare board constituent fetch for `锂矿` ended with `RemoteDisconnected('Remote end closed connection without response')`
+      - AkShare board constituent fetch for `猪肉` ended with `RemoteDisconnected('Remote end closed connection without response')`
+- Interpretation:
+  - the code path is now safer to read because empty-result runs self-label their upstream-failure condition inside the artifacts themselves
+  - this retry still did not validate the non-empty healthy upstream path
+
+## 2026-05-02 (board_cycle_scan local universe fallback + golden smoke)
+
+- Scope: make `board_cycle_scan` independently verifiable even when upstream board-constituent APIs are unstable, and improve board-level explanation fields.
+- Changes:
+  - Updated implementation:
+    - [`scripts/select_board_cycle_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_board_cycle_candidates.py)
+      - added `--board-universe-file`
+      - added `--board-universe-cache-dir`
+      - added `--use-local-cache`
+      - added local board-universe cache write/read with normalized list-field roundtrip
+      - board markdown / CSV now include richer explanation fields
+    - [`src/services/board_cycle_scan_service.py`](d:\bb\daily_stock_analysis\src\services\board_cycle_scan_service.py)
+      - added board-level `leader_ratio / earnings_supported_ratio / board_reason_summary`
+      - added stock-level `board_rank / selection_reason`
+      - added local row overrides for `belong_boards` and simplified earnings-quality context, so offline CSV smoke can avoid remote enrichment
+  - Added/updated tests:
+    - [`tests/test_board_cycle_scan_script.py`](d:\bb\daily_stock_analysis\tests\test_board_cycle_scan_script.py)
+      - added coverage for local board-universe file path
+      - added coverage for cache fallback path
+      - added coverage for cache list-field roundtrip
+    - [`tests/test_board_cycle_scan_service.py`](d:\bb\daily_stock_analysis\tests\test_board_cycle_scan_service.py)
+      - existing score/routing contract remained green against the new fields
+  - Added offline golden input:
+    - [`data/manual_runs/board_cycle_scan_golden_smoke_20260502/board_universe.csv`](d:\bb\daily_stock_analysis\data\manual_runs\board_cycle_scan_golden_smoke_20260502\board_universe.csv)
+  - Updated docs:
+    - [`docs/local_strategies/topics/board_cycle_scan.md`](d:\bb\daily_stock_analysis\docs\local_strategies\topics\board_cycle_scan.md)
+    - [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md)
+    - [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md)
+- Verification:
+  - `python -m pytest tests/test_board_cycle_scan_script.py -k "board_universe_file or cached_board_universe or selection_reason or leader_ratio" -v`
+    - result: passed
+  - `python -m pytest tests/test_board_cycle_scan_script.py -k roundtrip_preserves_list_fields -v`
+    - result: red first, then green after cache serialization fix
+  - `python -m py_compile scripts/select_board_cycle_candidates.py src/services/board_cycle_scan_service.py`
+    - result: passed
+  - `python -m pytest tests/test_board_cycle_scan_script.py tests/test_board_cycle_scan_service.py -v`
+    - result: `13 passed in 0.88s`
+  - offline golden smoke:
+    - command:
+      - `python scripts/select_board_cycle_candidates.py --boards 锂矿,猪肉 --board-type concept --board-universe-file data/manual_runs/board_cycle_scan_golden_smoke_20260502/board_universe.csv --board-universe-cache-dir data/manual_runs/board_cycle_scan_golden_smoke_20260502/cache --use-local-cache --output-dir data/manual_runs/board_cycle_scan_golden_smoke_20260502/output`
+    - process result:
+      - command exit code `0`
+      - output dir: [`data/manual_runs/board_cycle_scan_golden_smoke_20260502/output`](d:\bb\daily_stock_analysis\data\manual_runs\board_cycle_scan_golden_smoke_20260502\output)
+      - summary:
+        - `boards=2`
+        - `stock_candidates=6`
+        - both `锂矿` and `猪肉` produced `strengthening`
+        - board outputs now include `leader_ratio / earnings_supported_ratio / board_reason_summary`
+        - stock outputs now include `board_rank / selection_reason`
+  - cache fallback smoke:
+    - command:
+      - `python scripts/select_board_cycle_candidates.py --boards 锂矿,猪肉 --board-type concept --board-universe-cache-dir data/manual_runs/board_cycle_scan_golden_smoke_20260502/cache --use-local-cache --output-dir data/manual_runs/board_cycle_scan_golden_smoke_20260502/output_cache_fallback`
+    - process result:
+      - command exit code `0`
+      - output dir: [`data/manual_runs/board_cycle_scan_golden_smoke_20260502/output_cache_fallback`](d:\bb\daily_stock_analysis\data\manual_runs\board_cycle_scan_golden_smoke_20260502\output_cache_fallback)
+      - warnings:
+        - `Using cached board universe for 锂矿 because upstream board constituent fetch returned no usable rows.`
+        - `Using cached board universe for 猪肉 because upstream board constituent fetch returned no usable rows.`
+      - summary:
+        - `boards=2`
+        - `stock_candidates=6`
+        - both boards still produced non-empty `strengthening` results from cache, even though remote constituent fetch failed
+- Notes:
+  - This round finally separates three states clearly:
+    - remote healthy path
+    - local file / offline validation path
+    - remote failed but cache fallback path
+  - The board-cycle scoring itself is still lightweight and heuristic; this work focused on verifiability and output readability, not on changing strategy weights.
+
+## 2026-05-02 (board universe template helper)
+
+- Scope: reduce the cost of preparing `board_cycle_scan` local input files by adding a helper script and a fixed template path.
+- Changes:
+  - Added helper script:
+    - [`scripts/generate_board_universe_template.py`](d:\bb\daily_stock_analysis\scripts\generate_board_universe_template.py)
+      - tries remote board constituent fetch
+      - writes normalized `board_name/board_type/code/name` rows on success
+      - writes one `needs_manual_fill` placeholder row per failed board on fetch failure or empty result
+  - Added tests:
+    - [`tests/test_generate_board_universe_template.py`](d:\bb\daily_stock_analysis\tests\test_generate_board_universe_template.py)
+  - Added fixed template file:
+    - [`data/templates/board_cycle_scan/board_universe_template.csv`](d:\bb\daily_stock_analysis\data\templates\board_cycle_scan\board_universe_template.csv)
+  - Updated docs:
+    - [`docs/local_strategies/topics/board_cycle_scan.md`](d:\bb\daily_stock_analysis\docs\local_strategies\topics\board_cycle_scan.md)
+    - [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md)
+    - [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md)
+- Verification:
+  - `python -m py_compile scripts/generate_board_universe_template.py`
+    - result: passed
+  - `python -m pytest tests/test_generate_board_universe_template.py -v`
+    - result: `3 passed in 0.72s`
+  - smoke:
+    - command:
+      - `python scripts/generate_board_universe_template.py --boards 锂矿,猪肉 --board-type concept --output-file data/manual_runs/board_universe_template_smoke_20260502.csv`
+    - process result:
+      - command exit code `0`
+      - output file: [`data/manual_runs/board_universe_template_smoke_20260502.csv`](d:\bb\daily_stock_analysis\data\manual_runs\board_universe_template_smoke_20260502.csv)
+      - rows:
+        - `锂矿`: `template_status=needs_manual_fill`
+        - `猪肉`: `template_status=needs_manual_fill`
+      - note:
+        - current upstream concept-board constituent fetch still failed for both boards, but helper script still generated a usable template file instead of exiting with failure
+
+## 2026-05-01 (trend_leader financial-only earnings context + superset cache reuse)
+
+- Scope: continue the current `trend_leader_unified` performance/stability round by trimming the remaining deep candidate-evaluation hot path, specifically `fundamental_fetch`, without changing strict/fallback scoring semantics.
+- Why:
+  - After the shared prefilter trim, a real `limit=120` probe on `2026-04-29` showed the dominant remaining cost had moved into per-candidate `fundamental_fetch`:
+    - `elapsed_seconds=32.5202`
+    - `scan_eval_elapsed_sec=21.565902`
+    - `phase_timing_sec.fundamental_fetch=17.515977`
+  - Reading the current scoring path showed `trend_leader_unified` only uses the earnings side for:
+    - `revenue_yoy`
+    - `net_profit_yoy`
+    - `earnings_quality_score / verdict`
+    - plus `report_date` as a carry-through field
+  - The fast-scan path was still fetching `financial + forecast + quick_report`, but `forecast_summary / quick_report_summary` were not part of the actual trend-leader scoring decision.
+- Changes:
+  - Updated [`data_provider/base.py`](d:\bb\daily_stock_analysis\data_provider\base.py):
+    - `get_earnings_fundamental_context(...)` now accepts optional `enabled_blocks`.
+    - earnings-fundamental cache keys now include the requested block profile.
+    - added subset-compatibility fallback: a narrower request such as `("financial",)` can reuse an older broader cache built under `("financial","forecast","quick_report")`, avoiding a cold-start cache cliff after narrowing the fast-scan scope.
+  - Updated [`scripts/select_trend_leader_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_trend_leader_candidates.py):
+    - `_invoke_optional_budget_loader(...)` now supports forwarding extra optional keyword arguments with backward-compatible fallback for simplified test doubles.
+    - `trend_leader_unified` now calls `get_earnings_fundamental_context(...)` with `enabled_blocks=("financial",)` in the fast candidate path.
+  - Added regression coverage:
+    - [`tests/test_fundamental_context.py`](d:\bb\daily_stock_analysis\tests\test_fundamental_context.py)
+    - [`tests/test_trend_leader_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_trend_leader_signal_flow.py)
+- Verification:
+  - Red:
+    - `python -m pytest tests/test_fundamental_context.py -k enabled_blocks -q`
+      - failed as expected with `TypeError: DataFetcherManager.get_earnings_fundamental_context() got an unexpected keyword argument 'enabled_blocks'`
+    - `python -m pytest tests/test_trend_leader_signal_flow.py -k forwards_fast_enrichment_budgets -q`
+      - failed as expected because `trend_leader` was not forwarding `enabled_blocks=("financial",)`
+    - `python -m pytest tests/test_fundamental_context.py -k "financial_only_reuses_superset_disk_cache" -q`
+      - failed as expected because the narrower request did not yet reuse the broader disk cache
+  - Green:
+    - `python -m pytest tests/test_fundamental_context.py -k "superset_memory_cache or superset_disk_cache or enabled_blocks" -q`
+      - result: `2 passed`
+    - `python -m pytest tests/test_trend_leader_signal_flow.py -k forwards_fast_enrichment_budgets -q`
+      - result: `1 passed`
+    - `python -m pytest tests/test_fundamental_context.py tests/test_trend_leader_signal_flow.py -k "enabled_blocks or forwards_fast_enrichment_budgets or fast_enrichment_budgets" -q`
+      - result: `2 passed`
+    - `python -m py_compile data_provider/base.py scripts/select_trend_leader_candidates.py tests/test_fundamental_context.py tests/test_trend_leader_signal_flow.py`
+    - real-run probe on `snapshot_date=2026-04-29`, `limit=120`:
+      - first run after scope narrowing rebuilt the new exact-profile cache and showed the expected cold-start cliff: `phase_timing_sec.fundamental_fetch=38.997877`
+      - immediate same-parameter rerun then dropped to:
+        - `elapsed_seconds=16.5073`
+        - `scan_eval_elapsed_sec=3.752198`
+        - `phase_timing_sec.fundamental_fetch=0.135228`
+        - `phase_timing_sec.capital_profile=0.185339`
+- Notes:
+  - This round does not change `trend_leader_unified` scoring weights or hard-risk semantics; it only narrows the fetched earnings blocks to what the fast scan actually consumes.
+  - The superset-cache fallback is important for migration: without it, narrowing the block profile would have made the first post-change run unnecessarily rebuild caches even when an older broader cache already contained the needed `financial` payload.
+
+## 2026-05-01 (trend_leader stale spot reference cache as failure-only fallback)
+
+- Scope: continue the current `trend_leader_unified` performance/stability round by trimming the remaining `prep_universe` fallback overhead, without changing candidate scoring, selection tiers, or normal fresh-spot preference.
+- Why:
+  - After the `financial-only` earnings trim, the dominant remaining instability had moved out of deep candidate scoring and back into `prep_universe`, especially the live `spot` failure path.
+  - A real probe in the noisy environment showed:
+    - `elapsed_seconds=41.5798`
+    - `prep_universe_elapsed_sec=24.2944`
+    - `scan_eval_elapsed_sec=6.079488`
+    - `phase_timing_sec.fundamental_fetch=1.394006`
+  - Logs confirmed the hot path was now `spot` failure and retry:
+    - `K-line selector spot universe attempt 1/2 failed, retrying: ...`
+    - `K-line selector spot-enriched universe fallback to generic provider: ...`
+  - The existing disk reference cache was ignored once it crossed TTL, even though it could still serve as a materially better failure fallback than re-entering the generic provider path on unstable days.
+- Changes:
+  - Updated [`src/services/kline_selector_service.py`](d:\bb\daily_stock_analysis\src\services\kline_selector_service.py):
+    - `_read_spot_universe_reference_cache(...)` now supports `allow_stale=True`.
+    - stale `spot` reference cache remains ineligible as the normal preferred fresh source, but is now eligible as a failure-only fallback when live `spot` fetch fails.
+    - when such a fallback cache exists, live `spot` retries stay at a single attempt, avoiding the extra `1/2 -> 2/2` wait before downgrade.
+  - Updated regression coverage in [`tests/test_kline_selector_service.py`](d:\bb\daily_stock_analysis\tests\test_kline_selector_service.py):
+    - added `test_get_spot_enriched_a_share_universe_uses_stale_disk_cache_for_failure_fallback`
+- Verification:
+  - Red:
+    - `python -m pytest tests/test_kline_selector_service.py -k stale_disk_cache_for_failure_fallback -q`
+      - failed as expected because the stale disk cache was ignored, live `spot` retried `1/2`, and the path still fell through to generic fallback.
+  - Green:
+    - `python -m pytest tests/test_kline_selector_service.py -k "stale_disk_cache_for_failure_fallback or skips_second_live_retry_when_disk_cache_exists or uses_disk_cached_spot_snapshot_before_generic_fallback" -q`
+      - result: `3 passed`
+    - `python -m pytest tests/test_kline_selector_service.py -q`
+      - result: `38 passed`
+    - `python -m pytest tests/test_trend_leader_signal_flow.py -k "fast_enrichment_budgets or forwards_fast_enrichment_budgets" -q`
+      - result: `1 passed`
+    - `python -m py_compile src/services/kline_selector_service.py tests/test_kline_selector_service.py`
+  - Real smoke:
+    - `python -c "from datetime import date; from scripts.select_trend_leader_candidates import scan_trend_leader_candidates_with_stats; import json; payload=scan_trend_leader_candidates_with_stats(snapshot_date=date.fromisoformat('2026-04-29'), limit=120, max_workers=2, fallback_top_n=20, watch_top_n=20, progress_every=0, prefetch_realtime_quotes=False, second_stage_news_search_enabled=False, second_stage_business_profile_enabled=False, fundamental_budget_seconds=0.6, capital_flow_budget_seconds=0.45); print(json.dumps(payload.get('run_stats', {}), ensure_ascii=False))"`
+    - observed:
+      - `elapsed_seconds=27.2104`
+      - `prep_universe_elapsed_sec=18.9773`
+      - `scan_eval_elapsed_sec=2.699691`
+      - `phase_timing_sec.fundamental_fetch=0.458395`
+      - `phase_timing_sec.capital_profile=0.3456`
+      - log hit: `K-line selector spot-enriched universe fallback to disk cached spot snapshot: ...`
+- Outcome / next hotspot:
+  - The deep candidate-evaluation path is now largely under control for this round.
+  - The next meaningful optimization target remains in `prep_universe`, now most visibly the first live `spot` failure wait and the `sector_rankings_prefetch` slice rather than fundamentals.
+
+## 2026-05-01 (trend_leader sector-rankings prewarm prefers stale cache)
+
+- Scope: continue the current `trend_leader_unified` performance/stability round by cutting the `sector_rankings_prefetch` wall-clock slice inside scan preparation, without changing trend scoring weights or board-strength semantics.
+- Why:
+  - After the earlier `spot` fallback tightening, real smoke still showed `sector_rankings_prefetch` itself could dominate the remaining preparation tail:
+    - one run observed `sector_rankings_prefetch_elapsed_sec=5.311365`
+    - this block is only used as auxiliary `scan_context["sector_rankings"]` for board-strength hints, not as a hard gate
+  - The manager already had sector-rankings disk cache plus the new stale-fallback path, but the prewarm caller still used the default fresh-first behavior, so an expired cache could still force a blocking remote attempt before becoming useful.
+- Changes:
+  - Updated [`data_provider/base.py`](d:\bb\daily_stock_analysis\data_provider\base.py):
+    - `get_sector_rankings(...)` now accepts `prefer_stale_cache=True`
+    - when enabled, the manager can reuse stale sector-rankings cache before touching remote providers
+    - stale cache still remains opt-in at the call site rather than becoming the new global default
+  - Updated [`scripts/select_trend_leader_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_trend_leader_candidates.py):
+    - added `_invoke_optional_sector_rankings_loader(...)` compatibility helper
+    - `trend_leader_unified` prewarm now requests `get_sector_rankings(10, prefer_stale_cache=True)` with backward-compatible fallback for older stubs/mocks
+  - Added/updated regression coverage:
+    - [`tests/test_fundamental_context.py`](d:\bb\daily_stock_analysis\tests\test_fundamental_context.py)
+    - [`tests/test_trend_leader_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_trend_leader_signal_flow.py)
+- Verification:
+  - Red:
+    - `python -m pytest tests/test_fundamental_context.py -k prefer_stale_disk_cache_before_fetchers -q`
+      - failed as expected with `TypeError: DataFetcherManager.get_sector_rankings() got an unexpected keyword argument 'prefer_stale_cache'`
+    - `python -m pytest tests/test_trend_leader_signal_flow.py -k prewarms_sector_rankings_and_passes_scan_context -q`
+      - failed as expected because the prewarm path was still calling `get_sector_rankings(...)` without `prefer_stale_cache=True`
+  - Green:
+    - `python -m py_compile data_provider/base.py scripts/select_trend_leader_candidates.py tests/test_fundamental_context.py tests/test_trend_leader_signal_flow.py`
+    - `python -m pytest tests/test_fundamental_context.py -k "prefer_stale_disk_cache_before_fetchers or stale_disk_cache_when_fetchers_fail" -q`
+      - result: `2 passed`
+    - `python -m pytest tests/test_trend_leader_signal_flow.py -k prewarms_sector_rankings_and_passes_scan_context -q`
+      - result: `1 passed`
+  - Real smoke:
+    - first run:
+      - `prep_universe_elapsed_sec=15.2721`
+      - `sector_rankings_prefetch_elapsed_sec=0.001032`
+      - but the process happened to rebuild deeper caches, so `scan_eval_elapsed_sec=27.258309`
+    - immediate same-parameter rerun:
+      - `elapsed_seconds=19.8831`
+      - `prep_universe_elapsed_sec=17.4894`
+      - `sector_rankings_prefetch_elapsed_sec=0.000529`
+      - `scan_eval_elapsed_sec=2.19127`
+      - `fundamental_cache_hit_count=62`
+      - `capital_flow_cache_hit_count=62`
+- Outcome:
+  - This round effectively removed `sector_rankings_prefetch` as a meaningful trend-leader preparation bottleneck.
+  - The remaining main preparation hotspot is now more concentrated in the `spot-enriched universe` path itself.
+
+## 2026-05-01 (trend_leader prefers stale spot cache before live spot)
+
+- Scope: continue the current `trend_leader_unified` performance/stability round by cutting the remaining live-spot wait inside `prep_universe`, without changing scoring weights, fallback tiers, or the default spot freshness policy of other strategies.
+- Why:
+  - After the `sector_rankings` prewarm trim, the next remaining preparation wall-clock was still centered on `spot-enriched universe`.
+  - The prior round only allowed stale `spot` reference cache as a failure fallback after live `spot` had already been attempted.
+  - For `trend_leader_unified`, which is an opt-in fast scan and already prefers disk reference cache, continuing to block on a likely-failing live `spot` call was no longer the right tradeoff when a structurally complete stale cache already existed locally.
+- Changes:
+  - Updated [`src/services/kline_selector_service.py`](d:\bb\daily_stock_analysis\src\services\kline_selector_service.py):
+    - added `_prefer_stale_spot_universe_reference_cache`
+    - when both `_prefer_spot_universe_reference_cache` and `_prefer_stale_spot_universe_reference_cache` are enabled, the service can directly reuse a structurally complete stale disk `spot` snapshot before touching live `spot`
+  - Updated [`scripts/select_trend_leader_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_trend_leader_candidates.py):
+    - `trend_leader_unified` now explicitly enables `_prefer_stale_spot_universe_reference_cache = True`
+  - Added/updated regression coverage:
+    - [`tests/test_kline_selector_service.py`](d:\bb\daily_stock_analysis\tests\test_kline_selector_service.py)
+    - [`tests/test_trend_leader_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_trend_leader_signal_flow.py)
+- Verification:
+  - Red:
+    - `python -m pytest tests/test_kline_selector_service.py -k prefer_stale_disk_reference_cache -q`
+      - failed as expected because live `spot` was still called once before falling back to the stale disk cache
+    - `python -m pytest tests/test_trend_leader_signal_flow.py -k prewarms_sector_rankings_and_passes_scan_context -q`
+      - failed as expected because the selector flags were still `(True, False)` instead of `(True, True)`
+  - Green:
+    - `python -m py_compile src/services/kline_selector_service.py scripts/select_trend_leader_candidates.py tests/test_kline_selector_service.py tests/test_trend_leader_signal_flow.py`
+    - `python -m pytest tests/test_kline_selector_service.py -k "prefer_stale_disk_reference_cache or uses_stale_disk_cache_for_failure_fallback or can_prefer_disk_reference_cache" -q`
+      - result: `3 passed`
+    - `python -m pytest tests/test_trend_leader_signal_flow.py -k prewarms_sector_rankings_and_passes_scan_context -q`
+      - result: `1 passed`
+    - `python -m pytest tests/test_kline_selector_service.py tests/test_fundamental_context.py tests/test_trend_leader_signal_flow.py -q`
+      - result: `129 passed`
+  - Real smoke:
+    - `python -c "from datetime import date; from scripts.select_trend_leader_candidates import scan_trend_leader_candidates_with_stats; import json; payload=scan_trend_leader_candidates_with_stats(snapshot_date=date.fromisoformat('2026-04-29'), limit=120, max_workers=2, fallback_top_n=20, watch_top_n=20, progress_every=0, prefetch_realtime_quotes=False, second_stage_news_search_enabled=False, second_stage_business_profile_enabled=False, fundamental_budget_seconds=0.6, capital_flow_budget_seconds=0.45); print(json.dumps(payload.get('run_stats', {}), ensure_ascii=False))"`
+    - observed:
+      - `elapsed_seconds=13.0335`
+      - `prep_universe_elapsed_sec=9.7677`
+      - `sector_rankings_prefetch_elapsed_sec=0.000505`
+      - `scan_eval_elapsed_sec=3.083283`
+      - `fundamental_fetch=0.212987`
+      - `capital_profile=0.279869`
+    - the previous live-spot failure log did not appear in this run, which is consistent with direct stale-cache reuse instead of waiting for a failing remote spot attempt first.
+- Outcome:
+  - `trend_leader_unified` preparation now reuses both stale `spot` cache and stale `sector_rankings` cache aggressively enough that the remaining wall-clock is much closer to the actual scan/evaluation work than to remote preparation overhead.
+
+## 2026-05-01 (trend_leader prefilter skips partial pct_change hydration)
+
+- Scope: continue the current `trend_leader_unified` performance/stability round by trimming the remaining shared prefilter long tail, without changing the strict/fallback selection rules.
+- Why:
+  - Fresh local probing showed the next real bottleneck had moved into `KlineSelectorService.prepare_scan_universe(...)`, not the already-optimized per-candidate scoring path.
+  - On the current `2026-04-29` reference date with valid spot cache, the main long tail was not disk-cache read itself but quote hydration inside prefilter:
+    - before change, one real probe returned `prepare_sec=22.5958`
+    - another warm-ish probe still returned `prepare_sec=19.0357`
+    - corresponding prefilter stats showed `quote_requested_rows=146`, `quote_requested_fields='pct_change'`, `quote_hydrated_rows=0`
+  - Current prefilter semantics are already fail-open for missing values (`pct_change` / `turnover_rate` missing rows are not hard-blocked), so requesting per-code quote just to fill a minority of empty `pct_change` rows was mostly paying latency without changing the core gate definition.
+- Changes:
+  - Updated [`src/services/kline_selector_service.py`](d:\bb\daily_stock_analysis\src\services\kline_selector_service.py):
+    - `_resolve_scan_prefilter_hydration_fields(...)` now treats `pct_change` as hydration-required only when the column has no usable numeric values at all, instead of requesting quote just because some rows are null.
+    - kept existing `turnover_rate` behavior unchanged in this round; the cut is intentionally narrow and only targets the measured hot path.
+  - Updated [`scripts/select_trend_leader_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_trend_leader_candidates.py):
+    - mirrored the same `pct_change` hydration trigger narrowing so the script-local fallback path stays semantically aligned with the service-layer shared scan shell.
+  - Added regression coverage:
+    - [`tests/test_kline_selector_service.py`](d:\bb\daily_stock_analysis\tests\test_kline_selector_service.py)
+    - [`tests/test_trend_leader_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_trend_leader_signal_flow.py)
+  - Updated strategy-facing records:
+    - [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md)
+    - [`docs/LOCAL_STRATEGY_BASELINE.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_BASELINE.md)
+    - [`docs/local_strategies/core/trend_leader_unified.md`](d:\bb\daily_stock_analysis\docs\local_strategies\core\trend_leader_unified.md)
+    - [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md)
+- Verification:
+  - Red:
+    - `python -m pytest tests/test_kline_selector_service.py -k partial_values_already_exist -q`
+      - failed as expected with `AssertionError: Lists differ: ['600002'] != []`
+    - `python -m pytest tests/test_trend_leader_signal_flow.py -k partial_values_already_exist -q`
+      - failed as expected with `AssertionError: assert ['600002'] == []`
+  - Green:
+    - `python -m pytest tests/test_kline_selector_service.py -q`
+      - result: `37 passed`
+    - `python -m pytest tests/test_trend_leader_signal_flow.py -k "prefilter or shared_prepare or partial_values_already_exist or resolve_scan_prefilter_hydration_fields" -q`
+      - result: `16 passed`
+    - local probe after change:
+      - inline `prepare_scan_universe(...)` on `snapshot_date=2026-04-29`
+      - returned `prepare_sec=5.3712`
+      - returned `quote_requested_rows=0`, `quote_requested_fields=''`, `quote_hydrated_rows=0`
+    - limited real scan smoke:
+      - inline `scan_trend_leader_candidates_with_stats(snapshot_date=2026-04-29, limit=80, max_workers=1, fallback_top_n=0, watch_top_n=0, progress_every=0, prefetch_realtime_quotes=False, second_stage_news_search_enabled=False, second_stage_business_profile_enabled=False)`
+      - returned `elapsed_seconds=27.4344`, `prep_universe_elapsed_sec=13.0744`, `processed_count=67`, `selected_count=0`, `capital_flow_fetch_skipped_count=20`
+- Notes:
+  - This round is a shared-prefilter hotpath trim, not a strategy-score redesign.
+  - Full same-day scan without `limit` still ran beyond the local verification timeout in this session, so the real-run smoke evidence is anchored to `limit=80` plus the direct prefilter probe above.
+
+## 2026-05-01 (trend_leader nested-threadpool trim for multi-worker scan)
+
+- Scope: keep the existing `trend_leader_unified` inner enrichment overlap for single-worker runs, but stop creating a nested per-candidate thread pool when the outer scan already runs with `max_workers > 1`.
+- Why:
+  - The candidate hot path still created an internal `ThreadPoolExecutor(max_workers=2)` for every evaluated stock.
+  - The current daily baseline already runs `trend_max_workers=2`, so the runtime shape had become "outer worker pool + inner per-candidate worker pool", which adds thread churn and makes latency less predictable.
+  - This round targets stability and runtime efficiency without changing strategy gates, scoring weights, strict/fallback rules, or snapshot schema.
+- Changes:
+  - Updated [`scripts/select_trend_leader_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_trend_leader_candidates.py):
+    - added `parallelize_enrichment` to `_evaluate_trend_leader_candidate(...)`.
+    - preserved the old inner overlap path when `parallelize_enrichment=True`.
+    - changed `scan_trend_leader_candidates_with_stats(...)` to pass `parallelize_enrichment=False` whenever outer `max_workers > 1`, so multi-worker scans now rely on one level of concurrency.
+    - added `run_stats.candidate_inner_parallel_enrichment` to expose which mode the run used.
+  - Updated [`tests/test_trend_leader_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_trend_leader_signal_flow.py):
+    - added regression coverage that `parallelize_enrichment=False` does not instantiate the nested executor.
+    - added regression coverage that multi-worker scans forward `parallelize_enrichment=False` into candidate evaluation.
+  - Updated [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md), [`docs/LOCAL_STRATEGY_BASELINE.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_BASELINE.md), [`docs/local_strategies/core/trend_leader_unified.md`](d:\bb\daily_stock_analysis\docs\local_strategies\core\trend_leader_unified.md), and [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md).
+- Verification:
+  - red phase:
+    - `python -m pytest tests/test_trend_leader_signal_flow.py -k "disable_nested_parallel_enrichment" -q`
+      - failed as expected with `TypeError: _evaluate_trend_leader_candidate() got an unexpected keyword argument 'parallelize_enrichment'`
+  - green phase:
+    - `python -m pytest tests/test_trend_leader_signal_flow.py -k "disables_nested_parallel_enrichment_when_multi_worker or can_disable_nested_parallel_enrichment" -q`
+    - `python -m pytest tests/test_trend_leader_signal_flow.py tests/test_trend_leader_strategy_service.py -q`
+    - `python -m py_compile scripts/select_trend_leader_candidates.py tests/test_trend_leader_signal_flow.py tests/test_trend_leader_strategy_service.py`
+    - `python scripts/select_trend_leader_candidates.py --snapshot-date 2026-04-29 --limit 30 --max-workers 2 --fallback-top-n 5 --watch-top-n 5 --disable-second-stage-news-search --disable-second-stage-business-profile --skip-db-persist --output-dir data/manual_runs/trend_leader_opt_20260501_smoke --log-level INFO`
+      - completed successfully; `processed=27/27`, `strict_selected=0`, `selected=5`
+    - inline `scan_trend_leader_candidates_with_stats(limit=5, max_workers=2, fallback_top_n=0, watch_top_n=0, progress_every=0, prefetch_realtime_quotes=False, second_stage_news_search_enabled=False, second_stage_business_profile_enabled=False, scan_prefilter_enabled=False)`
+      - returned `candidate_inner_parallel_enrichment=False`, `processed_count=5`, `selected_count=0`, `elapsed_seconds=13.7163`
+    - inline candidate-equivalence probe on `snapshot_date=2026-04-29`, first 3 prepared-universe codes:
+      - compared `_evaluate_trend_leader_candidate(..., parallelize_enrichment=True/False)` on the same `quote_seed` and `scan_context`
+      - observed `same=True` for all sampled codes on digest fields including `passed / primary_profile / overall_score / breakout_score / pullback_score / hybrid_score / risk_flags / capital_flow_status / board_*`
+    - `python scripts/run_fast_review_bundle.py --snapshot-date 2026-04-29 --include-signals earnings,hundred_day_high,trend_leader --limit 5 --skip-persist-snapshots --output-dir data/manual_runs/fast_review_trend_verify_20260501 --log-level INFO`
+      - completed successfully
+      - `signal_trend_leader_count=3`, `signal_trend_leader_elapsed_sec=23.77`
+      - `signal_hundred_day_high_count=1`, `signal_hundred_day_high_elapsed_sec=37.21`
+      - `signal_earnings_count=0`, `skipped_signal=earnings|earnings_surprise|no_rows|no candidate rows loaded from csv`
+- Notes:
+  - Single-worker runs still keep the per-candidate `fundamental + capital_profile` overlap introduced on 2026-04-29.
+  - Multi-worker runs now favor one level of concurrency, which is safer on the current Windows daily workflow and avoids repeated short-lived inner thread pools.
+
+## 2026-05-01 (trend_leader lazy dragon init + tighter weak-sample short-circuit + hotpath benchmark)
+
+- Scope: continue the next `trend_leader_unified` performance/stability round by trimming worker cold-start noise and tightening one more layer of weak-sample non-capital short-circuiting, then benchmark the result.
+- Why:
+  - Multi-worker trend scans still initialized `DragonHeadAnalysisService` eagerly per worker, even though many weak samples never entered `board / dragon / fundamental` enrichment at all.
+  - The existing weak-sample short-circuit only triggered on clearly poor trend payloads; marginal non-pattern names with weak same-day tape could still enter the non-capital branch unnecessarily.
+  - The user explicitly asked to handle the next three steps together: hotpath optimization, weak-sample short-circuit tightening, and benchmark verification.
+- Changes:
+  - Updated [`scripts/select_trend_leader_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_trend_leader_candidates.py):
+    - added lazy `dragon_service_factory` support to `_evaluate_trend_leader_candidate(...)`, so weak short-circuit candidates no longer build `DragonHeadAnalysisService` at all.
+    - delayed worker-side `DragonHeadAnalysisService` creation until a candidate actually reaches `dragon_analysis`.
+    - extended `_should_skip_capital_flow_fetch_for_trend_payload(...)` with optional `quote_data` and a tighter marginal weak-pattern gate:
+      - still preserves the original hard weak-pattern skip.
+      - additionally skips non-structural names when trend structure is still marginal, `distance_to_high_pct / pullback_depth_pct` are weak, and same-day `change_pct / turnover_rate` are also weak.
+    - added internal benchmark toggles to `scan_trend_leader_candidates_with_stats(...)` for `dragon_service_lazy_init_enabled` and `tighten_non_trend_enrichment_short_circuit`.
+  - Updated [`scripts/benchmark_trend_leader_v1.py`](d:\bb\daily_stock_analysis\scripts\benchmark_trend_leader_v1.py):
+    - added `--compare-hotpath-round` to compare previous hotpath control vs current lazy-dragon/tightened-short-circuit mode under the same prefilter settings.
+    - added a markdown warning that `hotpath_*` same-process compares are cache-sensitive and should not be treated as final evidence without fresh-process reruns.
+    - extended benchmark payloads with `scan_eval_elapsed_sec`, `avg_candidate_eval_elapsed_sec`, `phase_timing_sec`, `candidate_inner_parallel_enrichment`, `dragon_service_lazy_init_enabled`, `tighten_non_trend_enrichment_short_circuit`, and `capital_flow_fetch_skipped_count`.
+  - Updated tests:
+    - [`tests/test_trend_leader_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_trend_leader_signal_flow.py)
+      - added coverage that weak short-circuit candidates do not call `dragon_service_factory`.
+      - added coverage that marginal non-pattern payloads with weak quote tape are now skipped earlier.
+    - [`tests/test_trend_leader_benchmark.py`](d:\bb\daily_stock_analysis\tests\test_trend_leader_benchmark.py) remained green with the richer benchmark payload/markdown generation.
+  - Updated [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md), [`docs/LOCAL_STRATEGY_BASELINE.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_BASELINE.md), [`docs/local_strategies/core/trend_leader_unified.md`](d:\bb\daily_stock_analysis\docs\local_strategies\core\trend_leader_unified.md), and [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md).
+- Verification:
+  - red phase:
+    - `python -m pytest tests/test_trend_leader_signal_flow.py -k "dragon_service_for_weak_short_circuit or marginal_non_pattern_with_weak_quote_tape" -q`
+      - failed as expected with missing `dragon_service_factory` / `quote_data` arguments.
+  - green phase:
+    - `python -m pytest tests/test_trend_leader_signal_flow.py tests/test_trend_leader_strategy_service.py tests/test_trend_leader_benchmark.py -q`
+    - `python -m py_compile scripts/select_trend_leader_candidates.py scripts/benchmark_trend_leader_v1.py tests/test_trend_leader_signal_flow.py tests/test_trend_leader_strategy_service.py tests/test_trend_leader_benchmark.py`
+    - `python scripts/run_fast_review_bundle.py --snapshot-date 2026-04-29 --include-signals earnings,hundred_day_high,trend_leader --limit 5 --skip-persist-snapshots --output-dir data/manual_runs/fast_review_trend_hotpath_verify_20260501 --log-level INFO`
+      - completed successfully
+      - `signal_trend_leader_count=3`, `signal_trend_leader_elapsed_sec=16.04`
+      - `signal_hundred_day_high_count=1`, `signal_hundred_day_high_elapsed_sec=28.60`
+      - `signal_earnings_count=0`, `skipped_signal=earnings|earnings_surprise|no_rows|no candidate rows loaded from csv`
+  - benchmark evidence:
+    - same-process diagnostic:
+      - `python scripts/benchmark_trend_leader_v1.py --snapshot-date 2026-04-29 --limit 120 --max-workers 2 --fallback-top-n 20 --compare-hotpath-round --output-dir data/manual_runs/trend_leader_hotpath_benchmarks --log-level INFO`
+      - produced `improvement_pct=78.4866`, but this run is cache-sensitive and was not treated as final evidence.
+    - fresh-process control:
+      - inline `scan_trend_leader_candidates_with_stats(...)` with `dragon_service_lazy_init_enabled=False`, `tighten_non_trend_enrichment_short_circuit=False`
+      - returned `elapsed_seconds=16.2763`, `scan_eval_elapsed_sec=3.593174`, `avg_candidate_eval_elapsed_sec=0.05428`, `selected_count=20`, `capital_flow_fetch_skipped_count=25`
+    - fresh-process optimized:
+      - inline `scan_trend_leader_candidates_with_stats(...)` with `dragon_service_lazy_init_enabled=True`, `tighten_non_trend_enrichment_short_circuit=True`
+      - returned `elapsed_seconds=15.9720`, `scan_eval_elapsed_sec=3.321032`, `avg_candidate_eval_elapsed_sec=0.050446`, `selected_count=20`, `capital_flow_fetch_skipped_count=25`
+      - same warmed-disk, fresh-process comparison implies about `0.3043s` total reduction, roughly `1.87%`, with `selected_count / fallback_selected_count` unchanged.
+- Notes:
+  - The lazy dragon-service init is mainly a cold-start/noise reduction and weak-sample hygiene change, not a strategy redesign.
+  - The fresh-process comparison is the more trustworthy benchmark for this round; the same-process hotpath compare is kept as a quick diagnostic only.
+
+## 2026-05-01 (strategy-doc cleanup: current-code-only local strategy layout)
+
+- Scope: rebuild the local-strategy reading path around the current code only, move our strategy docs into one dedicated tree, and remove redundant non-source artifacts.
+- Why:
+  - The working tree had already converged on four core governance documents, but `docs/` still contained extra long-form analysis drafts and temporary plan/spec artifacts that no longer served as current truth sources.
+  - The user explicitly wanted the docs to be easier to read and asked to delete some unnecessary files rather than keep accumulating side records.
+- Changes:
+  - Reorganized the project-owned strategy docs into a dedicated tree:
+    - `docs/local_strategies/README.md`
+    - `docs/local_strategies/core/`
+      - `trend_leader_unified.md`
+      - `earnings_surprise.md`
+      - `hundred_day_high.md`
+      - `monthly_slow_rise.md`
+    - `docs/local_strategies/supporting/`
+      - `main_strategy_blueprint.md`
+      - `capital_profile.md`
+      - `earnings_strategy_breakdown.md`
+      - `earnings_playbook.md`
+      - `earnings_quality_signal.md`
+    - `docs/local_strategies/topics/`
+      - board/theme/dragon/commodity related topic docs and snapshot docs
+    - this tree is now the only current reading path for project-owned local-strategy docs.
+  - Updated [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md):
+    - rewrote the catalog around the new `core / supporting / topics` structure.
+    - removed the old "compatibility/history" wording for root-level strategy entry docs.
+  - Updated [`docs/LOCAL_STRATEGY_BASELINE.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_BASELINE.md):
+    - rewrote it as a current-baseline handbook aligned with the new doc structure.
+    - moved historical benchmark/process narrative back to `AI_MODIFICATION_LOG.md` and kept only current default behavior, parameter defaults, and per-strategy baseline notes.
+  - Updated [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md):
+    - updated the flat `[文档]` summary so the user-visible entry matches the final structure.
+  - Moved former root-level strategy/topic docs into `docs/local_strategies/supporting/` and `docs/local_strategies/topics/`, then removed old root-level primary-strategy entry docs that no longer belong to the new layout.
+  - Removed files that were not referenced by the current main reading path:
+    - `docs/EARNINGS_SURPRISE_OPTIMIZATION.md`
+    - `docs/TREND_LEADER_UNIFIED_DETAILED_ANALYSIS.md`
+    - `docs/superpowers/` temporary plan/spec drafts
+    - `.tmp_ui_backend.log`
+    - `.tmp_ui_backend.err.log`
+    - `.tmp_ui_frontend.log`
+    - `.tmp_ui_frontend.err.log`
+- Notes:
+  - No strategy baseline or runtime behavior changed here. This is documentation-governance cleanup only.
+
+## 2026-05-01 (hundred_day_high checkpoint path isolation)
+
+- Scope: fix the real runtime collision exposed by overlapping `hundred_day_high` runs after the latest verification round.
+- Why:
+  - During verification on 2026-05-01, running a standalone `hundred_day_high` task and a `run_fast_review_bundle.py --include-signals hundred_day_high` task at the same time reproduced a real file-lock failure on Windows:
+    - `PermissionError: [WinError 32] ... hundred_day_high_checkpoint.json.tmp -> hundred_day_high_checkpoint.json`
+  - Root cause: when users did not explicitly pass `--checkpoint-path`, all runs still shared the same default runtime checkpoint file under `data/hundred_day_high_checkpoint.json`, even if their `output_dir` values were already different.
+- Changes:
+  - Updated [`scripts/select_hundred_day_high_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_hundred_day_high_candidates.py):
+    - changed `--checkpoint-path` from a fixed root-level default to an optional override.
+    - when `--checkpoint-path` is not provided, the runtime checkpoint now defaults to `output_dir/hundred_day_high_checkpoint.json`.
+    - kept explicit custom checkpoint paths compatible with the existing shard suffix behavior.
+    - skipped redundant self-copy when the runtime checkpoint is already the exported checkpoint file inside `output_dir`.
+  - Updated [`scripts/run_fast_review_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_fast_review_bundle.py):
+    - made the bundle helper explicitly forward `--checkpoint-path <signal_output_dir>/hundred_day_high_checkpoint.json` into the spawned `hundred_day_high` command, so the aggregate entry no longer depends on the selector script's implicit default.
+  - Updated [`tests/test_hundred_day_high_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_hundred_day_high_signal_flow.py):
+    - added regression coverage that CLI parsing leaves `checkpoint_path` unset by default.
+    - added regression coverage that default checkpoint resolution now scopes to `output_dir`.
+    - added regression coverage that explicit checkpoint paths still append shard suffixes.
+  - Updated [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md), [`docs/local_strategies/core/hundred_day_high.md`](d:\bb\daily_stock_analysis\docs\local_strategies\core\hundred_day_high.md), and [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md).
+- Verification:
+  - red phase:
+    - `python -m pytest tests/test_hundred_day_high_signal_flow.py -k "checkpoint_path_unset_by_default or defaults_to_output_dir_checkpoint or explicit_path_with_shard_suffix" -q`
+  - green phase:
+    - `python -m pytest tests/test_hundred_day_high_signal_flow.py -k "checkpoint_path_unset_by_default or defaults_to_output_dir_checkpoint or explicit_path_with_shard_suffix" -q`
+    - `python -m pytest tests/test_hundred_day_high_signal_flow.py -q`
+    - `python -m py_compile scripts/select_hundred_day_high_candidates.py tests/test_hundred_day_high_signal_flow.py`
+  - runtime:
+    - `python scripts/select_hundred_day_high_candidates.py --snapshot-date 2026-04-29 --profile breakout_loose --skip-cause-analysis --skip-db-persist --max-workers 2 --output-dir data\\manual_runs\\hundred_day_high_full_verify_20260501_r2`
+    - `python scripts/run_fast_review_bundle.py --snapshot-date 2026-04-29 --include-signals hundred_day_high --skip-persist-snapshots --output-dir data\\manual_runs\\fast_review_hundred_day_only_verify_20260501_r2`
+    - `python scripts/run_fast_review_bundle.py --snapshot-date 2026-04-29 --include-signals hundred_day_high --skip-persist-snapshots --limit 200 --output-dir data\\manual_runs\\fast_review_hundred_day_checkpoint_explicit_verify_20260501`
+- Notes:
+  - This round fixes the reproduced cross-run collision when runs use different `output_dir` values.
+  - If a user intentionally points multiple concurrent runs at the same `output_dir`, they still share the same checkpoint file by design.
+
+## 2026-05-01 (hundred_day_high same-output-dir fail-fast lock)
+
+- Scope: add one more safety rail so users do not accidentally reuse the same `output_dir` for overlapping `hundred_day_high` runs.
+- Why:
+  - After the previous checkpoint-path isolation fix, runs with different `output_dir` values no longer collided.
+  - The remaining gap was operational misuse: if two concurrent runs still point to the same `output_dir`, they would intentionally share the same runtime checkpoint and exports.
+- Changes:
+  - Updated [`scripts/select_hundred_day_high_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_hundred_day_high_candidates.py):
+    - added `hundred_day_high_run.lock` under `output_dir` as a fail-fast runtime lock.
+    - if another live process already holds the same `output_dir`, the new run now exits early with an explicit error instead of proceeding into shared writes.
+    - if a stale lock file exists but its recorded `pid` is no longer alive, the script clears that stale lock and continues.
+  - Updated [`tests/test_hundred_day_high_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_hundred_day_high_signal_flow.py):
+    - added regression coverage that a second lock holder for the same `output_dir` is rejected.
+    - added regression coverage that `main()` returns `2` when the target `output_dir` is already locked.
+  - Updated [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md), [`docs/local_strategies/core/hundred_day_high.md`](d:\bb\daily_stock_analysis\docs\local_strategies\core\hundred_day_high.md), and [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md).
+- Verification:
+  - red phase:
+    - `python -m pytest tests/test_hundred_day_high_signal_flow.py -k "hold_output_dir_lock_rejects_second_holder or main_rejects_locked_output_dir" -q`
+  - green phase:
+    - `python -m pytest tests/test_hundred_day_high_signal_flow.py -k "hold_output_dir_lock_rejects_second_holder or main_rejects_locked_output_dir" -q`
+    - `python -m pytest tests/test_fast_review_daily_bundle.py -k "test_build_commands_forward_skip_db_persist" -q`
+    - `python -m py_compile scripts/select_hundred_day_high_candidates.py tests/test_hundred_day_high_signal_flow.py`
+  - runtime:
+    - launched a helper Python process that held `data\\manual_runs\\hundred_day_high_locked_output_failfast_realproc_20260501\\hundred_day_high_run.lock`
+    - then ran `python scripts/select_hundred_day_high_candidates.py --snapshot-date 2026-04-29 --output-dir data\\manual_runs\\hundred_day_high_locked_output_failfast_realproc_20260501 --skip-cause-analysis --skip-db-persist --limit 5`
+    - observed `script_exit=2` and log:
+      - `output_dir is already in use: ... hundred_day_high_run.lock`
+- Notes:
+  - This round does not change candidate selection, profile thresholds, signal type, or export schema.
+  - It only blocks an unsafe concurrent write pattern on the same output directory.
+
+## 2026-05-01 (hundred_day_high parallel breakout-quality enrichment)
+
+- Scope: reduce `hundred_day_high` post-selection wall time without changing signal rules, selected fields, or signal namespace.
+- Why:
+  - The current `hundred_day_high` pipeline already used the shared scan shell for universe preparation, but after the main scan finished it still fetched `180` days of history again for every selected row during breakout-quality enrichment.
+  - This enrichment stage is I/O-heavy and independent per stock, so it is a good low-risk parallelization target.
+- Changes:
+  - Updated [`scripts/select_hundred_day_high_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_hundred_day_high_candidates.py):
+    - added a parallel breakout-quality enrichment path for selected rows when the selector service exposes `_manager_factory` and `max_workers > 1`.
+    - kept the old fail-open behavior: if one row cannot fetch quality history, that row still remains selectable with `quality_available=False` semantics instead of crashing the whole run.
+    - added run-level observability fields:
+      - `breakout_quality_parallel_enabled`
+      - `breakout_quality_parallel_workers`
+      - `breakout_quality_enrichment_elapsed_sec`
+    - wired `scan_hundred_day_high_candidates(...)` to forward the CLI/runtime `max_workers` into breakout-quality enrichment.
+  - Updated [`tests/test_hundred_day_high_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_hundred_day_high_signal_flow.py):
+    - added regression coverage that scan forwards `max_workers` into breakout-quality enrichment.
+    - added regression coverage that breakout-quality history fetch can run concurrently when worker managers are available.
+- Verification:
+  - red phase:
+    - `python -m pytest tests/test_hundred_day_high_signal_flow.py -k "forwards_max_workers_to_breakout_quality_enrichment or breakout_quality_enrichment_parallelizes_history_fetch_when_worker_manager_available" -q`
+  - green phase:
+    - `python -m pytest tests/test_hundred_day_high_signal_flow.py -q`
+    - `python -m py_compile scripts/select_hundred_day_high_candidates.py tests/test_hundred_day_high_signal_flow.py`
+- Notes:
+  - This round intentionally does not change `hundred_day_high` profile thresholds or breakout-quality floor semantics.
+  - It only reduces the cost of enriching already-selected rows.
+
+## 2026-05-01 (hundred_day_high breakout_loose quality floor tightening)
+
+- Scope: trim the weakest `hundred_day_high` loose-profile tail without changing the main profile layout or signal namespace.
+- Why:
+  - After the doc cleanup and the breakout-quality parallelization, the next highest-value low-risk step was to stop `breakout_loose` from behaving like "new-high touched, quality optional".
+  - The loose profile still had `breakout_quality_score >= 0`, which meant rows with no meaningful breakout-quality support could still survive the post-selection filter.
+- Changes:
+  - Updated [`scripts/select_hundred_day_high_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_hundred_day_high_candidates.py):
+    - raised the `breakout_loose` breakout-quality floor from `0.0` to `4.0`.
+    - kept other profile floors unchanged:
+      - `momentum_strict >= 8`
+      - `breakout_balanced* >= 6`
+  - Updated [`tests/test_hundred_day_high_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_hundred_day_high_signal_flow.py):
+    - added regression coverage that `breakout_loose` now resolves to a light quality floor of `4.0`.
+    - added regression coverage that a loose-profile selected row with `breakout_quality_score=2.0` is rejected during breakout-quality enrichment.
+- Verification:
+  - red phase:
+    - `python -m pytest tests/test_hundred_day_high_signal_flow.py -k "breakout_loose_profile_uses_light_quality_floor or breakout_quality_enrichment_rejects_breakout_loose_tail_below_floor" -q`
+  - green phase:
+    - `python -m pytest tests/test_hundred_day_high_signal_flow.py -q`
+    - `python -m py_compile scripts/select_hundred_day_high_candidates.py tests/test_hundred_day_high_signal_flow.py`
+  - smoke:
+    - `python scripts/select_hundred_day_high_candidates.py --snapshot-date 2026-04-29 --profile breakout_loose --skip-cause-analysis --skip-db-persist --limit 200 --max-workers 2 --output-dir data\\manual_runs\\hundred_day_high_breakout_loose_after_floor_20260501`
+    - same sample still finished with `evaluated=91`, `selected=4`, so this tightening did not change the current `limit=200` smoke sample.
+- Notes:
+  - This is intentionally a light tightening, not a profile redesign.
+  - The goal is to cut `score=0/2` style weak tail rows first, while keeping clearly supported loose breakouts.
+
+## 2026-05-01 (watchlist-verify rerun evidence for the 2026-04-29 fast review baseline)
+
+- Scope: rerun the old `2026-04-29` watchlist-verify caliber fast review after the new `earnings_surprise` optimization had landed, then decide whether this rerun could still serve as a clean before/after bundle benchmark.
+- Why:
+  - The user already had an older `persist=False` baseline artifact under `data/manual_runs/fast_review_watchlist_verify_20260429`.
+  - We needed one concrete answer: after the new earnings weak-event prefilter landed, does the default fast-review bundle wall time actually improve on the old `2026-04-29` watchlist-verify caliber run?
+- Command:
+  - `.\.venv\Scripts\python.exe scripts/run_fast_review_bundle.py --snapshot-date 2026-04-29 --strategy-profile-file config/local_strategy_profile.json --output-dir data\manual_runs\fast_review_watchlist_verify_20260429_rerun_20260501 --skip-persist-snapshots --trend-watch-top-n 20 --log-level INFO`
+- Artifacts:
+  - old baseline summary: `data/manual_runs/fast_review_watchlist_verify_20260429/2026-04-29/review/fast_review_summary.md`
+  - old baseline stdout: `data/manual_runs/fast_review_watchlist_verify_20260429/stdout.log`
+  - rerun summary: `data/manual_runs/fast_review_watchlist_verify_20260429_rerun_20260501/2026-04-29/review/fast_review_summary.md`
+  - rerun stdout: `data/manual_runs/fast_review_watchlist_verify_20260429_rerun_20260501/stdout.log`
+- Result:
+  - old baseline (`2026-04-29 21:59:18`):
+    - resonance candidates: `752`
+    - total signal elapsed: `2322.9s`
+    - `earnings`: `703`, `2159.20s`
+    - `hundred_day_high`: `84`, `97.11s`
+    - `trend_leader`: `2`, `66.58s`
+    - earnings recent-event prefilter summary: `skipped=1457`, `evaluated=3560`
+  - rerun (`2026-05-01 10:13:26`):
+    - resonance candidates: `842`
+    - total signal elapsed: `7038.6s`
+    - `earnings`: `723`, `2632.18s`
+    - `hundred_day_high`: `173`, `2206.66s`
+    - `trend_leader`: `8`, `2199.75s`
+    - earnings recent-event prefilter summary: `skipped=1521`, `evaluated=3490`
+- Conclusion:
+  - This rerun is useful as a current-state observation, but it is no longer a clean bundle A/B against the original `2026-04-29` watchlist-verify run.
+  - The key reason is not just earnings drift. `hundred_day_high` moved from `84 -> 173` and `97.11s -> 2206.66s`, while `trend_leader` moved from `2 -> 8` and `66.58s -> 2199.75s`.
+  - That means the bundle-level wall time is now dominated by cross-signal drift and cold-scan/runtime conditions, so `2322.9s -> 7038.6s` cannot be interpreted as “the earnings optimization regressed the whole fast review.”
+  - What this rerun still confirms is narrower:
+    - the new earnings prefilter is active in the bundle path (`evaluated=3490` vs old `3560`);
+    - the new bundle path still completes end-to-end and exports all expected review artifacts;
+    - but bundle-level elapsed is no longer a stable benchmark for isolating this one earnings change.
+- Decision:
+  - Keep the clean causality claim anchored to the dedicated earnings full-market rerun already recorded under `2026-04-29 (earnings low-depth weak-event prefilter and phase timing)`, where the like-for-like evidence was `2159.20s -> 1833.013s` with `evaluated=3560 -> 3490`.
+  - Treat `data/manual_runs/fast_review_watchlist_verify_20260429_rerun_20260501` as a “post-change current bundle snapshot”, not as the primary benchmark for the earnings optimization itself.
+  - Do not update `LOCAL_STRATEGY_BASELINE.md` from this rerun alone; it does not change the current default strategy baseline, only how we interpret this specific verification artifact.
+
+## 2026-04-29 (earnings low-depth weak-event prefilter and phase timing)
+
+- Scope: continue optimizing the default fast-review `earnings_surprise` path, with priority on lowering full-market wall time without turning the scan into a bundle-only special case.
+- Why:
+  - The latest real full-market rerun still showed `earnings_surprise` as the dominant bottleneck in fast review.
+  - The old low-depth recent-event prefilter only reduced the universe by “code exists in current-event catalog”, but it still sent obviously weak current-season events into full bundle evaluation.
+  - Runtime diagnostics also lacked phase-level timing in the exported review output, which made follow-up tuning harder.
+- Changes:
+  - Updated [`scripts/select_earnings_surprise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_earnings_surprise_candidates.py):
+    - added `should_keep_recent_event_candidate(...)` for the low-depth recent-event path.
+    - this prefilter is intentionally conservative: it keeps any event with positive text or positive growth/ROE overlays, and only skips obvious weak-event rows with negative earnings text plus non-positive overlay metrics.
+    - added `phase_timing_sec` to `EarningsSurpriseRunResult` and aggregated `fundamental_fetch / evaluate_candidate / capital_profile`.
+    - exposed those phase timings in `earnings_surprise_candidates.md` under `Efficiency Summary`.
+  - Updated [`tests/test_earnings_surprise_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_earnings_surprise_signal_flow.py):
+    - added regression coverage that low-depth recent-event screening skips obvious weak events before bundle evaluation.
+    - added regression coverage for `phase_timing_sec` in `scan_market(...)`.
+    - added markdown coverage that the exported report prints phase timing lines.
+- Verification:
+  - red phase:
+    - `python -m pytest tests/test_earnings_surprise_signal_flow.py -k "candidate_prefilter or phase_timing" -q`
+    - `python -m pytest tests/test_earnings_surprise_signal_flow.py -k markdown_report_includes_cache_efficiency_summary -q`
+  - green phase:
+    - `python -m pytest tests/test_earnings_surprise_signal_flow.py -q`
+    - `python -m pytest tests/test_fast_review_daily_bundle.py -q`
+    - `python -m py_compile scripts/select_earnings_surprise_candidates.py tests/test_earnings_surprise_signal_flow.py`
+  - real run:
+    - full-market `2026-04-29` earnings rerun artifact:
+      - `data/manual_runs/earnings_option2_live_20260429/2026-04-29/signals/earnings/earnings_surprise_candidates.md`
+      - before baseline: `evaluated=3560`, `selected=703`, `elapsed=2159.20s`
+      - after this change: `evaluated=3490`, `selected=723`, `elapsed=1833.013s`
+    - markdown smoke for phase timing visibility:
+      - `data/manual_runs/earnings_option2_smoke_20260429/2026-04-29/signals/earnings/earnings_surprise_candidates.md`
+- Notes:
+  - In the real rerun, the code-based recent-event scope first trimmed the universe to `3678`, and the new weak-event candidate prefilter further reduced actual evaluation to `3490`, which means `188` obviously weak rows were skipped before bundle evaluation.
+  - Strategy-effect risk is kept intentionally low in this step: the filter under-screens rather than aggressively dropping borderline events.
+
+## 2026-04-29 (fast review strategy-focus now consumes trend watchlist sidecar)
+
+- Scope: expose the newly-added `trend_leader_unified` review-only watchlist inside the fast-review reading layer, without changing unified candidates, resonance exports, or snapshot persistence.
+- Why:
+  - The trend script could already export `trend_leader_unified_watchlist.csv`, but `run_fast_review_bundle.py` still only consumed the main trend candidates CSV.
+  - That left watch-only names invisible in the daily aggregate reading path, which defeated the purpose of separating them from strict.
+- Changes:
+  - Updated [`scripts/run_fast_review_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_fast_review_bundle.py):
+    - added `--trend-watch-top-n` and forwarded it to `scripts/select_trend_leader_candidates.py`.
+    - added review-only loading of `trend_leader_unified_watchlist.csv` from the trend signal output directory.
+    - `strategy_focus` grouping now merges those watch rows only for focus generation, while `fast_review_candidates.csv` and `fast_review_resonance.csv` still use the original main signal results.
+  - Updated [`tests/test_fast_review_daily_bundle.py`](d:\bb\daily_stock_analysis\tests\test_fast_review_daily_bundle.py):
+    - added regression coverage that trend command forwarding includes `--watch-top-n`.
+    - added end-to-end aggregate coverage that a watch-only trend row appears in `strategy_focus` but not in the unified candidates export.
+- Verification:
+  - red phase:
+    - `python -m pytest tests/test_fast_review_daily_bundle.py -k "trend_watchlist_in_strategy_focus_only or build_commands_forward_skip_db_persist" -q`
+  - green phase:
+    - `python -m pytest tests/test_fast_review_daily_bundle.py -q`
+    - `python -m py_compile scripts/run_fast_review_bundle.py tests/test_fast_review_daily_bundle.py`
+- Notes:
+  - This keeps the boundary intact: watchlist rows are aggregate-review inputs only, not main signal outputs.
+
+## 2026-04-29 (trend watchlist sidecar for non-structural positive-score names)
+
+- Scope: keep `trend_leader_unified` strict output pure after the strict-gate fix, while still exposing review-worthy positive-score `trend_neutral` names in a separate sidecar.
+- Why:
+  - After strict was corrected to require a real `breakout` or `pullback`, the user still needed a fast way to review filtered-out positive-score names without mixing them back into strict results or `/signals`.
+  - The right boundary is a review-only export, not another relaxation of the strict gate.
+- Changes:
+  - Updated [`scripts/select_trend_leader_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_trend_leader_candidates.py):
+    - added `--watch-top-n` with default `20`.
+    - added `_pick_watch_pool(...)` to collect positive-score, non-`pseudo_leader`, non-breakout/non-pullback, non-hard-blocked names excluded from the main selected set.
+    - `scan_trend_leader_candidates_with_stats(...)` now returns `watchlist` plus `run_stats.watch_selected_count`.
+    - `export_results(...)` now emits review-only sidecar files: `trend_leader_unified_watchlist.csv/txt/md`.
+    - `main()` now exports both main selected rows and watchlist sidecar rows, while keeping DB persistence limited to the main selected results.
+- Verification:
+  - red phase:
+    - `python -m pytest tests/test_trend_leader_signal_flow.py -k "pick_watch_pool or export_results_writes_watchlist_sidecar_files" -q`
+  - green phase:
+    - `python -m pytest tests/test_trend_leader_signal_flow.py -q`
+    - `python -m py_compile scripts/select_trend_leader_candidates.py tests/test_trend_leader_signal_flow.py`
+- Notes:
+  - This change does not alter `/signals` selected rows, does not persist watchlist rows to DB, and does not change fast-review aggregate logic in this step.
+
+## 2026-04-29 (trend strict selection now requires real breakout or pullback)
+
+- Scope: fix `trend_leader_unified` strategy-effect drift where many `trend_neutral` names were still entering the strict pool.
+- Why:
+  - Recent daily artifacts showed that many strict rows had `trend_score=0`, which contradicted the documented strict-core rule that strict hits must be actual `breakout` or `pullback` structures.
+  - Root cause was in [`src/services/trend_leader_strategy_service.py`](d:\bb\daily_stock_analysis\src\services\trend_leader_strategy_service.py): `passed` only required `overall_score > 0` and no hard block, but did not require `is_breakout_candidate` or `is_pullback_candidate`.
+- Changes:
+  - Updated [`src/services/trend_leader_strategy_service.py`](d:\bb\daily_stock_analysis\src\services\trend_leader_strategy_service.py):
+    - strict `passed` now also requires a real trend structure (`is_breakout_candidate or is_pullback_candidate`).
+    - positive-score but `trend_neutral` names now stay in fallback/watch handling instead of mixing into the strict ranking.
+  - Updated [`tests/test_trend_leader_strategy_service.py`](d:\bb\daily_stock_analysis\tests\test_trend_leader_strategy_service.py):
+    - flipped the weak-trend regression so a strong leadership / capital / earnings sample without breakout or pullback can no longer pass strict.
+- Verification:
+  - red phase:
+    - `python -m pytest tests/test_trend_leader_strategy_service.py -k weak_trend_structure_cannot_pass_strict_even_when_leadership_is_strong -q`
+  - green phase:
+    - `python -m pytest tests/test_trend_leader_strategy_service.py -q`
+    - `python -m py_compile src/services/trend_leader_strategy_service.py tests/test_trend_leader_strategy_service.py`
+- Notes:
+  - This change narrows only the strict-pool definition and does not change the scoring formula itself.
+  - If these `trend_neutral` positive-score names are still worth watching, they should be reviewed through fallback/watch outputs rather than the strict ranking.
+
+## 2026-04-29 (spot reference cache in-process reuse for shared scan shell)
+
+- Scope: continue trimming `trend_leader_unified` scan-shell overhead after the previous rerun diagnostics showed candidate evaluation was no longer the dominant cost.
+- Why:
+  - A local timing split showed `prepare_scan_universe(...)` itself was cheap (about `0.45s`), while repeated reads of `kline_selector_spot_universe.csv` had become the real prep bottleneck.
+  - On the same process, one `_read_spot_universe_reference_cache()` took about `4.72s`, and the old trend path read the same disk snapshot multiple times in one run.
+- Changes:
+  - Updated [`src/services/kline_selector_service.py`](d:\bb\daily_stock_analysis\src\services\kline_selector_service.py):
+    - added an in-process memory cache for the normalized spot reference snapshot, keyed by the cache file paths.
+    - `_read_spot_universe_reference_cache()` now returns the in-memory copy when the path and TTL still match, instead of calling `pd.read_csv(...)` again.
+    - `_write_spot_universe_reference_cache()` now refreshes that in-memory snapshot immediately after writing, so same-process follow-up reads stay coherent.
+  - Updated [`tests/test_kline_selector_service.py`](d:\bb\daily_stock_analysis\tests\test_kline_selector_service.py):
+    - added regression coverage that repeated same-process spot reference reads only touch disk once.
+- Verification:
+  - red phase:
+    - `python -m pytest tests/test_kline_selector_service.py -k read_spot_universe_reference_cache_reuses_memory_copy_within_process -q`
+  - green phase:
+    - `python -m pytest tests/test_kline_selector_service.py -q`
+    - `python -m py_compile src/services/kline_selector_service.py tests/test_kline_selector_service.py`
+  - local timing split:
+    - before: first `_read_spot_universe_reference_cache()` about `4.72s`
+    - after: first read about `5.17s`, second same-process read about `0.0005s`
+  - real diagnostic:
+    - same-parameter `trend_leader_unified` rerun on `2026-04-28`, `limit=200`, shared scan shell on, second-stage enrichment off:
+      - `elapsed_seconds=13.3221`
+      - `prep_universe_elapsed_sec=10.4969`
+      - `prep_prefilter_elapsed_sec=0.2522`
+      - `scan_eval_elapsed_sec=2.088845`
+      - `selected_count=20`
+- Notes:
+  - This round mainly removes repeated disk I/O inside one scan process; it does not change first-process cold cache cost.
+  - After this change, the remaining prep cost is concentrated much more in the first `get_spot_enriched_a_share_universe(...)` load itself than in the prefilter stage.
+
+## 2026-04-29 (history-failure cache reuse for repeated trend reruns)
+
+- Scope: continue trimming `trend_leader_unified` rerun wall time by removing repeated waits on the small set of symbols that consistently hit history-fetch timeouts/failures.
+- Why:
+  - The latest diagnostics showed `history_fetch` was no longer broadly slow; the remaining drag came from a few outliers repeatedly hitting the manager-level `20s` timeout.
+  - A parsed `trend_checkpoint.json` from the April 29 diagnostics showed `7` symbols at `>=19.5s`, contributing about `141s` of the total `history_fetch` sum by themselves.
+- Changes:
+  - Updated [`data_provider/base.py`](d:\bb\daily_stock_analysis\data_provider\base.py):
+    - added a short-TTL disk cache for failed `DataFetcherManager.get_daily_data(...)` requests, keyed by `stock + request range + days`.
+    - same-parameter fresh-process reruns now reuse the previous failure immediately instead of re-entering the remote timeout path.
+    - successful cache hits or later successful fetches clear the failed-history cache entry, so recovery is not blocked once the source becomes healthy again.
+  - Updated [`tests/test_fetcher_logging.py`](d:\bb\daily_stock_analysis\tests\test_fetcher_logging.py):
+    - added regression coverage that a failed history request is reused across manager instances and does not call the second fetcher again.
+- Verification:
+  - red phase:
+    - `python -m pytest tests/test_fetcher_logging.py -k history_failure_cache_reuses_failed_result_across_manager_instances -q`
+  - green phase:
+    - `python -m pytest tests/test_fetcher_logging.py -q`
+    - `python -m py_compile data_provider/base.py tests/test_fetcher_logging.py`
+  - synthetic timing probe:
+    - with a `0.05s` manager timeout and a deliberately hanging fetcher, the first request took about `0.0567s` and the second fresh-manager rerun took about `0.0017s`, with fetcher calls `1 -> 0`.
+- Notes:
+  - This round is aimed at repeated same-day reruns and diagnostics, not the very first cold miss on a problematic symbol.
+  - Given the existing April 29 distribution, the practical gain target is the repeated removal of roughly `141s` of timeout-shaped long tail in the same-parameter rerun path.
+
+## 2026-04-29 (trend weak-enrichment threshold tightening)
+
+- Scope: continue trimming `trend_leader_unified` cold-run deep-scan cost by widening the already-landed weak-trend short-circuit, without changing the scan shell or warm-cache path.
+- Why:
+  - After warm-rerun `fundamental_fetch` and `capital_profile` had already been largely removed as repeat-run bottlenecks, the remaining value was in skipping more clearly weak cold-run names before they enter remote `earnings / boards / dragon / capital_flow` enrichment.
+  - A same-parameter offline distribution check on `2026-04-28`, `limit=200` showed the current weak-trend gate only skipped `21` names, while a slightly broader but still conservative threshold would skip `34`.
+- Changes:
+  - Updated [`scripts/select_trend_leader_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_trend_leader_candidates.py):
+    - tightened `_should_skip_capital_flow_fetch_for_trend_payload(...)` from `<12 / <=8 / <8 / <5` to `<14 / <=9 / <9 / <6` on `trend_template_score / trend_stage2_score / base_quality_score / return_20d`.
+    - kept the short-circuit limited to non-breakout, non-pullback, non-near-new-high samples to avoid broadening into stronger structures.
+  - Updated [`tests/test_trend_leader_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_trend_leader_signal_flow.py):
+    - added regression coverage that the broader weak non-pattern payload now triggers the heavy-enrichment skip path.
+- Verification:
+  - red phase:
+    - `python -m pytest tests/test_trend_leader_signal_flow.py -k weak_non_pattern_payload -q`
+  - green phase:
+    - `python -m pytest tests/test_trend_leader_signal_flow.py -q`
+    - `python -m py_compile scripts/select_trend_leader_candidates.py tests/test_trend_leader_signal_flow.py`
+  - live diagnostic:
+    - same-parameter structured rerun on `2026-04-28`, `limit=200`, `max_workers=1`, second-stage enrichment off:
+      - before: `pending_total=116`, `selected_count=20`, `capital_flow_fetch_skipped_count=21`
+      - after: `pending_total=116`, `selected_count=20`, `capital_flow_fetch_skipped_count=34`
+- Notes:
+  - This round is intentionally a cold-run optimization only; it does not try to improve warm-rerun cache behavior further.
+  - The remaining dominant costs are still `history_fetch` and the truly unavoidable cold-path remote fundamentals on the names that survive this broader weak-trend gate.
+
+## 2026-04-29 (capital-flow cache reuse + live warm-rerun validation)
+
+- Scope: remove the new dominant warm-rerun hotspot in `trend_leader_unified` after earnings-fundamental caching was already stabilized.
+- Why:
+  - The previous live diagnostic had already shown `phase_timing_sec.fundamental_fetch` was no longer the main bottleneck on warm reruns.
+  - The next root-cause probe showed `capital_profile` was dominated by repeated `get_capital_flow_context(...)` calls, many of which returned `failed` or `not_supported` and had no cross-process reuse path.
+- Changes:
+  - Updated [`data_provider/base.py`](d:\bb\daily_stock_analysis\data_provider\base.py):
+    - `get_capital_flow_context(...)` now uses the shared manager-level in-memory cache plus a dedicated disk cache directory.
+    - cache keys now isolate `include_sector_rankings` scope and preserve `cache_hit/cache_source` metadata on reuse.
+    - `failed` and `not_supported` capital-flow contexts are now cacheable, with failed results using a shorter capped disk TTL.
+    - aligned capital-flow disk-cache TTL behavior with the earnings-fundamental path so warm fresh-process reruns are not accidentally invalidated by the short in-memory TTL config.
+  - Updated [`src/services/capital_profile_service.py`](d:\bb\daily_stock_analysis\src\services\capital_profile_service.py):
+    - normalized capital-flow payloads now preserve `cache_hit/cache_source`.
+    - top-level capital-profile outputs now expose `capital_flow_cache_hit` and `capital_flow_cache_source`.
+  - Updated [`scripts/select_trend_leader_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_trend_leader_candidates.py):
+    - candidate payloads now preserve `_capital_flow_cache_hit` / `_capital_flow_cache_source`.
+    - run-level `run_stats` now expose `capital_flow_cache_hit_count` and `capital_flow_cache_source_counts`.
+  - Updated [`tests/test_fundamental_context.py`](d:\bb\daily_stock_analysis\tests\test_fundamental_context.py):
+    - added coverage for capital-flow memory-cache reuse and failed-result disk reuse across manager instances.
+    - isolated the memory-cache regression onto a temporary disk-cache directory so prior local cache files cannot pollute the test.
+- Verification:
+  - red phase:
+    - `python -m pytest tests/test_fundamental_context.py -k "capital_flow_context_reuses_memory_cache_within_ttl or capital_flow_context_failed_result_reuses_disk_cache_across_manager_instances" -q`
+    - `python -m pytest tests/test_trend_leader_signal_flow.py -k aggregates_phase_timing_stats -q`
+  - green phase:
+    - `python -m pytest tests/test_kline_selector_service.py tests/test_trend_leader_signal_flow.py tests/test_fundamental_context.py tests/test_fundamental_adapter.py tests/test_data_fetcher_market_cache.py tests/test_akshare_sector_rankings_backoff.py -q`
+    - `python -m py_compile data_provider/base.py scripts/select_trend_leader_candidates.py src/services/kline_selector_service.py src/services/capital_profile_service.py tests/test_fundamental_context.py tests/test_trend_leader_signal_flow.py tests/test_kline_selector_service.py tests/test_data_fetcher_market_cache.py`
+  - live diagnostic:
+    - a 100-stock cold/warm isolated diagnostic on `2026-04-29` reached:
+      - cold: `elapsed_seconds=83.6179`, `phase_timing_sec.fundamental_fetch=63.52455`, `phase_timing_sec.capital_profile=12.826114`, `capital_flow_cache_hit_count=0`
+      - warm: `elapsed_seconds=21.8414`, `phase_timing_sec.fundamental_fetch=0.134471`, `phase_timing_sec.capital_profile=0.178221`, `capital_flow_cache_hit_count=89`, `capital_flow_cache_source_counts={'disk': 89}`
+- Notes:
+  - This round confirms the remaining warm-rerun hotspot was not in the capital scorer itself, but in missing cross-process reuse for stock-only capital-flow contexts.
+  - The cold run still spends most time in remote fundamentals; the new cache primarily improves repeated diagnostics, same-day reruns, and scan iteration speed.
+
+## 2026-04-29 (earnings-fundamental cache diagnostics + failed-context disk reuse)
+
+- Scope: finish root-cause investigation on the remaining `trend_leader_unified` `fundamental_fetch` bottleneck and remove repeated fresh failures from the trend-side earnings context path.
+- Why:
+  - After adding prepared-history fast-paths, the next dominant question was whether `fundamental_fetch` time was coming from disk-cache parsing or from repeated remote bundle calls.
+  - New diagnostics on `2026-04-29` showed the decisive split: among the non-skipped trend candidates, `34` were `status=ok` and already reusing disk cache, while `29` were `status=failed` and were being recomputed every fresh-process rerun because failed contexts were not cacheable.
+- Changes:
+  - Updated [`data_provider/base.py`](d:\bb\daily_stock_analysis\data_provider\base.py):
+    - `get_earnings_fundamental_context(...)` now returns top-level `cache_hit` / `cache_source` metadata (`memory`, `disk`, or fresh miss).
+    - added short-lived disk caching for `status=failed` earnings-fundamental contexts, with a capped failed-cache TTL (`30m`) so repeated scans stop hammering the same failing remote path while still allowing later recovery.
+    - disk cache payloads now persist a `ttl_seconds` field so failed contexts can expire earlier than normal successful earnings-fundamental caches.
+  - Updated [`scripts/select_trend_leader_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_trend_leader_candidates.py):
+    - candidate payloads now preserve `_fundamental_cache_hit` / `_fundamental_cache_source`.
+    - run-level `run_stats` now expose `fundamental_cache_hit_count` and `fundamental_cache_source_counts`.
+  - Updated tests:
+    - [`tests/test_fundamental_context.py`](d:\bb\daily_stock_analysis\tests\test_fundamental_context.py): added assertions for `cache_hit/cache_source` on fresh, memory-cache, disk-cache, and failed-disk-cache earnings contexts.
+    - [`tests/test_trend_leader_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_trend_leader_signal_flow.py): extended aggregation coverage so trend run-stats include fundamental cache counters.
+- Verification:
+  - red phase:
+    - `python -m pytest tests/test_fundamental_context.py -k earnings_fundamental_failed_context_reuses_disk_cache_across_manager_instances -q`
+  - green phase:
+    - `python -m pytest tests/test_fundamental_context.py -k earnings_fundamental_failed_context_reuses_disk_cache_across_manager_instances -q`
+    - `python -m pytest tests/test_kline_selector_service.py tests/test_trend_leader_signal_flow.py tests/test_fundamental_context.py tests/test_fundamental_adapter.py tests/test_data_fetcher_market_cache.py tests/test_akshare_sector_rankings_backoff.py -q`
+    - `python -m py_compile data_provider/base.py scripts/select_trend_leader_candidates.py tests/test_fundamental_context.py tests/test_trend_leader_signal_flow.py tests/test_kline_selector_service.py tests/test_data_fetcher_market_cache.py src/services/kline_selector_service.py`
+  - live diagnostics:
+    - first diagnostic with the new counters showed `FUND_STATUS={'failed': 29, 'ok': 34}`, `FUND_CACHE_SOURCE={'none': 29, 'disk': 34}`.
+    - after enabling failed-context reuse, the next fresh-process rerun reached `FUND_CACHE_SOURCE={'disk': 63}`, `fundamental_cache_hit_count=63`, and `phase_timing_sec.fundamental_fetch=0.166446`.
+- Notes:
+  - This round confirms the previous root-cause hypothesis: the remaining trend-side fundamental cost was dominated by repeated failed remote bundle calls, not by disk-cache read overhead.
+  - With fundamentals now effectively removed as the hot spot on warm reruns, the next dominant remaining phase is `capital_profile`.
+
+## 2026-04-29 (prepared-history fast-path + cache-isolated regressions)
+
+- Scope: continue trimming the remaining local overhead in the scan shell after `trend_leader_unified` diagnostics showed most history calls were already hitting disk cache but still paying repeated in-process normalization cost.
+- Why:
+  - Live observation on `2026-04-29` showed `history_fetch` had shifted from network latency to local work: nearly all candidate history calls were coming back as `disk_cache_best_effort_stale:*`, with no `force_refresh`, which meant repeated `to_datetime / to_numeric / sort` inside `_prepare_history(...)` had become an avoidable hot path.
+  - Regression tests around earnings-fundamental and sector-rankings caching had also become machine-state dependent once disk caches were introduced, so they needed explicit isolation to remain trustworthy.
+- Changes:
+  - Updated [`src/services/kline_selector_service.py`](d:\bb\daily_stock_analysis\src\services\kline_selector_service.py):
+    - `_prepare_history(...)` now detects already-normalized manager output (`datetime` date column, numeric OHLC fields, monotonic dates, no missing `close/high`) and takes a fast-path that only appends `prev_close` instead of re-running the full normalization pass.
+  - Updated [`tests/test_kline_selector_service.py`](d:\bb\daily_stock_analysis\tests\test_kline_selector_service.py):
+    - added a red/green regression that asserts prepared manager output must not call `pd.to_datetime(...)` or `pd.to_numeric(...)` again.
+  - Updated [`tests/test_fundamental_context.py`](d:\bb\daily_stock_analysis\tests\test_fundamental_context.py) and [`tests/test_data_fetcher_market_cache.py`](d:\bb\daily_stock_analysis\tests\test_data_fetcher_market_cache.py):
+    - isolated disk-cache-sensitive tests onto temporary cache directories so existing local cache files no longer cause false cache hits.
+- Verification:
+  - red phase:
+    - `python -m pytest tests/test_kline_selector_service.py -k prepare_history_skips_reparsing_for_prepared_manager_output -q`
+  - green phase:
+    - `python -m pytest tests/test_kline_selector_service.py -k prepare_history_skips_reparsing_for_prepared_manager_output -q`
+    - `python -m pytest tests/test_kline_selector_service.py tests/test_trend_leader_signal_flow.py tests/test_fundamental_context.py tests/test_fundamental_adapter.py tests/test_data_fetcher_market_cache.py tests/test_akshare_sector_rankings_backoff.py -q`
+    - `python -m py_compile src/services/kline_selector_service.py tests/test_kline_selector_service.py tests/test_fundamental_context.py tests/test_data_fetcher_market_cache.py scripts/select_trend_leader_candidates.py data_provider/base.py data_provider/fundamental_adapter.py src/services/capital_profile_service.py tests/test_trend_leader_signal_flow.py tests/test_fundamental_adapter.py`
+  - live diagnostic:
+    - same-parameter warm rerun on `2026-04-29` (`limit=120`, `shared_scan_shell_enabled=True`, second-stage enrichment off) produced `elapsed_seconds=27.2718`, `scan_eval_elapsed_sec=12.47996`, `phase_timing_sec.history_fetch=6.622563`.
+- Notes:
+  - This round did not change selection logic or signal counts; it only reduces repeated local preprocessing work and makes cache-related regressions deterministic.
+
+## 2026-04-29 (trend parallel enrichment + stock-only capital flow + narrowed earnings bundle)
+
+- Scope: continue reducing the remaining `trend_leader_unified` deep-scan bottlenecks after phase timing showed the hot path was still dominated by `fundamental_fetch` and `capital_profile`.
+- Why:
+  - Code-path inspection showed the trend-side capital profile was still fetching full sector rankings even though the capital-profile scorer only consumes per-stock capital-flow fields.
+  - The trend-side earnings context was still requesting the full fundamental bundle even though this path only needs `financial / forecast / quick_report`.
+  - Live diagnostics on `2026-04-29` also showed that cold runs were increasingly dominated by external fundamental/capital latency, so simply trimming calls was not enough; some of that wait time needed to be overlapped.
+- Changes:
+  - Updated [`data_provider/fundamental_adapter.py`](d:\bb\daily_stock_analysis\data_provider\fundamental_adapter.py):
+    - added `include_sector_rankings` to `get_capital_flow(...)`.
+    - when `include_sector_rankings=False`, the adapter now returns after stock-flow extraction and skips the sector-fund-flow ranking fetch chain entirely.
+  - Updated [`data_provider/base.py`](d:\bb\daily_stock_analysis\data_provider\base.py):
+    - added `include_sector_rankings` passthrough to `get_capital_flow_context(...)`.
+    - narrowed `get_earnings_fundamental_context(...)` to request only `enabled_blocks=("financial", "forecast", "quick_report")`.
+  - Updated [`src/services/capital_profile_service.py`](d:\bb\daily_stock_analysis\src\services\capital_profile_service.py):
+    - capital-profile fetches now call `get_capital_flow_context(..., include_sector_rankings=False)`.
+    - stopped copying caller-provided `daily_df` so trend scans can reuse the prepared history frame directly.
+  - Updated [`scripts/select_trend_leader_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_trend_leader_candidates.py):
+    - candidate evaluation now overlaps non-capital enrichment (`fundamental + boards + dragon`) with capital-profile building using an internal `ThreadPoolExecutor(max_workers=2)`.
+    - preserved existing phase-level timing output while reducing wall-clock wait inside each candidate.
+  - Updated tests:
+    - [`tests/test_fundamental_adapter.py`](d:\bb\daily_stock_analysis\tests\test_fundamental_adapter.py): added coverage that stock-only capital flow skips sector-ranking fetches.
+    - [`tests/test_fundamental_context.py`](d:\bb\daily_stock_analysis\tests\test_fundamental_context.py): added coverage that trend-side earnings context only requests `financial + forecast + quick_report`.
+    - [`tests/test_trend_leader_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_trend_leader_signal_flow.py): added a regression test that candidate evaluation overlaps the slow fundamental and capital branches instead of waiting on them serially.
+- Verification:
+  - red phase:
+    - `python -m pytest tests/test_fundamental_adapter.py -k "capital_flow_can_skip_sector_rankings_fetch" -q`
+    - `python -m pytest tests/test_fundamental_context.py -k "earnings_fundamental_context_requests_only_trend_needed_blocks" -q`
+    - `python -m pytest tests/test_trend_leader_signal_flow.py -k "overlaps_fundamental_and_capital_profile_work" -q`
+  - green phase:
+    - `python -m pytest tests/test_trend_leader_signal_flow.py tests/test_fundamental_adapter.py tests/test_fundamental_context.py tests/test_data_fetcher_market_cache.py tests/test_akshare_sector_rankings_backoff.py -q`
+    - `python -m py_compile scripts/select_trend_leader_candidates.py data_provider/fundamental_adapter.py data_provider/base.py src/services/capital_profile_service.py tests/test_trend_leader_signal_flow.py tests/test_fundamental_adapter.py tests/test_fundamental_context.py`
+  - live diagnostic:
+    - before this round: `elapsed_seconds=62.9206`, `scan_eval_elapsed_sec=50.144252`, `avg_candidate_eval_elapsed_sec=0.853585`
+    - after this round: `elapsed_seconds=48.9296`, `scan_eval_elapsed_sec=36.356938`, `avg_candidate_eval_elapsed_sec=0.754764`
+- Notes:
+  - This round reduced real scan wall time without changing `selected_count`, `strict_selected_count`, `fallback_selected_count`, or the shared-scan-shell contract.
+  - On the latest live run, `fundamental_fetch` and `capital_profile` are still the dominant summed phase totals, but the user-visible wall time is lower because the two branches no longer sit fully serial inside a candidate.
+
+## 2026-04-29 (trend timing + sector rankings cache + market expectation cache)
+
+- Scope: add direct performance observability for `trend_leader_unified`, cache repeated sector-ranking prewarm work across reruns, and cache `earnings_surprise` market-expectation review fetches.
+- Why:
+  - Earlier `trend_leader_unified` optimization attempts were still relying on coarse total elapsed time, which made it hard to see whether the real bottleneck was `history`, `fundamentals`, `capital`, or prewarmed sector context.
+  - Repeated diagnostics showed `sector_rankings` prewarm alone could cost about 6 seconds when Eastmoney failed and the chain fell back to Sina.
+  - Logs around `stock_recommend.py` confirmed `stock_profit_forecast_ths` remained a repeated review-only remote dependency worth caching.
+- Changes:
+  - Updated [`scripts/select_trend_leader_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_trend_leader_candidates.py):
+    - added per-candidate `_phase_timing_sec` capture for `history_fetch / quote_fetch / fundamental_fetch / board_fetch / dragon_analysis / capital_profile / score_candidate`.
+    - added run-level `run_stats.phase_timing_sec`, `avg_candidate_eval_elapsed_sec`, `scan_eval_elapsed_sec`, `post_select_enrichment_elapsed_sec`, `sector_rankings_prefetch_elapsed_sec`, `sector_rankings_prefetch_status`, and `sector_rankings_prefetch_error`.
+  - Updated [`data_provider/base.py`](d:\bb\daily_stock_analysis\data_provider\base.py):
+    - added disk-backed cache reuse for `DataFetcherManager.get_sector_rankings(...)`, so repeated manager instances can reuse recent sector-ranking payloads instead of re-hitting fetchers.
+  - Updated [`data_provider/akshare_fetcher.py`](d:\bb\daily_stock_analysis\data_provider\akshare_fetcher.py):
+    - added fetcher-level disk cache for `get_sector_rankings(...)`, which still benefits direct fetcher callers and keeps the ordered fallback chain from re-running unnecessarily.
+  - Updated [`data_provider/fundamental_adapter.py`](d:\bb\daily_stock_analysis\data_provider\fundamental_adapter.py):
+    - added disk-backed cache for `get_market_expectation_snapshot(...)`.
+    - cached payloads now expose `cache_hit` and `cache_source` for diagnostics.
+  - Updated tests:
+    - [`tests/test_trend_leader_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_trend_leader_signal_flow.py)
+    - [`tests/test_data_fetcher_market_cache.py`](d:\bb\daily_stock_analysis\tests\test_data_fetcher_market_cache.py)
+    - [`tests/test_akshare_sector_rankings_backoff.py`](d:\bb\daily_stock_analysis\tests\test_akshare_sector_rankings_backoff.py)
+    - [`tests/test_fundamental_adapter.py`](d:\bb\daily_stock_analysis\tests\test_fundamental_adapter.py)
+- Verification:
+  - `python -m pytest tests/test_data_fetcher_market_cache.py tests/test_akshare_sector_rankings_backoff.py tests/test_trend_leader_signal_flow.py tests/test_fundamental_adapter.py -q`
+  - `python -m pytest tests/test_earnings_surprise_signal_flow.py -k "market_expectation_reference" -q`
+  - `python -m py_compile scripts/select_trend_leader_candidates.py data_provider/base.py data_provider/akshare_fetcher.py data_provider/fundamental_adapter.py tests/test_data_fetcher_market_cache.py tests/test_akshare_sector_rankings_backoff.py tests/test_trend_leader_signal_flow.py tests/test_fundamental_adapter.py`
+  - trend diagnostic run after instrumentation:
+    - first observed breakdown: `elapsed_seconds=29.2466`, `sector_rankings_prefetch_elapsed_sec=6.532552`, `phase_timing_sec.history_fetch=6.710514`, `fundamental_fetch=6.530588`, `capital_profile=6.634896`
+    - after manager-level sector-ranking disk cache was wired: `elapsed_seconds=27.5918`, `sector_rankings_prefetch_elapsed_sec=0.000552`
+- Notes:
+  - The new timing evidence shows the remaining dominant per-candidate costs are still `history_fetch`, `fundamental_fetch`, and `capital_profile`; `board_fetch`, `dragon_analysis`, and `score_candidate` are negligible.
+  - The sector-ranking disk cache removes a repeated prewarm penalty across reruns, but it does not reduce the still-dominant per-stock history/fundamental chain.
+
+## 2026-04-29 (trend_leader_unified weak-trend enrichment short-circuit)
+
+- Scope: reduce `trend_leader_unified` runtime by short-circuiting heavy enrichment for clearly weak trend setups, while keeping the deep-scan contract unchanged.
+- Why:
+  - The `2026-04-29` daily fast review showed `trend_leader_unified` remained one of the slowest strategies.
+  - Code-path inspection confirmed many deep-scan samples still entered `earnings_context / boards / dragon / capital_flow` enrichment, even when the trend structure had already degraded enough that the name was unlikely to pass.
+- Changes:
+  - Updated [`scripts/select_trend_leader_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_trend_leader_candidates.py):
+    - added `_should_skip_capital_flow_fetch_for_trend_payload(...)` to identify obviously weak non-breakout/non-pullback setups.
+    - when that gate hits, the scan now short-circuits `earnings_context / belong_boards / dragon analyze` and passes a synthetic `{"status": "skipped", "data": {"stock_flow": {}}}` context into capital-factor building instead of triggering the full `capital_flow` fetch.
+    - added per-run `run_stats["capital_flow_fetch_skipped_count"]` for direct observation.
+    - each result now also carries `capital_flow_fetch_skipped` for in-process diagnostics.
+  - Updated [`tests/test_trend_leader_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_trend_leader_signal_flow.py):
+    - added regression coverage that weak-trend samples propagate the synthetic skipped capital-flow context.
+    - added regression coverage that scan summaries report `capital_flow_fetch_skipped_count`.
+- Verification:
+  - `python -m pytest tests/test_trend_leader_signal_flow.py -q`
+  - `python -m py_compile scripts/select_trend_leader_candidates.py tests/test_trend_leader_signal_flow.py`
+  - diagnostic run:
+    - before short-circuit broadening: `limit=200`, deep-scan universe `116`, `capital_flow_fetch_skipped_count=21`, `elapsed_seconds=118.1788`
+    - after short-circuit broadening: `limit=200`, deep-scan universe `116`, `capital_flow_fetch_skipped_count=21`, `elapsed_seconds=115.1488`
+- Notes:
+  - This optimization does not change the fast-review API contract or snapshot schema.
+  - The current dominant bottlenecks are still universe/quote preparation and per-stock history fetch; this step only trims one expensive enrichment branch.
+
+## 2026-04-28 (fast-review earnings focus + market-expectation reference labels)
+
+- Scope: move the new market-expectation reference into the main fast-review reading path and add a fixed “best earnings names” review artifact.
+- Why:
+  - The previous step only appended market-expectation snapshots to `earnings_surprise` candidate exports.
+  - The next practical gap was still on the reading side: the user had to manually inspect raw earnings CSV rows instead of seeing the relevant expectation context directly inside the daily review summary and focus outputs.
+- Changes:
+  - Updated [`scripts/select_earnings_surprise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_earnings_surprise_candidates.py):
+    - added review-only `market_expectation_reference_label / basis / delta_pct` fields.
+    - current label contract is `beat_ref / inline_ref / miss_ref / unknown`.
+    - the label only resolves when same-basis `actual_eps` and consensus EPS are both available; otherwise it intentionally stays `unknown`.
+  - Updated [`scripts/run_fast_review_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_fast_review_bundle.py):
+    - preserved `event_date`, market-expectation summary, and reference-label fields while loading signal CSV rows.
+    - extended `strategy_focus` rows/CSV with those expectation fields.
+    - added `_build_earnings_focus_rows(...)` and `_write_earnings_focus_outputs(...)`.
+    - added new review artifacts:
+      - `fast_review_earnings_focus.csv`
+      - `fast_review_earnings_focus.md`
+    - inserted “今日业绩焦点 15 只” into `fast_review_summary.md`.
+  - Updated [`tests/test_earnings_surprise_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_earnings_surprise_signal_flow.py) and [`tests/test_fast_review_daily_bundle.py`](d:\bb\daily_stock_analysis\tests\test_fast_review_daily_bundle.py):
+    - added regression coverage for reference-label propagation, fast-review earnings-focus sorting, markdown rendering, and output files.
+  - Updated [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md) and [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md).
+- Verification:
+  - `python -m pytest tests/test_earnings_surprise_signal_flow.py -k "market_expectation_reference"` (3 passed)
+  - `python -m pytest tests/test_fast_review_daily_bundle.py -k "earnings_focus or strategy_focus_rows_prioritizes_overlap_earnings_capital_and_board or load_signal_rows_keeps_strategy_focus_fields or main_writes_strategy_focus_outputs"` (6 passed)
+  - full related regression and compile verification recorded after implementation completion.
+- Notes:
+  - This is still a review-layer reference, not a strict quarter-level consensus-surprise factor.
+  - The label framework is intentionally conservative now so we do not emit fake beat/miss conclusions when only annual consensus EPS is available.
+
+## 2026-04-28 (earnings_surprise market-expectation review reference)
+
+- Scope: add a post-selection market-expectation reference layer for `earnings_surprise` review outputs without changing current earnings scoring.
+- Why:
+  - The current `earnings_surprise` implementation is still a rule-based proxy model, not a strict sell-side consensus beat/miss engine.
+  - Daily review needs a lightweight “what did the market broadly expect” reference after candidates are selected, but that reference should not distort the current score or pass/fail gate before the underlying expectation model is fully standardized.
+- Changes:
+  - Updated [`data_provider/fundamental_adapter.py`](d:\bb\daily_stock_analysis\data_provider\fundamental_adapter.py):
+    - added `get_market_expectation_snapshot(...)` using `stock_profit_forecast_ths` to fetch review-only annual EPS expectation snapshots.
+    - normalized forecast year, institution count, EPS min/mean/max, industry-average EPS, and a concise summary string.
+  - Updated [`scripts/select_earnings_surprise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_earnings_surprise_candidates.py):
+    - added `enrich_selected_market_expectation_reference(...)` and applied it only after `run_result.selected` is produced.
+    - exported `market_expectation_*` fields into earnings candidate CSV/metrics.
+    - added a `市场预期参考` section to the earnings Markdown report, explicitly marked as review-only and non-scoring.
+  - Updated [`scripts/run_fast_review_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_fast_review_bundle.py):
+    - retained `market_expectation_*` fields when loading per-signal CSV rows, so unified review exports can keep the reference fields.
+  - Updated [`tests/test_earnings_surprise_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_earnings_surprise_signal_flow.py) and [`tests/test_fast_review_daily_bundle.py`](d:\bb\daily_stock_analysis\tests\test_fast_review_daily_bundle.py):
+    - added regression coverage for available/missing expectation snapshots, selected-dataframe field propagation, Markdown rendering, and fast-review CSV field retention.
+  - Updated [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md) and [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md).
+- Verification:
+  - `python -m pytest tests/test_earnings_surprise_signal_flow.py -k "market_expectation or readable_chinese_headers"` (4 passed after first observing the expected missing-helper failure)
+  - `python -m pytest tests/test_fast_review_daily_bundle.py -k "strategy_focus_fields"` (1 passed)
+  - `python -m pytest tests/test_earnings_surprise_signal_flow.py tests/test_fast_review_daily_bundle.py` (77 passed)
+  - `python -m py_compile scripts/select_earnings_surprise_candidates.py data_provider/fundamental_adapter.py scripts/run_fast_review_bundle.py tests/test_earnings_surprise_signal_flow.py tests/test_fast_review_daily_bundle.py` (passed)
+- Notes:
+  - This change intentionally does not compute a strict quarter-level consensus beat/miss label.
+  - The current source is a lightweight THS annual EPS forecast snapshot, meant for review context first; stricter expectation-delta modeling can be added later on top of this display layer.
+
+## 2026-04-28 (monthly_slow_rise shared scan-shell integration + fast-review bundle observation)
+
+- Scope: finish the WonderTrader-inspired shared scan-shell rollout for `monthly_slow_rise`, then wire it into the aggregate fast-review bundle as an optional scan-chain signal.
+- Why:
+  - `trend_leader_unified` and `hundred_day_high` had already converged onto `KlineSelectorService.prepare_scan_universe(...)`.
+  - The next requested checkpoint was to prove `monthly_slow_rise` keeps stable `selected / evaluated / skipped` semantics after the convergence, and that the three K-line scan strategies can be observed from one aggregate entry before moving on to the `RQAlpha`-style evaluation layer.
+- Changes:
+  - Updated [`scripts/select_monthly_slow_rise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_monthly_slow_rise_candidates.py):
+    - default scans now prepare the spot-enriched universe through `prepare_scan_universe(...)`.
+    - shared-shell filter/prefilter counters are merged back into `KlineSelectorRunResult` skip counters and `phase_metrics`.
+    - keeps `--disable-shared-scan-shell` as the same-parameter old-path diagnostic switch.
+  - Updated [`tests/test_monthly_slow_rise_candidates.py`](d:\bb\daily_stock_analysis\tests\test_monthly_slow_rise_candidates.py):
+    - added regression coverage that `monthly_slow_rise` prefers `prepare_scan_universe(...)`, forwards snapshot/shard parameters, disables double-sharding in deep scan, and keeps shared-shell stats visible.
+  - Updated [`scripts/run_fast_review_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_fast_review_bundle.py):
+    - added optional signal key `monthly_slow_rise`.
+    - added `build_monthly_slow_rise_command(...)` plus `--monthly-signal-type` / `--monthly-profile` / `--monthly-max-workers`.
+    - wired `monthly_slow_rise` into external signal jobs without changing the default daily signal set.
+  - Updated [`tests/test_fast_review_daily_bundle.py`](d:\bb\daily_stock_analysis\tests\test_fast_review_daily_bundle.py):
+    - added regression coverage for monthly command forwarding and bundle registration.
+  - Updated [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md), [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md), [`docs/architecture/external-capability-map-for-local-strategies.md`](d:\bb\daily_stock_analysis\docs\architecture\external-capability-map-for-local-strategies.md), and added [`docs/architecture/rqalpha-evaluation-layer-next-step.md`](d:\bb\daily_stock_analysis\docs\architecture\rqalpha-evaluation-layer-next-step.md).
+- Verification:
+  - `python -m pytest tests/test_monthly_slow_rise_candidates.py -q` (18 passed)
+  - `python -m py_compile scripts/select_monthly_slow_rise_candidates.py tests/test_monthly_slow_rise_candidates.py` (passed)
+  - Same-parameter A/B for `monthly_slow_rise` on `snapshot_date=2026-04-24`, `profile=balanced`, `limit=300`, `max_workers=2`, skip DB persist:
+    - shared path: `python scripts/select_monthly_slow_rise_candidates.py --profile balanced --snapshot-date 2026-04-24 --limit 300 --max-workers 2 --skip-db-persist --output-dir data/manual_runs/monthly_shared_ab_20260428/shared --checkpoint-path data/manual_runs/monthly_shared_ab_20260428/shared_checkpoint.json --log-level INFO`
+      - result: `universe=280`, `evaluated=280`, `selected=3`, `skipped_by_listed_days=0`
+      - shared-shell stats: `base=300`, `sharded=280`, `prepared=280`, `removed_st=20`
+    - legacy path: `python scripts/select_monthly_slow_rise_candidates.py --profile balanced --snapshot-date 2026-04-24 --limit 300 --max-workers 2 --skip-db-persist --disable-shared-scan-shell --output-dir data/manual_runs/monthly_shared_ab_20260428/legacy --checkpoint-path data/manual_runs/monthly_shared_ab_20260428/legacy_checkpoint.json --log-level INFO`
+      - result: `universe=300`, `evaluated=280`, `selected=3`, `skipped_by_prefilter=20`, `skipped_by_listed_days=0`
+      - conclusion: the shared-shell migration did not deform `selected / evaluated / skipped` semantics.
+  - `python -m pytest tests/test_fast_review_daily_bundle.py -q` (24 passed)
+  - `python -m py_compile scripts/run_fast_review_bundle.py tests/test_fast_review_daily_bundle.py` (passed)
+  - Unified K-line scan-chain bundle run:
+    - `python scripts/run_fast_review_bundle.py --snapshot-date 2026-04-24 --include-signals hundred_day_high,trend_leader,monthly_slow_rise --limit 300 --skip-persist-snapshots --external-parallelism 2 --output-dir data/manual_runs/fast_review_kline_scan_bundle_20260428 --log-level INFO`
+    - result: `signal_hundred_day_high_count=4`, `signal_trend_leader_count=1`, `signal_monthly_slow_rise_count=3`, `skipped_signals_count=0`
+    - elapsed: `hundred_day_high=86.84s`, `trend_leader=83.77s`, `monthly_slow_rise=80.98s`
+    - confirmation: the three scan-chain strategies can now be observed and exported from one fast-review aggregate entry.
+
+## 2026-04-28 (hundred_day_high shared scan-shell integration)
+
+- Scope: continue the WonderTrader-inspired shared scan-shell rollout by moving `hundred_day_high` onto `KlineSelectorService.prepare_scan_universe(...)`.
+- Why:
+  - `trend_leader_unified` had already validated the service-level scan preparation path.
+  - Architecture notes list the next convergence targets as `hundred_day_high` and `monthly_slow_rise`, before moving to standardized evaluation-layer work.
+- Changes:
+  - Updated [`scripts/select_hundred_day_high_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_hundred_day_high_candidates.py):
+    - default scans now call `prepare_scan_universe(...)` after loading the spot-enriched universe.
+    - deep K-line evaluation now receives the already prepared universe with local sharding disabled to avoid double-sharding.
+    - shared-shell filter/prefilter stats are merged back into `KlineSelectorRunResult.phase_metrics` and legacy skip counters.
+    - added `--disable-shared-scan-shell` for same-parameter old-path diagnostics.
+  - Updated [`tests/test_hundred_day_high_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_hundred_day_high_signal_flow.py):
+    - added regression coverage that `hundred_day_high` prefers shared scan preparation and passes only prepared rows into deep scanning.
+  - Updated [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md), [`docs/LOCAL_STRATEGY_BASELINE.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_BASELINE.md), and [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md).
+- Verification:
+  - `python -m pytest tests/test_hundred_day_high_signal_flow.py -k prefers_shared_prepare_scan_universe -q` (failed before implementation with missing `prepare_kwargs`, then passed).
+  - `python -m pytest tests/test_hundred_day_high_signal_flow.py -q` (17 passed).
+
+## 2026-04-28 (earnings_surprise 7-day fast-review benchmark + expanded full bundle rerun)
+
+- Scope: fix the documentation trail for the new daily `earnings_surprise` scope and remeasure both the default fast-review chain and the expanded chain with `continuous_up` enabled.
+- Why:
+  - The code path had already been changed to `latest_report_period + recent_event_max_age_days=7`, but the benchmark conclusion was not yet fixed into the strategy baseline documents.
+  - The previous total-chain comparison only covered the default three-signal daily bundle and did not include `continuous_up_ratio` / `continuous_up_streak`.
+- Benchmark notes recorded:
+  - default cold fast-review chain (`earnings + hundred_day_high + trend_leader`) on `2026-04-28` improved from about `2232s` to about `1661s` (`-25.6%` wall clock).
+  - clean `earnings_surprise` attribution: `evaluated_count 3002 -> 2648`, `selected_count 664 -> 561`, `elapsed 2231.48s -> 1661.41s`.
+  - expanded cold fast-review chain (`earnings + hundred_day_high + trend_leader + continuous_up_ratio + continuous_up_streak`) completed in about `1613s`; the local `continuous_up` phase evaluated `803` names and exported `ratio_selected=210`, `streak_selected=71`, with per-signal export timing recorded as `63.88s`.
+  - the default strategy baseline now explicitly documents that the daily fast-review default is the 7-day recent-announcement window, while full-season review remains available by omitting `--recent-event-max-age-days`.
+- Changes:
+  - Updated [`docs/LOCAL_STRATEGY_BASELINE.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_BASELINE.md):
+    - added the `2026-04-28 fast-review benchmark` section.
+    - updated the `earnings_surprise` parameter row to include `--recent-event-max-age-days`.
+  - Updated [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md):
+    - added a flat `[改进]` entry for the daily 7-day `earnings_surprise` fast-review default.
+  - Updated [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md):
+    - synchronized the top-level daily-entry note with the 7-day default and the expanded-bundle benchmark reference.
+- Verification:
+  - `python scripts/run_fast_review_bundle.py --snapshot-date 2026-04-28 --output-dir data/manual_runs/fast_review_full_recent7d_rerunfix_20260428_132619 --log-level INFO` using an isolated DB copy with same-day snapshots removed (default chain benchmark source).
+  - `python scripts/run_fast_review_bundle.py --snapshot-date 2026-04-28 --include-signals earnings,hundred_day_high,trend_leader,continuous_up --output-dir data/manual_runs/fast_review_full_with_continuous_20260428_141553 --log-level INFO` using an isolated DB copy with same-day snapshots removed (expanded chain benchmark source).
+- Notes:
+  - `hundred_day_high` and `trend_leader_unified` same-day selected counts can drift with late market data refresh, so they are operational observations rather than the core causal benchmark for the 7-day `earnings_surprise` change.
+
+## 2026-04-28 (earnings_surprise recent-announcement window for fast review)
+
+- Scope: shrink the daily `earnings_surprise` fast-review universe from “entire current report period” to “current report period plus recent announcements”, while preserving a full-season mode.
+- Why:
+  - The 2026-04-28 full-market fast review still evaluated `3002` names even under `recent_event_scope=latest_report_period`.
+  - Runtime profiling showed the dominant cost remained near-full per-stock `financial` refresh, so the highest-yield safe optimization was to narrow the default daily announcement window instead of changing scoring inputs.
+- Changes:
+  - Updated [`scripts/select_earnings_surprise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_earnings_surprise_candidates.py):
+    - added CLI support for `--recent-event-max-age-days`.
+    - extended `filter_recent_event_catalog_by_scope(...)` to optionally keep only announcements within the last N natural days.
+    - kept the standalone selector backward-compatible by leaving the new window disabled unless explicitly passed.
+  - Updated [`scripts/run_fast_review_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_fast_review_bundle.py):
+    - added `--earnings-recent-event-max-age-days`.
+    - fast-review earnings command now forwards the recent-announcement window to the selector.
+    - set the fast-review default window to `7` natural days.
+  - Updated [`config/local_strategy_profile.json`](d:\bb\daily_stock_analysis\config\local_strategy_profile.json):
+    - set `earnings_recent_event_max_age_days=7` in the default fast-review profile.
+  - Updated [`tests/test_earnings_surprise_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_earnings_surprise_signal_flow.py):
+    - added regression coverage for selector CLI parsing and current-report-period recent-announcement filtering.
+  - Updated [`tests/test_fast_review_daily_bundle.py`](d:\bb\daily_stock_analysis\tests\test_fast_review_daily_bundle.py):
+    - added regression coverage for fast-review default/profile wiring and command forwarding.
+  - Updated [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md) and [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md).
+- Verification:
+  - `python -m pytest tests/test_earnings_surprise_signal_flow.py -k "recent_event_max_age_days or recent_announcement_window" -q` (2 passed after first observing the expected failing tests)
+  - `python -m pytest tests/test_fast_review_daily_bundle.py -k "build_commands_forward_skip_db_persist or parse_args_applies_strategy_profile_defaults or parse_args_uses_fast_review_defaults_when_profile_missing" -q` (3 passed after first observing the expected failing tests)
+- Notes:
+  - This change intentionally does not alter `earnings_surprise` scoring or full-season standalone behavior.
+
+## 2026-04-28 (earnings_surprise fast manager for full-market scan)
+
+- Scope: prevent full-market `earnings_surprise` fast-review runs from hanging in the capital/history enrichment tail.
+- Why:
+  - The 2026-04-28 full-market fast review stalled after `earnings_surprise` reached `2400/3002`; the child process had no CPU/log progress and held a long-lived HTTPS connection.
+  - Root cause: `scan_market()` created `KlineSelectorService` with the default `DataFetcherManager`, so capital-profile/history enrichment used the full multi-provider daily fallback chain without the fast-scan manager timeout and source narrowing already used by K-line scans.
+  - A second rerun then stalled before the first `completed=` progress line because `AkshareFundamentalAdapter` candidate endpoint calls had no timeout wrapper.
+- Changes:
+  - Updated [`scripts/select_earnings_surprise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_earnings_surprise_candidates.py):
+    - construct `KlineSelectorService` with `manager_factory=KlineSelectorService.build_fast_a_share_manager`.
+    - keep existing selection criteria and output schema unchanged.
+  - Updated [`data_provider/fundamental_adapter.py`](d:\bb\daily_stock_analysis\data_provider\fundamental_adapter.py):
+    - added an adapter-level timeout wrapper for AkShare candidate DataFrame endpoint calls.
+    - cache timeout failures in the same candidate cache path as other endpoint failures.
+  - Updated [`tests/test_earnings_surprise_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_earnings_surprise_signal_flow.py):
+    - added regression coverage that `scan_market()` invokes the fast A-share manager factory.
+  - Updated [`tests/test_fundamental_adapter.py`](d:\bb\daily_stock_analysis\tests\test_fundamental_adapter.py):
+    - added regression coverage that a slow endpoint returns quickly and caches the timeout failure.
+- Verification:
+  - `python -m pytest tests/test_earnings_surprise_signal_flow.py -k "fast_a_share_manager_for_full_market_scan" -q` (1 passed after first observing the expected failing test).
+  - `python -m pytest tests/test_fundamental_adapter.py -k "times_out_slow_endpoint" -q` (1 passed after first observing the expected failing test).
+  - `python -m pytest tests/test_fundamental_adapter.py tests/test_earnings_surprise_signal_flow.py -q` (65 passed)
+  - `python -m py_compile data_provider/fundamental_adapter.py scripts/select_earnings_surprise_candidates.py tests/test_fundamental_adapter.py tests/test_earnings_surprise_signal_flow.py` (passed)
+- Notes:
+  - The interrupted manual run directory is `data/manual_runs/fast_review_full_20260428_20260428_002221`; it stalled before earnings outputs were written.
+
+## 2026-04-27 (earnings_surprise actual-report event overlay)
+
+- Scope: fix the `earnings_surprise` recent-event overlay so evening formal financial reports are not missed when an older forecast or quick report already exists.
+- Why:
+  - The April 27, 2026 review checked `002384` / Dongshan Precision against a stale April 8 forecast/quick-report event.
+  - The formal-report numbers were already available from the per-stock financial block for the current report period, but the fast-review catalog only consumed `stock_yjyg_em` and `stock_yjkb_em`; in live probing, the aggregate `stock_yjbb_em` table could still lag the evening announcement.
+- Changes:
+  - Updated [`scripts/select_earnings_surprise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_earnings_surprise_candidates.py):
+    - added `stock_yjbb_em` to the recent earnings-event catalog.
+    - extracted formal report announcement date, report period, revenue, net profit, revenue YoY, net profit YoY, and ROE into the overlay payload.
+    - made `report_announcement_date` participate in overlay freshness, event fingerprinting, event-date resolution, metrics output, and text-summary matching.
+    - kept the existing forecast + quick-report compatibility behavior, but when a formal report is the latest event it clears older forecast/quick-report fields and uses the formal report data.
+    - added a guarded fallback: if the aggregate formal-report table has not updated yet, but the fetched financial block already contains current-report-period amounts plus YoY growth, the overlay infers an actual-report event using the snapshot date.
+    - prevented same-source equal-date rows from older report periods overwriting the latest report period.
+    - prevented older report periods from overwriting newer report-period events even when the older period has a later announcement date.
+  - Updated [`data_provider/fundamental_adapter.py`](d:\bb\daily_stock_analysis\data_provider\fundamental_adapter.py):
+    - parsed `stock_financial_abstract` wide-table output into `financial_report`, `financial_report_series`, and growth metrics so the fallback has current-quarter amounts and YoY growth available.
+  - Updated [`tests/test_earnings_surprise_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_earnings_surprise_signal_flow.py):
+    - added regression coverage for formal-report catalog inclusion, actual-report overlay replacing stale forecast/quick events, and guarded inference from the financial block when the announcement table lags.
+  - Updated [`tests/test_fundamental_adapter.py`](d:\bb\daily_stock_analysis\tests\test_fundamental_adapter.py):
+    - added regression coverage for parsing wide `stock_financial_abstract` financial tables.
+  - Updated [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md) and [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md).
+- Verification:
+  - `python -m pytest tests/test_earnings_surprise_signal_flow.py -k "actual_report" -q` (2 passed)
+  - `python -m pytest tests/test_earnings_surprise_signal_flow.py -k "infers_actual_report or actual_report" -q` (3 passed)
+  - `python -m pytest tests/test_earnings_surprise_signal_flow.py -q` (47 passed)
+  - `python -m pytest tests/test_fundamental_adapter.py tests/test_earnings_surprise_signal_flow.py -q` (63 passed)
+  - `python -m py_compile data_provider/fundamental_adapter.py scripts/select_earnings_surprise_candidates.py tests/test_fundamental_adapter.py tests/test_earnings_surprise_signal_flow.py` (passed)
+  - Live single-stock probe for `002384` on `snapshot_date=2026-04-27`: fallback overlay produced `event_date=2026-04-27`, `revenue_yoy=52.723432`, `net_profit_yoy=143.471031`, `earnings_strategy_score=76.33`, and `passed_strategy_score`.
+- Notes:
+  - No threshold tuning was made in this change; the fix is data freshness and event-source coverage.
+  - `README.md` was not updated because this is an internal strategy-data correction, not a public entrypoint or onboarding change.
+
+## 2026-04-27 (fast review strategy focus output)
+
+- Scope: improve the fast-review aggregate output quality without changing child strategy selection rules.
+- Why:
+  - `trend_leader_unified`, `hundred_day_high`, and `earnings_surprise` already produce useful candidates, but the aggregate summary still forced manual reading of large flat lists.
+  - The requested next step was to process strategy quality first, while postponing further scan optimization.
+- Changes:
+  - Updated [`scripts/run_fast_review_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_fast_review_bundle.py):
+    - added strategy-focus post-processing for the three daily core signals.
+    - split candidates into `core / watch / low_priority`.
+    - added `trend_hundred_relation` with `intersection / trend_only / hundred_only` markers for `trend_leader_unified` and `hundred_day_high`.
+    - sorted the focus list by overlap, earnings score/status, capital confirmation, board strength, recognizability, and trend score.
+    - exported `fast_review_strategy_focus.csv` and `fast_review_strategy_focus.md`, and embedded a concise “策略精简焦点” section in `fast_review_summary.md`.
+    - preserved raw candidate and resonance outputs.
+  - Updated [`tests/test_fast_review_daily_bundle.py`](d:\bb\daily_stock_analysis\tests\test_fast_review_daily_bundle.py):
+    - added regression coverage for tiering, ranking, intersection/difference markers, summary rendering, CSV field retention, and main-output wiring.
+  - Updated [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md) and [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md).
+- Verification:
+  - `python -m pytest tests/test_fast_review_daily_bundle.py -q`（23 passed）
+  - `python -m py_compile scripts/run_fast_review_bundle.py tests/test_fast_review_daily_bundle.py`（通过）
+- Notes:
+  - `README.md` not updated because this is a local strategy review-output improvement, not a new public entrypoint, deployment path, or onboarding workflow.
+
+## 2026-04-27 (trend_leader_unified shared-scan A/B + universe prep optimization)
+
+- Scope: run the requested single-day `trend_leader_unified` shared-scan validation, add a same-parameter old-path diagnostic switch, and reduce the remaining universe preparation bottleneck.
+- Why:
+  - the first shared scan-shell run proved the shared path was active, but `universe_elapsed_sec` still fluctuated heavily and the previous code used `date.today()` instead of the requested `--snapshot-date` for universe/listed-days preparation.
+  - same-day A/B showed shared-shell and old local-prep paths were now almost identical after the shared helper extraction; the remaining slow block was live `spot` universe acquisition before local reference cache reuse.
+- Changes:
+  - Updated [`scripts/select_trend_leader_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_trend_leader_candidates.py):
+    - added `snapshot_date` plumbing through `scan_trend_leader_candidates_with_stats(...)` / `scan_trend_leader_candidates(...)`.
+    - changed universe fetch, shared scan-shell preparation, and queue admission listed-days checks to use `snapshot_date` instead of `date.today()`.
+    - added diagnostic CLI `--disable-shared-scan-shell` for same-parameter A/B runs.
+    - enabled local `spot` reference cache preference for the trend-leader fast-scan service instance.
+  - Updated [`src/services/kline_selector_service.py`](d:\bb\daily_stock_analysis\src\services\kline_selector_service.py):
+    - added `_prefer_spot_universe_reference_cache`; when enabled and the reference cache is valid, `get_spot_enriched_a_share_universe(...)` returns it before attempting live `spot`.
+  - Updated tests:
+    - [`tests/test_trend_leader_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_trend_leader_signal_flow.py)
+    - [`tests/test_kline_selector_service.py`](d:\bb\daily_stock_analysis\tests\test_kline_selector_service.py)
+- Verification:
+  - `python -m pytest tests/test_trend_leader_signal_flow.py -k "uses_snapshot_date_for_scan_preparation or disable_shared_scan_shell" -q`（2 passed）
+  - `python -m pytest tests/test_kline_selector_service.py -k "prefer_disk_reference_cache" -q`（1 passed）
+  - `python -m pytest tests/test_kline_selector_service.py tests/test_trend_leader_signal_flow.py -q`（76 passed）
+  - `python -m py_compile src/services/kline_selector_service.py scripts/select_trend_leader_candidates.py tests/test_kline_selector_service.py tests/test_trend_leader_signal_flow.py`（通过）
+  - A/B and optimized single-day runs for `snapshot_date=2026-04-24`, `max_workers=2`, `fallback_top_n=20`, no second-stage enrichment, skip DB persist:
+    - shared path before cache-preference optimization: [`shared_2026-04-24_20260427_213652.err.log`](d:\bb\daily_stock_analysis\data\manual_runs\unified_scan_shell_remeasure_snapshotfix_20260427\shared_2026-04-24_20260427_213652.err.log)
+      - `universe_elapsed_sec=85.81`, `prefilter_elapsed_sec=0.13`, `total=1398`, `selected=109`, wall time about `4m47s`.
+    - old local-prep path via `--disable-shared-scan-shell`: [`fallback_2026-04-24_20260427_214858.err.log`](d:\bb\daily_stock_analysis\data\manual_runs\unified_scan_shell_remeasure_snapshotfix_20260427_fallback\fallback_2026-04-24_20260427_214858.err.log)
+      - `universe_elapsed_sec=88.18`, `prefilter_elapsed_sec=0.12`, `total=1398`, `selected=109`, confirming the remaining bottleneck was before the shared/local prep split.
+    - optimized shared path with cache preference: [`shared_cacheprefer_2026-04-24_20260427_220318.err.log`](d:\bb\daily_stock_analysis\data\manual_runs\unified_scan_shell_remeasure_cacheprefer_20260427\shared_cacheprefer_2026-04-24_20260427_220318.err.log)
+      - `universe_elapsed_sec=21.34`, `prefilter_elapsed_sec=0.16`, `total=1398`, `selected=109`, wall time about `1m38s`.
+- Notes:
+  - `README.md` not updated because this is an internal local-strategy runtime/diagnostic optimization, not a new user-facing entrypoint or deployment workflow.
+
+## 2026-04-27 (shared scan-shell prototype: service-level setup + trend_leader integration)
+
+- Scope: start the first WonderTrader-inspired integration by landing a shared scan-shell prototype, without changing the strategy rules of `trend_leader_unified / hundred_day_high / monthly_slow_rise`.
+- Why:
+  - `hundred_day_high` and `monthly_slow_rise` were already closer to `KlineSelectorService`, but `trend_leader_unified` still owned a long block of universe filtering, quote hydration, prefilter orchestration, and shard setup inside its script.
+  - this made scan-layer optimizations stay script-local and increased the cost of later converging the three K-line style strategies onto one scan layer.
+- Changes:
+  - Updated [`src/services/kline_selector_service.py`](d:\bb\daily_stock_analysis\src\services\kline_selector_service.py):
+    - added `KlinePreparedUniverseResult` as a lightweight scan-setup result object.
+    - added `prepare_scan_universe(...)` to centralize:
+      - normalized universe filtering
+      - optional whitelist / ST / KCB / CYB trimming
+      - shard slicing
+      - quote hydration + scan prefilter preparation
+      - observability stats for the prepared universe
+    - copied the generic quote-prefilter helper path into the service layer so the scan shell no longer depends on `select_trend_leader_candidates.py` internals.
+  - Updated [`scripts/select_trend_leader_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_trend_leader_candidates.py):
+    - `scan_trend_leader_candidates_with_stats(...)` now prefers `selector.prepare_scan_universe(...)` when available.
+    - kept a compatibility fallback to the previous local prep path so existing tests and fake selectors without the new method still work.
+    - preserved current CLI semantics, snapshot schema, and scoring logic.
+  - Updated tests:
+    - [`tests/test_kline_selector_service.py`](d:\bb\daily_stock_analysis\tests\test_kline_selector_service.py)
+    - [`tests/test_trend_leader_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_trend_leader_signal_flow.py)
+    - added regression coverage for:
+      - shared service-level universe preparation
+      - trend-leader preferring the shared scan-shell path when the selector provides it
+- Expected impact:
+  - scan-layer changes for `trend_leader_unified` now have a real shared landing zone instead of staying script-only.
+  - this is the first step toward converging `trend_leader_unified / hundred_day_high / monthly_slow_rise` onto one scan shell.
+  - current strategy logic and output contracts remain unchanged.
+- Verification:
+  - `python -m py_compile src/services/kline_selector_service.py scripts/select_trend_leader_candidates.py`
+  - `python -m pytest tests/test_kline_selector_service.py -q`
+  - `python -m pytest tests/test_trend_leader_signal_flow.py -q`
+
+## 2026-04-26 (earnings_surprise event overlay fix + balanced gate relaxation)
+
+- Scope: fix `earnings_surprise` recent-event contamination and slightly relax the balanced profile without turning it into a loose screen.
+- Why:
+  - the 2026-04-26 daily run evaluated 186 names under `latest_report_period` but returned `0`, and debugging showed two concrete issues:
+  - cached bundles could keep stale `quick_report_*` fields from 2022/2023, so `event_date` and text gating were sometimes driven by old announcements rather than the current report-period event.
+  - the balanced profile blocked many watch-level names solely because `earnings_quality_signal` was missing, even when both positive text and growth thresholds were already present.
+- Changes:
+  - Updated [`scripts/select_earnings_surprise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_earnings_surprise_candidates.py):
+    - `apply_recent_earnings_event_overlay(...)` now treats the current recent-event payload as the authoritative announcement block and clears stale `forecast_*` / `quick_report_*` fields before overlaying fresh values.
+    - added `_resolve_primary_event_date(...)` so evaluation prefers the latest valid announcement/report date instead of blindly preferring `quick_report_announcement_date`.
+    - softened balanced/strict watch confirmation: when `require_quality_confirmation_for_watch=true`, watch-level pass can now use either `earnings_quality_signal` or a stronger combined confirmation of `positive_text_signal and growth_signal`.
+    - changed duplicate-event handling from unconditional hard block to cooldown-based block by profile (`strict=5`, `balanced=3`, `relaxed=1` days), while keeping duplicate markers observable through `duplicate_event`, `latest_duplicate_hit_date`, and `days_since_duplicate_hit`.
+  - Updated [`tests/test_earnings_surprise_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_earnings_surprise_signal_flow.py):
+    - added regressions for stale quick-report clearing, latest event-date selection, balanced watch fallback pass, and duplicate-event cooldown re-entry.
+- Verification:
+  - `python -m pytest tests/test_earnings_surprise_signal_flow.py -q`
+  - `python -m py_compile scripts/select_earnings_surprise_candidates.py tests/test_earnings_surprise_signal_flow.py`
+  - `python scripts/select_earnings_surprise_candidates.py --snapshot-date 2026-04-26 --strategy-profile balanced --scan-depth low --recent-event-scope latest_report_period --output-dir data/manual_runs/earnings_debug_20260426_after_relax --skip-db-persist --log-level INFO`
+    - selected count moved from previous `0` to `31`
+    - stale-event failed samples with `earnings_days_since_event >= 365` dropped from `33` to `0`
+    - latest failed-reason mix became `negative_text=70`, `missing_quality_confirmation=60`, `low_strategy_score=15`, `missing_confirmation=10`
+
+## 2026-04-26 (fast-review bottleneck optimization: earnings concurrency + cache reuse)
+
+- Scope: optimize short-term fast-review bottleneck on earnings leg during multi-day backfill.
+- Why:
+  - `run_fast_review_bundle.py` incorrectly reused `hundred_day_max_workers` for earnings, coupling two independent legs.
+  - relaxed earnings backfill showed very high `quote/capital refresh` with near-zero cache hit, causing avoidable runtime cost.
+- Changes:
+  - Updated [`scripts/run_fast_review_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_fast_review_bundle.py):
+    - Added `--earnings-max-workers` (independent from `--hundred-day-max-workers`).
+    - Fixed earnings command wiring to use `earnings_max_workers`.
+    - Added `--earnings-capital-profile-ttl-seconds` (default `86400`) and forwarded it to earnings selector.
+    - Raised fast-review external idle timeout default from `900` to `1800` seconds for long-running earnings legs.
+  - Updated [`scripts/select_earnings_surprise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_earnings_surprise_candidates.py):
+    - Added CLI arg `--capital-profile-ttl-seconds` (default `900` in standalone script).
+    - Wired ttl into `scan_market(...)` and `load_or_refresh_signal_capital_profile(...)`.
+    - Added runtime guard for non-negative ttl and startup log field for ttl visibility.
+    - Added `_upsert_signal_fundamental_snapshot_with_retry(...)` for earnings snapshot writes, reusing SQLite retry budget/backoff to reduce transient lock drops on signal cache writes.
+  - Updated [`config/local_strategy_profile.json`](d:\bb\daily_stock_analysis\config\local_strategy_profile.json):
+    - Set fast-review default `external_command_idle_timeout_sec=1800`.
+    - Set fast-review default `earnings_max_workers=1`.
+- Expected impact:
+  - earnings leg tuning decoupled from hundred-day-high workers.
+  - in fast-review/backfill path, capital profile refresh should drop significantly after first day, improving multi-day rerun throughput.
+  - transient SQLite lock conflicts on earnings cache writes should be retried instead of being dropped on first failure.
+- Verification:
+  - `python -m py_compile scripts/run_fast_review_bundle.py scripts/select_earnings_surprise_candidates.py`
+  - `python -m pytest tests/test_fast_review_daily_bundle.py -q`
+  - `python -m pytest tests/test_earnings_surprise_signal_flow.py -k "signal_snapshot_upsert_retries_after_sqlite_write_failure or scan_market_low_depth_uses_core_fundamental_blocks" -q`
+  - `python scripts/run_fast_review_bundle.py --snapshot-date 2026-04-24 --include-signals earnings --limit 20 --earnings-strategy-profile relaxed --earnings-scan-depth low --earnings-recent-event-scope lookback --log-level INFO`
+    - observed runtime log confirms `idle_timeout_sec=1800`
+    - observed earnings command confirms `--max-workers 1 --capital-profile-ttl-seconds 86400`
+    - smoke run finished successfully in about `36.46s`
+
+## 2026-04-26 (trend leader prefilter optimization: reuse spot reference cache before per-code hydration)
+
+- Scope: reduce `trend_leader_unified` prefilter overhead during short-term reruns without changing strategy gates or output schema.
+- Why:
+  - slow-day logs showed `trend_leader` spent over a minute in quote prefilter, with `quote_requested_rows` above 1500 because many rows still missed `pct_change/turnover_rate`.
+  - the code only reused `spot` reference cache when the whole spot-universe fetch failed, but not when the fetch succeeded with sparse quote fields.
+- Changes:
+  - Updated [`src/services/kline_selector_service.py`](d:\bb\daily_stock_analysis\src\services\kline_selector_service.py):
+    - `get_spot_enriched_a_share_universe(...)` now merges the existing `spot` reference cache back into the freshly fetched spot universe before returning and before overwriting the cache.
+    - this preserves previously known non-null quote fields when a new bulk spot snapshot is sparse.
+    - `_read_spot_universe_reference_cache()` now reads cached CSV `code` as string, preserving leading-zero A-share symbols such as `000001` / `001201` during normalization.
+    - when live `spot` fetch fails and disk cached `spot` snapshot exists, the service now falls back directly to that cached snapshot instead of rebuilding a generic universe first.
+    - when disk cached `spot` snapshot already exists, live `spot` fetch retries are reduced from `2` to `1`, avoiding an extra slow retry before local fallback.
+  - Updated [`scripts/select_trend_leader_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_trend_leader_candidates.py):
+    - `_prepare_scan_prefilter_universe(...)` now accepts `cached_quote_universe`.
+    - prefilter now merges cached spot quote fields first via `KlineSelectorService._merge_spot_quote_fields(...)`, then only performs per-code realtime hydration for the remaining gaps.
+    - `scan_trend_leader_candidates_with_stats(...)` now passes `selector._read_spot_universe_reference_cache()` into the prefilter stage.
+- Expected impact:
+  - repeated/manual reruns can reuse same-day recent `spot` cache to reduce per-code realtime quote requests.
+  - prefilter latency should shrink first, especially on days where bulk spot data is available but sparse.
+  - when live `spot` endpoints are unstable, universe preparation should spend less time in fallback and reuse local disk snapshot faster.
+  - strategy selection rules and snapshot payload contract remain unchanged.
+- Verification:
+  - `python -m pytest tests/test_kline_selector_service.py -k "reuses_cached_quote_fields_when_new_spot_snapshot_is_sparse" -q`
+  - `python -m pytest tests/test_kline_selector_service.py -k "preserves_leading_zero_codes" -q`
+  - `python -m pytest tests/test_kline_selector_service.py -k "uses_disk_cached_spot_snapshot_before_generic_fallback or skips_second_live_retry_when_disk_cache_exists" -q`
+  - `python -m pytest tests/test_trend_leader_signal_flow.py -k "reuses_cached_spot_quotes_before_per_code_hydration" -q`
+  - single-day trend-leader prep log comparison (`snapshot_date=2026-04-21`, `max_workers=2`):
+    - baseline: `quote_requested_rows=1570`, `prefilter_elapsed_sec=72.22`, `total_prep_elapsed_sec=109.17`
+    - after cache merge + code preservation: `quote_requested_rows=123`, `prefilter_elapsed_sec=13.19`, `total_prep_elapsed_sec=47.41`
+    - after direct disk snapshot fallback + single live retry: `universe_elapsed_sec=29.69`, `prefilter_elapsed_sec=11.62`, `total_prep_elapsed_sec=41.31`
+
+## 2026-04-26 (trend leader tail optimization: skip redundant listing fetch + pre-skip insufficient-history recent IPOs)
+
+- Scope: continue shrinking `trend_leader_unified` full-scan tail after prefilter improvements, without changing signal schema or score rules.
+- Why:
+  - once `spot` snapshots already contain full `list_date/listed_days`, repeating listing-metadata fetch is pure prep overhead.
+  - the remaining slow tail still contained recent IPOs that had `>=120` natural listed days but still could not possibly accumulate `120` trading sessions, so they were entering the main scan and burning `Akshare -> Tushare empty_result` history fallback time.
+- Changes:
+  - Updated [`src/services/kline_selector_service.py`](d:\bb\daily_stock_analysis\src\services\kline_selector_service.py):
+    - added `_has_complete_listing_metadata(...)`.
+    - `get_spot_enriched_a_share_universe(...)` now skips `_merge_listing_metadata_if_available(...)` when the fetched/cached `spot` universe already has complete `listed_days` or `list_date`.
+  - Updated [`scripts/select_trend_leader_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_trend_leader_candidates.py):
+    - `_is_unscannable_history_candidate(...)` now keeps the existing natural-day guard and adds a stricter business-day lower-bound check from `list_date` to scan date.
+    - candidates that cannot possibly reach `MIN_TREND_SCAN_HISTORY_DAYS=120` trading sessions are skipped before entering the threaded history-fetch queue.
+- Expected impact:
+  - reduces redundant universe-prep work on reruns where `spot` cache already carries listing fields.
+  - trims a class of recent-IPO long-tail failures before they hit `Akshare/Tushare` history fallback.
+  - keeps trend-leader scoring logic unchanged; only queue admission becomes stricter for objectively insufficient-history names.
+- Verification:
+  - `python -m pytest tests/test_kline_selector_service.py -k "skips_listing_metadata_fetch_when_spot_snapshot_is_already_complete or uses_disk_cached_spot_snapshot_before_generic_fallback or skips_second_live_retry_when_disk_cache_exists" -q`
+  - `python -m pytest tests/test_trend_leader_signal_flow.py -k "business_day_lower_bound or short_circuits_recent_ipo_before_main_scan or prefilter_universe_reuses_cached_spot_quotes_before_per_code_hydration" -q`
+  - `python -m py_compile scripts/select_trend_leader_candidates.py`
+
+## 2026-04-26 (trend leader tail optimization: skip empty Tushare history fallback in fast scan manager)
+
+- Scope: continue trimming `trend_leader_unified` end-of-run history-fetch tail without changing general market-data fallback behavior outside the fast K-line selector path.
+- Why:
+  - fresh single-day verification on `2026-04-21` showed the fast selector manager still entered `AkshareFetcher -> TushareFetcher` history fallback on a handful of tail names.
+  - in the latest full-day run before this change, `TushareFetcher` contributed `0` successful history fetches but still produced `15` `(empty_result)` failures after Akshare failures, so the fallback was mostly pure latency.
+- Changes:
+  - Updated [`data_provider/base.py`](d:\bb\daily_stock_analysis\data_provider\base.py):
+    - added manager flag `_skip_tushare_history_fallback_for_fast_scan` (default `False`).
+    - added `_should_skip_fast_scan_tushare_history_fallback(...)`.
+    - when the flag is enabled and the current pair is `AkshareFetcher -> TushareFetcher`, and Akshare failure reason already contains `Akshare 所有渠道获取失败`, the manager stops early instead of invoking Tushare for another empty history attempt.
+  - Updated [`src/services/kline_selector_service.py`](d:\bb\daily_stock_analysis\src\services\kline_selector_service.py):
+    - `build_fast_a_share_manager()` now enables `_skip_tushare_history_fallback_for_fast_scan=True` only for the specialized full-market fast scan manager.
+  - Updated [`tests/test_fetcher_logging.py`](d:\bb\daily_stock_analysis\tests\test_fetcher_logging.py):
+    - added regression coverage proving the fast-scan flag skips `TushareFetcher` after Akshare all-channel history failure.
+- Expected impact:
+  - shrinks the repeated `Akshare failed -> Tushare empty_result` tail in `trend_leader_unified`.
+  - leaves normal `DataFetcherManager` fallback semantics unchanged for non-fast-scan callers.
+- Verification:
+  - `python -m py_compile data_provider/base.py src/services/kline_selector_service.py`
+  - `python -m pytest tests/test_fetcher_logging.py -k "manager_logs_fallback_and_final_success or manager_records_empty_results_before_fallback or skip_tushare_history_fallback_for_fast_scan" -q`
+  - `python -m pytest tests/test_kline_selector_service.py -k "skips_listing_metadata_fetch_when_spot_snapshot_is_already_complete" -q`
+  - `python -m pytest tests/test_trend_leader_signal_flow.py -k "business_day_lower_bound or short_circuits_recent_ipo_before_main_scan or prefilter_universe_reuses_cached_spot_quotes_before_per_code_hydration" -q`
+  - full single-day rerun:
+    - log: [`data/manual_runs/trend_leader_full_20260426_single_day_fastskip/run_2026-04-21.stderr.log`](d:\bb\daily_stock_analysis\data\manual_runs\trend_leader_full_20260426_single_day_fastskip\run_2026-04-21.stderr.log)
+    - observed `skip fast-scan Tushare history fallback` count: `5`
+    - observed `TushareFetcher (empty_result)` count: `0`
+    - representative tail symbols now short-circuit at manager layer: `688759`, `688783`
+    - note: total wall time still remained network-sensitive; this round mainly removed redundant second-leg failure churn, not upstream Akshare latency itself
+
+## 2026-04-26 (trend leader tail optimization: reduce Akshare retries + collapse queue-build hot path)
+
+- Scope: continue shrinking `trend_leader_unified` full-scan tail and queue-build overhead in the fast A-share manager path, without changing strategy scores, fallback pool rules, or snapshot schema.
+- Why:
+  - after skipping the redundant `Tushare` history fallback, single-day reruns still showed `Akshare` `EM` transport failures burning extra time on the remaining internal retry.
+  - the next dominant hotspot moved to `scan queue prepared`: `_is_unscannable_history_candidate(...)` was still recomputing `pd.bdate_range(...)` for almost every candidate, even when `listed_days` was already large enough to prove the stock was not a recent-IPO edge case.
+- Changes:
+  - Updated [`data_provider/akshare_fetcher.py`](d:\bb\daily_stock_analysis\data_provider\akshare_fetcher.py):
+    - added constructor arg `stock_history_retry_attempts` (default `2`) and wired `_run_stock_history_call_with_retry(...)` to use it instead of the previous hard-coded retry count.
+  - Updated [`src/services/kline_selector_service.py`](d:\bb\daily_stock_analysis\src\services\kline_selector_service.py):
+    - `build_fast_a_share_manager()` now constructs `AkshareFetcher(..., stock_history_retry_attempts=1)` only for the fast full-market K-line selector manager.
+  - Updated [`scripts/select_trend_leader_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_trend_leader_candidates.py):
+    - `_is_unscannable_history_candidate(...)` now uses a three-stage guard:
+      - `listed_days < required_history_days` -> direct skip
+      - `listed_days >= safe_calendar_threshold` -> direct pass
+      - only the gray zone between those two thresholds falls back to the precise `business-day` lower-bound check
+    - this preserves the recent-IPO correctness fix while removing thousands of repeated `pd.bdate_range(...)` computations during queue construction.
+  - Updated tests:
+    - [`tests/test_fetcher_logging.py`](d:\bb\daily_stock_analysis\tests\test_fetcher_logging.py): regression for reduced fast-scan Akshare history retries.
+    - [`tests/test_trend_leader_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_trend_leader_signal_flow.py): regression proving sufficient `listed_days` no longer triggers unnecessary business-day recomputation.
+- Expected impact:
+  - removes the final redundant `EM` retry inside the fast-scan history path while keeping normal `AkshareFetcher` retry behavior unchanged elsewhere.
+  - collapses `scan start -> scan queue prepared` from a per-stock business-day recomputation loop into an almost free pass for clearly old-enough names.
+  - keeps strategy output stable: the verified single-day rerun still produced `selected=69`.
+- Verification:
+  - `python -m py_compile scripts/select_trend_leader_candidates.py data_provider/akshare_fetcher.py src/services/kline_selector_service.py data_provider/base.py`
+  - `python -m pytest tests/test_trend_leader_signal_flow.py -k "business_day_lower_bound or skips_business_day_scan_when_listed_days_is_sufficient or short_circuits_recent_ipo_before_main_scan" -q`
+  - `python -m pytest tests/test_fetcher_logging.py -k "skip_tushare_history_fallback_for_fast_scan or retry_attempts_can_be_reduced_for_fast_scan" -q`
+  - `python -m pytest tests/test_kline_selector_service.py -k "skips_listing_metadata_fetch_when_spot_snapshot_is_already_complete" -q`
+  - full single-day rerun:
+    - retry-only run: [`data/manual_runs/trend_leader_full_20260426_single_day_fastskip_retry1/run_2026-04-21.stderr.log`](d:\bb\daily_stock_analysis\data\manual_runs\trend_leader_full_20260426_single_day_fastskip_retry1\run_2026-04-21.stderr.log)
+      - start `2026-04-26 15:50:27.152`, end `2026-04-26 16:06:24.680`, total about `957.53s`
+      - `retrying history source=em`: `0`
+      - `history EM source in backoff, skipping`: `1`
+      - `skip fast-scan Tushare history fallback`: `5`
+      - `selected=69`
+    - queue-path optimized run: [`data/manual_runs/trend_leader_full_20260426_single_day_queueopt/run_2026-04-21.stderr.log`](d:\bb\daily_stock_analysis\data\manual_runs\trend_leader_full_20260426_single_day_queueopt\run_2026-04-21.stderr.log)
+      - start `2026-04-26 16:15:03.710`, end `2026-04-26 16:26:47.727`, total about `704.02s`
+      - `trend leader preparation timing`: `universe_elapsed_sec=26.99`, `prefilter_elapsed_sec=12.54`, `total_prep_elapsed_sec=39.53`
+      - `trend leader scan start`: `2026-04-26 16:15:48.517`
+      - `trend leader scan queue prepared`: `2026-04-26 16:15:48.542`
+      - queue-build gap after scan start shrank to about `0.03s`
+      - `retrying history source=em`: `0`
+      - `history EM source in backoff, skipping`: `1`
+      - `skip fast-scan Tushare history fallback`: `5`
+      - `TushareFetcher (empty_result)`: `0`
+      - `selected=69`
+
+## 2026-04-26 (next-session TODO: Signals page simplification)
+
+- Scope: simplify `Signals` UI interaction model for daily usage.
+- Why: current page mixes core daily strategies, topic signals, profile-comparison tools, and advanced filters in one surface; decision flow is overloaded.
+- Next session execution order:
+  1. Add a page-level mode switch: `daily` (default) vs `research`.
+  2. In `daily` mode, keep only 4 main strategy tabs:
+     - `trend_leader_unified`
+     - `earnings_surprise`
+     - `hundred_day_high`
+     - `monthly_slow_rise`
+  3. Move topic/extended signals (`dragon_head`, `commodity_beneficiary`, `board_recognizability`, monthly profiles) to `research` mode only.
+  4. Collapse advanced controls by default (code filter, streak grouping, compare/linked-selection extras).
+  5. Change monthly profile compare from always-on block to explicit action entry (button / drawer trigger).
+  6. Keep backend signal-type compatibility unchanged; this round is UI information architecture, not signal schema rewrite.
+- Acceptance criteria:
+  - Default first screen is readable in <10 seconds and focuses on the 4 main strategies.
+  - `SignalsPage` tests pass after tab/mode behavior updates.
+  - No regression in `/signals` API contract or existing snapshot data paths.
+- Notes:
+  - If this lands with local-strategy-facing behavior changes, update `docs/LOCAL_STRATEGY_CATALOG.md` and `docs/CHANGELOG.md` in the same round.
+
 ## 2026-04-25 (local strategy docs rationalization: baseline + parameter clarity)
 
 - Scope: rewrite local strategy docs to remove stale narrative blocks and make current rules/parameters directly readable.
@@ -1650,3 +6219,172 @@
 - Notes:
   - This remains a docs-only change.
   - The playbook is intentionally opinionated for review efficiency, but the implementation truth source is still the strategy breakdown doc plus the script itself.
+## 2026-05-01 (fast review rise reason summary for strong focus names)
+
+- Scope: add a lightweight explanation layer to the daily fast-review focus output, so strong names show rise-reason summary/tags without creating a new parallel strategy.
+- Why:
+  - The fast review already had `strategy_focus` and `earnings_focus`, but users still had to infer "why this stock is rising" from scattered fields or open each sub-strategy artifact.
+  - The repo already had reusable cause-analysis schema and service (`reason_summary`, `cause_tags`, `industry_logic`, `news_logic`, `technical_logic`), so the right move was to reuse that contract in the review layer instead of building a separate explanation strategy.
+- Changes:
+  - Updated [`scripts/run_fast_review_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_fast_review_bundle.py):
+    - imported `SignalCauseAnalysisService` into the fast-review bundle
+    - extended `_load_signal_rows_from_csv(...)` to preserve existing `reason_summary / cause_tags / industry_logic / news_logic / technical_logic`
+    - added focus-layer helpers to normalize cause tags, translate them to concise Chinese labels, select the preferred source signal, and enrich missing rise reasons in fail-open mode
+    - `strategy_focus_rows` now carries `reason_summary`, `cause_tags`, `cause_tags_zh`, `industry_logic`, `news_logic`, and `technical_logic`
+    - `fast_review_strategy_focus.csv` now exports those cause fields
+    - `fast_review_strategy_focus.md` now shows `rise_reason` and `tags`
+    - `fast_review_summary.md` now includes a concise `强势股上涨原因摘要` section for `core` plus leading `watch` names
+  - Added regression coverage in [`tests/test_fast_review_daily_bundle.py`](d:\bb\daily_stock_analysis\tests\test_fast_review_daily_bundle.py):
+    - reuse existing reason fields when already present
+    - enrich missing reason fields through a mocked cause-analysis service
+    - fail open when enrichment raises
+    - include the new rise-reason summary section in the review summary markdown
+- Verification:
+  - Red:
+    - `python -m pytest tests/test_fast_review_daily_bundle.py -k "reuses_existing_reason_fields or enriches_missing_reason_fields or fails_open_when_reason_enrichment_errors or includes_rise_reason_section" -v`
+      - failed as expected with missing `reason_summary` fields and missing summary section
+  - Green:
+    - `python -m pytest tests/test_fast_review_daily_bundle.py -k "reuses_existing_reason_fields or enriches_missing_reason_fields or fails_open_when_reason_enrichment_errors or includes_rise_reason_section" -v`
+      - result: `4 passed`
+    - `python -m pytest tests/test_fast_review_daily_bundle.py -v`
+      - result: `32 passed`
+      - note: one existing `akshare.stock_recommend` `FutureWarning` remains in the suite output
+- Notes:
+  - This is intentionally a review-layer enhancement only; it does not write the new explanation result back into snapshot persistence or `/signals`.
+  - Enrichment prefers existing per-strategy reason fields first, and only computes a lightweight fallback when the focus row still lacks a usable explanation.
+
+## 2026-05-01 (trend_leader fast enrichment budgets for tail-latency control)
+
+- Scope: continue the next `trend_leader_unified` performance/stability round by tightening the fast-scan remote-enrichment time budget, mainly to cap slow-tail samples in `earnings fundamental` and `capital_flow` without redesigning the scoring path.
+- Why:
+  - After the previous hotpath round, fresh-process improvement from lazy dragon init and tighter weak-sample short-circuiting was positive but modest; the remaining practical risk was still tail latency from remote enrichment calls rather than local object construction.
+  - `trend_leader_unified` is a fast daily scan, so it should prefer bounded fail-open enrichment over waiting close to the generic fundamental timeout budget on marginal samples.
+- Changes:
+  - Updated [`scripts/select_trend_leader_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_trend_leader_candidates.py):
+    - added fast-scan defaults `DEFAULT_FAST_FUNDAMENTAL_BUDGET_SECONDS=0.6` and `DEFAULT_FAST_CAPITAL_FLOW_BUDGET_SECONDS=0.45`
+    - added CLI diagnostics `--fundamental-budget-seconds` and `--capital-flow-budget-seconds`
+    - `_evaluate_trend_leader_candidate(...)` now accepts `fundamental_budget_seconds` and `capital_flow_budget_seconds`
+    - earnings fundamental loading now forwards the fast budget to `get_earnings_fundamental_context(...)` when supported, with backward-compatible fallback for mocks/helpers that do not accept `budget_seconds`
+    - capital profile building now forwards the fast capital-flow budget and records both values in `run_stats`
+  - Updated [`src/services/capital_profile_service.py`](d:\bb\daily_stock_analysis\src\services\capital_profile_service.py):
+    - `build_stock_profile(...)` now accepts `capital_flow_budget_seconds`
+    - `get_capital_flow_context(...)` now receives that budget when the manager supports it, while keeping compatibility fallback for simplified manager stubs
+  - Updated [`src/services/shared_signal_factors_service.py`](d:\bb\daily_stock_analysis\src\services\shared_signal_factors_service.py) so the shared capital path forwards `capital_flow_budget_seconds` too.
+  - Added regression coverage:
+    - [`tests/test_capital_profile_service.py`](d:\bb\daily_stock_analysis\tests\test_capital_profile_service.py)
+    - [`tests/test_trend_leader_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_trend_leader_signal_flow.py)
+- Verification:
+  - Red:
+    - `python -m pytest tests/test_capital_profile_service.py tests/test_trend_leader_signal_flow.py -k "capital_flow_budget_seconds or fast_enrichment_budgets" -q`
+      - failed as expected with:
+        - `TypeError: CapitalProfileService.build_stock_profile() got an unexpected keyword argument 'capital_flow_budget_seconds'`
+        - `TypeError: _evaluate_trend_leader_candidate() got an unexpected keyword argument 'fundamental_budget_seconds'`
+  - Green:
+    - `python -m pytest tests/test_capital_profile_service.py tests/test_trend_leader_signal_flow.py -k "capital_flow_budget_seconds or fast_enrichment_budgets" -q`
+    - `python -m pytest tests/test_capital_profile_service.py tests/test_shared_signal_factors_service.py tests/test_trend_leader_signal_flow.py tests/test_trend_leader_strategy_service.py tests/test_trend_leader_benchmark.py -q`
+      - result: `75 passed`
+    - `python -m py_compile scripts/select_trend_leader_candidates.py scripts/benchmark_trend_leader_v1.py src/services/capital_profile_service.py src/services/shared_signal_factors_service.py tests/test_capital_profile_service.py tests/test_trend_leader_signal_flow.py`
+    - `python scripts/select_trend_leader_candidates.py --snapshot-date 2026-04-29 --limit 30 --max-workers 2 --fallback-top-n 5 --watch-top-n 5 --disable-second-stage-news-search --disable-second-stage-business-profile --skip-db-persist --output-dir data/manual_runs/trend_leader_budget_smoke_20260501 --log-level INFO`
+      - completed successfully
+      - logged fast-scan budget config: `fundamental_budget_seconds=0.6`, `capital_flow_budget_seconds=0.45`
+      - output artifacts:
+        - [`trend_leader_unified_candidates.csv`](d:\bb\daily_stock_analysis\data\manual_runs\trend_leader_budget_smoke_20260501\trend_leader_unified_candidates.csv)
+        - [`trend_leader_unified_watchlist.csv`](d:\bb\daily_stock_analysis\data\manual_runs\trend_leader_budget_smoke_20260501\trend_leader_unified_watchlist.csv)
+    - fresh-process sequential budget A/B on the same scan path:
+      - `python -c "from datetime import date; from scripts.select_trend_leader_candidates import scan_trend_leader_candidates_with_stats; import json; payload=scan_trend_leader_candidates_with_stats(snapshot_date=date.fromisoformat('2026-04-29'), limit=120, max_workers=2, fallback_top_n=20, watch_top_n=20, progress_every=0, prefetch_realtime_quotes=False, second_stage_news_search_enabled=False, second_stage_business_profile_enabled=False, fundamental_budget_seconds=1.5, capital_flow_budget_seconds=0.8); print(json.dumps(payload.get('run_stats', {}), ensure_ascii=False))"`
+        - returned `elapsed_seconds=14.0971`, `scan_eval_elapsed_sec=2.929574`, `selected_count=20`, `capital_flow_fetch_skipped_count=25`
+      - `python -c "from datetime import date; from scripts.select_trend_leader_candidates import scan_trend_leader_candidates_with_stats; import json; payload=scan_trend_leader_candidates_with_stats(snapshot_date=date.fromisoformat('2026-04-29'), limit=120, max_workers=2, fallback_top_n=20, watch_top_n=20, progress_every=0, prefetch_realtime_quotes=False, second_stage_news_search_enabled=False, second_stage_business_profile_enabled=False, fundamental_budget_seconds=0.6, capital_flow_budget_seconds=0.45); print(json.dumps(payload.get('run_stats', {}), ensure_ascii=False))"`
+        - returned `elapsed_seconds=15.2151`, `scan_eval_elapsed_sec=3.289506`, `selected_count=20`, `capital_flow_fetch_skipped_count=25`
+- Notes:
+  - This round is primarily a tail-latency/stability guard for fast daily scans, not a strategy-logic redesign.
+  - The follow-up fresh-process sequential A/B used a warm-ish cache state (`fundamental_cache_hit_count=62`, `capital_flow_cache_hit_count=62` on both sides) and did not show a stable speedup from the tighter budget alone; interpretation for now is “tail-latency guard / bounded fail-open” rather than “confirmed warm-run acceleration”.
+## 2026-05-04 (shortline WonderTrader source-mode stabilization and real serial validation)
+
+- Scope: finish the previously identified `1 / 2 / 3` shortline follow-up by locking WonderTrader candidate-source priority, verifying real two-day serial tracking, and surfacing repeat-symbol focus directly in the report summary.
+- Why:
+  - Real daily validation had shown no natural repeat symbols, but the actual issue was upstream source instability rather than broken tracking logic.
+  - The external WonderTrader bridge could still let `bridge_data` sample exports override `wondertrader_real_engine`, which made cross-day tracking evidence noisy and reduced trust in the daily result.
+- Changes:
+  - Updated [`src/shortline_hub/adapters/wondertrader_adapter.py`](d:\bb\daily_stock_analysis\src\shortline_hub\adapters\wondertrader_adapter.py):
+    - `WonderTraderProcessAdapter` now writes `wt_source_mode` into the bridge request.
+    - default mode is `prefer_real_engine`.
+  - Updated [`scripts/run_shortline_hub.py`](d:\bb\daily_stock_analysis\scripts\run_shortline_hub.py):
+    - added `--wt-source-mode` with `prefer_real_engine` / `prefer_bridge_data`.
+    - process-mode scanner now forwards that mode to the adapter.
+  - Updated [`scripts/bridges/shortline_wondertrader_bridge_template.py`](d:\bb\daily_stock_analysis\scripts\bridges\shortline_wondertrader_bridge_template.py) and external bridge [`D:\bb\WonderTrader\bridge\wt_export_candidates.py`](</d:/bb/WonderTrader/bridge/wt_export_candidates.py>):
+    - default loader order is now `real_engine -> bridge_data -> repo spot cache -> placeholder`.
+    - explicit `wt_source_mode=prefer_bridge_data` restores bridge-data-first behavior for compare/demo flows.
+  - Updated [`scripts/run_shortline_bridge_data_compare.py`](d:\bb\daily_stock_analysis\scripts\run_shortline_bridge_data_compare.py):
+    - compare flow now explicitly uses `prefer_bridge_data` for the seeded run and `prefer_real_engine` for the fallback run.
+  - Updated shortline wrappers:
+    - [`scripts/run-shortline-daily.ps1`](d:\bb\daily_stock_analysis\scripts\run-shortline-daily.ps1)
+    - [`scripts/run-shortline-fullcheck.ps1`](d:\bb\daily_stock_analysis\scripts\run-shortline-fullcheck.ps1)
+    - [`scripts/run-shortline-review-bundle.ps1`](d:\bb\daily_stock_analysis\scripts\run-shortline-review-bundle.ps1)
+    - [`scripts/run_shortline_review_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_shortline_review_bundle.py)
+    - all now lock the daily default to `prefer_real_engine`.
+  - Updated [`src/shortline_hub/report_builder.py`](d:\bb\daily_stock_analysis\src\shortline_hub\report_builder.py):
+    - result overview now shows `tracking_repeat_symbol_count`
+    - `tracking_longest_streak_days`
+    - `tracking_focus_symbols`
+  - Added / updated regression coverage:
+    - [`tests/test_shortline_bridge_templates.py`](d:\bb\daily_stock_analysis\tests\test_shortline_bridge_templates.py)
+    - [`tests/test_shortline_hub_cli.py`](d:\bb\daily_stock_analysis\tests\test_shortline_hub_cli.py)
+    - [`tests/test_shortline_daily_review_layers.py`](d:\bb\daily_stock_analysis\tests\test_shortline_daily_review_layers.py)
+    - [`tests/test_shortline_daily_scripts.py`](d:\bb\daily_stock_analysis\tests\test_shortline_daily_scripts.py)
+    - [`tests/test_shortline_review_bundle_script.py`](d:\bb\daily_stock_analysis\tests\test_shortline_review_bundle_script.py)
+- Verification:
+  - Red:
+    - `py -3.10 -m pytest tests/test_shortline_bridge_templates.py tests/test_shortline_hub_cli.py tests/test_shortline_daily_review_layers.py -k "wt_source_mode or prefers_real_engine_over_bridge_data_by_default or can_prefer_bridge_data_explicitly or highlights_repeat_symbols" -q`
+      - failed as expected because default bridge order, CLI passthrough, and report-summary tracking fields were still missing.
+  - Green:
+    - `py -3.10 -m pytest tests/test_shortline_bridge_templates.py tests/test_shortline_bridge_data_compare.py tests/test_shortline_hub_cli.py tests/test_shortline_daily_review_layers.py tests/test_shortline_review_bundle.py tests/test_shortline_daily_scripts.py tests/test_shortline_review_bundle_script.py -q`
+      - result: `55 passed`
+    - `py -3.10 -m py_compile src/shortline_hub/adapters/wondertrader_adapter.py src/shortline_hub/report_builder.py scripts/run_shortline_hub.py scripts/run_shortline_review_bundle.py scripts/run_shortline_bridge_data_compare.py scripts/bridges/shortline_wondertrader_bridge_template.py tests/test_shortline_bridge_templates.py tests/test_shortline_hub_cli.py tests/test_shortline_daily_review_layers.py tests/test_shortline_daily_scripts.py tests/test_shortline_review_bundle_script.py`
+      - passed
+  - Real serial validation:
+    - `powershell -ExecutionPolicy Bypass -File .\scripts\run-shortline-daily.ps1 -TradeDate 2026-05-03 -TopN 5 -RunId shortline_daily_real_tracking_fix_day1_20260503 -OutputDir .\data\manual_runs\shortline_daily_real_tracking_fix_day1_20260503 -TrackingHistoryPath .\data\runtime\shortline_hub\tracking\validation_real_fix_20260503_20260504.json -LogLevel INFO`
+      - [`run_summary.json`](d:\bb\daily_stock_analysis\data\manual_runs\shortline_daily_real_tracking_fix_day1_20260503\run_summary.json): `scan_source_counts={"wondertrader_real_engine":5}`, `tracking_repeat_symbol_count=0`
+    - `powershell -ExecutionPolicy Bypass -File .\scripts\run-shortline-daily.ps1 -TradeDate 2026-05-04 -TopN 5 -RunId shortline_daily_real_tracking_fix_day2_20260504 -OutputDir .\data\manual_runs\shortline_daily_real_tracking_fix_day2_20260504 -TrackingHistoryPath .\data\runtime\shortline_hub\tracking\validation_real_fix_20260503_20260504.json -LogLevel INFO`
+      - [`run_summary.json`](d:\bb\daily_stock_analysis\data\manual_runs\shortline_daily_real_tracking_fix_day2_20260504\run_summary.json): `scan_source_counts={"wondertrader_real_engine":5}`, `tracking_repeat_symbol_count=5`, `tracking_longest_streak_days=2`
+      - [`validation_real_fix_20260503_20260504.json`](d:\bb\daily_stock_analysis\data\runtime\shortline_hub\tracking\validation_real_fix_20260503_20260504.json) shows all 5 symbols repeated across the two real runs with `watchlist->high_risk_mover` transitions.
+- Notes:
+  - This round confirms the tracking layer was already usable; the unstable part was the upstream WonderTrader source-selection default.
+  - The new report summary does not replace the detailed tracking section; it only makes repeat-signal focus visible earlier in the reading flow.
+
+## 2026-05-04 (shortline runs summary includes bundle child run and deduplicates reruns)
+
+- Scope: continue the real bundle validation follow-up by fixing the `runs_summary` view so it reflects the current bundle's own `shortline_run`, while avoiding duplicate rows when the same bundle `run_id` is re-run multiple times.
+- Why:
+  - Real bundle validation showed that `shortline_review_bundle` could complete successfully, but `shortline_runs_summary.json` still treated older top-level runs as the latest view because nested `shortline_run` directories were not collected.
+  - After fixing nested discovery, repeated bundle re-runs with the same `run_id` would otherwise appear multiple times, which would distort aggregate cache / anomaly counts.
+- Changes:
+  - Updated [`scripts/summarize_shortline_runs.py`](d:\bb\daily_stock_analysis\scripts\summarize_shortline_runs.py):
+    - `_iter_shortline_run_dirs(...)` now also collects `<bundle_dir>/shortline_run` when `run_summary.json` exists.
+    - sorting now uses each `run_summary.json` mtime instead of only the parent directory mtime.
+    - `build_summary_payload(...)` now deduplicates by `run_id`, keeping only the newest entry.
+  - Updated [`tests/test_shortline_runs_summary.py`](d:\bb\daily_stock_analysis\tests\test_shortline_runs_summary.py):
+    - added regression for including bundle child `shortline_run`
+    - added regression for deduplicating repeated bundle reruns with the same `run_id`
+- Verification:
+  - Red:
+    - `py -3.10 -m pytest tests/test_shortline_runs_summary.py -k "bundle_shortline_child_run" -q`
+      - failed as expected with `run_count == 1` instead of `2`
+    - `py -3.10 -m pytest tests/test_shortline_runs_summary.py -k "deduplicates_same_run_id" -q`
+      - failed as expected with duplicated `run_id` rows still counted
+  - Green:
+    - `py -3.10 -m pytest tests/test_shortline_runs_summary.py tests/test_shortline_review_bundle.py -q`
+      - result: `18 passed`
+    - `py -3.10 -m py_compile scripts/summarize_shortline_runs.py tests/test_shortline_runs_summary.py`
+      - passed
+    - real verification:
+      - re-ran bundle:
+        - `powershell -ExecutionPolicy Bypass -File .\scripts\run-shortline-review-bundle.ps1 -TradeDate 2026-05-04 -TopN 5 -OutputDir .\data\manual_runs\shortline_review_bundle_real_verify_20260504_rerun -SkipShortlinePersistSnapshot -SkipFastReviewPersistSnapshots -LogLevel INFO`
+      - re-ran summary:
+        - `py -3.10 scripts\summarize_shortline_runs.py --runs-root .\data\manual_runs --output-dir .\data\manual_runs\shortline_runs_summary_verify_after_dedupe --limit 12 --log-level INFO`
+      - result:
+        - [`shortline_runs_summary.json`](d:\bb\daily_stock_analysis\data\manual_runs\shortline_runs_summary_verify_after_dedupe\shortline_runs_summary.json) now reports `latest_run_id="shortline_bundle_20260504"`
+        - the latest row now points to bundle child dir `data\manual_runs\shortline_review_bundle_real_verify_20260504_rerun\shortline_run`
+        - same-`run_id` earlier bundle run is no longer duplicated in the top 12 summary
+- Notes:
+  - This change is intentionally summary-layer only; it does not alter the underlying shortline artifacts.
+  - The practical effect is that bundle root and runs-summary root now tell the same “latest shortline run” story.

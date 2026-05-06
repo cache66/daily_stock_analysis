@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import argparse
-from datetime import date
+from datetime import date, datetime
 import logging
 import sys
 from pathlib import Path
@@ -23,6 +23,7 @@ from scripts.select_commodity_beneficiaries import (
     scan_commodity_beneficiaries,
     write_outputs,
 )
+from src.core.trading_calendar import get_effective_trading_date
 from src.storage import DatabaseManager
 
 
@@ -36,8 +37,9 @@ DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "commodity_beneficiary_snapshots"
 def parse_snapshot_date(value: Optional[Any]) -> date:
     text = str(value or "").strip()
     if not text:
-        return date.today()
-    return date.fromisoformat(text)
+        return get_effective_trading_date("cn")
+    parsed = date.fromisoformat(text)
+    return get_effective_trading_date("cn", current_time=datetime.combine(parsed, datetime.min.time()))
 
 
 def build_signal_type(prefix: str, commodity_key: str) -> str:

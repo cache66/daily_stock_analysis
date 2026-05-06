@@ -69,6 +69,7 @@ class CapitalProfileService:
         quote_data: Optional[Any] = None,
         daily_df: Optional[pd.DataFrame] = None,
         capital_flow_context: Optional[Dict[str, Any]] = None,
+        capital_flow_budget_seconds: Optional[float] = None,
     ) -> Dict[str, Any]:
         normalized_code = normalize_stock_code(stock_code)
         quote_payload = self._normalize_quote_payload(
@@ -87,6 +88,7 @@ class CapitalProfileService:
             stock_code=normalized_code,
             capital_flow_context=capital_flow_context,
             total_market_cap=quote_payload.get("total_market_cap"),
+            capital_flow_budget_seconds=capital_flow_budget_seconds,
         )
 
         liquidity_score, liquidity_reasons = self._score_liquidity(liquidity_context)
@@ -144,6 +146,8 @@ class CapitalProfileService:
             "inflow_5d_pct_mv": capital_flow_payload.get("inflow_5d_pct_mv"),
             "inflow_10d_pct_mv": capital_flow_payload.get("inflow_10d_pct_mv"),
             "capital_flow_status": capital_flow_payload.get("status"),
+            "capital_flow_cache_hit": bool(capital_flow_payload.get("cache_hit")),
+            "capital_flow_cache_source": capital_flow_payload.get("cache_source"),
             "capital_profile_summary": summary,
             "capital_profile_factor_breakdown": {
                 "capital_flow": {
@@ -211,7 +215,7 @@ class CapitalProfileService:
         daily_df: Optional[pd.DataFrame],
     ) -> Optional[pd.DataFrame]:
         if daily_df is not None:
-            return daily_df.copy()
+            return daily_df
         try:
             history_df, _ = self.manager.get_daily_data(stock_code, days=40)
         except Exception as exc:
@@ -227,11 +231,32 @@ class CapitalProfileService:
         stock_code: str,
         capital_flow_context: Optional[Dict[str, Any]],
         total_market_cap: Optional[float],
+        capital_flow_budget_seconds: Optional[float],
     ) -> Dict[str, Any]:
         payload = capital_flow_context
         if payload is None:
             try:
-                payload = self.manager.get_capital_flow_context(stock_code)
+                try:
+                    payload = self.manager.get_capital_flow_context(
+                        stock_code,
+                        budget_seconds=capital_flow_budget_seconds,
+                        include_sector_rankings=False,
+                    )
+                except TypeError as exc:
+                    if "budget_seconds" not in str(exc) and "include_sector_rankings" not in str(exc):
+                        raise
+                    if capital_flow_budget_seconds is not None:
+                        try:
+                            payload = self.manager.get_capital_flow_context(
+                                stock_code,
+                                budget_seconds=capital_flow_budget_seconds,
+                            )
+                        except TypeError as inner_exc:
+                            if "budget_seconds" not in str(inner_exc):
+                                raise
+                            payload = self.manager.get_capital_flow_context(stock_code)
+                    else:
+                        payload = self.manager.get_capital_flow_context(stock_code)
             except Exception as exc:
                 logger.debug("Capital profile capital-flow fetch failed for %s: %s", stock_code, exc)
                 payload = {"status": "failed", "errors": [str(exc)]}
@@ -247,6 +272,8 @@ class CapitalProfileService:
 
         return {
             "status": _safe_text(block.get("status")) or "unknown",
+            "cache_hit": bool(block.get("cache_hit")),
+            "cache_source": _safe_text(block.get("cache_source")),
             "main_net_inflow": main_net_inflow,
             "inflow_5d": inflow_5d,
             "inflow_10d": inflow_10d,

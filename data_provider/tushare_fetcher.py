@@ -1282,7 +1282,72 @@ class TushareFetcher(BaseFetcher):
             logger.info(f"[Tushare] 当前时间 {china_clock} 可能无法获取当天筹码分布，尝试获取前一个交易日的数据 {start_date}")
 
         return start_date
-    
+
+    def _normalize_board_concept_pool_frame(self, df: Optional[pd.DataFrame], *, api_name: str) -> pd.DataFrame:
+        """Normalize THS/DC board pool rows into a compact board list."""
+        if df is None or df.empty:
+            return pd.DataFrame(columns=["board_name", "board_code", "board_source"])
+
+        work = df.copy()
+        if api_name == "moneyflow_ind_ths":
+            name_col = "industry"
+            code_col = "ts_code" if "ts_code" in work.columns else None
+            source_name = "ths"
+        else:
+            name_col = "name"
+            code_col = "ts_code" if "ts_code" in work.columns else None
+            source_name = "dc"
+
+        if name_col not in work.columns:
+            return pd.DataFrame(columns=["board_name", "board_code", "board_source"])
+
+        work["board_name"] = work[name_col].astype(str).str.strip()
+        work = work[work["board_name"] != ""].copy()
+        if code_col and code_col in work.columns:
+            work["board_code"] = work[code_col].astype(str).str.strip()
+        else:
+            work["board_code"] = work["board_name"]
+        work["board_source"] = source_name
+        work = work[["board_name", "board_code", "board_source"]].drop_duplicates(
+            subset=["board_name"],
+            keep="first",
+        )
+        return work.reset_index(drop=True)
+
+    def get_board_concept_pool(self, source: str = "auto") -> pd.DataFrame:
+        """Fetch a reusable board-name pool from Tushare THS/DC feeds."""
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化")
+
+        resolved_source = str(source or "auto").strip().lower()
+        if resolved_source not in {"auto", "ths", "dc"}:
+            raise ValueError(f"unsupported board concept pool source: {source}")
+
+        trade_date = self.get_trade_time(early_time="00:00", late_time="15:30")
+        if not trade_date:
+            raise DataFetchError("unable to resolve trade date for board concept pool")
+
+        api_candidates = (
+            ["moneyflow_ind_ths", "moneyflow_ind_dc"]
+            if resolved_source == "auto"
+            else ["moneyflow_ind_ths" if resolved_source == "ths" else "moneyflow_ind_dc"]
+        )
+        errors: List[str] = []
+
+        for api_name in api_candidates:
+            try:
+                df = self._call_api_with_rate_limit(api_name, trade_date=trade_date)
+            except Exception as exc:
+                errors.append(f"{api_name}:{exc}")
+                continue
+
+            normalized = self._normalize_board_concept_pool_frame(df, api_name=api_name)
+            if normalized is not None and not normalized.empty:
+                return normalized
+            errors.append(f"{api_name}:empty")
+
+        raise DataFetchError("; ".join(errors) or "board concept pool fetch failed")
+
     def get_sector_rankings(self, n: int = 5) -> Optional[Tuple[list, list]]:
         """
         获取行业板块涨跌榜 (Tushare Pro)

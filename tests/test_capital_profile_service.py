@@ -13,6 +13,7 @@ class _FakeManager:
         self._history_df = history_df
         self._quote_payload = quote_payload
         self._capital_flow_payload = capital_flow_payload
+        self.capital_flow_budget_seconds = None
 
     def get_daily_data(self, _stock_code: str, days: int):
         return self._history_df.tail(days).copy(), "fake"
@@ -20,7 +21,8 @@ class _FakeManager:
     def get_realtime_quote(self, _stock_code: str):
         return dict(self._quote_payload)
 
-    def get_capital_flow_context(self, _stock_code: str):
+    def get_capital_flow_context(self, _stock_code: str, budget_seconds=None):
+        self.capital_flow_budget_seconds = budget_seconds
         return dict(self._capital_flow_payload)
 
 
@@ -181,6 +183,35 @@ class CapitalProfileServiceTestCase(unittest.TestCase):
         payload = CapitalProfileService(manager=manager).build_stock_profile("600222", stock_name="澶у競鍊肩浉瀵瑰皬娴佸叆")
 
         self.assertLessEqual(payload["capital_flow_score"], 1)
+
+    def test_build_stock_profile_forwards_capital_flow_budget_seconds(self) -> None:
+        manager = _FakeManager(
+            history_df=_build_history(),
+            quote_payload={
+                "price": 12.6,
+                "change_pct": 1.2,
+                "amount": 320_000_000,
+                "turnover_rate": 1.4,
+                "total_mv": 22_000_000_000,
+            },
+            capital_flow_payload={
+                "status": "ok",
+                "data": {
+                    "stock_flow": {
+                        "main_net_inflow": 28_000_000,
+                        "inflow_5d": 72_000_000,
+                        "inflow_10d": 110_000_000,
+                    }
+                },
+            },
+        )
+
+        CapitalProfileService(manager=manager).build_stock_profile(
+            "600333",
+            capital_flow_budget_seconds=0.35,
+        )
+
+        self.assertEqual(manager.capital_flow_budget_seconds, 0.35)
 
 
 if __name__ == "__main__":

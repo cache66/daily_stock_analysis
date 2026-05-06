@@ -1,0 +1,51 @@
+{
+  "run_id": "shortline_bundle_20260503",
+  "trade_date": "2026-05-03",
+  "top_n": 1,
+  "candidate_count": 1,
+  "explanation_count": 1,
+  "combined_count": 1,
+  "scan_source_counts": {
+    "wondertrader_real_engine": 1
+  },
+  "setup_tag_counts": {
+    "涨停后高换手分歧": 1
+  },
+  "risk_flag_counts": {
+    "volume_reconstructed_from_amount": 1
+  },
+  "shortline_category_counts": {
+    "涨停接力": 1
+  },
+  "review_tier_counts": {
+    "high_risk_mover": 1
+  },
+  "top_pick_count": 0,
+  "watchlist_count": 0,
+  "high_risk_mover_count": 1,
+  "explanation_source_counts": {
+    "upstream_tools": 1
+  },
+  "bridge_data_hit_count": 0,
+  "upstream_tools_hit_count": 1,
+  "heuristic_fallback_count": 0,
+  "legacy_unknown_count": 0,
+  "upstream_tool_hit_counts": {
+    "HotMoneyTool": 1,
+    "ChipAnalysisTool": 1
+  },
+  "explanation_success_count": 1,
+  "tool_error_count": 0,
+  "total_explain_elapsed_ms": 36990,
+  "avg_explain_elapsed_ms": 36990,
+  "max_explain_elapsed_ms": 36990,
+  "min_explain_elapsed_ms": 36990,
+  "upstream_tool_elapsed_totals_ms": {
+    "HotMoneyTool": 8110,
+    "ChipAnalysisTool": 26458
+  },
+  "score_max": 159.07,
+  "score_min": 159.07,
+  "score_avg": 159.07,
+  "orchestrator_explain_elapsed_ms": 37472
+}

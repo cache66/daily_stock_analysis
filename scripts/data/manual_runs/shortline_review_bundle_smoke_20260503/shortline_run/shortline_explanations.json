@@ -1,0 +1,25 @@
+[
+  {
+    "candidate_id": "2026-05-03-300083",
+    "hot_money_summary": "创世纪 的 FinGenius 资金侧显示：换手 26.82%。当前更贴近 机床制造 方向。",
+    "big_deal_summary": "创世纪 未开启 BigDealAnalysisTool，先用 HotMoney/行情做代理大单强度：换手 26.82%；量比 6.91。当前资金仍围绕 机床制造 博弈。",
+    "chip_commentary": "创世纪 的筹码分析显示：平均成本线 8.75；获利盘 0.99%；主力成本乖离率16.46%，控盘程度：极度控盘；90%集中度0.00%，70%集中度0.00%；偏多信号 底部单峰密集，筹码高度集中。",
+    "sentiment_commentary": "机床制造 是这只票当前最主要的情绪锚点，limit_up_momentum 容易吸引短线资金反复博弈。",
+    "risk_commentary": "创世纪 当前主要风险在 volume_reconstructed_from_amount，若 机床制造 转弱，短线波动会明显放大。",
+    "short_term_view": "短线先看 机床制造 能否继续扩散，再看 涨停后高换手分歧 是否持续得到承接；当前偏多信号有 底部单峰密集，筹码高度集中。",
+    "confidence_label": "high",
+    "protocol_version": "shortline_fg_v1",
+    "explanation_source": "upstream_tools",
+    "used_upstream_tools": [
+      "HotMoneyTool",
+      "ChipAnalysisTool"
+    ],
+    "tool_error_count": 0,
+    "tool_errors": [],
+    "explain_elapsed_ms": 36990,
+    "upstream_tool_elapsed_ms": {
+      "HotMoneyTool": 8110,
+      "ChipAnalysisTool": 26458
+    }
+  }
+]

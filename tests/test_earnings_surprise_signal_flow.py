@@ -18,8 +18,10 @@ from scripts.evaluate_signal_snapshot_performance import build_report
 from scripts.select_earnings_surprise_candidates import (
     SIGNAL_TYPE,
     EarningsSurpriseCriteria,
+    EarningsSurpriseEvaluation,
     EarningsSurpriseRunResult,
     _latest_completed_quarter_end,
+    _upsert_signal_fundamental_snapshot_with_retry,
     apply_recent_earnings_event_overlay,
     build_selected_dataframe,
     build_criteria_from_args,
@@ -27,7 +29,9 @@ from scripts.select_earnings_surprise_candidates import (
     build_markdown_report,
     build_event_key,
     build_history_payload,
+    enrich_selected_market_expectation_reference,
     evaluate_earnings_surprise_candidate,
+    filter_recent_event_catalog_by_scope,
     load_or_fetch_signal_fundamental_snapshot,
     parse_args_v2,
     persist_selected_evaluations,
@@ -333,6 +337,48 @@ class EarningsSurpriseSignalFlowTestCase(unittest.TestCase):
         self.assertEqual(args.snapshot_date, "2026-04-23")
         self.assertEqual(args.recent_event_scope, "latest_report_period")
 
+    def test_parse_args_v2_accepts_recent_event_max_age_days(self) -> None:
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "select_earnings_surprise_candidates.py",
+                "--recent-event-max-age-days",
+                "7",
+            ],
+        ):
+            args = parse_args_v2()
+
+        self.assertEqual(args.recent_event_max_age_days, 7)
+
+    def test_filter_recent_event_catalog_by_scope_applies_recent_announcement_window(self) -> None:
+        catalog = {
+            "000001": {
+                "code": "000001",
+                "report_periods": ["20260331"],
+                "report_announcement_date": "2026-04-28",
+            },
+            "000002": {
+                "code": "000002",
+                "report_periods": ["20260331"],
+                "report_announcement_date": "2026-04-21",
+            },
+            "000003": {
+                "code": "000003",
+                "report_periods": ["20251231"],
+                "report_announcement_date": "2026-04-28",
+            },
+        }
+
+        filtered = filter_recent_event_catalog_by_scope(
+            catalog,
+            snapshot_date=date(2026, 4, 28),
+            recent_event_scope="latest_report_period",
+            recent_event_max_age_days=7,
+        )
+
+        self.assertEqual(set(filtered.keys()), {"000001"})
+
     def test_evaluate_candidate_can_pass_on_earnings_quality_signal(self) -> None:
         evaluation = evaluate_earnings_surprise_candidate(
             stock_code="600011",
@@ -505,6 +551,41 @@ class EarningsSurpriseSignalFlowTestCase(unittest.TestCase):
         self.assertFalse(evaluation.passed)
         self.assertTrue(evaluation.metrics["duplicate_event"])
         self.assertEqual(evaluation.failure_reason, "same event key already recorded in history")
+
+    def test_duplicate_event_can_pass_again_after_cooldown(self) -> None:
+        self.db.upsert_signal_snapshot(
+            signal_type=SIGNAL_TYPE,
+            signal_date="2026-04-01",
+            code="600033",
+            name="冷却后重入样本",
+            criteria_payload={"signal_type": SIGNAL_TYPE},
+            metrics_payload={"event_key": "event_date:2026-04-18", "close": 10.0},
+            cause_payload={"reason_summary": "old"},
+            history_payload={"previous_hit_count": 0},
+        )
+
+        evaluation = evaluate_earnings_surprise_candidate(
+            stock_code="600033",
+            stock_name="冷却后重入样本",
+            bundle_payload={
+                "growth": {"revenue_yoy": 18.0, "net_profit_yoy": 35.0},
+                "earnings": {
+                    "financial_report": {"report_date": "2026-03-31"},
+                    "forecast_announcement_date": "2026-04-18",
+                    "forecast_summary": "业绩预增",
+                },
+                "source_chain": [],
+            },
+            criteria=EarningsSurpriseCriteria(),
+            total_market_cap=50e8,
+            latest_price=10.5,
+            snapshot_date=date(2026, 4, 7),
+            db=self.db,
+        )
+
+        self.assertTrue(evaluation.passed)
+        self.assertTrue(evaluation.metrics["duplicate_event"])
+        self.assertEqual(evaluation.metrics["earnings_strategy_gate_status"], "passed_duplicate_event_after_cooldown")
 
     def test_persist_and_performance_report_work_for_earnings_surprise_signal(self) -> None:
         evaluation = evaluate_earnings_surprise_candidate(
@@ -680,6 +761,55 @@ class EarningsSurpriseSignalFlowTestCase(unittest.TestCase):
         self.assertEqual(relaxed.metrics["strategy_profile"], "relaxed")
         self.assertEqual(relaxed.metrics["earnings_strategy_gate_status"], "passed_watch_with_confirmation")
 
+    def test_balanced_profile_watch_can_pass_with_strong_text_and_growth_confirmation(self) -> None:
+        balanced = evaluate_earnings_surprise_candidate(
+            stock_code="600034",
+            stock_name="balanced_watch_strong_confirmation",
+            bundle_payload={
+                "growth": {"revenue_yoy": 10.5, "net_profit_yoy": 21.0},
+                "earnings": {
+                    "financial_report": {"report_date": "2026-03-31"},
+                    "forecast_announcement_date": "2025-12-20",
+                    "forecast_summary": "beat improve",
+                },
+                "earnings_quality": {
+                    "score_total": 52.0,
+                    "verdict": "weak",
+                    "growth_continuity_score": 14.0,
+                    "profit_quality_score": 10.0,
+                    "profitability_score": 8.0,
+                    "disclosure_signal_score": 2.0,
+                    "risk_flags": [],
+                    "cycle_analysis": {"phase": "neutral"},
+                },
+                "source_chain": ["test"],
+            },
+            criteria=build_criteria_from_args(
+                argparse.Namespace(
+                    strategy_profile="balanced",
+                    min_revenue_yoy=None,
+                    min_net_profit_yoy=None,
+                    min_roe=None,
+                    require_positive_text=None,
+                    require_growth_thresholds=None,
+                    strategy_direct_pass_score=None,
+                    strategy_watch_pass_score=None,
+                    max_total_mv_yi=None,
+                    disable_event_dedupe=False,
+                )
+            ),
+            total_market_cap=50e8,
+            latest_price=9.8,
+            snapshot_date=date(2026, 4, 19),
+            db=self.db,
+        )
+
+        self.assertTrue(balanced.passed)
+        self.assertFalse(balanced.metrics["earnings_quality_signal"])
+        self.assertTrue(balanced.metrics["positive_text_signal"])
+        self.assertTrue(balanced.metrics["growth_signal"])
+        self.assertEqual(balanced.metrics["earnings_strategy_gate_status"], "passed_watch_with_confirmation")
+
     def test_recent_earnings_overlay_updates_bundle_with_latest_announcement(self) -> None:
         merged = apply_recent_earnings_event_overlay(
             {
@@ -709,6 +839,56 @@ class EarningsSurpriseSignalFlowTestCase(unittest.TestCase):
         self.assertEqual(merged["growth"]["net_profit_yoy"], 38.0)
         self.assertEqual(merged["growth"]["roe"], 9.5)
         self.assertIn("stock_yjyg_em:20260331", merged["source_chain"])
+
+    def test_recent_earnings_overlay_clears_stale_quick_report_when_current_scope_only_has_forecast(self) -> None:
+        merged = apply_recent_earnings_event_overlay(
+            {
+                "growth": {"revenue_yoy": 12.0, "net_profit_yoy": 18.0},
+                "earnings": {
+                    "financial_report": {"report_date": "2025-12-31"},
+                    "forecast_announcement_date": "2026-01-15",
+                    "forecast_summary": "old forecast",
+                    "quick_report_announcement_date": "2022-02-22",
+                    "quick_report_summary": "2022 stale quick report",
+                },
+                "source_chain": ["adapter"],
+            },
+            {
+                "forecast_announcement_date": "2026-04-18",
+                "forecast_summary": "latest forecast summary",
+                "net_profit_yoy": 38.0,
+                "sources": ["stock_yjyg_em:20260331"],
+            },
+        )
+
+        self.assertEqual(merged["earnings"]["forecast_announcement_date"], "2026-04-18")
+        self.assertEqual(merged["earnings"]["forecast_summary"], "latest forecast summary")
+        self.assertNotIn("quick_report_announcement_date", merged["earnings"])
+        self.assertNotIn("quick_report_summary", merged["earnings"])
+
+    def test_evaluate_candidate_prefers_latest_forecast_date_over_stale_quick_report(self) -> None:
+        evaluation = evaluate_earnings_surprise_candidate(
+            stock_code="600032",
+            stock_name="stale_quick_report_sample",
+            bundle_payload={
+                "growth": {"revenue_yoy": 20.0, "net_profit_yoy": 32.0},
+                "earnings": {
+                    "financial_report": {"report_date": "2026-03-31"},
+                    "forecast_announcement_date": "2026-04-18",
+                    "forecast_summary": "业绩预增",
+                    "quick_report_announcement_date": "2022-02-22",
+                    "quick_report_summary": "",
+                },
+                "source_chain": ["test"],
+            },
+            criteria=EarningsSurpriseCriteria(),
+            total_market_cap=50e8,
+            latest_price=10.2,
+            snapshot_date=date(2026, 4, 19),
+            db=self.db,
+        )
+
+        self.assertEqual(evaluation.metrics["event_date"], "2026-04-18")
 
     def test_signal_fundamental_snapshot_cache_round_trip(self) -> None:
         self.db.upsert_signal_fundamental_snapshot(
@@ -870,6 +1050,79 @@ class EarningsSurpriseSignalFlowTestCase(unittest.TestCase):
             bundle_fetch.call_args.kwargs["enabled_blocks"],
             ("financial", "forecast", "quick_report"),
         )
+
+    def test_scan_market_uses_fast_a_share_manager_for_full_market_scan(self) -> None:
+        universe_df = pd.DataFrame(
+            {
+                "code": ["600031"],
+                "name": ["fast_manager_sample"],
+                "total_mv": [52e8],
+                "latest_price": [10.5],
+            }
+        )
+        bundle_payload = {
+            "growth": {"revenue_yoy": 18.0, "net_profit_yoy": 36.0, "roe": 11.0},
+            "earnings": {
+                "financial_report": {"report_date": "2026-03-31"},
+                "forecast_summary": "业绩预增",
+            },
+            "source_chain": ["test"],
+        }
+        fast_manager = object()
+
+        with patch(
+            "scripts.select_earnings_surprise_candidates.KlineSelectorService.build_fast_a_share_manager",
+            return_value=fast_manager,
+        ) as build_fast_manager, patch(
+            "data_provider.fundamental_adapter.AkshareFundamentalAdapter.get_fundamental_bundle",
+            return_value=bundle_payload,
+        ), patch(
+            "scripts.select_earnings_surprise_candidates.CapitalProfileService.build_stock_profile",
+            return_value={"capital_consensus_score": 2, "capital_profile_score": 61.0},
+        ), patch(
+            "scripts.select_earnings_surprise_candidates.build_recent_earnings_event_catalog",
+            return_value={},
+        ):
+            scan_market(
+                criteria=EarningsSurpriseCriteria(),
+                snapshot_date=date(2026, 4, 19),
+                signal_type=SIGNAL_TYPE,
+                history_lookback_days=365,
+                event_lookback_days=120,
+                db=self.db,
+                limit=None,
+                max_workers=1,
+                universe_provider=lambda: universe_df.copy(),
+                scan_depth="low",
+            )
+
+        build_fast_manager.assert_called_once()
+
+    def test_signal_snapshot_upsert_retries_after_sqlite_write_failure(self) -> None:
+        db = Mock()
+        db._is_sqlite_engine = True
+        db._sqlite_write_retry_max = 2
+        db._sqlite_write_retry_base_delay = 0.01
+        db.upsert_signal_fundamental_snapshot.side_effect = [0, 0, 1]
+        session = Mock()
+
+        with patch("scripts.select_earnings_surprise_candidates.time.sleep") as sleep_mock:
+            saved_count = _upsert_signal_fundamental_snapshot_with_retry(
+                db=db,
+                signal_type=SIGNAL_TYPE,
+                snapshot_date=date(2026, 4, 19),
+                code="600031",
+                name="retry_sample",
+                bundle_payload={"growth": {"revenue_yoy": 18.0}},
+                quote_payload={"latest_price": 10.5},
+                session=session,
+                auto_commit=False,
+            )
+
+        self.assertEqual(saved_count, 1)
+        self.assertEqual(db.upsert_signal_fundamental_snapshot.call_count, 3)
+        self.assertEqual(session.rollback.call_count, 2)
+        self.assertEqual(sleep_mock.call_count, 2)
 
     def test_scan_market_recent_event_prefilter_skips_codes_without_recent_event(self) -> None:
         universe_df = pd.DataFrame(
@@ -1053,6 +1306,115 @@ class EarningsSurpriseSignalFlowTestCase(unittest.TestCase):
 
         self.assertEqual(run_result.evaluated_count, 0)
         self.assertEqual(len(run_result.selected), 0)
+
+    def test_scan_market_low_depth_recent_event_candidate_prefilter_skips_obvious_weak_events(self) -> None:
+        universe_df = pd.DataFrame(
+            {
+                "code": ["600051", "600052"],
+                "name": ["positive_event", "weak_event"],
+                "total_mv": [52e8, 53e8],
+                "latest_price": [10.5, 10.8],
+            }
+        )
+
+        loaded_codes = []
+
+        def _bundle_loader(code: str) -> dict:
+            loaded_codes.append(code)
+            return {
+                "growth": {"revenue_yoy": 18.0, "net_profit_yoy": 36.0, "roe": 11.0},
+                "earnings": {
+                    "financial_report": {"report_date": "2026-03-31"},
+                    "forecast_summary": "业绩预增",
+                },
+                "source_chain": ["test"],
+            }
+
+        with patch(
+            "scripts.select_earnings_surprise_candidates.CapitalProfileService.build_stock_profile",
+            return_value={"capital_consensus_score": 2, "capital_profile_score": 61.0},
+        ), patch(
+            "scripts.select_earnings_surprise_candidates.build_recent_earnings_event_catalog",
+            return_value={
+                "600051": {
+                    "forecast_announcement_date": "2026-04-18",
+                    "forecast_summary": "业绩预增",
+                    "net_profit_yoy": 35.0,
+                },
+                "600052": {
+                    "forecast_announcement_date": "2026-04-18",
+                    "forecast_summary": "业绩预减",
+                    "revenue_yoy": -8.0,
+                    "net_profit_yoy": -25.0,
+                },
+            },
+        ):
+            run_result = scan_market(
+                criteria=EarningsSurpriseCriteria(),
+                snapshot_date=date(2026, 4, 19),
+                signal_type=SIGNAL_TYPE,
+                history_lookback_days=365,
+                event_lookback_days=120,
+                db=self.db,
+                limit=None,
+                max_workers=1,
+                universe_provider=lambda: universe_df.copy(),
+                scan_depth="low",
+                bundle_loader=_bundle_loader,
+            )
+
+        self.assertEqual(run_result.evaluated_count, 1)
+        self.assertEqual(len(run_result.selected), 1)
+        self.assertEqual(run_result.selected[0].stock_code, "600051")
+        self.assertEqual(loaded_codes, ["600051"])
+
+    def test_scan_market_returns_phase_timing_metrics(self) -> None:
+        universe_df = pd.DataFrame(
+            {
+                "code": ["600061"],
+                "name": ["timing_sample"],
+                "total_mv": [52e8],
+                "latest_price": [10.5],
+            }
+        )
+
+        def _bundle_loader(_code: str) -> dict:
+            return {
+                "growth": {"revenue_yoy": 18.0, "net_profit_yoy": 36.0, "roe": 11.0},
+                "earnings": {
+                    "financial_report": {"report_date": "2026-03-31"},
+                    "forecast_summary": "业绩预增",
+                },
+                "source_chain": ["test"],
+            }
+
+        with patch(
+            "scripts.select_earnings_surprise_candidates.CapitalProfileService.build_stock_profile",
+            return_value={"capital_consensus_score": 2, "capital_profile_score": 61.0},
+        ), patch(
+            "scripts.select_earnings_surprise_candidates.build_recent_earnings_event_catalog",
+            return_value={"600061": {"forecast_announcement_date": "2026-04-18", "forecast_summary": "业绩预增"}},
+        ):
+            run_result = scan_market(
+                criteria=EarningsSurpriseCriteria(),
+                snapshot_date=date(2026, 4, 19),
+                signal_type=SIGNAL_TYPE,
+                history_lookback_days=365,
+                event_lookback_days=120,
+                db=self.db,
+                limit=None,
+                max_workers=1,
+                universe_provider=lambda: universe_df.copy(),
+                scan_depth="low",
+                bundle_loader=_bundle_loader,
+            )
+
+        self.assertIn("fundamental_fetch", run_result.phase_timing_sec)
+        self.assertIn("evaluate_candidate", run_result.phase_timing_sec)
+        self.assertIn("capital_profile", run_result.phase_timing_sec)
+        self.assertGreaterEqual(run_result.phase_timing_sec["fundamental_fetch"], 0.0)
+        self.assertGreaterEqual(run_result.phase_timing_sec["evaluate_candidate"], 0.0)
+        self.assertGreaterEqual(run_result.phase_timing_sec["capital_profile"], 0.0)
 
     def test_same_day_bundle_cache_overlay_refresh_marks_cache_source_without_refetch(self) -> None:
         adapter = Mock()
@@ -1347,6 +1709,130 @@ class EarningsSurpriseSignalFlowTestCase(unittest.TestCase):
         self.assertGreater(first_calls["yjkb"], 0)
         self.assertEqual(calls["yjyg"], first_calls["yjyg"])
         self.assertEqual(calls["yjkb"], first_calls["yjkb"])
+
+    def test_recent_event_catalog_includes_actual_report_announcements(self) -> None:
+        calls = {"yjbb": 0}
+
+        def _empty_frame(*args, **kwargs) -> pd.DataFrame:
+            return pd.DataFrame()
+
+        def _fake_stock_yjbb_em(*, date: str) -> pd.DataFrame:
+            calls["yjbb"] += 1
+            return pd.DataFrame(
+                {
+                    "股票代码": ["002384"],
+                    "股票简称": ["东山精密"],
+                    "营业总收入-营业总收入": [131.38e8],
+                    "营业总收入-同比增长": [52.72],
+                    "净利润-净利润": [11.1e8],
+                    "净利润-同比增长": [143.47],
+                    "净资产收益率": [6.62],
+                    "最新公告日期": ["2026-04-27"],
+                }
+            )
+
+        fake_ak = types.SimpleNamespace(
+            stock_yjyg_em=_empty_frame,
+            stock_yjkb_em=_empty_frame,
+            stock_yjbb_em=_fake_stock_yjbb_em,
+        )
+        cache_dir = Path(self._temp_dir.name) / "actual_report_event_cache"
+
+        with patch.dict(sys.modules, {"akshare": fake_ak}):
+            catalog = build_recent_earnings_event_catalog(
+                snapshot_date=date(2026, 4, 27),
+                lookback_days=120,
+                cache_dir=cache_dir,
+                force_refresh=True,
+            )
+
+        self.assertIn("002384", catalog)
+        payload = catalog["002384"]
+        self.assertEqual(payload["report_announcement_date"], "2026-04-27")
+        self.assertEqual(payload["report_date"], "2026-03-31")
+        self.assertEqual(payload["revenue_yoy"], 52.72)
+        self.assertEqual(payload["net_profit_yoy"], 143.47)
+        self.assertIn("stock_yjbb_em:20260331", payload["sources"])
+        self.assertGreater(calls["yjbb"], 0)
+
+    def test_actual_report_overlay_supersedes_stale_forecast_event(self) -> None:
+        merged = apply_recent_earnings_event_overlay(
+            {
+                "growth": {"revenue_yoy": 9.12, "net_profit_yoy": 22.43, "roe": 6.62},
+                "earnings": {
+                    "financial_report": {"report_date": "2025-12-31"},
+                    "forecast_announcement_date": "2026-04-08",
+                    "forecast_summary": "old forecast",
+                    "quick_report_announcement_date": "2026-04-08",
+                    "quick_report_summary": "old quick report",
+                },
+                "source_chain": ["adapter"],
+            },
+            {
+                "report_announcement_date": "2026-04-27",
+                "report_date": "2026-03-31",
+                "report_summary": "正式财报披露，营收增长52.72%，净利润增长143.47%",
+                "revenue_yoy": 52.72,
+                "net_profit_yoy": 143.47,
+                "roe": 6.62,
+                "revenue": 131.38e8,
+                "net_profit_parent": 11.1e8,
+                "sources": ["stock_yjbb_em:20260331"],
+            },
+        )
+
+        self.assertNotIn("forecast_announcement_date", merged["earnings"])
+        self.assertNotIn("quick_report_announcement_date", merged["earnings"])
+        self.assertEqual(merged["earnings"]["report_announcement_date"], "2026-04-27")
+        self.assertEqual(merged["earnings"]["financial_report"]["report_date"], "2026-03-31")
+        self.assertEqual(merged["growth"]["revenue_yoy"], 52.72)
+
+        evaluation = evaluate_earnings_surprise_candidate(
+            stock_code="002384",
+            stock_name="东山精密",
+            bundle_payload=merged,
+            criteria=EarningsSurpriseCriteria(),
+            total_market_cap=500e8,
+            latest_price=32.0,
+            snapshot_date=date(2026, 4, 27),
+            db=self.db,
+        )
+
+        self.assertTrue(evaluation.passed)
+        self.assertEqual(evaluation.metrics["event_date"], "2026-04-27")
+        self.assertTrue(evaluation.metrics["growth_signal"])
+
+    def test_overlay_infers_actual_report_when_financial_block_has_current_period(self) -> None:
+        merged = apply_recent_earnings_event_overlay(
+            {
+                "growth": {"revenue_yoy": 52.72, "net_profit_yoy": 143.47, "roe": 6.62},
+                "earnings": {
+                    "financial_report": {
+                        "report_date": "2026-03-31",
+                        "revenue": 131.38e8,
+                        "net_profit_parent": 11.1e8,
+                        "roe": 6.62,
+                    },
+                    "forecast_announcement_date": "2026-04-08",
+                    "forecast_summary": "old forecast",
+                },
+                "source_chain": ["adapter"],
+            },
+            {
+                "forecast_announcement_date": "2026-04-08",
+                "forecast_summary": "forecast for current quarter",
+                "net_profit_yoy": 22.43,
+                "sources": ["stock_yjyg_em:20260331"],
+                "report_periods": ["20260331"],
+            },
+            report_announcement_fallback_date=date(2026, 4, 27),
+        )
+
+        self.assertEqual(merged["earnings"]["report_announcement_date"], "2026-04-27")
+        self.assertEqual(merged["earnings"]["financial_report"]["report_date"], "2026-03-31")
+        self.assertEqual(merged["growth"]["revenue_yoy"], 52.72)
+        self.assertEqual(merged["growth"]["net_profit_yoy"], 143.47)
+        self.assertNotIn("forecast_announcement_date", merged["earnings"])
 
     def test_non_default_profiles_use_profile_specific_signal_type(self) -> None:
         self.assertEqual(resolve_signal_type_for_profile("balanced"), SIGNAL_TYPE)
@@ -1735,6 +2221,11 @@ class EarningsSurpriseSignalFlowTestCase(unittest.TestCase):
             quote_capital_refresh_count=3,
             capital_profile_cache_hit_count=5,
             elapsed_seconds=12.345,
+            phase_timing_sec={
+                "fundamental_fetch": 4.321,
+                "evaluate_candidate": 2.222,
+                "capital_profile": 1.111,
+            },
         )
         selected_df = pd.DataFrame(
             [
@@ -1771,6 +2262,9 @@ class EarningsSurpriseSignalFlowTestCase(unittest.TestCase):
         self.assertIn("- Quote/capital refresh count: 3", markdown)
         self.assertIn("- Capital profile cache hits: 5", markdown)
         self.assertIn("- Elapsed seconds: 12.345", markdown)
+        self.assertIn("- Phase timing (fundamental_fetch): 4.321s", markdown)
+        self.assertIn("- Phase timing (evaluate_candidate): 2.222s", markdown)
+        self.assertIn("- Phase timing (capital_profile): 1.111s", markdown)
 
     def test_markdown_report_uses_readable_chinese_headers(self) -> None:
         run_result = EarningsSurpriseRunResult(
@@ -1794,6 +2288,115 @@ class EarningsSurpriseSignalFlowTestCase(unittest.TestCase):
         self.assertIn("# 业绩超预期代理信号结果", markdown)
         self.assertIn("## 当前规则", markdown)
         self.assertIn("## 命中结果", markdown)
+
+    def test_enrich_selected_market_expectation_reference_populates_review_fields(self) -> None:
+        evaluation = EarningsSurpriseEvaluation(
+            stock_code="300502",
+            stock_name="新易盛",
+            passed=True,
+            metrics={
+                "report_date": "2026-03-31",
+                "actual_eps": 18.8,
+                "reason_summary": "earnings candidate",
+            },
+        )
+
+        with patch(
+            "scripts.select_earnings_surprise_candidates.AkshareFundamentalAdapter.get_market_expectation_snapshot",
+            return_value={
+                "status": "available",
+                "source": "stock_profit_forecast_ths",
+                "forecast_year": "2026",
+                "institution_count": 19,
+                "eps_min": 12.59,
+                "eps_mean": 17.54,
+                "eps_max": 27.18,
+                "industry_avg_eps": 2.86,
+                "summary": "2026年EPS一致预期 17.54 元（19家机构；区间 12.59-27.18；行业均值 2.86）",
+            },
+        ):
+            enrich_selected_market_expectation_reference([evaluation], snapshot_date=date(2026, 4, 28))
+
+        self.assertEqual(evaluation.metrics["market_expectation_status"], "available")
+        self.assertEqual(evaluation.metrics["market_expectation_source"], "stock_profit_forecast_ths")
+        self.assertEqual(evaluation.metrics["market_expectation_year"], "2026")
+        self.assertEqual(evaluation.metrics["market_expectation_institution_count"], 19)
+        self.assertAlmostEqual(float(evaluation.metrics["market_expectation_eps_mean"]), 17.54, places=2)
+        self.assertEqual(evaluation.metrics["market_expectation_reference_label"], "beat_ref")
+        self.assertEqual(evaluation.metrics["market_expectation_reference_basis"], "actual_eps_vs_consensus_eps")
+        self.assertGreater(float(evaluation.metrics["market_expectation_reference_delta_pct"]), 5.0)
+        self.assertIn("2026年EPS一致预期 17.54 元", evaluation.metrics["market_expectation_summary"])
+
+        selected_df = build_selected_dataframe([evaluation])
+        self.assertEqual(selected_df.iloc[0]["market_expectation_status"], "available")
+        self.assertEqual(selected_df.iloc[0]["market_expectation_year"], "2026")
+        self.assertEqual(selected_df.iloc[0]["market_expectation_institution_count"], 19)
+        self.assertEqual(selected_df.iloc[0]["market_expectation_reference_label"], "beat_ref")
+        self.assertIn("2026年EPS一致预期 17.54 元", selected_df.iloc[0]["market_expectation_summary"])
+
+    def test_enrich_selected_market_expectation_reference_marks_unavailable_when_missing(self) -> None:
+        evaluation = EarningsSurpriseEvaluation(
+            stock_code="600001",
+            stock_name="sample",
+            passed=True,
+            metrics={"report_date": "2026-03-31"},
+        )
+
+        with patch(
+            "scripts.select_earnings_surprise_candidates.AkshareFundamentalAdapter.get_market_expectation_snapshot",
+            return_value={},
+        ):
+            enrich_selected_market_expectation_reference([evaluation], snapshot_date=date(2026, 4, 28))
+
+        self.assertEqual(evaluation.metrics["market_expectation_status"], "unavailable")
+        self.assertIsNone(evaluation.metrics["market_expectation_summary"])
+        selected_df = build_selected_dataframe([evaluation])
+        self.assertEqual(selected_df.iloc[0]["market_expectation_status"], "unavailable")
+
+    def test_markdown_report_includes_market_expectation_reference_section(self) -> None:
+        run_result = EarningsSurpriseRunResult(
+            criteria=EarningsSurpriseCriteria(),
+            universe_size=1,
+            evaluated_count=1,
+            skipped_market_cap_count=0,
+            skipped_duplicate_event_count=0,
+            selected=[],
+            failed=[],
+        )
+        selected_df = pd.DataFrame(
+            [
+                {
+                    "code": "300502",
+                    "name": "新易盛",
+                    "total_market_cap_yi": 520.0,
+                    "event_date": "2026-04-24",
+                    "report_date": "2026-03-31",
+                    "revenue_yoy": 105.7,
+                    "net_profit_yoy": 76.8,
+                    "roe": 14.5,
+                    "earnings_strategy_score": 91.8,
+                    "earnings_strategy_gate_status": "passed_strategy_score",
+                    "earnings_quality_verdict": "strong",
+                    "earnings_quality_score": 82.0,
+                    "reason_summary": "earnings candidate",
+                    "latest_previous_hit_date": None,
+                    "previous_hit_count": 0,
+                    "market_expectation_status": "available",
+                    "market_expectation_summary": "2026年EPS一致预期 17.54 元（19家机构；区间 12.59-27.18；行业均值 2.86）",
+                }
+            ]
+        )
+
+        markdown = build_markdown_report(
+            run_result,
+            selected_df,
+            "2026-04-28 15:00:00",
+            snapshot_date=date(2026, 4, 28),
+            signal_type=SIGNAL_TYPE,
+        )
+
+        self.assertIn("## 市场预期参考", markdown)
+        self.assertIn("2026年EPS一致预期 17.54 元", markdown)
 
     def test_scan_market_supports_universe_shards(self) -> None:
         universe_df = pd.DataFrame(

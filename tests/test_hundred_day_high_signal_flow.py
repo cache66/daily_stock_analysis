@@ -5,6 +5,8 @@ import json
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from datetime import date
 from pathlib import Path
@@ -23,17 +25,21 @@ from scripts.select_hundred_day_high_candidates import (
     SIGNAL_TYPE,
     EARNINGS_BALANCED_PROFILE_NAME,
     EARNINGS_BALANCED_SIGNAL_TYPE,
+    _min_breakout_quality_score_for_profile,
     compute_breakout_quality_metrics,
     main as hundred_day_high_main,
     parse_args,
     build_selected_dataframe,
     build_criteria_payload,
     build_markdown_report,
+    _enrich_run_result_with_breakout_quality,
     enrich_selected_results,
     export_results,
     filter_selected_results_by_earnings_balanced,
     load_snapshot_run_result,
+    hold_output_dir_lock,
     persist_selected_results,
+    resolve_checkpoint_path,
     resolve_profile_settings,
     resolve_runtime_signal_type,
     scan_hundred_day_high_candidates,
@@ -497,6 +503,70 @@ class HundredDayHighSignalFlowTestCase(unittest.TestCase):
 
         self.assertEqual(args.profile, EARNINGS_BALANCED_PROFILE_NAME)
 
+    def test_parse_args_leaves_checkpoint_path_unset_by_default(self):
+        with patch.object(sys, "argv", ["select_hundred_day_high_candidates.py"]):
+            args = parse_args()
+
+        self.assertIsNone(args.checkpoint_path)
+
+    def test_resolve_checkpoint_path_defaults_to_output_dir_checkpoint(self):
+        output_dir = Path(self._temp_dir.name) / "isolated_run"
+
+        resolved = resolve_checkpoint_path(
+            output_dir,
+            None,
+            shard_count=1,
+            shard_index=0,
+        )
+
+        self.assertEqual(resolved, output_dir / "hundred_day_high_checkpoint.json")
+
+    def test_resolve_checkpoint_path_keeps_explicit_path_with_shard_suffix(self):
+        output_dir = Path(self._temp_dir.name) / "unused"
+        explicit_path = Path(self._temp_dir.name) / "shared" / "checkpoint.json"
+
+        resolved = resolve_checkpoint_path(
+            output_dir,
+            explicit_path,
+            shard_count=4,
+            shard_index=1,
+        )
+
+        self.assertEqual(
+            resolved,
+            explicit_path.with_name("checkpoint.shard_02_of_04.json"),
+        )
+
+    def test_hold_output_dir_lock_rejects_second_holder(self):
+        output_dir = Path(self._temp_dir.name) / "locked_output"
+
+        with hold_output_dir_lock(output_dir):
+            with self.assertRaisesRegex(RuntimeError, "output_dir is already in use"):
+                with hold_output_dir_lock(output_dir):
+                    self.fail("second lock acquisition should not succeed")
+
+    def test_main_rejects_locked_output_dir(self):
+        output_dir = Path(self._temp_dir.name) / "locked_main_output"
+
+        with hold_output_dir_lock(output_dir), patch.object(
+            sys,
+            "argv",
+            [
+                "select_hundred_day_high_candidates.py",
+                "--snapshot-date",
+                "2026-04-29",
+                "--output-dir",
+                str(output_dir),
+                "--skip-cause-analysis",
+                "--skip-db-persist",
+                "--limit",
+                "5",
+            ],
+        ):
+            exit_code = hundred_day_high_main()
+
+        self.assertEqual(exit_code, 2)
+
     def test_resolve_runtime_signal_type_uses_earnings_namespace_for_new_profile(self):
         self.assertEqual(
             resolve_runtime_signal_type(
@@ -621,6 +691,248 @@ class HundredDayHighSignalFlowTestCase(unittest.TestCase):
             build_profile_signal_type("hundred_day_high_profile", "momentum_strict"),
             "hundred_day_high_profile__momentum_strict",
         )
+
+    def test_scan_hundred_day_high_candidates_prefers_shared_prepare_scan_universe(self):
+        captured: dict[str, object] = {}
+        expected_run_result = self._build_run_result()
+
+        class _FakeService:
+            def get_spot_enriched_a_share_universe(self, *, limit=None, as_of_date=None):
+                captured["limit"] = limit
+                captured["spot_as_of_date"] = as_of_date
+                return pd.DataFrame(
+                    [
+                        {"code": "600519", "name": "璐靛窞鑼呭彴", "listed_days": 5000},
+                        {"code": "600001", "name": "ST sample", "listed_days": 5000},
+                    ]
+                )
+
+            def prepare_scan_universe(self, **kwargs):
+                captured["prepare_kwargs"] = kwargs
+                return SimpleNamespace(
+                    prepared_universe=pd.DataFrame(
+                        [{"code": "600519", "name": "璐靛窞鑼呭彴", "listed_days": 5000}]
+                    ),
+                    base_universe_size=2,
+                    sharded_universe_size=1,
+                    prepared_universe_size=1,
+                    filter_stats={
+                        "before": 2,
+                        "after": 1,
+                        "removed_invalid_code": 0,
+                        "removed_whitelist": 0,
+                        "removed_st": 1,
+                        "removed_kcb": 0,
+                        "removed_cyb": 0,
+                    },
+                    prefilter_stats={
+                        "before": 1,
+                        "after": 1,
+                        "after_primary": 1,
+                        "after_relaxed": 1,
+                        "removed_listed_days": 0,
+                        "removed_change_60d": 0,
+                        "removed_turnover_rate": 0,
+                        "removed_negative_change": 0,
+                        "added_relaxed_buffer": 0,
+                        "adaptive_positive_change_applied": False,
+                        "quote_hydrated_rows": 0,
+                        "quote_requested_rows": 0,
+                        "quote_requested_fields": "",
+                        "quote_missing_unsupported_fields": "",
+                        "quote_worker_count": 0,
+                    },
+                )
+
+            def scan_market(self, **kwargs):
+                captured["scan_kwargs"] = kwargs
+                return expected_run_result
+
+        run_result = scan_hundred_day_high_candidates(
+            criteria=KlineSelectorCriteria(require_up_day_ratio=False, require_recent_limit_up=False, require_new_high=True),
+            snapshot_date=date(2026, 4, 22),
+            limit=10,
+            max_workers=3,
+            shard_count=2,
+            shard_index=1,
+            prefilter=KlineSelectorPrefilter(min_change_pct_60d=12.0, min_listed_days=120, exclude_st=True),
+            service=_FakeService(),
+        )
+
+        self.assertIs(run_result, expected_run_result)
+        self.assertEqual(captured["limit"], 10)
+        self.assertEqual(captured["spot_as_of_date"], date(2026, 4, 22))
+        self.assertEqual(captured["prepare_kwargs"]["as_of_date"], date(2026, 4, 22))
+        self.assertEqual(captured["prepare_kwargs"]["shard_count"], 2)
+        self.assertEqual(captured["prepare_kwargs"]["shard_index"], 1)
+        self.assertEqual(captured["prepare_kwargs"]["quote_hydration_workers"], 3)
+        self.assertTrue(captured["prepare_kwargs"]["exclude_st"])
+        self.assertEqual(captured["scan_kwargs"]["as_of_date"], date(2026, 4, 22))
+        self.assertIsNone(captured["scan_kwargs"]["prefilter"])
+        self.assertEqual(captured["scan_kwargs"]["shard_count"], 1)
+        self.assertEqual(captured["scan_kwargs"]["shard_index"], 0)
+        self.assertEqual(captured["scan_kwargs"]["universe"]["code"].tolist(), ["600519"])
+        self.assertEqual(run_result.skipped_prefilter_count, 1)
+        self.assertTrue(run_result.phase_metrics["shared_scan_shell_enabled"])
+        self.assertEqual(run_result.phase_metrics["scan_shell_filter_stats"]["removed_st"], 1)
+
+    def test_scan_hundred_day_high_candidates_forwards_max_workers_to_breakout_quality_enrichment(self):
+        captured: dict[str, object] = {}
+        expected_run_result = self._build_run_result()
+
+        class _FakeService:
+            def get_spot_enriched_a_share_universe(self, *, limit=None, as_of_date=None):
+                return pd.DataFrame([{"code": "600519", "name": "贵州茅台", "listed_days": 5000}])
+
+            def scan_market(self, **kwargs):
+                return expected_run_result
+
+        def _fake_enrich(run_result, *, service, profile_name, max_workers):
+            captured["service"] = service
+            captured["profile_name"] = profile_name
+            captured["max_workers"] = max_workers
+            return run_result
+
+        with patch(
+            "scripts.select_hundred_day_high_candidates._enrich_run_result_with_breakout_quality",
+            side_effect=_fake_enrich,
+        ):
+            run_result = scan_hundred_day_high_candidates(
+                criteria=KlineSelectorCriteria(
+                    require_up_day_ratio=False,
+                    require_recent_limit_up=False,
+                    require_new_high=True,
+                ),
+                snapshot_date=date(2026, 4, 22),
+                limit=10,
+                max_workers=3,
+                prefilter=KlineSelectorPrefilter(min_change_pct_60d=12.0, min_listed_days=120),
+                service=_FakeService(),
+                shared_scan_shell_enabled=False,
+            )
+
+        self.assertIs(run_result, expected_run_result)
+        self.assertEqual(captured["profile_name"], DEFAULT_PROFILE_NAME)
+        self.assertEqual(captured["max_workers"], 3)
+
+    def test_breakout_quality_enrichment_parallelizes_history_fetch_when_worker_manager_available(self):
+        history = pd.DataFrame(
+            [
+                {
+                    "date": current_date,
+                    "close": 20.0 + idx * 0.12,
+                    "high": 20.4 + idx * 0.12,
+                    "low": 19.7 + idx * 0.12,
+                    "volume": 1000 + idx * 10,
+                }
+                for idx, current_date in enumerate(pd.date_range("2025-01-01", periods=220, freq="B"))
+            ]
+        )
+
+        run_result = KlineSelectorRunResult(
+            criteria=KlineSelectorCriteria(
+                require_up_day_ratio=False,
+                require_recent_limit_up=False,
+                require_new_high=True,
+            ),
+            universe_size=3,
+            evaluated_count=3,
+            skipped_market_cap_count=0,
+            skipped_prefilter_count=0,
+            universe_codes=["600519", "000001", "300750"],
+            selected=[
+                KlineSelectionEvaluation(stock_code="600519", stock_name="贵州茅台", passed=True),
+                KlineSelectionEvaluation(stock_code="000001", stock_name="平安银行", passed=True),
+                KlineSelectionEvaluation(stock_code="300750", stock_name="宁德时代", passed=True),
+            ],
+            failed=[],
+        )
+
+        lock = threading.Lock()
+        active_calls = 0
+        peak_concurrency = 0
+
+        class _SlowManager:
+            def get_daily_data(self, stock_code, days):
+                nonlocal active_calls, peak_concurrency
+                with lock:
+                    active_calls += 1
+                    peak_concurrency = max(peak_concurrency, active_calls)
+                time.sleep(0.05)
+                with lock:
+                    active_calls -= 1
+                return history.copy(), "fake"
+
+        class _FakeService:
+            def __init__(self):
+                self.manager = _SlowManager()
+                self._manager_factory = _SlowManager
+
+        enriched = _enrich_run_result_with_breakout_quality(
+            run_result,
+            service=_FakeService(),
+            profile_name="breakout_loose",
+            max_workers=3,
+        )
+
+        self.assertEqual(len(enriched.selected), 3)
+        self.assertGreaterEqual(peak_concurrency, 2)
+        for evaluation in enriched.selected:
+            self.assertIn("breakout_quality_score", evaluation.metrics)
+
+    def test_breakout_loose_profile_uses_light_quality_floor(self):
+        self.assertEqual(_min_breakout_quality_score_for_profile("breakout_loose"), 4.0)
+        self.assertEqual(_min_breakout_quality_score_for_profile(DEFAULT_PROFILE_NAME), 6.0)
+
+    def test_breakout_quality_enrichment_rejects_breakout_loose_tail_below_floor(self):
+        run_result = KlineSelectorRunResult(
+            criteria=KlineSelectorCriteria(
+                require_up_day_ratio=False,
+                require_recent_limit_up=False,
+                require_new_high=True,
+            ),
+            universe_size=1,
+            evaluated_count=1,
+            skipped_market_cap_count=0,
+            skipped_prefilter_count=0,
+            universe_codes=["600519"],
+            selected=[KlineSelectionEvaluation(stock_code="600519", stock_name="贵州茅台", passed=True)],
+            failed=[],
+        )
+
+        with patch(
+            "scripts.select_hundred_day_high_candidates._build_breakout_quality_metrics_map",
+            return_value=(
+                {
+                    "600519": (
+                        True,
+                        {
+                            "breakout_quality_score": 2.0,
+                            "breakout_contraction_ratio": 1.2,
+                            "breakout_volume_ratio": 0.8,
+                            "distance_to_new_high_pct": 4.5,
+                            "minervini_template_score": 4.0,
+                            "minervini_template_passed": False,
+                            "breakout_follow_through_score": 1.0,
+                        },
+                    )
+                },
+                {
+                    "breakout_quality_parallel_enabled": False,
+                    "breakout_quality_parallel_workers": 1,
+                },
+            ),
+        ):
+            enriched = _enrich_run_result_with_breakout_quality(
+                run_result,
+                service=SimpleNamespace(),
+                profile_name="breakout_loose",
+                max_workers=1,
+            )
+
+        self.assertEqual(len(enriched.selected), 0)
+        self.assertEqual(len(enriched.failed), 1)
+        self.assertIn("required 4.0", enriched.failed[0].failure_reason)
 
     def test_export_results_keeps_csv_headers_when_no_selection(self):
         run_result = KlineSelectorRunResult(

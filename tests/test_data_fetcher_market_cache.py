@@ -3,7 +3,9 @@
 
 import os
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 
 import pandas as pd
 
@@ -50,14 +52,39 @@ class DataFetcherMarketCacheTestCase(unittest.TestCase):
         self.assertEqual(fetcher.board_calls, 1)
 
     def test_get_sector_rankings_uses_ttl_cache(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
         fetcher = _MarketCacheFetcher()
         manager = DataFetcherManager(fetchers=[fetcher])
+        manager._sector_rankings_disk_cache_dir = Path(temp_dir.name)
+        manager._sector_rankings_disk_cache_ttl_seconds = 3600
 
         first = manager.get_sector_rankings(10)
         second = manager.get_sector_rankings(10)
 
         self.assertEqual(first, second)
         self.assertEqual(fetcher.sector_calls, 1)
+
+    def test_get_sector_rankings_uses_disk_cache_across_manager_instances(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+
+        first_fetcher = _MarketCacheFetcher()
+        first_manager = DataFetcherManager(fetchers=[first_fetcher])
+        first_manager._sector_rankings_disk_cache_dir = Path(temp_dir.name)
+        first_manager._sector_rankings_disk_cache_ttl_seconds = 3600
+
+        second_fetcher = _MarketCacheFetcher()
+        second_manager = DataFetcherManager(fetchers=[second_fetcher])
+        second_manager._sector_rankings_disk_cache_dir = Path(temp_dir.name)
+        second_manager._sector_rankings_disk_cache_ttl_seconds = 3600
+
+        first = first_manager.get_sector_rankings(10)
+        second = second_manager.get_sector_rankings(10)
+
+        self.assertEqual(first, second)
+        self.assertEqual(first_fetcher.sector_calls, 1)
+        self.assertEqual(second_fetcher.sector_calls, 0)
 
 
 if __name__ == "__main__":

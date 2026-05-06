@@ -1,0 +1,23 @@
+[
+  {
+    "candidate_id": "2026-05-03-300083",
+    "symbol": "300083",
+    "name": "创世纪",
+    "trade_date": "2026-05-03",
+    "scan_source": "wondertrader_real_engine",
+    "trigger_type": "limit_up_momentum",
+    "trigger_reason": "daily limit-up style momentum; engine_asof=2026-04-30; pct_change=20.02; volume_ratio=6.91",
+    "trigger_score": 287.14,
+    "price": 10.19,
+    "change_pct": 20.02,
+    "volume_ratio": 6.91,
+    "turnover_rate": 26.82,
+    "board_name": "机床制造",
+    "change_pct_60d": 5.93,
+    "amount": 4003210000.0,
+    "setup_tag": "涨停后高换手分歧",
+    "risk_flags": [
+      "volume_reconstructed_from_amount"
+    ]
+  }
+]

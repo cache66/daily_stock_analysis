@@ -13,9 +13,12 @@ from __future__ import annotations
 
 import argparse
 import copy
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import asdict
 import json
 import logging
+import os
 import sys
 from datetime import date, datetime
 from pathlib import Path
@@ -80,6 +83,7 @@ BREAKOUT_QUALITY_METRIC_KEYS: List[str] = [
     "minervini_template_passed",
     "breakout_follow_through_score",
 ]
+OUTPUT_DIR_LOCK_FILENAME = "hundred_day_high_run.lock"
 INDUSTRY_STRENGTH_METRIC_KEYS: List[str] = [
     "industry_strength_score",
     "industry_strength_confirmed",
@@ -187,11 +191,78 @@ def resolve_output_dir(output_dir: Path, shard_count: int, shard_index: int) -> 
     return output_dir / _shard_suffix(shard_count, shard_index)
 
 
-def resolve_checkpoint_path(checkpoint_path: Path, shard_count: int, shard_index: int) -> Path:
+def resolve_checkpoint_path(
+    output_dir: Path,
+    checkpoint_path: Optional[Path],
+    *,
+    shard_count: int,
+    shard_index: int,
+) -> Path:
+    if checkpoint_path is None:
+        return output_dir / "hundred_day_high_checkpoint.json"
     if shard_count <= 1:
         return checkpoint_path
     suffix = _shard_suffix(shard_count, shard_index)
     return checkpoint_path.with_name(f"{checkpoint_path.stem}.{suffix}{checkpoint_path.suffix}")
+
+
+def _read_output_dir_lock_payload(lock_path: Path) -> Dict[str, Any]:
+    try:
+        return json.loads(lock_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _is_pid_running(pid: Optional[int]) -> bool:
+    if pid is None or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+@contextmanager
+def hold_output_dir_lock(output_dir: Path):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = output_dir / OUTPUT_DIR_LOCK_FILENAME
+    lock_payload = {
+        "pid": os.getpid(),
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "output_dir": str(output_dir),
+    }
+    for attempt in range(2):
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            existing_payload = _read_output_dir_lock_payload(lock_path)
+            existing_pid = existing_payload.get("pid")
+            if attempt == 0 and not _is_pid_running(existing_pid):
+                try:
+                    lock_path.unlink()
+                    continue
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    pass
+            raise RuntimeError(
+                f"output_dir is already in use: {output_dir} "
+                f"(lock={lock_path}, pid={existing_pid or 'unknown'})"
+            )
+    else:
+        raise RuntimeError(f"failed to acquire output_dir lock: {output_dir}")
+
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(lock_payload, handle, ensure_ascii=False, indent=2)
+        yield lock_path
+    finally:
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def profile_requires_earnings_confirmation(profile_name: str) -> bool:
@@ -366,6 +437,7 @@ def filter_selected_results_by_earnings_balanced(
         universe_codes=list(run_result.universe_codes),
         selected=retained,
         failed=list(run_result.failed) + rejected,
+        phase_metrics=dict(getattr(run_result, "phase_metrics", {}) or {}),
     )
 
 
@@ -570,9 +642,14 @@ def parse_args() -> argparse.Namespace:
         help="关闭上市天数快速短路。",
     )
     parser.add_argument(
+        "--disable-shared-scan-shell",
+        action="store_true",
+        help="Disable service-level shared scan shell for diagnostics.",
+    )
+    parser.add_argument(
         "--checkpoint-path",
-        default=str(PROJECT_ROOT / "data" / "hundred_day_high_checkpoint.json"),
-        help="checkpoint 路径；开启分片时会自动追加 shard 后缀。",
+        default=None,
+        help="可选 checkpoint 路径；未传时默认使用 output_dir 下的 hundred_day_high_checkpoint.json，开启分片时会自动追加 shard 后缀。",
     )
     parser.add_argument(
         "--checkpoint-every",
@@ -839,7 +916,102 @@ def _min_breakout_quality_score_for_profile(profile_name: str) -> float:
         return 8.0
     if normalized in {DEFAULT_PROFILE_NAME, EARNINGS_BALANCED_PROFILE_NAME}:
         return 6.0
+    if normalized == "breakout_loose":
+        return 4.0
     return 0.0
+
+
+def _empty_breakout_quality_metrics() -> Dict[str, Any]:
+    return {
+        "breakout_quality_score": 0.0,
+        "breakout_contraction_ratio": None,
+        "breakout_volume_ratio": None,
+        "distance_to_new_high_pct": None,
+        "minervini_template_score": 0.0,
+        "minervini_template_passed": False,
+        "breakout_follow_through_score": 0.0,
+    }
+
+
+def _compute_breakout_quality_for_stock(
+    stock_code: str,
+    *,
+    manager: Any,
+) -> tuple[bool, Dict[str, Any]]:
+    try:
+        history_df, _ = manager.get_daily_data(stock_code, days=180)
+        prepared = KlineSelectorService._prepare_history(history_df)
+        return True, compute_breakout_quality_metrics(prepared)
+    except Exception as exc:
+        logger.debug("breakout quality enrich failed for %s: %s", stock_code, exc)
+        return False, _empty_breakout_quality_metrics()
+
+
+def _build_breakout_quality_metrics_map(
+    evaluations: List[KlineSelectionEvaluation],
+    *,
+    service: KlineSelectorService,
+    max_workers: int,
+) -> tuple[Dict[str, tuple[bool, Dict[str, Any]]], Dict[str, Any]]:
+    if not evaluations:
+        return {}, {
+            "breakout_quality_parallel_enabled": False,
+            "breakout_quality_parallel_workers": 0,
+        }
+
+    resolved_max_workers = max(1, int(max_workers or 1))
+    manager_factory = getattr(service, "_manager_factory", None)
+    primary_manager = getattr(service, "manager", None)
+    parallel_enabled = bool(callable(manager_factory) and resolved_max_workers > 1 and len(evaluations) > 1)
+    metrics_by_code: Dict[str, tuple[bool, Dict[str, Any]]] = {}
+
+    if primary_manager is None and not parallel_enabled:
+        for evaluation in evaluations:
+            metrics_by_code[evaluation.stock_code] = (False, _empty_breakout_quality_metrics())
+        return metrics_by_code, {
+            "breakout_quality_parallel_enabled": False,
+            "breakout_quality_parallel_workers": 0,
+        }
+
+    if not parallel_enabled:
+        for evaluation in evaluations:
+            metrics_by_code[evaluation.stock_code] = _compute_breakout_quality_for_stock(
+                evaluation.stock_code,
+                manager=primary_manager,
+            )
+        return metrics_by_code, {
+            "breakout_quality_parallel_enabled": False,
+            "breakout_quality_parallel_workers": 1,
+        }
+
+    worker_count = min(resolved_max_workers, len(evaluations))
+
+    def _worker(stock_code: str) -> tuple[str, bool, Dict[str, Any]]:
+        manager = manager_factory()
+        quality_available, breakout_metrics = _compute_breakout_quality_for_stock(
+            stock_code,
+            manager=manager,
+        )
+        return stock_code, quality_available, breakout_metrics
+
+    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="hundred-day-quality") as executor:
+        future_map = {
+            executor.submit(_worker, evaluation.stock_code): evaluation.stock_code
+            for evaluation in evaluations
+        }
+        for future in as_completed(future_map):
+            stock_code = future_map[future]
+            try:
+                resolved_code, quality_available, breakout_metrics = future.result()
+                metrics_by_code[resolved_code] = (quality_available, breakout_metrics)
+            except Exception as exc:
+                logger.debug("breakout quality parallel worker failed for %s: %s", stock_code, exc)
+                metrics_by_code[stock_code] = (False, _empty_breakout_quality_metrics())
+
+    return metrics_by_code, {
+        "breakout_quality_parallel_enabled": True,
+        "breakout_quality_parallel_workers": worker_count,
+    }
 
 
 def _enrich_run_result_with_breakout_quality(
@@ -847,35 +1019,26 @@ def _enrich_run_result_with_breakout_quality(
     *,
     service: KlineSelectorService,
     profile_name: str,
+    max_workers: int = 1,
 ) -> KlineSelectorRunResult:
     if not run_result.selected:
         return run_result
 
+    enrich_started_at = datetime.now()
     quality_floor = _min_breakout_quality_score_for_profile(profile_name)
     retained: List[KlineSelectionEvaluation] = []
     rejected: List[KlineSelectionEvaluation] = []
+    metrics_by_code, enrich_phase_metrics = _build_breakout_quality_metrics_map(
+        run_result.selected,
+        service=service,
+        max_workers=max_workers,
+    )
 
     for evaluation in run_result.selected:
-        quality_available = True
-        try:
-            history_df, _ = service.manager.get_daily_data(
-                evaluation.stock_code,
-                days=180,
-            )
-            prepared = KlineSelectorService._prepare_history(history_df)
-            breakout_metrics = compute_breakout_quality_metrics(prepared)
-        except Exception as exc:
-            logger.debug("breakout quality enrich failed for %s: %s", evaluation.stock_code, exc)
-            quality_available = False
-            breakout_metrics = {
-                "breakout_quality_score": 0.0,
-                "breakout_contraction_ratio": None,
-                "breakout_volume_ratio": None,
-                "distance_to_new_high_pct": None,
-                "minervini_template_score": 0.0,
-                "minervini_template_passed": False,
-                "breakout_follow_through_score": 0.0,
-            }
+        quality_available, breakout_metrics = metrics_by_code.get(
+            evaluation.stock_code,
+            (False, _empty_breakout_quality_metrics()),
+        )
 
         merged_metrics = dict(evaluation.metrics or {})
         merged_metrics.update(breakout_metrics)
@@ -899,8 +1062,28 @@ def _enrich_run_result_with_breakout_quality(
         )
 
     if not rejected and len(retained) == len(run_result.selected):
+        run_result.phase_metrics = dict(getattr(run_result, "phase_metrics", {}) or {})
+        run_result.phase_metrics.update(
+            {
+                **enrich_phase_metrics,
+                "breakout_quality_enrichment_elapsed_sec": round(
+                    (datetime.now() - enrich_started_at).total_seconds(),
+                    4,
+                ),
+            }
+        )
         return run_result
 
+    merged_phase_metrics = dict(getattr(run_result, "phase_metrics", {}) or {})
+    merged_phase_metrics.update(
+        {
+            **enrich_phase_metrics,
+            "breakout_quality_enrichment_elapsed_sec": round(
+                (datetime.now() - enrich_started_at).total_seconds(),
+                4,
+            ),
+        }
+    )
     return KlineSelectorRunResult(
         criteria=run_result.criteria,
         universe_size=run_result.universe_size,
@@ -911,6 +1094,7 @@ def _enrich_run_result_with_breakout_quality(
         universe_codes=list(run_result.universe_codes),
         selected=retained,
         failed=list(run_result.failed) + rejected,
+        phase_metrics=merged_phase_metrics,
     )
 
 
@@ -1566,7 +1750,11 @@ def export_results(
         ),
         encoding="utf-8",
     )
-    if checkpoint_path is not None and checkpoint_path.exists():
+    if (
+        checkpoint_path is not None
+        and checkpoint_path.exists()
+        and checkpoint_path.resolve() != exported_checkpoint_path.resolve()
+    ):
         exported_checkpoint_path.write_text(
             checkpoint_path.read_text(encoding="utf-8"),
             encoding="utf-8",
@@ -1577,7 +1765,57 @@ def export_results(
     logger.info("已写出百日新高结果 TXT: %s", txt_path)
     logger.info("已写出百日新高结果 Markdown: %s", md_path)
     if checkpoint_path is not None and checkpoint_path.exists():
-        logger.info("已复制 checkpoint 到输出目录: %s", exported_checkpoint_path)
+        if checkpoint_path.resolve() == exported_checkpoint_path.resolve():
+            logger.info("checkpoint 已保存在输出目录: %s", exported_checkpoint_path)
+        else:
+            logger.info("已复制 checkpoint 到输出目录: %s", exported_checkpoint_path)
+
+
+def _safe_count(value: Any) -> int:
+    try:
+        numeric = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, numeric)
+
+
+def _apply_shared_scan_shell_stats(
+    run_result: KlineSelectorRunResult,
+    prepared_universe: Any,
+    *,
+    prefilter: KlineSelectorPrefilter | None,
+) -> KlineSelectorRunResult:
+    filter_stats = dict(getattr(prepared_universe, "filter_stats", {}) or {})
+    prefilter_stats = dict(getattr(prepared_universe, "prefilter_stats", {}) or {})
+    skipped_prefilter_count = sum(
+        _safe_count(prefilter_stats.get(key))
+        for key in ("removed_change_60d", "removed_turnover_rate", "removed_negative_change")
+    )
+    if prefilter is not None and prefilter.exclude_st:
+        skipped_prefilter_count += _safe_count(filter_stats.get("removed_st"))
+
+    run_result.skipped_prefilter_count += skipped_prefilter_count
+    run_result.skipped_listed_days_count += _safe_count(prefilter_stats.get("removed_listed_days"))
+    run_result.universe_size = _safe_count(
+        getattr(prepared_universe, "sharded_universe_size", run_result.universe_size)
+    )
+    phase_metrics = dict(getattr(run_result, "phase_metrics", {}) or {})
+    phase_metrics.update(
+        {
+            "shared_scan_shell_enabled": True,
+            "scan_shell_base_universe_size": _safe_count(getattr(prepared_universe, "base_universe_size", 0)),
+            "scan_shell_sharded_universe_size": _safe_count(
+                getattr(prepared_universe, "sharded_universe_size", 0)
+            ),
+            "scan_shell_prepared_universe_size": _safe_count(
+                getattr(prepared_universe, "prepared_universe_size", 0)
+            ),
+            "scan_shell_filter_stats": filter_stats,
+            "scan_shell_prefilter_stats": prefilter_stats,
+        }
+    )
+    run_result.phase_metrics = phase_metrics
+    return run_result
 
 
 def scan_hundred_day_high_candidates(
@@ -1595,9 +1833,56 @@ def scan_hundred_day_high_candidates(
     resume: bool = False,
     on_evaluation: Any = None,
     service: KlineSelectorService | None = None,
+    shared_scan_shell_enabled: bool = True,
 ) -> KlineSelectorRunResult:
     service = service or KlineSelectorService(manager_factory=KlineSelectorService.build_fast_a_share_manager)
     universe = service.get_spot_enriched_a_share_universe(limit=limit, as_of_date=snapshot_date)
+    use_shared_scan_shell = bool(shared_scan_shell_enabled) and hasattr(service, "prepare_scan_universe")
+    if use_shared_scan_shell:
+        prepared_universe = service.prepare_scan_universe(
+            universe=universe,
+            prefilter=prefilter,
+            exclude_st=bool(prefilter.exclude_st) if prefilter is not None else False,
+            shard_count=shard_count,
+            shard_index=shard_index,
+            cached_quote_universe=service._read_spot_universe_reference_cache()
+            if hasattr(service, "_read_spot_universe_reference_cache")
+            else None,
+            hydrated_quote_cache_writer=service._write_spot_universe_reference_cache
+            if hasattr(service, "_write_spot_universe_reference_cache")
+            else None,
+            quote_hydration_workers=max(1, int(max_workers)),
+            as_of_date=snapshot_date,
+        )
+        run_result = service.scan_market(
+            criteria=criteria,
+            max_workers=max_workers,
+            shard_count=1,
+            shard_index=0,
+            prefilter=None,
+            checkpoint_path=checkpoint_path,
+            checkpoint_every=checkpoint_every,
+            resume=resume,
+            on_evaluation=on_evaluation,
+            universe=prepared_universe.prepared_universe,
+            as_of_date=snapshot_date,
+        )
+        _apply_shared_scan_shell_stats(run_result, prepared_universe, prefilter=prefilter)
+        logger.info(
+            "hundred_day_high shared scan shell prepared: base=%s sharded=%s prepared=%s filter=%s prefilter=%s",
+            run_result.phase_metrics.get("scan_shell_base_universe_size"),
+            run_result.phase_metrics.get("scan_shell_sharded_universe_size"),
+            run_result.phase_metrics.get("scan_shell_prepared_universe_size"),
+            run_result.phase_metrics.get("scan_shell_filter_stats"),
+            run_result.phase_metrics.get("scan_shell_prefilter_stats"),
+        )
+        return _enrich_run_result_with_breakout_quality(
+            run_result,
+            service=service,
+            profile_name=profile_name,
+            max_workers=max_workers,
+        )
+
     run_result = service.scan_market(
         criteria=criteria,
         max_workers=max_workers,
@@ -1615,6 +1900,7 @@ def scan_hundred_day_high_candidates(
         run_result,
         service=service,
         profile_name=profile_name,
+        max_workers=max_workers,
     )
 
 
@@ -1622,10 +1908,12 @@ def main() -> int:
     args = parse_args()
     configure_logging(args.log_level)
     output_dir = resolve_output_dir(Path(args.output_dir), args.shard_count, args.shard_index)
+    checkpoint_arg = Path(args.checkpoint_path) if args.checkpoint_path else None
     checkpoint_path = resolve_checkpoint_path(
-        Path(args.checkpoint_path),
-        args.shard_count,
-        args.shard_index,
+        output_dir,
+        checkpoint_arg,
+        shard_count=args.shard_count,
+        shard_index=args.shard_index,
     )
 
     try:
@@ -1653,6 +1941,12 @@ def main() -> int:
         profile_name=profile_name,
     )
     db = DatabaseManager.get_instance()
+    try:
+        output_dir_lock = hold_output_dir_lock(output_dir)
+        output_dir_lock.__enter__()
+    except RuntimeError as exc:
+        logger.error("%s", exc)
+        return 2
     if args.cause_analysis_only:
         logger.info(
             "开始运行百日新高归因补全: snapshot_date=%s, history_lookback_days=%s, output_dir=%s",
@@ -1679,6 +1973,7 @@ def main() -> int:
                 checkpoint_path=checkpoint_path,
                 selected_df=build_selected_dataframe(run_result),
             )
+            output_dir_lock.__exit__(None, None, None)
             return 0
 
         selected_df = enrich_selected_results(
@@ -1706,6 +2001,7 @@ def main() -> int:
             snapshot_date.isoformat(),
             len(run_result.selected),
         )
+        output_dir_lock.__exit__(None, None, None)
         return 0
     logger.info(
         "开始运行百日新高策略: snapshot_date=%s, new_high_window=%s, max_total_mv=%.2f亿, limit=%s, "
@@ -1770,6 +2066,7 @@ def main() -> int:
         resume=args.resume,
         on_evaluation=handle_incremental_snapshot,
         service=service,
+        shared_scan_shell_enabled=not bool(args.disable_shared_scan_shell),
     )
     if profile_requires_earnings_confirmation(profile_name):
         logger.info(
@@ -1845,6 +2142,7 @@ def main() -> int:
         len(run_result.selected),
         snapshot_date.isoformat(),
     )
+    output_dir_lock.__exit__(None, None, None)
     return 0
 
 

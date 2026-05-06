@@ -735,5 +735,32 @@ class SignalSnapshotApiTestCase(unittest.TestCase):
         self.assertEqual(payload["streak_leaderboard"][0]["industry"], "白酒")
 
 
+    def test_counts_endpoint_includes_shortline_snapshot_types(self) -> None:
+        self.db.upsert_signal_snapshot(
+            signal_type="shortline_top_pick",
+            signal_date="2026-05-03",
+            code="300083",
+            name="shortline sample",
+            criteria_payload={"source": "shortline_hub"},
+            metrics_payload={
+                "review_tier": "top_pick",
+                "board_name": "robot",
+                "composite_score": 138.5,
+            },
+            cause_payload={"reason_summary": "shortline top pick"},
+            history_payload={"previous_hit_count": 0, "days_since_previous_hit": None},
+        )
+
+        response = self.client.get(
+            "/api/v1/signals/kline-snapshot-counts",
+            params={"signal_date": "2026-05-03"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        counts = {item["signal_type"]: item["total"] for item in payload["items"]}
+        self.assertEqual(counts["shortline_top_pick"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

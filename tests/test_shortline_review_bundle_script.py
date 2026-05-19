@@ -67,3 +67,27 @@ def test_shortline_replay_validation_script_reuses_shared_cache_and_tracking() -
     assert "ExplainCachePath" in content
     assert "SkipShortlinePersistSnapshot" in content
     assert "SkipFastReviewPersistSnapshots" in content
+
+
+def test_run_pytest_batches_wrapper_reuses_repo_python_resolution() -> None:
+    script_path = PROJECT_ROOT / "scripts" / "run-pytest-batches.ps1"
+    helper_path = PROJECT_ROOT / "scripts" / "shortline-wrapper-common.ps1"
+
+    assert script_path.exists()
+    assert helper_path.exists()
+
+    content = script_path.read_text(encoding="utf-8")
+    helper_content = helper_path.read_text(encoding="utf-8")
+    assert _first_code_line(content).startswith("param(")
+    assert ". (Join-Path $PSScriptRoot 'shortline-wrapper-common.ps1')" in content
+    assert "function Resolve-RepoPythonExecutable" in helper_content
+    assert "run_pytest_batches.py" in content
+    assert "[switch]$DryRun" in content
+    assert "if ($DryRun)" in content
+    assert "StartBatch" in content
+    assert "EndBatch" in content
+    assert "HeartbeatSeconds" in content
+    assert "ValueFromRemainingArguments" in content
+    assert "--start-batch" in content
+    assert "--end-batch" in content
+    assert "--heartbeat-seconds" in content

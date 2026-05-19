@@ -26,6 +26,7 @@ from scripts.select_hundred_day_high_candidates import (
     EARNINGS_BALANCED_PROFILE_NAME,
     EARNINGS_BALANCED_SIGNAL_TYPE,
     _min_breakout_quality_score_for_profile,
+    classify_hundred_day_chart_pattern,
     compute_breakout_quality_metrics,
     main as hundred_day_high_main,
     parse_args,
@@ -108,6 +109,11 @@ class HundredDayHighSignalFlowTestCase(unittest.TestCase):
                 "breakout_contraction_ratio": 0.64,
                 "breakout_volume_ratio": 1.8,
                 "distance_to_new_high_pct": 0.0,
+                "chart_pattern_label": "base_breakout",
+                "chart_pattern_score": 15.0,
+                "chart_pattern_summary": "横盘突破型",
+                "base_breakout_score": 15.0,
+                "healthy_trend_score": 8.0,
                 "earnings_continuity_score": 9.0,
                 "quality_overlay_score": 9.0,
                 "quality_overlay_label": "qualified",
@@ -161,6 +167,100 @@ class HundredDayHighSignalFlowTestCase(unittest.TestCase):
         self.assertIn(metrics["minervini_template_passed"], {True, False})
         self.assertGreaterEqual(metrics["breakout_follow_through_score"], 0.0)
 
+    def test_classify_hundred_day_chart_pattern_marks_base_breakout(self):
+        dates = pd.date_range("2025-11-01", periods=120, freq="B")
+        rows = []
+        for idx, current_date in enumerate(dates):
+            if idx < 95:
+                close = 20.0 + (idx % 5) * 0.08
+                daily_range = 1.5
+                volume = 1200 + (idx % 7) * 20
+            elif idx < 115:
+                close = 20.4 + (idx - 95) * 0.12
+                daily_range = 0.28
+                volume = 1100 + (idx - 95) * 10
+            else:
+                close = 22.8 + (idx - 115) * 0.42
+                daily_range = 0.22
+                volume = 2800 + (idx - 115) * 180
+            rows.append(
+                {
+                    "date": current_date,
+                    "close": close,
+                    "high": close + daily_range * 0.6,
+                    "low": close - daily_range * 0.4,
+                    "volume": volume,
+                }
+            )
+        history = pd.DataFrame(rows)
+
+        pattern = classify_hundred_day_chart_pattern(history)
+
+        self.assertEqual(pattern["chart_pattern_label"], "base_breakout")
+        self.assertEqual(pattern["chart_pattern_summary"], "横盘突破型")
+        self.assertGreater(pattern["base_breakout_score"], pattern["healthy_trend_score"])
+
+    def test_classify_hundred_day_chart_pattern_marks_healthy_trend(self):
+        dates = pd.date_range("2025-11-01", periods=120, freq="B")
+        rows = []
+        close = 18.0
+        for idx, current_date in enumerate(dates):
+            close += 0.16
+            if idx % 18 == 0 and idx > 0:
+                close -= 0.45
+            daily_range = 0.55
+            volume = 1400 + idx * 8
+            rows.append(
+                {
+                    "date": current_date,
+                    "close": close,
+                    "high": close + daily_range * 0.55,
+                    "low": close - daily_range * 0.45,
+                    "volume": volume,
+                }
+            )
+        history = pd.DataFrame(rows)
+
+        pattern = classify_hundred_day_chart_pattern(history)
+
+        self.assertEqual(pattern["chart_pattern_label"], "healthy_trend")
+        self.assertEqual(pattern["chart_pattern_summary"], "健康慢涨型")
+        self.assertGreaterEqual(pattern["healthy_trend_score"], 10.0)
+
+    def test_classify_hundred_day_chart_pattern_marks_plain_breakout(self):
+        dates = pd.date_range("2025-11-01", periods=120, freq="B")
+        closes = []
+        close = 20.0
+        for idx in range(120):
+            if idx % 14 == 0 and idx > 0:
+                close += 2.4
+            elif idx % 9 == 0 and idx > 0:
+                close -= 1.9
+            else:
+                close += 0.08 if idx > 100 else 0.02
+            closes.append(close)
+        rows = []
+        for idx, current_date in enumerate(dates):
+            close = closes[idx]
+            daily_range = 1.9 if idx % 6 == 0 else 1.25
+            volume = 1100 + (idx % 10) * 35
+            rows.append(
+                {
+                    "date": current_date,
+                    "close": close,
+                    "high": close + daily_range * 0.65,
+                    "low": close - daily_range * 0.55,
+                    "volume": volume,
+                }
+            )
+        history = pd.DataFrame(rows)
+
+        pattern = classify_hundred_day_chart_pattern(history)
+
+        self.assertEqual(pattern["chart_pattern_label"], "plain_breakout")
+        self.assertEqual(pattern["chart_pattern_summary"], "图形一般")
+        self.assertLess(pattern["chart_pattern_score"], 10.0)
+
     def test_build_selected_dataframe_includes_breakout_quality_fields(self):
         selected_df = build_selected_dataframe(self._build_run_result())
 
@@ -171,10 +271,16 @@ class HundredDayHighSignalFlowTestCase(unittest.TestCase):
         self.assertIn("minervini_template_score", selected_df.columns)
         self.assertIn("minervini_template_passed", selected_df.columns)
         self.assertIn("breakout_follow_through_score", selected_df.columns)
+        self.assertIn("chart_pattern_label", selected_df.columns)
+        self.assertIn("chart_pattern_score", selected_df.columns)
+        self.assertIn("chart_pattern_summary", selected_df.columns)
+        self.assertIn("base_breakout_score", selected_df.columns)
+        self.assertIn("healthy_trend_score", selected_df.columns)
         self.assertIn("quality_overlay_score", selected_df.columns)
         self.assertIn("quality_overlay_label", selected_df.columns)
         self.assertIn("earnings_continuity_score", selected_df.columns)
         self.assertEqual(selected_df.iloc[0]["breakout_quality_score"], 12.0)
+        self.assertEqual(selected_df.iloc[0]["chart_pattern_label"], "base_breakout")
         self.assertEqual(selected_df.iloc[0]["quality_overlay_score"], 9.0)
 
     def test_enrich_selected_results_persists_and_updates_same_day_snapshot(self):
@@ -965,6 +1071,11 @@ class HundredDayHighSignalFlowTestCase(unittest.TestCase):
         self.assertIn("industry_logic", csv_text)
         self.assertIn("news_logic", csv_text)
         self.assertIn("technical_logic", csv_text)
+        self.assertIn("chart_pattern_label", csv_text)
+        self.assertIn("chart_pattern_score", csv_text)
+        self.assertIn("chart_pattern_summary", csv_text)
+        self.assertIn("base_breakout_score", csv_text)
+        self.assertIn("healthy_trend_score", csv_text)
         self.assertIn("latest_previous_hit_date", csv_text)
 
 

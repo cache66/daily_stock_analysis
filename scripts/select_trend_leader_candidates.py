@@ -14,7 +14,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
-from datetime import date, datetime
+from datetime import date, datetime, time as dt_time
 from pathlib import Path
 from threading import local
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -238,12 +238,12 @@ def parse_snapshot_date(value: Optional[Any]) -> date:
     if value is None or str(value).strip() == "":
         return get_effective_trading_date("cn")
     if isinstance(value, datetime):
-        parsed = value.date()
+        return get_effective_trading_date("cn", current_time=value)
     elif isinstance(value, date):
         parsed = value
     else:
         parsed = date.fromisoformat(str(value).strip())
-    return get_effective_trading_date("cn", current_time=datetime.combine(parsed, datetime.min.time()))
+    return get_effective_trading_date("cn", current_time=datetime.combine(parsed, dt_time.max))
 
 
 def _normalize_code_token(value: Any) -> str:

@@ -5,6 +5,8 @@ import sys
 import unittest
 from unittest.mock import MagicMock
 
+import pandas as pd
+
 if "litellm" not in sys.modules:
     sys.modules["litellm"] = MagicMock()
 if "json_repair" not in sys.modules:
@@ -64,6 +66,29 @@ class _FailingSearchService:
 
     def search_stock_news(self, stock_code: str, stock_name: str, max_results: int = 5):
         raise RuntimeError("search unavailable")
+
+
+class _TrackingAuthoritySearchService:
+    is_available = True
+
+    def __init__(self) -> None:
+        self.comprehensive_calls = 0
+
+    def search_stock_news(self, stock_code: str, stock_name: str, max_results: int = 5):
+        return SearchResponse(
+            query=f"{stock_name} {stock_code}",
+            provider="fake",
+            success=True,
+            results=[],
+        )
+
+    def search_comprehensive_intel(self, stock_code: str, stock_name: str, max_searches: int = 3):
+        self.comprehensive_calls += 1
+        return {
+            "announcements": [],
+            "earnings": [],
+            "market_analysis": [],
+        }
 
 
 class _FakeAnalyzer:
@@ -283,6 +308,548 @@ class SignalCauseAnalysisServiceTestCase(unittest.TestCase):
 
         self.assertEqual(rail_theme["theme_label"], "")
         self.assertEqual(motor_theme["theme_label"], "")
+
+    def test_collect_authority_intel_keeps_research_items_within_extended_window(self):
+        service = SignalCauseAnalysisService(
+            manager=_BareManager(),
+            search_service=None,
+            analyzer=_NoneAnalyzer(),
+            enable_authority_search=False,
+        )
+
+        with unittest.mock.patch(
+            "akshare.stock_research_report_em",
+            return_value=pd.DataFrame(
+                [
+                    {
+                        "股票代码": "300476",
+                        "股票简称": "胜宏科技",
+                        "报告名称": "Deep dive: AI PCB demand remains strong",
+                        "机构": "Test Broker A",
+                        "近一月个股研报数": 3,
+                        "行业": "components",
+                        "日期": "2026-04-29",
+                    },
+                    {
+                        "股票代码": "300476",
+                        "股票简称": "胜宏科技",
+                        "报告名称": "Update: 2026Q1 growth and capacity ramp continue",
+                        "机构": "Test Broker B",
+                        "近一月个股研报数": 3,
+                        "行业": "components",
+                        "日期": "2026-04-30",
+                    },
+                ]
+            ),
+        ):
+            intel = service._collect_authority_intel(
+                stock_code="300476",
+                stock_name="胜宏科技",
+                signal_date=service._coerce_signal_date("2026-05-09"),
+            )
+
+        self.assertGreaterEqual(len(intel["market_analysis"]), 2)
+        self.assertIn("AI PCB", intel["market_analysis"][0]["title"])
+
+    def test_collect_authority_intel_skips_fallback_search_when_structured_earnings_already_confirm(self):
+        search_service = _TrackingAuthoritySearchService()
+        service = SignalCauseAnalysisService(
+            manager=_BareManager(),
+            search_service=search_service,
+            analyzer=_NoneAnalyzer(),
+        )
+        service._fetch_structured_announcement_items = MagicMock(return_value=[])
+        service._fetch_structured_research_items = MagicMock(return_value=[])
+        service._fetch_structured_earnings_items = MagicMock(
+            return_value=[
+                {
+                    "title": "2026Q1业绩快报",
+                    "snippet": "营收与净利润同比增长",
+                    "report_date": "2026-03-31",
+                    "report_periods": ["2026-03-31"],
+                    "report_announcement_date": "2026-04-29",
+                    "net_profit_parent": 1288000000,
+                    "revenue_yoy": 28.0,
+                    "net_profit_yoy": 40.0,
+                }
+            ]
+        )
+
+        intel = service._collect_authority_intel(
+            stock_code="300476",
+            stock_name="胜宏科技",
+            signal_date=service._coerce_signal_date("2026-05-15"),
+            fundamental_context={
+                "status": "ok",
+                "earnings": {
+                    "data": {
+                        "financial_report": {
+                            "report_date": "2026-03-31",
+                            "revenue": 8200000000,
+                            "net_profit_parent": 1288000000,
+                        }
+                    }
+                },
+                "growth": {"data": {"revenue_yoy": 28.0, "net_profit_yoy": 40.0}},
+                "earnings_quality": {"data": {"verdict": "good", "score_total": 82}},
+            },
+            metrics_payload={
+                "signal_date": "2026-05-15",
+                "report_date": "2026-03-31",
+                "event_date": "2026-04-29",
+            },
+        )
+
+        self.assertEqual(search_service.comprehensive_calls, 0)
+        self.assertEqual(len(intel["earnings"]), 1)
+
+    def test_collect_authority_intel_skips_fallback_search_when_strong_announcement_already_exists(self):
+        search_service = _TrackingAuthoritySearchService()
+        service = SignalCauseAnalysisService(
+            manager=_BareManager(),
+            search_service=search_service,
+            analyzer=_NoneAnalyzer(),
+        )
+        service._fetch_structured_announcement_items = MagicMock(
+            return_value=[
+                {
+                    "title": "签订重大订单公告",
+                    "snippet": "公司公告披露重大订单与扩产安排",
+                    "published_date": "2026-05-14",
+                }
+            ]
+        )
+        service._fetch_structured_research_items = MagicMock(return_value=[])
+        service._fetch_structured_earnings_items = MagicMock(return_value=[])
+
+        intel = service._collect_authority_intel(
+            stock_code="002384",
+            stock_name="东山精密",
+            signal_date=service._coerce_signal_date("2026-05-15"),
+            fundamental_context={"status": "ok"},
+            metrics_payload={"signal_date": "2026-05-15"},
+        )
+
+        self.assertEqual(search_service.comprehensive_calls, 0)
+        self.assertEqual(len(intel["announcements"]), 1)
+
+    def test_merge_reason_payload_uses_extended_research_window_for_earnings_confirmation(self):
+        service = SignalCauseAnalysisService(
+            manager=_BareManager(),
+            search_service=_FailingSearchService(),
+            analyzer=_NoneAnalyzer(),
+        )
+
+        payload = service._merge_reason_payload(
+            {
+                "industry": "PCB",
+                "theme_mapping": {"theme_label": "AI / semis"},
+                "signal_pool_profile": {"entry_reason": "trend leader"},
+                "business_profile": {
+                    "business_labels": ["PCB"],
+                    "business_summary": "PCB, AI infra supply chain",
+                },
+                "fundamental_context": {
+                    "status": "ok",
+                    "growth": {"data": {"revenue_yoy": 28.0, "net_profit_yoy": 40.0}},
+                    "earnings": {
+                        "data": {
+                            "financial_report": {
+                                "report_date": "2026-03-31",
+                                "revenue": 8200000000,
+                                "net_profit_parent": 1288000000,
+                            }
+                        }
+                    },
+                    "earnings_quality": {"data": {"verdict": "good", "score_total": 82}},
+                },
+                "news_items": [],
+                "authority_intel": {
+                    "announcements": [],
+                    "earnings": [],
+                    "market_analysis": [
+                        {
+                            "title": "Deep dive: AI PCB demand remains strong",
+                            "snippet": "Institutions still reinforce AI infrastructure demand and order delivery",
+                            "published_date": "2026-04-30",
+                            "support_count": 3,
+                        }
+                    ],
+                },
+                "cause_tags": ["earnings", "sector_rotation"],
+                "evidence_points": [],
+                "fact_vs_inference": {"facts": [], "inferences": []},
+            },
+            None,
+            stock_name="research window sample",
+            signal_type="trend_leader_unified",
+            metrics_payload={"signal_date": "2026-05-15"},
+        )
+
+        self.assertEqual(payload.get("authority_level"), "earnings")
+        self.assertIn("21", payload.get("research_evidence_summary", ""))
+        self.assertIn("21", payload.get("authority_reason_summary", ""))
+
+    def test_merge_reason_payload_adds_boom_and_catalyst_clues_into_authority_summary(self):
+        service = SignalCauseAnalysisService(
+            manager=_BareManager(),
+            search_service=_FailingSearchService(),
+            analyzer=_NoneAnalyzer(),
+        )
+
+        payload = service._merge_reason_payload(
+            {
+                "industry": "印制电路板",
+                "theme_mapping": {"theme_label": "AI算力 / 半导体"},
+                "signal_pool_profile": {"entry_reason": "trend leader"},
+                "business_profile": {
+                    "business_labels": ["PCB"],
+                    "business_summary": "PCB，偏AI算力供应链",
+                },
+                "fundamental_context": {
+                    "status": "ok",
+                    "growth": {"data": {"revenue_yoy": 31.0, "net_profit_yoy": 48.0}},
+                    "earnings": {
+                        "data": {
+                            "financial_report": {
+                                "report_date": "2026-03-31",
+                                "revenue": 9200000000,
+                                "net_profit_parent": 1380000000,
+                            }
+                        }
+                    },
+                    "earnings_quality": {"data": {"verdict": "good", "score_total": 86}},
+                },
+                "news_items": [],
+                "authority_intel": {
+                    "announcements": [],
+                    "earnings": [],
+                    "market_analysis": [
+                        {
+                            "title": "AI PCB 订单放量，产能爬坡延续",
+                            "snippet": "机构继续强调客户导入、供不应求与订单饱满",
+                            "published_date": "2026-05-05",
+                            "support_count": 4,
+                        }
+                    ],
+                },
+                "cause_tags": ["earnings", "supply_demand"],
+                "evidence_points": [],
+                "fact_vs_inference": {"facts": [], "inferences": []},
+            },
+            None,
+            stock_name="景气样本",
+            signal_type="trend_leader_unified",
+            metrics_payload={"signal_date": "2026-05-10"},
+        )
+
+        self.assertEqual(payload.get("authority_level"), "earnings")
+        self.assertIn("AI算力供应链", payload.get("authority_reason_summary", ""))
+        self.assertRegex(payload.get("authority_reason_summary", ""), "订单放量|产能爬坡|供不应求")
+
+    def test_merge_reason_payload_compacts_reason_summary_for_daily_review(self):
+        service = SignalCauseAnalysisService(
+            manager=_BareManager(),
+            search_service=_FailingSearchService(),
+            analyzer=_NoneAnalyzer(),
+        )
+
+        payload = service._merge_reason_payload(
+            {
+                "industry": "通信设备",
+                "theme_mapping": {},
+                "signal_pool_profile": {"entry_reason": "trend leader"},
+                "business_profile": {
+                    "business_labels": ["光模块", "光通信"],
+                    "business_summary": "光模块/光通信，偏AI算力供应链",
+                    "main_business": "公司主要从事光模块、光通信器件的研发、生产和销售",
+                },
+                "fundamental_context": {
+                    "status": "ok",
+                    "growth": {"data": {"revenue_yoy": 24.0, "net_profit_yoy": 36.0}},
+                    "earnings": {
+                        "data": {
+                            "financial_report": {
+                                "report_date": "2026-03-31",
+                                "revenue": 4200000000,
+                                "net_profit_parent": 620000000,
+                            }
+                        }
+                    },
+                    "earnings_quality": {"data": {"verdict": "good", "score_total": 81}},
+                },
+                "news_items": [],
+                "authority_intel": {
+                    "announcements": [],
+                    "earnings": [],
+                    "market_analysis": [],
+                },
+                "cause_tags": ["earnings", "sector_rotation"],
+                "evidence_points": [],
+                "fact_vs_inference": {"facts": [], "inferences": []},
+            },
+            None,
+            stock_name="压短样本",
+            signal_type="trend_leader_unified",
+            metrics_payload={"signal_date": "2026-05-10"},
+        )
+
+        self.assertIn("当前更像是", payload.get("reason_summary", ""))
+        self.assertIn("主线判断更偏", payload.get("reason_summary", ""))
+        self.assertNotIn("当前未检索到足够稳定的公开消息催化", payload.get("reason_summary", ""))
+        self.assertNotIn("短线先按技术突破与资金轮动延续看待", payload.get("reason_summary", ""))
+        self.assertNotIn("主营业务显示公司主要从事", payload.get("reason_summary", ""))
+
+    def test_merge_reason_payload_normalizes_soft_magnetic_long_business_text(self):
+        service = SignalCauseAnalysisService(
+            manager=_BareManager(),
+            search_service=_FailingSearchService(),
+            analyzer=_NoneAnalyzer(),
+        )
+
+        payload = service._merge_reason_payload(
+            {
+                "industry": "电子元件",
+                "theme_mapping": {"theme_label": "有色 / 涨价资源"},
+                "signal_pool_profile": {"entry_reason": "trend leader"},
+                "business_profile": {
+                    "main_business": "软磁材料及磁心的研发、生产和销售；钽酸锂、铌酸锂晶体材料的研发、生产和销售。",
+                },
+                "fundamental_context": {
+                    "status": "ok",
+                    "growth": {"data": {"revenue_yoy": 12.7, "net_profit_yoy": -187.2}},
+                    "earnings": {
+                        "data": {
+                            "financial_report": {
+                                "report_date": "2026-03-31",
+                                "revenue": 1200000000,
+                                "net_profit_parent": -41844700,
+                            }
+                        }
+                    },
+                },
+                "news_items": [],
+                "authority_intel": {
+                    "announcements": [],
+                    "earnings": [],
+                    "market_analysis": [],
+                },
+                "cause_tags": ["earnings", "sector_rotation"],
+                "evidence_points": [],
+                "fact_vs_inference": {"facts": [], "inferences": []},
+            },
+            None,
+            stock_name="天通股份",
+            signal_type="trend_leader_unified",
+            metrics_payload={"signal_date": "2026-05-10"},
+        )
+
+        self.assertIn("软磁材料/磁性材料", payload.get("reason_summary", ""))
+        self.assertNotIn("软磁材料及磁心的研发、生产和销售", payload.get("reason_summary", ""))
+
+    def test_merge_reason_payload_normalizes_resin_long_business_text(self):
+        service = SignalCauseAnalysisService(
+            manager=_BareManager(),
+            search_service=_FailingSearchService(),
+            analyzer=_NoneAnalyzer(),
+        )
+
+        payload = service._merge_reason_payload(
+            {
+                "industry": "化工",
+                "theme_mapping": {},
+                "signal_pool_profile": {"entry_reason": "trend leader"},
+                "business_profile": {
+                    "main_business": "聚酯树脂系列产品的生产销售。",
+                },
+                "fundamental_context": {
+                    "status": "ok",
+                    "growth": {"data": {"revenue_yoy": -5.5, "net_profit_yoy": -144.4}},
+                    "earnings": {
+                        "data": {
+                            "financial_report": {
+                                "report_date": "2026-03-31",
+                                "revenue": 680000000,
+                                "net_profit_parent": -5267900,
+                            }
+                        }
+                    },
+                },
+                "news_items": [],
+                "authority_intel": {
+                    "announcements": [],
+                    "earnings": [],
+                    "market_analysis": [],
+                },
+                "cause_tags": ["earnings", "sector_rotation"],
+                "evidence_points": [],
+                "fact_vs_inference": {"facts": [], "inferences": []},
+            },
+            None,
+            stock_name="神剑股份",
+            signal_type="trend_leader_unified",
+            metrics_payload={"signal_date": "2026-05-10"},
+        )
+
+        self.assertIn("树脂/化工材料", payload.get("reason_summary", ""))
+        self.assertNotIn("聚酯树脂系列产品的生产销售", payload.get("reason_summary", ""))
+    def test_merge_reason_payload_normalizes_special_paper_long_business_text(self):
+        service = SignalCauseAnalysisService(
+            manager=_BareManager(),
+            search_service=_FailingSearchService(),
+            analyzer=_NoneAnalyzer(),
+        )
+
+        payload = service._merge_reason_payload(
+            {
+                "industry": "轻工制造",
+                "theme_mapping": {"theme_label": "有色 / 涨价资源"},
+                "signal_pool_profile": {"entry_reason": "trend leader"},
+                "business_profile": {
+                    "main_business": "特种环保纸的研发、生产及销售。",
+                },
+                "fundamental_context": {
+                    "status": "ok",
+                    "growth": {"data": {"revenue_yoy": 8.5, "net_profit_yoy": -22.3}},
+                    "earnings": {
+                        "data": {
+                            "financial_report": {
+                                "report_date": "2026-03-31",
+                                "revenue": 520000000,
+                                "net_profit_parent": 18300000,
+                            }
+                        }
+                    },
+                },
+                "news_items": [],
+                "authority_intel": {
+                    "announcements": [],
+                    "earnings": [],
+                    "market_analysis": [],
+                },
+                "cause_tags": ["earnings", "sector_rotation"],
+                "evidence_points": [],
+                "fact_vs_inference": {"facts": [], "inferences": []},
+            },
+            None,
+            stock_name="顺灏股份",
+            signal_type="trend_leader_unified",
+            metrics_payload={"signal_date": "2026-05-10"},
+        )
+
+        self.assertIn("特种环保纸", payload.get("reason_summary", ""))
+        self.assertNotIn("特种环保纸的研发、生产及销售", payload.get("reason_summary", ""))
+
+    def test_merge_reason_payload_normalizes_optics_component_long_business_text(self):
+        service = SignalCauseAnalysisService(
+            manager=_BareManager(),
+            search_service=_FailingSearchService(),
+            analyzer=_NoneAnalyzer(),
+        )
+
+        payload = service._merge_reason_payload(
+            {
+                "industry": "光学光电子",
+                "theme_mapping": {},
+                "signal_pool_profile": {"entry_reason": "hundred day high"},
+                "business_profile": {
+                    "main_business": "光学元器件的研发、生产和销售。",
+                },
+                "fundamental_context": {
+                    "status": "ok",
+                    "growth": {"data": {"revenue_yoy": 12.0, "net_profit_yoy": 33.0}},
+                    "earnings": {
+                        "data": {
+                            "financial_report": {
+                                "report_date": "2026-03-31",
+                                "revenue": 380000000,
+                                "net_profit_parent": 66000000,
+                            }
+                        }
+                    },
+                },
+                "news_items": [],
+                "authority_intel": {
+                    "announcements": [],
+                    "earnings": [],
+                    "market_analysis": [],
+                },
+                "cause_tags": ["earnings", "sector_rotation"],
+                "evidence_points": [],
+                "fact_vs_inference": {"facts": [], "inferences": []},
+            },
+            None,
+            stock_name="蓝特光学",
+            signal_type="hundred_day_high",
+            metrics_payload={"signal_date": "2026-05-10"},
+        )
+
+        self.assertIn("光学元器件", payload.get("reason_summary", ""))
+        self.assertNotIn("光学元器件的研发、生产和销售", payload.get("reason_summary", ""))
+
+    def test_merge_reason_payload_normalizes_wide_industry_clause_for_optics_component_text(self):
+        service = SignalCauseAnalysisService(
+            manager=_BareManager(),
+            search_service=_FailingSearchService(),
+            analyzer=_NoneAnalyzer(),
+        )
+
+        payload = service._merge_reason_payload(
+            {
+                "industry": "光学元器件的研发、生产和销售",
+                "theme_mapping": {},
+                "signal_pool_profile": {"entry_reason": "hundred day high"},
+                "business_profile": {
+                    "main_business": "光学元器件的研发、生产和销售。",
+                },
+                "fundamental_context": {
+                    "status": "ok",
+                    "growth": {"data": {"revenue_yoy": 12.0, "net_profit_yoy": 33.0}},
+                    "earnings": {
+                        "data": {
+                            "financial_report": {
+                                "report_date": "2026-03-31",
+                                "revenue": 380000000,
+                                "net_profit_parent": 66000000,
+                            }
+                        }
+                    },
+                },
+                "boards": [],
+                "news_items": [],
+                "authority_intel": {},
+                "cause_tags": ["earnings", "sector_rotation"],
+                "evidence_points": [],
+                "fact_vs_inference": {"facts": [], "inferences": []},
+            },
+            None,
+            stock_name="蓝特光学",
+            signal_type="hundred_day_high",
+            metrics_payload={"signal_date": "2026-05-10"},
+        )
+
+        self.assertNotIn(
+            "宽口径行业标签仍归在 光学元器件的研发、生产和销售",
+            payload.get("industry_logic", ""),
+        )
+
+    def test_normalize_business_label_text_normalizes_cable_industry_sentence(self):
+        self.assertEqual(
+            SignalCauseAnalysisService._normalize_business_label_text("电线电缆的研发、生产、销售和服务"),
+            "电力设备",
+        )
+
+
+    def test_derive_mainline_judgement_prefers_earnings_over_broad_ai_theme_when_business_is_grounded(self):
+        judgement = SignalCauseAnalysisService._derive_mainline_judgement(
+            theme_label="AI算力 / 半导体",
+            business_summary="PCB，偏AI算力供应链",
+            cause_tags=["earnings", "sector_rotation"],
+            ai_upstream_material_chain=False,
+            mapping_evidence=[{"source": "theme_mapping", "value": "AI算力 / 半导体"}],
+        )
+
+        self.assertEqual(judgement, "业绩兑现")
 
 
 if __name__ == "__main__":

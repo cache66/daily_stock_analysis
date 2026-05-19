@@ -1120,7 +1120,8 @@ class KlineSelectorService:
         manager._daily_data_request_calendar_span_multiplier = 1.6
         manager._daily_data_include_derived_indicators = False
         manager._prefer_cached_history_when_covered = True
-        manager._skip_tushare_history_fallback_for_fast_scan = True
+        # Keep Tushare as a real fallback for transient Akshare history misses.
+        manager._skip_tushare_history_fallback_for_fast_scan = False
         return manager
 
     @staticmethod
@@ -1176,6 +1177,7 @@ class KlineSelectorService:
         if self._universe_provider is not None:
             return self.get_a_share_universe(limit=limit, as_of_date=as_of_date)
 
+        skip_listing_metadata_merge = False
         cached_spot_reference = self._read_spot_universe_reference_cache()
         fallback_spot_reference = cached_spot_reference
         if fallback_spot_reference is None or fallback_spot_reference.empty:
@@ -1202,11 +1204,7 @@ class KlineSelectorService:
                 fallback_spot_reference.copy(),
                 as_of_date=as_of_date,
             )
-            if not self._has_complete_listing_metadata(spot_universe):
-                spot_universe = self._merge_listing_metadata_if_available(
-                    spot_universe,
-                    as_of_date=as_of_date,
-                )
+            skip_listing_metadata_merge = True
             if limit is not None and limit > 0:
                 spot_universe = spot_universe.head(limit)
             return spot_universe.reset_index(drop=True)
@@ -1245,6 +1243,7 @@ class KlineSelectorService:
                         cached_spot_universe.copy(),
                         as_of_date=as_of_date,
                     )
+                    skip_listing_metadata_merge = True
                 else:
                     generic_universe = self.get_a_share_universe(limit=limit, as_of_date=as_of_date)
                     logger.warning("K-line selector spot-enriched universe fallback to generic provider: %s", exc)
@@ -1262,7 +1261,7 @@ class KlineSelectorService:
             )
             return generic_universe.reset_index(drop=True)
 
-        if not self._has_complete_listing_metadata(spot_universe):
+        if not skip_listing_metadata_merge and not self._has_complete_listing_metadata(spot_universe):
             spot_universe = self._merge_listing_metadata_if_available(
                 spot_universe,
                 as_of_date=as_of_date,

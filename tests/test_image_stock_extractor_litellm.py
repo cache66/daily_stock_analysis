@@ -283,7 +283,12 @@ class TestParseItemsFromText:
 
     def test_uses_json_repair_when_json_invalid(self):
         text = '[{"code":"600519","name":"贵州茅台","confidence":"high"'
-        items = _parse_items_from_text(text)
+        mock_json_repair = MagicMock()
+        mock_json_repair.repair_json.return_value = [
+            {"code": "600519", "name": "贵州茅台", "confidence": "high"}
+        ]
+        with patch.dict(sys.modules, {"json_repair": mock_json_repair}):
+            items = _parse_items_from_text(text)
         assert items == [("600519", "贵州茅台", "high")]
 
 

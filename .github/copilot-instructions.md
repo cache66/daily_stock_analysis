@@ -31,6 +31,6 @@ If any instruction in this file conflicts with `AGENTS.md`, follow `AGENTS.md`.
 ## AI Asset Governance
 
 - `AGENTS.md` is the single source of truth for repository AI collaboration rules.
-- `CLAUDE.md` must remain a symlink to `AGENTS.md`.
+- `CLAUDE.md` should point to `AGENTS.md`; prefer a symlink, but a plain-text pointer file containing exactly `AGENTS.md` is acceptable when local symlink privileges are unavailable.
 - Use `.github/instructions/*.instructions.md` for path-specific guidance.
 - Current repository collaboration skills live in `.claude/skills/`; keep them aligned with `AGENTS.md`.

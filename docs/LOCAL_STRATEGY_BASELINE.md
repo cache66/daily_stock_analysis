@@ -1,6 +1,6 @@
 # 当前本地策略基线（Current Baseline）
 
-最后更新：2026-05-02  
+最后更新：2026-05-07  
 真源优先级：代码与脚本 > 本文档
 
 ## 0. 这份文档负责什么
@@ -61,8 +61,8 @@ python scripts/run_fast_review_bundle.py --strategy-profile-file config/local_st
 - `trend_watch_top_n = 20`
 - `trend_disable_second_stage_enrichment = true`
 - `trend_scan_prefilter_min_listed_days = 120`
-- `trend_scan_prefilter_min_change_pct_60d = 4.0`
-- `trend_scan_prefilter_min_turnover_rate = 1.0`
+- `trend_scan_prefilter_min_change_pct_60d = 8.0`
+- `trend_scan_prefilter_min_turnover_rate = 1.2`
 - `trend_scan_prefilter_require_positive_change = true`
 
 ## 3. 当前默认行为速记
@@ -76,6 +76,8 @@ python scripts/run_fast_review_bundle.py --strategy-profile-file config/local_st
 ## 4. 四条主策略当前口径
 
 - `strategy_focus` 现在会为焦点强势股补充“上涨原因摘要/标签”：优先复用子策略已有 `reason_summary / cause_tags`，缺失时才在复盘层做轻量补算；当前仅进入 `fast_review_strategy_focus.csv/.md` 与 `fast_review_summary.md`，不写回 snapshot
+- `strategy_focus` 现在还会为焦点强势股补充 `A类/B类` 复盘分层，以及 `业绩兑现型 / 拐点观察型 / 事件驱动型 / 题材情绪型` 驱动标签；同时单独输出 `兑现 / 半兑现 / 拐点 / 纯轮动` 四层阶段字段，用来把“业绩已兑现”和“仅有拐点/轮动”拆开；其中 `半兑现` 现只保留“业绩已出现且趋势已启动、但尚未完全确认”的样本，缺少趋势确认的 `earnings + hundred_only / earnings_only` 会下沉到 `拐点`；这些分类只用于复盘阅读和观察池维护，不改变三条每日主策略的筛选结果
+- `run_fast_review_bundle.py` 现支持可选 `--manual-review-labels-file <json>` 人工校准样本；当提供该文件时，会按 `snapshot_date + code` 对照 `strategy_focus` 实际分类，额外输出 `fast_review_manual_calibration.csv/.md`，并在 `fast_review_summary.md` 中汇总匹配、偏差与漏出样本
 ### 4.1 `trend_leader_unified`
 
 脚本：`scripts/select_trend_leader_candidates.py`  
@@ -113,8 +115,8 @@ python scripts/run_fast_review_bundle.py --strategy-profile-file config/local_st
 - `--fallback-top-n`（默认 20）
 - `--watch-top-n`（默认 20）
 - `--scan-prefilter-min-listed-days`（默认 120）
-- `--scan-prefilter-min-change-pct-60d`（脚本默认 3.0，日常配置覆盖为 4.0）
-- `--scan-prefilter-min-turnover-rate`（脚本默认 0.8，日常配置覆盖为 1.0）
+- `--scan-prefilter-min-change-pct-60d`（脚本默认 3.0，日常配置覆盖为 8.0）
+- `--scan-prefilter-min-turnover-rate`（脚本默认 0.8，日常配置覆盖为 1.2）
 - `--scan-prefilter-require-positive-change`
 - `--fundamental-budget-seconds`（默认 `0.6`）
 - `--capital-flow-budget-seconds`（默认 `0.45`）
@@ -143,6 +145,8 @@ python scripts/run_fast_review_bundle.py --strategy-profile-file config/local_st
 
 - 日常默认是 `balanced + low + latest_report_period + recent_event_max_age_days=7`
 - 低深度路径已加弱事件预过滤
+- 当 `low/medium` 且 `recent_event` overlay 已经给出足够的公告摘要/增速字段时，`earnings_surprise` 现在会直接 bootstrap 轻量 bundle，不再为这批样本逐只 fresh fetch 一次基础面 bundle；这属于实现层提速，不改变 `strategy_profile`、分数线或快复盘口径
+- 当 `db=None` 的 `low/medium` 快复盘链路运行时，`earnings_surprise` 会先为全部通过样本生成 `lightweight_fast_review` 资金画像，只对当前优先级前 `15` 只升级为 `full_priority_refresh`，并仅为这批重点样本补抓市场预期参考；非重点样本会写 `skipped_fast_review` 作为显式跳过标记
 - `phase_timing_sec` 已进入候选 Markdown 的效率摘要
 - 市场预期层只用于复盘参考，不参与当前策略打分
 

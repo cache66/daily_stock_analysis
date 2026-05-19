@@ -2486,6 +2486,21 @@ class SearchService:
             news_strategy_profile=self.news_strategy_profile,
         )
 
+    @staticmethod
+    def _is_fatal_provider_unavailable(provider: Any, response: "SearchResponse") -> bool:
+        """Return True when retrying the same provider in the same call is pointless."""
+        if getattr(provider, "name", "") != "SearXNG":
+            return False
+        if getattr(response, "success", False):
+            return False
+        error_message = str(getattr(response, "error_message", "") or "")
+        fatal_markers = (
+            "未获取到可用的公共 SearXNG 实例",
+            "公共 SearXNG 实例全部处于冷却中",
+            "SearXNG 未配置可用实例",
+        )
+        return any(marker in error_message for marker in fatal_markers)
+
     @classmethod
     def _provider_request_size(cls, max_results: int) -> int:
         """Apply light overfetch before time filtering to avoid sparse outputs."""
@@ -3023,6 +3038,7 @@ class SearchService:
         """
         results = {}
         search_count = 0
+        suppressed_providers: set[str] = set()
 
         is_foreign = self._is_foreign_stock(stock_code)
         is_index_etf = self.is_index_or_etf(stock_code, stock_name)
@@ -3158,7 +3174,11 @@ class SearchService:
                 break
             
             # 选择搜索引擎（轮流使用）
-            available_providers = [p for p in self._providers if p.is_available]
+            available_providers = [
+                p
+                for p in self._providers
+                if p.is_available and getattr(p, "name", "") not in suppressed_providers
+            ]
             if not available_providers:
                 break
             
@@ -3194,6 +3214,7 @@ class SearchService:
                 )
             results[dim['name']] = filtered_response
             search_count += 1
+            fatal_provider_unavailable = self._is_fatal_provider_unavailable(provider, response)
             
             if response.success:
                 logger.info(
@@ -3206,6 +3227,15 @@ class SearchService:
                 logger.warning(f"[情报搜索] {dim['desc']}: 搜索失败 - {response.error_message}")
             
             # 短暂延迟避免请求过快
+            if fatal_provider_unavailable:
+                suppressed_providers.add(getattr(provider, "name", ""))
+                remaining_providers = [
+                    p
+                    for p in self._providers
+                    if p.is_available and getattr(p, "name", "") not in suppressed_providers
+                ]
+                if not remaining_providers:
+                    break
             time.sleep(0.5)
         
         return results

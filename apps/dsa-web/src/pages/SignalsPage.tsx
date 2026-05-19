@@ -17,6 +17,8 @@ import {
   StickyActionBar,
 } from '../components/common';
 import type {
+  FastReviewFocusItem,
+  FastReviewFocusResponse,
   SignalSnapshotCountsResponse,
   SignalSnapshotHistoryResponse,
   SignalSnapshotListItem,
@@ -129,6 +131,7 @@ type SortOption = 'latestHighDesc' | 'previousHitCountDesc' | 'closeDesc' | 'ytd
 type StreakGroupBy = 'none' | 'theme' | 'industry';
 type YtdFilterOption = 'all' | 'gt0' | 'gt20' | 'gt50';
 type SignalViewMode = 'short_term' | 'long_term';
+type SignalsDataMode = 'snapshots' | 'fast_review';
 type ActionStatus = {
   type: 'success' | 'error';
   message: string;
@@ -141,6 +144,7 @@ type LinkedSelectionContext = {
 const COMPARE_SUMMARY_PREVIEW_DAYS = 10;
 const MONTHLY_COMPARE_MAX_ITEMS = 200;
 const MONTHLY_SLOW_RISE_PROFILE_ORDER = ['strict', 'robust', 'balanced', 'loose'] as const;
+const FAST_REVIEW_STAGE_ORDER = ['兑现', '半兑现', '拐点', '纯轮动'] as const;
 const SIGNALS_INPUT_CLASS =
   'input-surface input-focus-glow h-10 rounded-xl border bg-transparent px-3 text-sm transition-all focus:outline-none disabled:cursor-not-allowed disabled:opacity-60';
 
@@ -420,9 +424,104 @@ function buildEmptySnapshotListResponse(params: {
   };
 }
 
+function formatCompactNumber(value?: number | null): string {
+  if (value == null) return '--';
+  return Number.isInteger(value) ? `${value}` : value.toFixed(1);
+}
+
+function formatSignedPct(value?: number | null): string {
+  if (value == null) return '--';
+  const sign = value > 0 ? '+' : '';
+  return `${sign}${value.toFixed(1)}%`;
+}
+
+function formatRatio(value?: number | null): string {
+  if (value == null) return '--';
+  return Number.isInteger(value) ? `${value}` : value.toFixed(1);
+}
+
+function formatYiAmount(value?: number | null): string {
+  if (value == null) return '--';
+  return `${(value / 100000000).toFixed(2)}亿`;
+}
+
+function formatPeRatio(value?: number | null): string {
+  if (value == null) return '--';
+  if (value >= 1000) return '>1000';
+  if (value <= -1000) return '<-1000';
+  return formatRatio(value);
+}
+
+const MAINLINE_EVIDENCE_LABELS: Record<string, string> = {
+  business_summary: '业务标签',
+  theme_mapping: '主题映射',
+  supply_demand: '供需景气',
+  price_increase: '涨价传导',
+  earnings: '业绩披露',
+  signal_pool: '强势池理由',
+  news: '新闻催化',
+  sector_rotation: '板块轮动',
+};
+
+function buildFastReviewMainlineJudgement(item: FastReviewFocusItem): string {
+  if (item.mainlineJudgement) return item.mainlineJudgement;
+  if (item.supplyDemandBias === 'supply_demand' && item.themeLabel?.includes('AI')) return 'AI主线扩散';
+  if (item.supplyDemandBias === 'supply_demand') return '景气扩散';
+  if (item.earningsAnchor) return '业绩兑现';
+  if (item.themeLabel || item.themeSource) return '题材映射';
+  return '板块轮动';
+}
+
+function buildFastReviewMainlineEvidenceSources(item: FastReviewFocusItem): string[] {
+  const explicit = item.mainlineEvidenceSources ?? [];
+  if (explicit.length > 0) return explicit;
+
+  const inferred: string[] = [];
+  if (item.businessSummary || item.businessLabels.length > 0) inferred.push('business_summary');
+  if (item.themeLabel || item.themeSource) inferred.push('theme_mapping');
+  if (item.supplyDemandBias === 'supply_demand') inferred.push('supply_demand');
+  if (item.earningsAnchor) inferred.push('earnings');
+  return inferred;
+}
+
+function formatMainlineEvidenceSources(values: string[]): string {
+  const labels = values
+    .map((value) => MAINLINE_EVIDENCE_LABELS[value] || value)
+    .filter((value, index, array) => value && array.indexOf(value) === index);
+  return labels.length > 0 ? labels.join(' / ') : '--';
+}
+
+function buildFastReviewSnapshotSummary(item: FastReviewFocusItem): string {
+  const parts: string[] = [];
+  const today = formatSignedPct(item.todayChangePct);
+  if (today !== '--') parts.push(today);
+  const pe = formatPeRatio(item.peRatio);
+  if (pe !== '--') parts.push(`PE ${pe}`);
+  const period = item.reportPeriodLabel || item.reportDate || '';
+  if (period) parts.push(period);
+  const netProfit = formatYiAmount(item.netProfitAmount);
+  if (netProfit !== '--') {
+    parts.push(`净利 ${netProfit}`);
+  } else {
+    const revenue = formatYiAmount(item.revenueAmount);
+    if (revenue !== '--') parts.push(`营收 ${revenue}`);
+  }
+  return parts.length > 0 ? parts.join(' / ') : '--';
+}
+
+function getFastReviewBadgeVariant(value?: string | null): 'default' | 'success' | 'warning' | 'danger' | 'history' {
+  if (!value) return 'default';
+  if (value === 'A' || value === '兑现') return 'success';
+  if (value === '半兑现') return 'warning';
+  if (value === '拐点') return 'history';
+  if (value === 'B' || value === '纯轮动') return 'danger';
+  return 'default';
+}
+
 const SignalsPage: React.FC = () => {
   const [signalType, setSignalType] = useState('hundred_day_high');
   const [signalViewMode, setSignalViewMode] = useState<SignalViewMode>('short_term');
+  const [dataMode, setDataMode] = useState<SignalsDataMode>('snapshots');
   const [dateMode, setDateMode] = useState<'single' | 'range'>('single');
   const [signalDate, setSignalDate] = useState(getTodayIsoDate);
   const [signalDateFrom, setSignalDateFrom] = useState(getTodayIsoDate);
@@ -447,11 +546,17 @@ const SignalsPage: React.FC = () => {
   const [selectedItem, setSelectedItem] = useState<SignalSnapshotListItem | null>(null);
   const [historyData, setHistoryData] = useState<SignalSnapshotHistoryResponse | null>(null);
   const [monthlyCompareData, setMonthlyCompareData] = useState<MonthlyCompareResponseMap | null>(null);
+  const [fastReviewData, setFastReviewData] = useState<FastReviewFocusResponse | null>(null);
+  const [selectedFastReviewItem, setSelectedFastReviewItem] = useState<FastReviewFocusItem | null>(null);
+  const [showFastReviewAuthorityDetails, setShowFastReviewAuthorityDetails] = useState(false);
+  const [showFastReviewPeerDetails, setShowFastReviewPeerDetails] = useState(false);
   const [showMonthlyComparePanel, setShowMonthlyComparePanel] = useState(false);
   const [isLoadingMonthlyCompare, setIsLoadingMonthlyCompare] = useState(false);
+  const [isLoadingFastReview, setIsLoadingFastReview] = useState(false);
   const [monthlyCompareError, setMonthlyCompareError] = useState<ParsedApiError | null>(null);
   const [isLoadingList, setIsLoadingList] = useState(false);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
+  const [fastReviewError, setFastReviewError] = useState<ParsedApiError | null>(null);
   const [pageError, setPageError] = useState<ParsedApiError | null>(null);
   const listCacheRef = useRef<Map<string, SignalSnapshotListResponse>>(new Map());
   const historyCacheRef = useRef<Map<string, SignalSnapshotHistoryResponse>>(new Map());
@@ -463,6 +568,7 @@ const SignalsPage: React.FC = () => {
   const historyAbortControllerRef = useRef<AbortController | null>(null);
   const monthlyCompareAbortControllerRef = useRef<AbortController | null>(null);
   const countAbortControllerRef = useRef<AbortController | null>(null);
+  const fastReviewAbortControllerRef = useRef<AbortController | null>(null);
 
   const boardRecognizabilityOptions = useMemo(
     () => (countData?.items ?? [])
@@ -537,8 +643,8 @@ const SignalsPage: React.FC = () => {
   const signalMeta = signalTypeMetaMap[signalType] ?? signalTypeMetaMap.hundred_day_high;
 
   useEffect(() => {
-    document.title = `${signalMeta.title} - DSA`;
-  }, [signalMeta.title]);
+    document.title = `${dataMode === 'fast_review' ? 'Fast Review Focus' : signalMeta.title} - DSA`;
+  }, [dataMode, signalMeta.title]);
 
   const requestedCodes = useMemo(() => {
     if (activeLinkedCodes.length > 0) {
@@ -557,6 +663,45 @@ const SignalsPage: React.FC = () => {
     }
     return counts;
   }, [countData]);
+
+  const fastReviewAbSummary = useMemo(
+    () => Object.entries(fastReviewData?.abSummary ?? {})
+      .map(([bucket, total]) => ({ bucket, total }))
+      .sort((left, right) => left.bucket.localeCompare(right.bucket)),
+    [fastReviewData?.abSummary],
+  );
+
+  const fastReviewStageSummary = useMemo(() => {
+    const stageOrder = new Map<string, number>(FAST_REVIEW_STAGE_ORDER.map((stage, index) => [stage, index]));
+    return Object.entries(fastReviewData?.stageSummary ?? {})
+      .map(([stage, total]) => ({ stage, total }))
+      .sort((left, right) => (stageOrder.get(left.stage) ?? 999) - (stageOrder.get(right.stage) ?? 999));
+  }, [fastReviewData?.stageSummary]);
+
+  const fastReviewTopDrivers = useMemo(
+    () => Object.entries(fastReviewData?.driverSummary ?? {})
+      .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+      .slice(0, 6),
+    [fastReviewData?.driverSummary],
+  );
+
+  const fastReviewStageGroups = useMemo(() => {
+    const groups = new Map<string, FastReviewFocusItem[]>();
+    for (const item of fastReviewData?.items ?? []) {
+      const stage = item.reviewStageLabel || '未分类';
+      if (!groups.has(stage)) {
+        groups.set(stage, []);
+      }
+      groups.get(stage)?.push(item);
+    }
+    const stageOrder = new Map<string, number>(FAST_REVIEW_STAGE_ORDER.map((stage, index) => [stage, index]));
+    return [...groups.entries()]
+      .sort((left, right) => (stageOrder.get(left[0]) ?? 999) - (stageOrder.get(right[0]) ?? 999))
+      .map(([stage, items]) => ({
+        stage,
+        items: [...items].sort((left, right) => (right.priorityScore ?? 0) - (left.priorityScore ?? 0) || left.code.localeCompare(right.code)),
+      }));
+  }, [fastReviewData?.items]);
 
   const isMonthlyCompareContext = signalViewMode === 'long_term'
     && isMonthlySlowRiseSignalType(signalType);
@@ -672,6 +817,51 @@ const SignalsPage: React.FC = () => {
       if (countAbortControllerRef.current === abortController) {
         countAbortControllerRef.current = null;
       }
+    }
+  };
+
+  const loadFastReview = async (force = false) => {
+    const snapshotDate = signalDate;
+    if (!snapshotDate) {
+      setFastReviewData(null);
+      setSelectedFastReviewItem(null);
+      setFastReviewError(null);
+      return;
+    }
+    if (!force && fastReviewData?.snapshotDate === snapshotDate) {
+      return;
+    }
+
+    fastReviewAbortControllerRef.current?.abort();
+    const abortController = new AbortController();
+    fastReviewAbortControllerRef.current = abortController;
+    setIsLoadingFastReview(true);
+    try {
+      const response = await signalsApi.getFastReviewFocus(
+        { snapshotDate },
+        { signal: abortController.signal },
+      );
+      if (fastReviewAbortControllerRef.current !== abortController) {
+        return;
+      }
+      setFastReviewData(response);
+      setSelectedFastReviewItem((prev) => response.items.find((item) => item.code === prev?.code) ?? response.items[0] ?? null);
+      setFastReviewError(null);
+    } catch (error) {
+      if (isRequestCanceled(error)) {
+        return;
+      }
+      if (fastReviewAbortControllerRef.current !== abortController) {
+        return;
+      }
+      setFastReviewData(null);
+      setSelectedFastReviewItem(null);
+      setFastReviewError(getParsedApiError(error));
+    } finally {
+      if (fastReviewAbortControllerRef.current === abortController) {
+        fastReviewAbortControllerRef.current = null;
+      }
+      setIsLoadingFastReview(false);
     }
   };
 
@@ -931,19 +1121,38 @@ const SignalsPage: React.FC = () => {
   }, [activeLinkedCodes, listData?.items, recentEventDays, showOnlyStreak, signalType, sortBy, ytdFilter]);
 
   useEffect(() => {
+    if (dataMode !== 'snapshots') {
+      return;
+    }
     void loadList();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [signalDate, signalDateFrom, signalDateTo, signalType, currentPage, dateMode, appliedCodeFilter, activeLinkedCodes.join(',')]);
+  }, [dataMode, signalDate, signalDateFrom, signalDateTo, signalType, currentPage, dateMode, appliedCodeFilter, activeLinkedCodes.join(',')]);
 
   useEffect(() => {
+    if (dataMode !== 'snapshots') {
+      return;
+    }
     void loadCounts();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [signalDate, signalDateFrom, signalDateTo, dateMode, appliedCodeFilter, activeLinkedCodes.join(',')]);
+  }, [dataMode, signalDate, signalDateFrom, signalDateTo, dateMode, appliedCodeFilter, activeLinkedCodes.join(',')]);
 
   useEffect(() => {
+    if (dataMode !== 'snapshots') {
+      return;
+    }
     void loadMonthlyCompare();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [signalType, signalDate, signalDateFrom, signalDateTo, dateMode, appliedCodeFilter, activeLinkedCodes.join(','), monthlySlowRiseOptions.map((option) => option.value).join('|'), signalViewMode, showMonthlyComparePanel]);
+  }, [dataMode, signalType, signalDate, signalDateFrom, signalDateTo, dateMode, appliedCodeFilter, activeLinkedCodes.join(','), monthlySlowRiseOptions.map((option) => option.value).join('|'), signalViewMode, showMonthlyComparePanel]);
+
+  useEffect(() => {
+    if (dataMode !== 'fast_review') {
+      fastReviewAbortControllerRef.current?.abort();
+      setFastReviewError(null);
+      return;
+    }
+    void loadFastReview();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dataMode, signalDate]);
 
   useEffect(() => {
     setCompareSummaryExpanded(false);
@@ -955,10 +1164,14 @@ const SignalsPage: React.FC = () => {
       historyAbortControllerRef.current?.abort();
       monthlyCompareAbortControllerRef.current?.abort();
       countAbortControllerRef.current?.abort();
+      fastReviewAbortControllerRef.current?.abort();
     };
   }, []);
 
   useEffect(() => {
+    if (dataMode !== 'snapshots') {
+      return;
+    }
     if (!filteredAndSortedItems.length) {
       historyRequestIdRef.current += 1;
       historyAbortControllerRef.current?.abort();
@@ -976,9 +1189,12 @@ const SignalsPage: React.FC = () => {
     if (!stillVisible) {
       setSelectedItem(filteredAndSortedItems[0]);
     }
-  }, [filteredAndSortedItems, selectedItem]);
+  }, [dataMode, filteredAndSortedItems, selectedItem]);
 
   useEffect(() => {
+    if (dataMode !== 'snapshots') {
+      return;
+    }
     if (!selectedItem) {
       historyRequestIdRef.current += 1;
       historyAbortControllerRef.current?.abort();
@@ -987,10 +1203,58 @@ const SignalsPage: React.FC = () => {
     }
     void loadHistory(selectedItem);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedItem?.code, historyDays]);
+  }, [dataMode, selectedItem?.code, historyDays]);
+
+  useEffect(() => {
+    setShowFastReviewAuthorityDetails(false);
+    setShowFastReviewPeerDetails(false);
+  }, [selectedFastReviewItem?.code]);
 
   const currentHistoryItem = useMemo(() => historyData?.items?.[0] ?? null, [historyData]);
   const todayIsoDate = getTodayIsoDate();
+  const selectedFastReviewBusinessLabels = selectedFastReviewItem?.businessLabels ?? [];
+  const selectedFastReviewSignalKeys = selectedFastReviewItem?.signalKeys ?? [];
+  const selectedFastReviewRiskFlags = selectedFastReviewItem?.riskFlags ?? [];
+  const selectedFastReviewMainlineJudgement = selectedFastReviewItem
+    ? buildFastReviewMainlineJudgement(selectedFastReviewItem)
+    : '--';
+  const selectedFastReviewMainlineEvidence = selectedFastReviewItem
+    ? formatMainlineEvidenceSources(buildFastReviewMainlineEvidenceSources(selectedFastReviewItem))
+    : '--';
+  const selectedFastReviewDisplayReasonSummary = selectedFastReviewItem
+    ? selectedFastReviewItem.displayReasonSummary || selectedFastReviewItem.reasonSummary || '--'
+    : '--';
+  const selectedFastReviewDisplayAuthoritySummary = selectedFastReviewItem
+    ? selectedFastReviewItem.displayAuthoritySummary
+      || selectedFastReviewItem.authorityReasonSummary
+      || selectedFastReviewItem.displayReasonSummary
+      || selectedFastReviewItem.reasonSummary
+      || '--'
+    : '--';
+  const selectedFastReviewVerifiedLogic = selectedFastReviewItem
+    ? selectedFastReviewDisplayAuthoritySummary
+    : '--';
+  const selectedFastReviewAuthorityLabel = selectedFastReviewItem?.displayAuthorityJudgement
+    || selectedFastReviewItem?.authorityJudgement
+    || '--';
+  const selectedFastReviewPeerSummary = selectedFastReviewItem
+    ? selectedFastReviewItem.displayPeerSummary || selectedFastReviewItem.peerResonanceSummary || '--'
+    : '--';
+  const selectedFastReviewAuthorityRows = selectedFastReviewItem
+    ? [
+        ['Announcement', selectedFastReviewItem.announcementEvidenceSummary],
+        ['Earnings', selectedFastReviewItem.earningsEvidenceSummary],
+        ['Research', selectedFastReviewItem.researchEvidenceSummary],
+      ].filter(([, value]) => Boolean(value && String(value).trim()))
+    : [];
+  const selectedFastReviewPeerRows = selectedFastReviewItem
+    ? [
+        ['Group', selectedFastReviewItem.peerGroupLabel],
+        ['Resonance', selectedFastReviewItem.peerResonanceSummary],
+        ['Leadership', selectedFastReviewItem.leaderPositionSummary],
+        ['Turning Point', selectedFastReviewItem.turningPointPeerSummary],
+      ].filter(([, value]) => Boolean(value && String(value).trim()))
+    : [];
   const continuousCount = useMemo(
     () => (listData?.items ?? []).filter((item) => item.isConsecutiveSignal).length,
     [listData?.items],
@@ -1250,6 +1514,17 @@ const SignalsPage: React.FC = () => {
     setShowMonthlyComparePanel(false);
   };
 
+  const handleDataModeChange = (nextMode: SignalsDataMode) => {
+    if (nextMode === dataMode) {
+      return;
+    }
+    setDataMode(nextMode);
+    setActionStatus(null);
+    if (nextMode === 'fast_review') {
+      setDateMode('single');
+    }
+  };
+
   const handleSignalViewModeChange = (nextMode: SignalViewMode) => {
     if (nextMode === signalViewMode) {
       return;
@@ -1400,6 +1675,438 @@ const SignalsPage: React.FC = () => {
     }
   };
 
+  if (dataMode === 'fast_review') {
+    const fastReviewItems = fastReviewData?.items ?? [];
+    return (
+      <AppPage>
+        <div className="space-y-6" data-testid="signals-page">
+          <PageHeader
+            eyebrow="Fast Review"
+            title="Fast Review Focus"
+            description="每日复盘焦点视图，只保留 A/B、阶段、驱动、信号和优先级，细节集中到右侧阅读面板。"
+            actions={(
+              <>
+                <div className="inline-flex items-center gap-1 rounded-2xl border border-border/60 bg-card/45 p-1 shadow-soft-card">
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => handleDataModeChange('snapshots')}
+                    aria-label="signals-data-mode-snapshots"
+                  >
+                    Signal Snapshots
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => handleDataModeChange('fast_review')}
+                    aria-label="signals-data-mode-fast_review"
+                  >
+                    Fast Review Focus
+                  </Button>
+                </div>
+                <input
+                  type="date"
+                  value={signalDate}
+                  onChange={(e) => setSignalDate(e.target.value)}
+                  className={`${SIGNALS_INPUT_CLASS} min-w-[160px]`}
+                  aria-label="signal-date"
+                />
+                <Button variant="secondary" onClick={() => handleShiftDate(-1)} aria-label="previous-day">
+                  上一天
+                </Button>
+                <Button
+                  variant="secondary"
+                  onClick={() => handleShiftDate(1)}
+                  aria-label="next-day"
+                  disabled={signalDate >= todayIsoDate}
+                >
+                  下一天
+                </Button>
+                <Button
+                  variant="secondary"
+                  onClick={() => setSignalDate(todayIsoDate)}
+                  aria-label="go-today"
+                  disabled={signalDate === todayIsoDate}
+                >
+                  今天
+                </Button>
+                <Button
+                  variant="secondary"
+                  onClick={() => void loadFastReview(true)}
+                  disabled={isLoadingFastReview}
+                  aria-label="refresh-fast-review"
+                >
+                  {isLoadingFastReview ? '加载中...' : '刷新复盘'}
+                </Button>
+              </>
+            )}
+          />
+
+          <div className="grid gap-4 xl:grid-cols-[minmax(0,1.2fr)_minmax(300px,0.8fr)]">
+            <Card title="Session Snapshot" subtitle="Scan Layer">
+              <div className="space-y-4">
+                <div className="flex flex-wrap items-center gap-2 text-xs">
+                  <span className="rounded-full border border-border/50 bg-card/60 px-3 py-1.5 text-secondary-text">
+                    Date {signalDate}
+                  </span>
+                  <span className="rounded-full border border-border/50 bg-card/60 px-3 py-1.5 text-secondary-text">
+                    Total {fastReviewData?.total ?? 0}
+                  </span>
+                  <span className="rounded-full border border-border/50 bg-card/60 px-3 py-1.5 text-secondary-text">
+                    Source {fastReviewData?.sourceRunDir || '--'}
+                  </span>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {fastReviewTopDrivers.length > 0 ? fastReviewTopDrivers.map(([label, count]) => (
+                    <Badge key={label} variant="history">{label} {count}</Badge>
+                  )) : (
+                    <span className="text-sm text-secondary-text">No driver summary yet.</span>
+                  )}
+                </div>
+              </div>
+            </Card>
+            <Card title="Focus Mix" subtitle="A/B + stages">
+              <div className="space-y-3">
+                <div className="flex flex-wrap gap-2">
+                  {fastReviewAbSummary.map((item) => (
+                    <span
+                      key={item.bucket}
+                      aria-label={`fast-review-ab-${item.bucket}`}
+                      className="inline-flex items-center gap-2 rounded-full border border-border/55 bg-card/55 px-3 py-1.5 text-sm text-secondary-text"
+                    >
+                      <span className="font-medium text-foreground">{item.bucket}</span>
+                      <span>{item.total}</span>
+                    </span>
+                  ))}
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {fastReviewStageSummary.map((item) => (
+                    <span
+                      key={item.stage}
+                      aria-label={`fast-review-stage-${item.stage}`}
+                      className="inline-flex items-center gap-2 rounded-full border border-border/55 bg-card/55 px-3 py-1.5 text-sm text-secondary-text"
+                    >
+                      <span className="font-medium text-foreground">{item.stage}</span>
+                      <span>{item.total}</span>
+                    </span>
+                  ))}
+                </div>
+              </div>
+            </Card>
+          </div>
+
+          {fastReviewError ? <ApiErrorAlert error={fastReviewError} /> : null}
+
+          <div className="grid gap-4 xl:grid-cols-[minmax(0,1.28fr)_minmax(360px,0.92fr)]">
+            <Card title="Focus List" subtitle={fastReviewData?.sourceRunDir || '等待复盘结果'}>
+              {isLoadingFastReview && !fastReviewData ? (
+                <div className="space-y-3">
+                  <div className="h-14 animate-pulse rounded-2xl bg-card/40" />
+                  <div className="h-14 animate-pulse rounded-2xl bg-card/40" />
+                  <div className="h-14 animate-pulse rounded-2xl bg-card/40" />
+                </div>
+              ) : fastReviewItems.length > 0 ? (
+                <div className="space-y-2">
+                  {fastReviewStageGroups.map((group) => (
+                    <div key={group.stage} className="space-y-2">
+                      <div
+                        aria-label={`fast-review-stage-group-${group.stage}`}
+                        className="flex items-center justify-between rounded-2xl border border-border/55 bg-card/30 px-3 py-2"
+                      >
+                        <div className="flex items-center gap-2">
+                          <Badge variant={getFastReviewBadgeVariant(group.stage)}>{group.stage}</Badge>
+                          <span className="text-xs text-secondary-text">Stage Group</span>
+                        </div>
+                        <span className="text-xs font-medium text-foreground">{group.items.length}</span>
+                      </div>
+                      {group.items.map((item) => {
+                        const isActive = selectedFastReviewItem?.code === item.code;
+                        return (
+                          <button
+                            key={`${item.code}-${item.reviewStageLabel ?? ''}-${item.driverLabel ?? ''}`}
+                            type="button"
+                            onClick={() => setSelectedFastReviewItem(item)}
+                            aria-label={`fast-review-row-${item.code}`}
+                            className={`w-full rounded-2xl border px-3 py-3 text-left transition-all ${
+                              isActive
+                                ? 'border-cyan/40 bg-cyan/10 shadow-lg shadow-cyan/10'
+                                : 'border-border/60 bg-card/35 hover:border-border hover:bg-hover'
+                            }`}
+                          >
+                            <div className="space-y-3">
+                              <div className="flex flex-wrap items-start justify-between gap-3">
+                                <div className="min-w-0">
+                                  <p className="font-medium text-foreground">{item.code} {item.name || '--'}</p>
+                                  <p className="mt-1 truncate text-xs text-secondary-text">
+                                    {item.businessSummary || item.eventDate || item.tier || 'tap to read detail'}
+                                  </p>
+                                </div>
+                                <div className="flex flex-wrap items-center justify-end gap-2">
+                                  <Badge variant={getFastReviewBadgeVariant(item.abBucket)}>{item.abBucket || '--'}</Badge>
+                                  <Badge variant={getFastReviewBadgeVariant(item.reviewStageLabel)}>{item.reviewStageLabel || '--'}</Badge>
+                                  <span className="text-sm font-medium text-foreground">{formatCompactNumber(item.priorityScore)}</span>
+                                </div>
+                              </div>
+                              <div className="flex flex-wrap items-center justify-between gap-3 text-sm">
+                                <span className="min-w-0 truncate text-secondary-text">{item.driverLabel || '--'}</span>
+                                <span className="text-right text-secondary-text">{buildFastReviewSnapshotSummary(item)}</span>
+                              </div>
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <EmptyState
+                  title="暂无 fast review 结果"
+                  description="先运行当天 fast review，或切换到已有结果的日期。"
+                />
+              )}
+            </Card>
+
+            <Card
+              title={selectedFastReviewItem ? `${selectedFastReviewItem.code} ${selectedFastReviewItem.name || ''}`.trim() : 'Focus Detail'}
+              subtitle={selectedFastReviewItem?.driverLabel || '选择左侧一行查看细节'}
+            >
+              {selectedFastReviewItem ? (
+                <div className="space-y-4">
+                  <div className="flex flex-wrap gap-2">
+                    <Badge variant={getFastReviewBadgeVariant(selectedFastReviewItem.abBucket)}>{selectedFastReviewItem.abBucket || '--'}</Badge>
+                    <Badge variant={getFastReviewBadgeVariant(selectedFastReviewItem.reviewStageLabel)}>{selectedFastReviewItem.reviewStageLabel || '--'}</Badge>
+                    {selectedFastReviewItem.driverLabel ? <Badge variant="history">{selectedFastReviewItem.driverLabel}</Badge> : null}
+                    {selectedFastReviewSignalKeys.map((signalKey) => (
+                      <Badge key={signalKey} variant="default">{signalKey}</Badge>
+                    ))}
+                  </div>
+
+                  <div className="rounded-2xl border border-border/60 bg-card/40 p-4">
+                    <p className="text-xs font-semibold uppercase tracking-[0.24em] text-muted-text">Quick Read</p>
+                    <div className="mt-3 space-y-3">
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        <div className="rounded-2xl border border-border/50 bg-card/50 p-3">
+                          <p className="text-[11px] uppercase tracking-[0.22em] text-muted-text">Verified Logic</p>
+                          <div className="mt-2 flex flex-wrap gap-2">
+                            <Badge variant="success">{selectedFastReviewAuthorityLabel}</Badge>
+                          </div>
+                          <p className="mt-2 text-secondary-text">{selectedFastReviewVerifiedLogic}</p>
+                        </div>
+                        <div className="rounded-2xl border border-border/50 bg-card/50 p-3">
+                          <p className="text-[11px] uppercase tracking-[0.22em] text-muted-text">Mainline</p>
+                          <p className="mt-2 text-secondary-text">{selectedFastReviewMainlineJudgement}</p>
+                          <p className="mt-2 text-xs text-muted-text">{selectedFastReviewMainlineEvidence}</p>
+                        </div>
+                      </div>
+                      <div>
+                        <p className="text-[11px] uppercase tracking-[0.22em] text-muted-text">Reason Summary</p>
+                        <p className="mt-2 text-secondary-text">{selectedFastReviewDisplayReasonSummary}</p>
+                      </div>
+                      <div>
+                        <p className="text-[11px] uppercase tracking-[0.22em] text-muted-text">Peer Summary</p>
+                        <p className="mt-2 text-secondary-text">{selectedFastReviewPeerSummary}</p>
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        <Badge variant="default">{buildFastReviewSnapshotSummary(selectedFastReviewItem)}</Badge>
+                        {selectedFastReviewItem.businessSummary ? <Badge variant="warning">{selectedFastReviewItem.businessSummary}</Badge> : null}
+                        {selectedFastReviewItem.themeLabel ? <Badge variant="history">{selectedFastReviewItem.themeLabel}</Badge> : null}
+                        {selectedFastReviewItem.earningsAnchor ? <Badge variant="success">{selectedFastReviewItem.earningsAnchor}</Badge> : null}
+                      </div>
+                      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                        <div className="rounded-2xl border border-border/50 bg-card/50 p-3">
+                          <p className="text-[11px] uppercase tracking-[0.22em] text-muted-text">Today</p>
+                          <p className="mt-2 text-lg font-semibold text-foreground">{formatSignedPct(selectedFastReviewItem.todayChangePct)}</p>
+                        </div>
+                        <div className="rounded-2xl border border-border/50 bg-card/50 p-3">
+                          <p className="text-[11px] uppercase tracking-[0.22em] text-muted-text">PE</p>
+                          <p className="mt-2 text-lg font-semibold text-foreground">{formatPeRatio(selectedFastReviewItem.peRatio)}</p>
+                        </div>
+                        <div className="rounded-2xl border border-border/50 bg-card/50 p-3">
+                          <p className="text-[11px] uppercase tracking-[0.22em] text-muted-text">Report</p>
+                          <p className="mt-2 text-secondary-text">{selectedFastReviewItem.reportPeriodLabel || selectedFastReviewItem.reportDate || '--'}</p>
+                        </div>
+                        <div className="rounded-2xl border border-border/50 bg-card/50 p-3">
+                          <p className="text-[11px] uppercase tracking-[0.22em] text-muted-text">Net Profit</p>
+                          <p className="mt-2 text-secondary-text">
+                            {selectedFastReviewItem.netProfitAmount != null
+                              ? formatYiAmount(selectedFastReviewItem.netProfitAmount)
+                              : selectedFastReviewItem.revenueAmount != null
+                                ? `营收 ${formatYiAmount(selectedFastReviewItem.revenueAmount)}`
+                                : '--'}
+                          </p>
+                        </div>
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        <Button
+                          type="button"
+                          variant="secondary"
+                          aria-expanded={showFastReviewAuthorityDetails}
+                          onClick={() => setShowFastReviewAuthorityDetails((value) => !value)}
+                        >
+                          Authority Details
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="secondary"
+                          aria-expanded={showFastReviewPeerDetails}
+                          onClick={() => setShowFastReviewPeerDetails((value) => !value)}
+                        >
+                          Peer Check Details
+                        </Button>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="rounded-2xl border border-border/60 bg-card/40 p-4">
+                    <p className="text-xs font-semibold uppercase tracking-[0.24em] text-muted-text">Logic</p>
+                    <div className="mt-3 overflow-hidden rounded-2xl border border-border/50 bg-card/50">
+                      {[
+                        ['Industry', selectedFastReviewItem.industryLogic || '--'],
+                        ['News', selectedFastReviewItem.newsLogic || '--'],
+                        ['Technical', selectedFastReviewItem.technicalLogic || '--'],
+                      ].map(([label, value], index) => (
+                        <div
+                          key={`fast-review-logic-${selectedFastReviewItem.code}-${label}`}
+                          className={`p-3 ${index > 0 ? 'border-t border-border/40' : ''}`}
+                        >
+                          <p className="text-[11px] uppercase tracking-[0.22em] text-muted-text">{label}</p>
+                          <p className="mt-2 text-secondary-text">{value}</p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  {showFastReviewAuthorityDetails ? (
+                    <div className="rounded-2xl border border-border/60 bg-card/40 p-4">
+                      <p className="text-xs font-semibold uppercase tracking-[0.24em] text-muted-text">Authority</p>
+                      <div className="mt-3 space-y-3">
+                        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+                          {selectedFastReviewAuthorityRows.length > 0 ? (
+                            selectedFastReviewAuthorityRows.map(([label, value]) => (
+                              <div
+                                key={`fast-review-authority-${selectedFastReviewItem.code}-${label}`}
+                                className="rounded-2xl border border-border/50 bg-card/50 p-3"
+                              >
+                                <p className="text-[11px] uppercase tracking-[0.22em] text-muted-text">{label}</p>
+                                <p className="mt-2 text-secondary-text">{value}</p>
+                              </div>
+                            ))
+                          ) : (
+                            <div className="rounded-2xl border border-border/50 bg-card/50 p-3 sm:col-span-2">
+                              <p className="text-[11px] uppercase tracking-[0.22em] text-muted-text">Verified Logic</p>
+                              <p className="mt-2 text-secondary-text">--</p>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  ) : null}
+
+                  {showFastReviewPeerDetails ? (
+                    <div className="rounded-2xl border border-border/60 bg-card/40 p-4">
+                      <p className="text-xs font-semibold uppercase tracking-[0.24em] text-muted-text">Peer Check</p>
+                      <div className="mt-3 overflow-hidden rounded-2xl border border-border/50 bg-card/50">
+                        {selectedFastReviewPeerRows.length > 0 ? (
+                          selectedFastReviewPeerRows.map(([label, value], index) => (
+                            <div
+                              key={`fast-review-peer-${selectedFastReviewItem.code}-${label}`}
+                              className={`p-3 ${index > 0 ? 'border-t border-border/40' : ''}`}
+                            >
+                              <p className="text-[11px] uppercase tracking-[0.22em] text-muted-text">{label}</p>
+                              <p className="mt-2 text-secondary-text">{value}</p>
+                            </div>
+                          ))
+                        ) : (
+                          <div className="p-3">
+                            <p className="text-[11px] uppercase tracking-[0.22em] text-muted-text">Peer Check</p>
+                            <p className="mt-2 text-secondary-text">--</p>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  ) : null}
+
+                  <div className="rounded-2xl border border-border/60 bg-card/40 p-4">
+                    <p className="text-xs font-semibold uppercase tracking-[0.24em] text-muted-text">Context &amp; Risk</p>
+                    <div className="mt-3 space-y-3">
+                      <div className="rounded-2xl border border-border/50 bg-card/50 p-3">
+                        <p className="text-[11px] uppercase tracking-[0.22em] text-muted-text">Business Labels</p>
+                        {selectedFastReviewBusinessLabels.length > 0 ? (
+                          <div className="mt-2 flex flex-wrap gap-2">
+                            {selectedFastReviewBusinessLabels.map((label) => (
+                              <Badge key={`fast-review-business-${selectedFastReviewItem.code}-${label}`} variant="warning">{label}</Badge>
+                            ))}
+                          </div>
+                        ) : (
+                          <p className="mt-2 text-secondary-text">--</p>
+                        )}
+                      </div>
+                      <div className="rounded-2xl border border-border/50 bg-card/50 p-3">
+                        <p className="text-[11px] uppercase tracking-[0.22em] text-muted-text">Focus Reason</p>
+                        <p className="mt-2 text-secondary-text">{selectedFastReviewItem.focusReason || '--'}</p>
+                      </div>
+                      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                        <div className="rounded-2xl border border-border/50 bg-card/50 p-3">
+                          <p className="text-[11px] uppercase tracking-[0.22em] text-muted-text">Chain Role</p>
+                          <p className="mt-2 text-secondary-text">{selectedFastReviewItem.chainRoleLabel || '--'}</p>
+                        </div>
+                        <div className="rounded-2xl border border-border/50 bg-card/50 p-3">
+                          <p className="text-[11px] uppercase tracking-[0.22em] text-muted-text">Theme</p>
+                          <p className="mt-2 text-secondary-text">{selectedFastReviewItem.themeLabel || '--'}</p>
+                        </div>
+                        <div className="rounded-2xl border border-border/50 bg-card/50 p-3">
+                          <p className="text-[11px] uppercase tracking-[0.22em] text-muted-text">Theme Source</p>
+                          <p className="mt-2 text-secondary-text">{selectedFastReviewItem.themeSource || '--'}</p>
+                        </div>
+                        <div className="rounded-2xl border border-border/50 bg-card/50 p-3">
+                          <p className="text-[11px] uppercase tracking-[0.22em] text-muted-text">Earnings Anchor</p>
+                          <p className="mt-2 text-secondary-text">{selectedFastReviewItem.earningsAnchor || '--'}</p>
+                        </div>
+                        <div className="rounded-2xl border border-border/50 bg-card/50 p-3">
+                          <p className="text-[11px] uppercase tracking-[0.22em] text-muted-text">Bias</p>
+                          <p className="mt-2 text-secondary-text">{selectedFastReviewItem.supplyDemandBias || '--'}</p>
+                        </div>
+                        <div className="rounded-2xl border border-border/50 bg-card/50 p-3">
+                          <p className="text-[11px] uppercase tracking-[0.22em] text-muted-text">Tier</p>
+                          <p className="mt-2 text-secondary-text">{selectedFastReviewItem.tier || '--'}</p>
+                        </div>
+                        <div className="rounded-2xl border border-border/50 bg-card/50 p-3">
+                          <p className="text-[11px] uppercase tracking-[0.22em] text-muted-text">Trend</p>
+                          <p className="mt-2 text-secondary-text">{selectedFastReviewItem.trendLabel || '--'}</p>
+                        </div>
+                        <div className="rounded-2xl border border-border/50 bg-card/50 p-3">
+                          <p className="text-[11px] uppercase tracking-[0.22em] text-muted-text">Mode</p>
+                          <p className="mt-2 text-secondary-text">{selectedFastReviewItem.selectionMode || '--'}</p>
+                        </div>
+                      </div>
+                      <div>
+                        <p className="text-[11px] uppercase tracking-[0.22em] text-muted-text">Signal Keys</p>
+                        <p className="mt-2 text-secondary-text">
+                          {selectedFastReviewSignalKeys.length > 0 ? selectedFastReviewSignalKeys.join(' / ') : '--'}
+                        </p>
+                      </div>
+                      <div>
+                        <p className="text-[11px] uppercase tracking-[0.22em] text-muted-text">Risk Flags</p>
+                        <p className="mt-2 text-secondary-text">
+                          {selectedFastReviewRiskFlags.length > 0 ? selectedFastReviewRiskFlags.join(' / ') : '--'}
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <EmptyState
+                  title="选择一条焦点"
+                  description="左侧列表只保留复盘最关键字段，点击后在这里看阅读细节。"
+                />
+              )}
+            </Card>
+          </div>
+        </div>
+      </AppPage>
+    );
+  }
+
   return (
     <AppPage>
       <div className="space-y-6" data-testid="signals-page">
@@ -1409,6 +2116,24 @@ const SignalsPage: React.FC = () => {
           description={signalMeta.description}
           actions={(
             <>
+              <div className="inline-flex items-center gap-1 rounded-2xl border border-border/60 bg-card/45 p-1 shadow-soft-card">
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={() => handleDataModeChange('snapshots')}
+                  aria-label="signals-data-mode-snapshots"
+                >
+                  Signal Snapshots
+                </Button>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => handleDataModeChange('fast_review')}
+                  aria-label="signals-data-mode-fast_review"
+                >
+                  Fast Review Focus
+                </Button>
+              </div>
               <div className="inline-flex items-center gap-1 rounded-2xl border border-border/60 bg-card/45 p-1 shadow-soft-card">
                 <Button
                   size="sm"
@@ -2797,3 +3522,4 @@ const SignalsPage: React.FC = () => {
 };
 
 export default SignalsPage;
+

@@ -115,6 +115,26 @@ class TestKlineSelectorService(unittest.TestCase):
         self.assertEqual(tushare_mock.call_count, 1)
         self.assertEqual(akshare_mock.call_count, 0)
 
+    def test_build_fast_a_share_manager_keeps_tushare_history_fallback_enabled(self):
+        class _FakeAkshareFetcher:
+            def __init__(self, *args, **kwargs) -> None:
+                self.priority = 1
+
+        class _FakeTushareFetcher:
+            priority = -1
+
+            def is_available(self) -> bool:
+                return True
+
+        with patch("data_provider.akshare_fetcher.AkshareFetcher", _FakeAkshareFetcher), patch(
+            "data_provider.tushare_fetcher.TushareFetcher",
+            _FakeTushareFetcher,
+        ):
+            manager = KlineSelectorService.build_fast_a_share_manager()
+
+        self.assertEqual(len(manager._get_fetchers_snapshot()), 2)
+        self.assertFalse(getattr(manager, "_skip_tushare_history_fallback_for_fast_scan", True))
+
     def test_get_a_share_universe_filters_bse_and_duplicates(self):
         service = KlineSelectorService(
             universe_provider=lambda: pd.DataFrame(
@@ -668,6 +688,61 @@ class TestKlineSelectorService(unittest.TestCase):
         self.assertEqual(float(universe.iloc[0]["pct_change"]), 1.2)
         self.assertEqual(float(universe.iloc[1]["turnover_rate"]), 1.3)
 
+    def test_get_spot_enriched_a_share_universe_can_prefer_incomplete_stale_disk_reference_cache_without_listing_metadata(self):
+        service = KlineSelectorService()
+        service._prefer_spot_universe_reference_cache = True
+        service._prefer_stale_spot_universe_reference_cache = True
+        cached_spot_df = pd.DataFrame(
+            {
+                "code": ["000001", "600519"],
+                "name": ["pingan", "maotai"],
+                "latest_price": [12.3, 1800.0],
+                "pct_change": [1.2, 2.5],
+                "turnover_rate": [0.8, 1.3],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cache_csv = Path(tmp_dir) / "spot_cache.csv"
+            cache_meta = Path(tmp_dir) / "spot_cache.json"
+            stale_written_at = datetime(2026, 4, 21, 9, 30, 0)
+            cached_spot_df.to_csv(cache_csv, index=False, encoding="utf-8-sig")
+            cache_meta.write_text(
+                json.dumps({"written_at": stale_written_at.isoformat(), "rows": 2}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            with patch.object(
+                service,
+                "_fetch_universe_from_akshare_spot",
+                side_effect=RuntimeError("live spot should not be fetched when stale disk reference is preferred"),
+            ) as spot_mock, patch.object(
+                service,
+                "_fetch_listing_dates_dataframe",
+                side_effect=AssertionError("listing metadata should not be fetched when stale preferred cache is used as a fast path"),
+            ), patch.object(
+                service,
+                "_get_spot_universe_reference_cache_paths",
+                return_value=(cache_csv, cache_meta),
+                create=True,
+            ), patch.object(
+                service,
+                "_spot_universe_reference_cache_min_rows",
+                1,
+                create=True,
+            ), patch.object(
+                service,
+                "_spot_universe_reference_cache_ttl_seconds",
+                1,
+                create=True,
+            ):
+                universe = service.get_spot_enriched_a_share_universe(as_of_date=date(2026, 4, 22))
+
+        self.assertEqual(spot_mock.call_count, 0)
+        self.assertEqual(universe["code"].tolist(), ["000001", "600519"])
+        self.assertEqual(float(universe.iloc[0]["pct_change"]), 1.2)
+        self.assertEqual(float(universe.iloc[1]["turnover_rate"]), 1.3)
+
     def test_get_spot_enriched_a_share_universe_skips_second_live_retry_when_disk_cache_exists(self):
         service = KlineSelectorService()
         cached_spot_df = pd.DataFrame(
@@ -748,6 +823,63 @@ class TestKlineSelectorService(unittest.TestCase):
                 service,
                 "_fetch_listing_dates_dataframe",
                 side_effect=AssertionError("listing metadata should not be fetched when stale spot snapshot is complete"),
+            ), patch.object(
+                service,
+                "_get_spot_universe_reference_cache_paths",
+                return_value=(cache_csv, cache_meta),
+                create=True,
+            ), patch.object(
+                service,
+                "_spot_universe_reference_cache_min_rows",
+                1,
+                create=True,
+            ), patch.object(
+                service,
+                "_spot_universe_reference_cache_ttl_seconds",
+                1,
+                create=True,
+            ):
+                universe = service.get_spot_enriched_a_share_universe(as_of_date=date(2026, 4, 22))
+
+        self.assertEqual(spot_mock.call_count, 1)
+        self.assertEqual(universe["code"].tolist(), ["000001", "600519"])
+        self.assertEqual(float(universe.iloc[0]["pct_change"]), 1.2)
+        self.assertEqual(float(universe.iloc[1]["turnover_rate"]), 1.3)
+
+    def test_get_spot_enriched_a_share_universe_uses_incomplete_stale_disk_cache_for_failure_fallback_without_listing_metadata(self):
+        service = KlineSelectorService()
+        cached_spot_df = pd.DataFrame(
+            {
+                "code": ["000001", "600519"],
+                "name": ["pingan", "maotai"],
+                "latest_price": [12.3, 1800.0],
+                "pct_change": [1.2, 2.5],
+                "turnover_rate": [0.8, 1.3],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cache_csv = Path(tmp_dir) / "spot_cache.csv"
+            cache_meta = Path(tmp_dir) / "spot_cache.json"
+            stale_written_at = datetime(2026, 4, 21, 9, 30, 0)
+            cached_spot_df.to_csv(cache_csv, index=False, encoding="utf-8-sig")
+            cache_meta.write_text(
+                json.dumps({"written_at": stale_written_at.isoformat(), "rows": 2}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            with patch.object(
+                service,
+                "_fetch_universe_from_akshare_spot",
+                side_effect=RuntimeError("offline"),
+            ) as spot_mock, patch.object(
+                service,
+                "get_a_share_universe",
+                side_effect=AssertionError("generic fallback should not be used when stale disk spot snapshot exists"),
+            ), patch.object(
+                service,
+                "_fetch_listing_dates_dataframe",
+                side_effect=AssertionError("listing metadata should not be fetched for incomplete stale disk fallback"),
             ), patch.object(
                 service,
                 "_get_spot_universe_reference_cache_paths",

@@ -49,7 +49,10 @@ def ensure_symlink() -> None:
     if not CLAUDE.exists():
         fail("CLAUDE.md is missing")
     if not CLAUDE.is_symlink():
-        fail("CLAUDE.md must be a symlink to AGENTS.md")
+        content = CLAUDE.read_text(encoding="utf-8").strip()
+        if content == "AGENTS.md":
+            return
+        fail("CLAUDE.md must be a symlink to AGENTS.md, or a plain-text pointer file containing exactly 'AGENTS.md'")
 
     target = Path(CLAUDE.readlink())
     if target != Path("AGENTS.md"):

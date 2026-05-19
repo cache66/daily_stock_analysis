@@ -7,7 +7,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time as dt_time, timedelta
 import hashlib
 import json
 import logging
@@ -42,6 +42,7 @@ DEFAULT_CROSS_DAY_CACHE_MAX_AGE_DAYS = 7
 DEFAULT_HIGH_DEPTH_ENRICHMENT_MARGIN = 8.0
 DEFAULT_EVENT_CATALOG_CROSS_DAY_REUSE_DAYS = 1
 DEFAULT_EVENT_CATALOG_INCREMENTAL_PERIODS = 2
+DEFAULT_FAST_REVIEW_PRIORITY_ENRICHMENT_TOP_N = 15
 DEFAULT_RECENT_EVENT_SCOPE = "lookback"
 DEFAULT_RECENT_EVENT_MAX_AGE_DAYS: Optional[int] = None
 RECENT_EVENT_SCOPE_CHOICES: Tuple[str, ...] = ("lookback", "latest_report_period")
@@ -133,6 +134,9 @@ DEFAULT_NEGATIVE_TEXT_KEYWORDS: Sequence[str] = (
     "below expectations",
     "warning",
 )
+FAST_REVIEW_SKIPPED_STATUS = "skipped_fast_review"
+FAST_REVIEW_LIGHTWEIGHT_CAPITAL_PROFILE_MODE = "lightweight_fast_review"
+FAST_REVIEW_FULL_PRIORITY_CAPITAL_PROFILE_MODE = "full_priority_refresh"
 
 
 @dataclass
@@ -434,11 +438,15 @@ def parse_snapshot_date(value: Optional[Any]) -> date:
     text = _safe_text(value)
     if not text:
         return get_effective_trading_date("cn")
+    if isinstance(value, datetime):
+        return get_effective_trading_date("cn", current_time=value)
+    if isinstance(value, date):
+        return get_effective_trading_date("cn", current_time=datetime.combine(value, dt_time.max))
     try:
         parsed = date.fromisoformat(text)
     except ValueError as exc:
         raise ValueError(f"invalid snapshot date: {text}") from exc
-    return get_effective_trading_date("cn", current_time=datetime.combine(parsed, datetime.min.time()))
+    return get_effective_trading_date("cn", current_time=datetime.combine(parsed, dt_time.max))
 
 
 def configure_logging(level: str) -> None:
@@ -1339,14 +1347,27 @@ def build_recent_earnings_event_catalog(
     lookback_days: int = DEFAULT_EVENT_LOOKBACK_DAYS,
     cache_dir: Optional[Path] = None,
     force_refresh: bool = False,
+    period_list_override: Optional[Sequence[str]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     lookback_days_value = max(1, int(lookback_days))
     lookback_start = snapshot_date - timedelta(days=lookback_days_value)
-    period_count = resolve_recent_report_period_count(lookback_days_value)
-    period_list = resolve_recent_report_periods(
-        snapshot_date,
-        count=period_count,
+    normalized_period_list_override = list(
+        dict.fromkeys(
+            [
+                _safe_text(item)
+                for item in (period_list_override or [])
+                if len(_safe_text(item)) == 8 and _safe_text(item).isdigit()
+            ]
+        )
     )
+    if normalized_period_list_override:
+        period_list = normalized_period_list_override
+    else:
+        period_count = resolve_recent_report_period_count(lookback_days_value)
+        period_list = resolve_recent_report_periods(
+            snapshot_date,
+            count=period_count,
+        )
     cache_path = _event_catalog_cache_file(lookback_days=lookback_days_value, cache_dir=cache_dir)
     cached_payload = None if force_refresh else _load_event_catalog_from_disk(cache_path)
 
@@ -1554,6 +1575,75 @@ def apply_recent_earnings_event_overlay(
     for source_name in recent_event_payload.get("sources") or []:
         _append_source_chain(merged, str(source_name))
     return merged
+
+
+def _build_recent_event_bootstrap_bundle(
+    *,
+    recent_event_payload: Optional[Dict[str, Any]],
+    snapshot_date: date,
+    scan_depth: str,
+) -> Optional[Dict[str, Any]]:
+    normalized_scan_depth, _ = resolve_scan_depth_enabled_blocks(scan_depth)
+    if normalized_scan_depth not in {"low", "medium"}:
+        return None
+    if not isinstance(recent_event_payload, dict) or not recent_event_payload:
+        return None
+    if _latest_overlay_announcement_date(recent_event_payload) is None:
+        return None
+
+    has_text_signal = any(
+        _safe_text(recent_event_payload.get(field_name))
+        for field_name in ("report_summary", "forecast_summary", "quick_report_summary")
+    )
+    has_numeric_signal = any(
+        _safe_float(recent_event_payload.get(field_name)) is not None
+        for field_name in (
+            "revenue_yoy",
+            "net_profit_yoy",
+            "roe",
+            "revenue",
+            "net_profit_parent",
+        )
+    )
+    if not has_text_signal and not has_numeric_signal:
+        return None
+
+    bootstrap_payload: Dict[str, Any] = {
+        "growth": {},
+        "earnings": {"financial_report": {}},
+        "source_chain": [],
+    }
+    merged_payload = apply_recent_earnings_event_overlay(
+        bootstrap_payload,
+        recent_event_payload,
+        report_announcement_fallback_date=snapshot_date,
+    )
+    earnings_payload = (
+        merged_payload.get("earnings")
+        if isinstance(merged_payload.get("earnings"), dict)
+        else {}
+    )
+    growth_payload = (
+        merged_payload.get("growth")
+        if isinstance(merged_payload.get("growth"), dict)
+        else {}
+    )
+    has_bootstrapped_event = bool(
+        growth_payload
+        or earnings_payload.get("report_summary")
+        or earnings_payload.get("forecast_summary")
+        or earnings_payload.get("quick_report_summary")
+        or earnings_payload.get("report_announcement_date")
+        or earnings_payload.get("forecast_announcement_date")
+        or earnings_payload.get("quick_report_announcement_date")
+        or (
+            isinstance(earnings_payload.get("financial_report"), dict)
+            and bool(earnings_payload.get("financial_report"))
+        )
+    )
+    if not has_bootstrapped_event:
+        return None
+    return merged_payload
 
 
 def _upsert_signal_fundamental_snapshot_with_retry(
@@ -1788,6 +1878,44 @@ def load_or_fetch_signal_fundamental_snapshot(
                 "fundamental_refreshed": False,
             }
 
+    bootstrap_bundle_payload = _build_recent_event_bootstrap_bundle(
+        recent_event_payload=recent_event_payload,
+        snapshot_date=snapshot_date,
+        scan_depth=normalized_scan_depth,
+    )
+    if bootstrap_bundle_payload is not None:
+        quote_payload = {
+            "total_market_cap": total_market_cap,
+            "latest_price": latest_price,
+            "scan_depth": normalized_scan_depth,
+            "enabled_blocks": list(enabled_blocks),
+            "recent_event_payload": dict(recent_event_payload or {}),
+            "recent_event_latest_announcement_date": latest_overlay_date.isoformat() if latest_overlay_date else None,
+            "recent_event_fingerprint": current_recent_event_fingerprint,
+            "bundle_refreshed_at": _isoformat_timestamp(now_ts),
+        }
+        if db is not None:
+            _upsert_signal_fundamental_snapshot_with_retry(
+                db=db,
+                signal_type=cache_signal_type,
+                snapshot_date=snapshot_date,
+                code=stock_code,
+                name=stock_name,
+                bundle_payload=bootstrap_bundle_payload,
+                quote_payload=quote_payload,
+                session=db_session,
+                auto_commit=db_session is None,
+            )
+        return {
+            "stock_name": stock_name,
+            "bundle_payload": bootstrap_bundle_payload,
+            "quote_payload": quote_payload,
+            "from_cache": False,
+            "cache_source": "recent_event_overlay_only",
+            "bundle_refreshed_at": quote_payload.get("bundle_refreshed_at"),
+            "fundamental_refreshed": False,
+        }
+
     bundle_payload = adapter.get_fundamental_bundle(stock_code, enabled_blocks=enabled_blocks)
     bundle_payload = apply_recent_earnings_event_overlay(
         bundle_payload,
@@ -1840,6 +1968,7 @@ def load_or_refresh_signal_capital_profile(
     ttl_seconds: int = DEFAULT_CAPITAL_PROFILE_TTL_SECONDS,
     now: Optional[datetime] = None,
     db_session: Optional[Any] = None,
+    lightweight_only: bool = False,
 ) -> Dict[str, Any]:
     now_ts = now or datetime.now()
     cached_quote_payload = _quote_payload_cache_meta(quote_payload)
@@ -1862,24 +1991,59 @@ def load_or_refresh_signal_capital_profile(
             "capital_profile_cache_hit": True,
             "capital_profile_refreshed_at": refreshed_at_text,
             "quote_capital_refreshed": False,
+            "capital_profile_mode": _safe_text(cached_quote_payload.get("capital_profile_mode")) or None,
         }
 
-    if shared_factors_service is not None:
-        capital_profile = shared_factors_service.build_capital_factors(
-            stock_code,
-            stock_name=stock_name,
-            latest_price=_safe_float(cached_quote_payload.get("latest_price")),
-            total_market_cap=_safe_float(cached_quote_payload.get("total_market_cap")),
-            quote_data=cached_quote_payload,
-        )
+    capital_profile_mode = None
+    if lightweight_only:
+        lightweight_capital_flow_context = {
+            "status": FAST_REVIEW_SKIPPED_STATUS,
+            "cache_hit": False,
+            "cache_source": FAST_REVIEW_LIGHTWEIGHT_CAPITAL_PROFILE_MODE,
+            "data": {"stock_flow": {}},
+        }
+        capital_profile_mode = FAST_REVIEW_LIGHTWEIGHT_CAPITAL_PROFILE_MODE
+        if shared_factors_service is not None:
+            capital_profile = shared_factors_service.build_capital_factors(
+                stock_code,
+                stock_name=stock_name,
+                latest_price=_safe_float(cached_quote_payload.get("latest_price")),
+                total_market_cap=_safe_float(cached_quote_payload.get("total_market_cap")),
+                quote_data=cached_quote_payload,
+                daily_df=pd.DataFrame(),
+                capital_flow_context=lightweight_capital_flow_context,
+                capital_flow_budget_seconds=0.0,
+            )
+        else:
+            capital_profile = capital_profile_service.build_stock_profile(
+                stock_code,
+                stock_name=stock_name,
+                latest_price=_safe_float(cached_quote_payload.get("latest_price")),
+                total_market_cap=_safe_float(cached_quote_payload.get("total_market_cap")),
+                quote_data=cached_quote_payload,
+                daily_df=pd.DataFrame(),
+                capital_flow_context=lightweight_capital_flow_context,
+                capital_flow_budget_seconds=0.0,
+            )
     else:
-        capital_profile = capital_profile_service.build_stock_profile(
-            stock_code,
-            stock_name=stock_name,
-        )
+        capital_profile_mode = "full"
+        if shared_factors_service is not None:
+            capital_profile = shared_factors_service.build_capital_factors(
+                stock_code,
+                stock_name=stock_name,
+                latest_price=_safe_float(cached_quote_payload.get("latest_price")),
+                total_market_cap=_safe_float(cached_quote_payload.get("total_market_cap")),
+                quote_data=cached_quote_payload,
+            )
+        else:
+            capital_profile = capital_profile_service.build_stock_profile(
+                stock_code,
+                stock_name=stock_name,
+            )
     refreshed_at_text = _isoformat_timestamp(now_ts)
     cached_quote_payload["capital_profile"] = capital_profile
     cached_quote_payload["capital_profile_refreshed_at"] = refreshed_at_text
+    cached_quote_payload["capital_profile_mode"] = capital_profile_mode
     if db is not None:
         _upsert_signal_fundamental_snapshot_with_retry(
             db=db,
@@ -1897,6 +2061,7 @@ def load_or_refresh_signal_capital_profile(
         "capital_profile_cache_hit": False,
         "capital_profile_refreshed_at": refreshed_at_text,
         "quote_capital_refreshed": True,
+        "capital_profile_mode": capital_profile_mode,
     }
 
 
@@ -3192,17 +3357,80 @@ def build_selected_dataframe(selected: List[EarningsSurpriseEvaluation]) -> pd.D
     ).reset_index(drop=True)
 
 
+def _desc_sort_float(value: Any) -> float:
+    numeric = _safe_float(value)
+    return -numeric if numeric is not None else float("inf")
+
+
+def _asc_sort_float(value: Any) -> float:
+    numeric = _safe_float(value)
+    return numeric if numeric is not None else float("inf")
+
+
+def _priority_evaluation_sort_key(evaluation: EarningsSurpriseEvaluation) -> Tuple[Any, ...]:
+    metrics = evaluation.metrics or {}
+    total_market_cap_yi = (
+        round(float(evaluation.total_market_cap) / 1e8, 2)
+        if evaluation.total_market_cap is not None
+        else None
+    )
+    return (
+        _desc_sort_float(metrics.get("earnings_strategy_score")),
+        _desc_sort_float(metrics.get("earnings_financial_series_continuity_score")),
+        _desc_sort_float(metrics.get("earnings_surprise_history_score")),
+        _desc_sort_float(metrics.get("earnings_post_event_3d_return_pct")),
+        _desc_sort_float(metrics.get("signal_score")),
+        _desc_sort_float(metrics.get("earnings_quality_score")),
+        _desc_sort_float(metrics.get("net_profit_yoy")),
+        _desc_sort_float(metrics.get("revenue_yoy")),
+        _asc_sort_float(total_market_cap_yi),
+        _safe_text(evaluation.stock_code),
+    )
+
+
+def _select_priority_evaluations(
+    selected: List[EarningsSurpriseEvaluation],
+    *,
+    limit: Optional[int],
+) -> List[EarningsSurpriseEvaluation]:
+    capped_limit = max(0, int(limit or 0))
+    if capped_limit <= 0 or not selected:
+        return []
+    return sorted(selected, key=_priority_evaluation_sort_key)[:capped_limit]
+
+
 def enrich_selected_market_expectation_reference(
     selected: List[EarningsSurpriseEvaluation],
     *,
     snapshot_date: date,
     adapter: Optional[AkshareFundamentalAdapter] = None,
+    limit: Optional[int] = None,
 ) -> None:
     if not selected:
         return
     expectation_adapter = adapter or AkshareFundamentalAdapter()
+    priority_codes = (
+        {item.stock_code for item in _select_priority_evaluations(selected, limit=limit)}
+        if limit is not None
+        else {item.stock_code for item in selected}
+    )
     for evaluation in selected:
         metrics = evaluation.metrics if isinstance(evaluation.metrics, dict) else {}
+        if evaluation.stock_code not in priority_codes:
+            metrics["market_expectation_status"] = FAST_REVIEW_SKIPPED_STATUS
+            metrics["market_expectation_source"] = None
+            metrics["market_expectation_year"] = None
+            metrics["market_expectation_institution_count"] = None
+            metrics["market_expectation_eps_min"] = None
+            metrics["market_expectation_eps_mean"] = None
+            metrics["market_expectation_eps_max"] = None
+            metrics["market_expectation_industry_avg_eps"] = None
+            metrics["market_expectation_summary"] = None
+            metrics["market_expectation_reference_label"] = FAST_REVIEW_SKIPPED_STATUS
+            metrics["market_expectation_reference_basis"] = None
+            metrics["market_expectation_reference_delta_pct"] = None
+            evaluation.metrics = metrics
+            continue
         report_date = _safe_text(metrics.get("report_date"))
         prefer_year = _parse_iso_date(report_date).year if report_date and _parse_iso_date(report_date) else snapshot_date.year
         try:
@@ -3695,6 +3923,7 @@ def scan_market(
     universe_provider: Optional[Any] = None,
     bundle_loader: Optional[Any] = None,
     on_evaluation: Optional[Callable[[EarningsSurpriseEvaluation, int, int], None]] = None,
+    priority_enrichment_top_n: Optional[int] = None,
 ) -> EarningsSurpriseRunResult:
     started_at = datetime.now()
     normalized_scan_depth, required_blocks = resolve_scan_depth_enabled_blocks(scan_depth)
@@ -3718,6 +3947,13 @@ def scan_market(
     if checkpoint_every <= 0:
         raise ValueError("checkpoint_every must be > 0")
 
+    fast_review_lightweight_enrichment = db is None and normalized_scan_depth in {"low", "medium"}
+    effective_priority_enrichment_top_n = (
+        DEFAULT_FAST_REVIEW_PRIORITY_ENRICHMENT_TOP_N
+        if priority_enrichment_top_n is None and fast_review_lightweight_enrichment
+        else max(0, int(priority_enrichment_top_n or 0))
+    )
+
     adapter = AkshareFundamentalAdapter()
     cache_signal_type = SIGNAL_TYPE
     normalized_recent_event_scope = _safe_text(recent_event_scope).lower() or DEFAULT_RECENT_EVENT_SCOPE
@@ -3726,9 +3962,14 @@ def scan_market(
             f"recent_event_scope must be one of {','.join(RECENT_EVENT_SCOPE_CHOICES)}"
         )
 
+    period_list_override = None
+    if normalized_recent_event_scope == "latest_report_period":
+        period_list_override = [resolve_current_report_period(snapshot_date)]
+
     recent_event_catalog = build_recent_earnings_event_catalog(
         snapshot_date,
         lookback_days=event_lookback_days,
+        period_list_override=period_list_override,
     )
     recent_event_catalog = filter_recent_event_catalog_by_scope(
         recent_event_catalog,
@@ -3902,6 +4143,7 @@ def scan_market(
         bundle_refreshed_at = None
         capital_profile_refreshed_at = None
         capital_profile_cache_hit = False
+        capital_profile_mode = None
         fundamental_refreshed = False
         quote_capital_refreshed = False
         high_depth_enriched = False
@@ -4032,10 +4274,12 @@ def scan_market(
                 shared_factors_service=shared_factors_service,
                 ttl_seconds=capital_profile_ttl_seconds,
                 db_session=db_session,
+                lightweight_only=fast_review_lightweight_enrichment,
             )
             phase_timing_sec["capital_profile"] += time.perf_counter() - capital_started_at
             capital_profile_cache_hit = bool(capital_cache_payload.get("capital_profile_cache_hit"))
             capital_profile_refreshed_at = capital_cache_payload.get("capital_profile_refreshed_at")
+            capital_profile_mode = capital_cache_payload.get("capital_profile_mode")
             quote_capital_refreshed = bool(capital_cache_payload.get("quote_capital_refreshed"))
             evaluation.metrics.update(dict(capital_cache_payload.get("capital_profile") or {}))
         evaluation.metrics.update(
@@ -4044,6 +4288,7 @@ def scan_market(
                 "bundle_refreshed_at": bundle_refreshed_at,
                 "capital_profile_refreshed_at": capital_profile_refreshed_at,
                 "capital_profile_cache_hit": capital_profile_cache_hit,
+                "capital_profile_mode": capital_profile_mode,
                 "fundamental_refreshed": fundamental_refreshed,
                 "quote_capital_refreshed": quote_capital_refreshed,
                 "high_depth_enriched": high_depth_enriched,
@@ -4167,6 +4412,29 @@ def scan_market(
                 evaluation = future.result()
                 handle_evaluation(evaluation, completed)
 
+    if fast_review_lightweight_enrichment and effective_priority_enrichment_top_n > 0 and selected:
+        priority_candidates = _select_priority_evaluations(
+            selected,
+            limit=effective_priority_enrichment_top_n,
+        )
+        if priority_candidates:
+            refresh_started_at = time.perf_counter()
+            for evaluation in priority_candidates:
+                full_profile = shared_factors_service.build_capital_factors(
+                    evaluation.stock_code,
+                    stock_name=evaluation.stock_name,
+                    latest_price=_safe_float((evaluation.metrics or {}).get("close")),
+                    total_market_cap=evaluation.total_market_cap,
+                )
+                evaluation.metrics.update(full_profile)
+                evaluation.metrics["capital_profile_mode"] = FAST_REVIEW_FULL_PRIORITY_CAPITAL_PROFILE_MODE
+            phase_timing_totals["capital_profile"] += time.perf_counter() - refresh_started_at
+            logger.info(
+                "fast-review lightweight earnings enrichment upgraded priority capital profiles: count=%s top_n=%s",
+                len(priority_candidates),
+                effective_priority_enrichment_top_n,
+            )
+
     return EarningsSurpriseRunResult(
         criteria=criteria,
         universe_size=len(universe),
@@ -4234,9 +4502,15 @@ def main() -> int:
         checkpoint_every=args.checkpoint_every,
         resume=args.resume,
     )
+    market_expectation_limit = (
+        DEFAULT_FAST_REVIEW_PRIORITY_ENRICHMENT_TOP_N
+        if db is None and normalize_scan_depth(args.scan_depth) in {"low", "medium"}
+        else None
+    )
     enrich_selected_market_expectation_reference(
         run_result.selected,
         snapshot_date=snapshot_date,
+        limit=market_expectation_limit,
     )
 
     if db is not None:

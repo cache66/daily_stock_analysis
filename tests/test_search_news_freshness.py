@@ -496,6 +496,37 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
 
         self.assertIn("announcements", intel)
 
+    def test_search_comprehensive_intel_short_circuits_when_public_searxng_unavailable(self) -> None:
+        unavailable = SearchResponse(
+            query="test",
+            results=[],
+            provider="SearXNG",
+            success=False,
+            error_message="未获取到可用的公共 SearXNG 实例",
+        )
+        provider = SimpleNamespace(
+            name="SearXNG",
+            is_available=True,
+            search=MagicMock(return_value=unavailable),
+        )
+        service = SearchService(
+            searxng_public_instances_enabled=False,
+            news_max_age_days=3,
+            news_strategy_profile="short",
+        )
+        service._providers = [provider]
+
+        with patch("src.search_service.time.sleep") as sleep_mock:
+            intel = service.search_comprehensive_intel(
+                stock_code="600519",
+                stock_name="贵州茅台",
+                max_searches=4,
+            )
+
+        self.assertIn("latest_news", intel)
+        self.assertEqual(provider.search.call_count, 1)
+        sleep_mock.assert_not_called()
+
     def test_effective_window_helper_has_no_side_effect(self) -> None:
         """_effective_news_window_days should not mutate stored news_window_days."""
         service, _ = self._create_service_with_mock_provider(

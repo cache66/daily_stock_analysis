@@ -1,5 +1,2694 @@
 # AI Modification Log
 
+## 2026-05-19 (fast review authority structured settle before broad search)
+
+- Scope: `src/services/signal_cause_analysis_service.py`, `tests/test_signal_cause_analysis_service.py`, and `docs/CHANGELOG.md`.
+- Why:
+  - After the shared cause-service reuse change, the next explanation-stage hotspot was the authority fallback path itself.
+  - Root cause:
+    - `_collect_authority_intel(...)` fetched structured `announcements / earnings / market_analysis`
+    - but as long as the three dimensions were not all present, it still escalated into `search_comprehensive_intel(...)`
+    - this meant many fast-review rows with already sufficient structured earnings or announcement evidence still paid for a broad multi-dimension search
+- Changes:
+  - Updated [`src/services/signal_cause_analysis_service.py`](d:\bb\daily_stock_analysis\src\services\signal_cause_analysis_service.py)
+    - `_collect_structured_evidence(...)` now passes `fundamental_context` and `metrics_payload` into `_collect_authority_intel(...)`
+    - `_collect_authority_intel(...)` now short-circuits before broad search when structured evidence is already enough to settle authority at:
+      - strong announcement
+      - authoritative current-season earnings confirmation
+      - sufficiently strong structured research summary
+    - the broad fallback remains in place for rows that still need missing authority evidence
+  - Updated [`tests/test_signal_cause_analysis_service.py`](d:\bb\daily_stock_analysis\tests\test_signal_cause_analysis_service.py)
+    - added `test_collect_authority_intel_skips_fallback_search_when_structured_earnings_already_confirm`
+    - added `test_collect_authority_intel_skips_fallback_search_when_strong_announcement_already_exists`
+- Verification:
+  - `.\.venv\Scripts\python.exe -m py_compile src/services/signal_cause_analysis_service.py tests/test_signal_cause_analysis_service.py`
+  - `.\.venv\Scripts\python.exe -m pytest tests/test_signal_cause_analysis_service.py tests/test_fast_review_daily_bundle.py -q`
+  - real replay:
+    - `.\.venv\Scripts\python.exe scripts\run_fast_review_bundle.py --strategy-profile-file config\local_strategy_profile.json --snapshot-date 2026-05-19 --output-dir data/manual_runs/fast_review_20260519_today_review_after_authority_settle_20260519 --log-level INFO`
+    - wall-clock: `387.5s`
+    - summary signal elapsed: `285.5s`
+    - comparison vs prior shared-cause-service replay:
+      - `315.7s -> 285.5s` signal elapsed
+      - `trend_leader 154.20s -> 129.86s`
+      - `daily_slow_rise 84.69s -> 78.51s`
+      - `hundred_day_high 76.79s -> 77.17s` (roughly flat)
+
+## 2026-05-19 (fast review shared cause-service cache reuse)
+
+- Scope: `scripts/run_fast_review_bundle.py`, `tests/test_fast_review_daily_bundle.py`, and `docs/CHANGELOG.md`.
+- Why:
+  - After the earlier quote-tail cleanup, the next likely explanation-stage bottleneck was not quote retry any more but repeated authority cache warmup.
+  - Root cause found in bundle assembly:
+    - `_build_strategy_focus_rows(...)` called `_resolve_focus_rise_reason_fields(...)`
+    - that helper instantiated a brand-new `SignalCauseAnalysisService(enable_news_search=False)` per row
+    - this discarded in-instance caches such as:
+      - structured announcement day cache
+      - structured research cache
+      - earnings catalog cache
+  - For same-day fast review, this meant multiple rows in one bundle were paying repeated authority bootstrapping cost instead of sharing it.
+- Changes:
+  - Updated [`scripts/run_fast_review_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_fast_review_bundle.py)
+    - `_build_strategy_focus_rows(...)` now creates one shared `SignalCauseAnalysisService(enable_news_search=False)` for the whole focus-row build
+    - `_resolve_focus_rise_reason_fields(...)` now accepts an optional injected `cause_service`
+    - per-row fallback behavior is preserved: if no service is injected, the helper still instantiates one for isolated use
+  - Updated [`tests/test_fast_review_daily_bundle.py`](d:\bb\daily_stock_analysis\tests\test_fast_review_daily_bundle.py)
+    - added `test_build_strategy_focus_rows_reuses_one_cause_service_instance_per_bundle`
+    - kept existing alias refresh / missing-reason / fail-open regressions green to confirm behavior did not change
+- Verification:
+  - `.\.venv\Scripts\python.exe -m pytest tests/test_fast_review_daily_bundle.py -k "reuses_one_cause_service_instance_per_bundle or refreshes_existing_reason_fields_for_alias_names or enriches_missing_reason_fields or fails_open_when_reason_enrichment_errors" -q`
+  - `.\.venv\Scripts\python.exe -m py_compile scripts/run_fast_review_bundle.py tests/test_fast_review_daily_bundle.py`
+  - `.\.venv\Scripts\python.exe -m pytest tests/test_fast_review_daily_bundle.py -q`
+
+## 2026-05-19 (fast review focus quote-tail dedupe)
+
+- Scope: `src/services/fast_review_focus_service.py`, `tests/test_fast_review_focus_api.py`, and `docs/CHANGELOG.md`.
+- Why:
+  - The latest `2026-05-19` real fast-review run still had a visible tail in `FastReviewFocusService` quote enrichment.
+  - Root cause split into two redundant retry patterns:
+    - when `Akshare EM` cold-start warmup immediately returned empty, `_load_batch_quote_payloads(...)` still kept walking every remaining A-share code through the same empty cache path
+    - when Tencent batch prefetch had already tried a code and still missed, `_resolve_quote_payload(...)` retried the same lightweight Tencent call again per row before falling through
+- Changes:
+  - Updated [`src/services/fast_review_focus_service.py`](d:\bb\daily_stock_analysis\src\services\fast_review_focus_service.py)
+    - `_load_batch_quote_payloads(...)` now stops repeated `EM` reads after a cold-start warmup miss, and jumps directly to Tencent batch prefetch for the unresolved remainder
+    - batch quote loading now tracks which codes already went through Tencent prefetch
+    - `_resolve_quote_payload(...)` now skips the redundant per-row lightweight Tencent retry for codes that already missed in the batch stage
+    - `_is_em_quote_cache_warm()` now treats empty cached payloads as not truly warm/usable for quote reuse
+  - Updated [`tests/test_fast_review_focus_api.py`](d:\bb\daily_stock_analysis\tests\test_fast_review_focus_api.py)
+    - added `test_focus_service_skips_repeated_em_reads_after_cold_warmup_miss`
+    - added `test_focus_service_does_not_repeat_lightweight_tencent_after_batch_miss`
+- Verification:
+  - `.\.venv\Scripts\python.exe -m pytest tests/test_fast_review_focus_api.py -k "skips_repeated_em_reads_after_cold_warmup_miss or does_not_repeat_lightweight_tencent_after_batch_miss" -q`
+
+## 2026-05-19 (fast review default slow-rise + fallback/perf tightening)
+
+- Scope: `scripts/run_fast_review_bundle.py`, `config/local_strategy_profile.json`, `src/services/kline_selector_service.py`, `src/search_service.py`, `tests/test_fast_review_daily_bundle.py`, `tests/test_kline_selector_service.py`, `tests/test_search_news_freshness.py`, `docs/LOCAL_STRATEGY_CATALOG.md`, and `docs/CHANGELOG.md`.
+- Why:
+  - The latest real run showed two separate gaps at the same time:
+    - default fast review still did not include `daily_slow_rise`, so the new `30-45 degree` daily continuation line was invisible unless manually enabled
+    - coverage/performance degraded because fast K-line scans were skipping intended `Tushare` fallback after `Akshare` history failures, while `search_comprehensive_intel(...)` kept repeating doomed `SearXNG` public-instance attempts across multiple dimensions
+- Changes:
+  - Updated [`scripts/run_fast_review_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_fast_review_bundle.py)
+    - added `daily_slow_rise` to `DEFAULT_INCLUDE_SIGNALS`
+    - changed fast-review default `daily_profile` from `balanced` to `accelerating`
+  - Updated [`config/local_strategy_profile.json`](d:\bb\daily_stock_analysis\config\local_strategy_profile.json)
+    - added `daily_slow_rise` to repo default `include_signals`
+    - pinned repo default `daily_profile` to `accelerating`
+  - Updated [`src/services/kline_selector_service.py`](d:\bb\daily_stock_analysis\src\services\kline_selector_service.py)
+    - re-enabled manager-level `Tushare` history fallback for fast A-share scans
+  - Updated [`src/search_service.py`](d:\bb\daily_stock_analysis\src\search_service.py)
+    - added a fatal-unavailability short-circuit for `SearXNG` inside `search_comprehensive_intel(...)`
+    - when public-instance bootstrap is clearly unavailable, the same stock-level intel call no longer retries the same dead provider across every remaining dimension
+  - Updated tests:
+    - [`tests/test_fast_review_daily_bundle.py`](d:\bb\daily_stock_analysis\tests\test_fast_review_daily_bundle.py)
+    - [`tests/test_kline_selector_service.py`](d:\bb\daily_stock_analysis\tests\test_kline_selector_service.py)
+    - [`tests/test_search_news_freshness.py`](d:\bb\daily_stock_analysis\tests\test_search_news_freshness.py)
+- Verification:
+  - `.\.venv\Scripts\python.exe -m pytest tests/test_fast_review_daily_bundle.py -k "parse_args_uses_fast_review_defaults_when_profile_missing or parse_args_uses_repo_strategy_profile_tighter_trend_prefilter_defaults" -q`
+  - `.\.venv\Scripts\python.exe -m pytest tests/test_kline_selector_service.py -k build_fast_a_share_manager_keeps_tushare_history_fallback_enabled -q`
+  - `.\.venv\Scripts\python.exe -m pytest tests/test_search_news_freshness.py -k search_comprehensive_intel_short_circuits_when_public_searxng_unavailable -q`
+
+## 2026-05-19 (daily slow-rise accelerating profile)
+
+- Scope: `scripts/select_daily_slow_rise_candidates.py`, `tests/test_daily_slow_rise_candidates.py`, `docs/LOCAL_STRATEGY_CATALOG.md`, and `docs/CHANGELOG.md`.
+- Why:
+  - After the fetch-buffer fix, the next real gap was no longer history availability; it was profile semantics.
+  - The user then supplied a new calibration direction group:
+    - `603115`
+    - `000811`
+    - `000026`
+    - `603311`
+    - `603283`
+  - Under the existing `balanced` profile, these names mostly failed on `single-day gain too large`, which showed that the default profile still rejected “healthy slow-rise with one acceleration step” structures too aggressively.
+- Changes:
+  - Updated [`scripts/select_daily_slow_rise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_daily_slow_rise_candidates.py)
+    - added a new optional profile: `accelerating`
+    - intent: capture names that still read like `30-45°` daily continuation, but may include:
+      - one `10cm`-style step-up day
+      - a broader, less perfectly flat pre-acceleration base
+    - current `accelerating` criteria:
+      - `max_single_day_gain_pct=10.3`
+      - `max_advance_return_pct=130.0`
+      - `max_base_range_pct=40.0`
+      - `max_base_return_abs_pct=12.0`
+      - `min_steady_positive_ratio=0.55`
+    - kept `balanced` unchanged so the repo still has a stricter default slow-rise reading line
+  - Updated [`tests/test_daily_slow_rise_candidates.py`](d:\bb\daily_stock_analysis\tests\test_daily_slow_rise_candidates.py)
+    - added profile-resolution regression coverage for `accelerating`
+    - added a synthetic sample that:
+      - fails under `balanced` because of `single-day gain too large`
+      - passes under `accelerating`
+- Verification:
+  - `.\.venv\Scripts\python.exe -m pytest tests/test_daily_slow_rise_candidates.py tests/test_daily_slow_rise_fast_review_integration.py -q`
+  - `.\.venv\Scripts\python.exe -m py_compile scripts/select_daily_slow_rise_candidates.py tests/test_daily_slow_rise_candidates.py`
+  - Real sample replay with `accelerating`:
+    - `000811` -> pass
+    - `000026` -> pass
+    - `603283` -> pass
+    - `603311` -> fail (`insufficient history: need about 62 trading days, got 57`)
+    - `603115` -> fail (`base structure not clean enough`)
+- Notes:
+  - `603115` still looks too extended for the current “slow-rise” family rather than just “single acceleration allowed”:
+    - `full_window_return_pct ≈ 296%`
+    - `base_range_pct ≈ 98%`
+    - `base_return_pct ≈ 84%`
+  - `603311` is still a data-window issue first, not a threshold issue.
+  - This means `accelerating` has already become useful for the user’s new direction set, but there is still room for a later third profile if the repo wants to explicitly model “super-extended but still smooth” names.
+
+## 2026-05-19 (daily slow-rise fetch-buffer fix)
+
+- Scope: `scripts/select_daily_slow_rise_candidates.py`, `tests/test_daily_slow_rise_candidates.py`, `docs/LOCAL_STRATEGY_CATALOG.md`, and `docs/CHANGELOG.md`.
+- Why:
+  - The first real `daily_slow_rise` probe was not failing on chart quality first; it was collapsing on history-window edge cases.
+  - The concrete evidence was:
+    - `32/32` failed in the first `limit=200` probe
+    - `30` were `insufficient daily history`
+    - a direct re-check showed history length distribution `{49: 1, 58: 1, 59: 30}`
+  - That meant the strategy was requesting an exact 60-bar window, while the fast manager often returned one bar short in real cached/full-market conditions.
+- Changes:
+  - Updated [`scripts/select_daily_slow_rise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_daily_slow_rise_candidates.py)
+    - changed `DailySlowRiseCriteria.history_days_required` from the exact 60-bar rule window to a buffered fetch window of `62`
+    - kept the actual pattern semantics unchanged: the rule still judges the latest 30-bar base + 30-bar advance shape
+  - Updated [`tests/test_daily_slow_rise_candidates.py`](d:\bb\daily_stock_analysis\tests\test_daily_slow_rise_candidates.py)
+    - added a regression test that locks the buffered default at `62`
+    - extended the synthetic chart fixtures with two extra prefix bars so the strategy tests still exercise real shape rules instead of failing early on history length
+- Verification:
+  - `.\.venv\Scripts\python.exe -m pytest tests/test_daily_slow_rise_candidates.py -q`
+  - `.\.venv\Scripts\python.exe -m py_compile scripts/select_daily_slow_rise_candidates.py tests/test_daily_slow_rise_candidates.py`
+  - `.\.venv\Scripts\python.exe -m pytest tests/test_daily_slow_rise_fast_review_integration.py tests/test_fast_review_daily_bundle.py -k daily_slow_rise -q`
+  - `.\.venv\Scripts\python.exe scripts/select_daily_slow_rise_candidates.py --snapshot-date 2026-05-19 --skip-db-persist --limit 200 --max-workers 2 --output-dir data/manual_runs/daily_slow_rise_20260519_probe_buffer_fix_200 --checkpoint-path data/manual_runs/daily_slow_rise_20260519_probe_buffer_fix_200/daily_slow_rise_checkpoint.json --log-level INFO`
+- Result:
+  - The same real probe no longer died on history length.
+  - Failure distribution changed from mostly `insufficient daily history` to real chart-quality reasons:
+    - `single-day gain too large`: `14`
+    - `average daily amount too low`: `11`
+    - `drawdown too deep`: `6`
+    - `insufficient history: need about 62 trading days, got 52`: `1`
+  - A direct re-check after the fix showed history length distribution `{52: 1, 61: 1, 62: 30}`.
+- Notes:
+  - This round fixed a fetch-window bug, not the final shape thresholds.
+  - The next threshold-tuning round should focus on whether `single-day gain too large` and `average daily amount too low` are too strict for the user’s target “healthy 30-45 degree rise” names.
+
+## 2026-05-19 (new optional daily slow-rise strategy)
+
+- Scope: `scripts/select_daily_slow_rise_candidates.py`, `scripts/run_fast_review_bundle.py`, `src/services/signal_snapshot_service.py`, `tests/test_daily_slow_rise_candidates.py`, `tests/test_daily_slow_rise_fast_review_integration.py`, `docs/LOCAL_STRATEGY_CATALOG.md`, and `docs/CHANGELOG.md`.
+- Why:
+  - The user wanted a dedicated replayable strategy for “日线小 30-45 度上涨” names, instead of only reading them through `hundred_day_high`.
+  - The target shape was explicitly “前面横着、后面健康 45 度上行” or “整体慢涨、回调很小、很快修复”的日线节奏票。
+- Changes:
+  - Added [`scripts/select_daily_slow_rise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_daily_slow_rise_candidates.py)
+    - introduced standalone signal type `daily_slow_rise`
+    - detects two readable chart buckets:
+      - `base_to_trend`
+      - `steady_rise`
+    - explicitly rejects:
+      - `single-day gain too large`
+      - `drawdown too deep`
+    - exports `daily_slow_rise_candidates.csv/.md/.txt` and optional snapshot persistence
+  - Updated [`scripts/run_fast_review_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_fast_review_bundle.py)
+    - added optional `--include-signals daily_slow_rise`
+    - added `build_daily_slow_rise_command(...)`
+    - added `日线慢涨候选` summary section so the new signal is readable directly from `fast_review_summary.md`
+    - kept repo default daily include-signals unchanged for now
+  - Updated [`src/services/signal_snapshot_service.py`](d:\bb\daily_stock_analysis\src\services\signal_snapshot_service.py)
+    - registered `daily_slow_rise` as a known strategy signal with display label `日线慢涨`
+- Verification:
+  - `.\.venv\Scripts\python.exe -m py_compile scripts/select_daily_slow_rise_candidates.py scripts/run_fast_review_bundle.py src/services/signal_snapshot_service.py tests/test_daily_slow_rise_candidates.py tests/test_daily_slow_rise_fast_review_integration.py`
+  - `.\.venv\Scripts\python.exe -m pytest tests/test_daily_slow_rise_candidates.py tests/test_daily_slow_rise_fast_review_integration.py`
+  - `.\.venv\Scripts\python.exe -m pytest tests/test_fast_review_daily_bundle.py tests/test_signal_snapshot_service.py tests/test_daily_slow_rise_candidates.py tests/test_daily_slow_rise_fast_review_integration.py`
+- Notes:
+  - This round adds a new independent replay path; it does not loosen `hundred_day_high` or change the default fast-review signal set.
+  - The new strategy is meant to complement `hundred_day_high`: names that are “创高但图形一般” can still stay in the existing line, while prettier slow-rise structures can now be reviewed independently.
+
+## 2026-05-19 (fast review trend-only continuation spotlight)
+
+- Scope: `scripts/run_fast_review_bundle.py`, `tests/test_fast_review_daily_bundle.py`, `docs/LOCAL_STRATEGY_CATALOG.md`, and `docs/CHANGELOG.md`.
+- Why:
+  - The user reported cases like `002281 光迅科技` that were already scanned into `strategy_focus`, but still felt like “not scanned” because they were neither in `hundred_day_high` nor explicitly surfaced on the first summary screen.
+  - The real gap was no longer raw selection coverage; it was a reading-layer visibility gap for `trend_leader only` continuation names.
+- Changes:
+  - Updated [`scripts/run_fast_review_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_fast_review_bundle.py)
+    - added `review_display_group / review_display_group_label` to `fast_review_strategy_focus.csv`
+    - normalized reading groups into:
+      - `intersection` -> `交叉强样本`
+      - `hundred_strong_chart` -> `纯百日新高`
+      - `trend_continuation` -> `纯趋势延续`
+    - added a new summary section `纯趋势延续 Top N` after the hundred-day spotlight so `trend_leader_unified only` continuation names are explicitly visible
+    - kept `hundred_day_high` and `trend_leader` selection thresholds unchanged; this round is reading-layer only
+  - Updated [`tests/test_fast_review_daily_bundle.py`](d:\bb\daily_stock_analysis\tests\test_fast_review_daily_bundle.py)
+    - added regression coverage that `intersection / hundred_only / trend_only` rows receive the expected display groups
+    - added summary coverage that `trend_only` names render under the new `纯趋势延续 Top N` section
+- Verification:
+  - `python -m py_compile scripts/run_fast_review_bundle.py tests/test_fast_review_daily_bundle.py`
+  - `.\.venv\Scripts\python.exe -m pytest tests/test_fast_review_daily_bundle.py -k "review_display_groups or trend_continuation_section or hundred_day_spotlight_uses_combined_limit_across_two_sections or marks_trend_hundred_intersection_and_difference" -q`
+  - `.\.venv\Scripts\python.exe -m pytest tests/test_fast_review_daily_bundle.py -k "build_summary_markdown_places_hundred_day_spotlight_before_strategy_focus_section or build_strategy_focus_rows_prioritizes_strong_hundred_day_chart_patterns_when_earnings_signal_empty" -q`
+  - `.\.venv\Scripts\python.exe -m pytest tests/test_fast_review_daily_bundle.py -k "strategy_focus_fields or load_signal_rows_keeps_strategy_focus_fields or main_writes_strategy_focus_outputs" -q`
+- Notes:
+  - This change does not alter candidate inclusion; it only makes `trend_only` continuation names readable without having to inspect the full CSV manually.
+  - `603938 三孚股份` still reads through the `纯百日新高` path when it is a `hundred_only` sample; it is not forcibly remapped into the new pure-trend group.
+
+## 2026-05-19 (fast review 业绩空窗期模式 + hundred-day chart-first surfacing)
+
+- Scope: `scripts/run_fast_review_bundle.py`, `tests/test_fast_review_daily_bundle.py`, and local-strategy docs.
+- Why:
+  - The user observed that daily fast review still felt biased toward earlier earnings-period exemplars.
+  - The raw pool on `2026-05-19` already contained many `hundred_day_high` names, but `strategy_focus` front rows were still dominated by `trend_leader` rows carrying residual quarterly earnings context.
+  - On earnings-empty days, that made the first screen feel like “still selecting by earnings logic”, while healthy `45°` / `base breakout` / `healthy trend` names were pushed into the separate hundred-day section only.
+- Changes:
+  - Updated [`scripts/run_fast_review_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_fast_review_bundle.py)
+    - added an earnings-empty day mode for `strategy_focus`: when same-day `earnings` candidates are empty, residual `earnings_strategy_score` on `trend_leader` rows no longer dominates `driver_type`, `review_stage`, or `priority_score`
+    - tightened no-earnings-day interpretation so those rows now fall back to `theme_sentiment_driven + pure_rotation` instead of continuing to read as `turning_point_watch`
+    - added explicit run-context markers to review artifacts:
+      - summary markdown now prints `当前模式：业绩窗口 / 业绩空窗期`
+      - `fast_review_strategy_focus.csv` now persists `review_context_label / review_context_reason`
+    - wired `hundred_day_high` chart fields into bundle loading and focus ranking:
+      - `breakout_quality_score`
+      - `chart_pattern_label / chart_pattern_score / chart_pattern_summary`
+      - `base_breakout_score / healthy_trend_score`
+    - added a blank-window front-row rebalance:
+      - intersections first
+      - then top `hundred_only` chart-driven names (`base_breakout / healthy_trend`)
+      - then remaining `trend_only` continuation names
+  - Updated [`tests/test_fast_review_daily_bundle.py`](d:\bb\daily_stock_analysis\tests\test_fast_review_daily_bundle.py)
+    - added regression coverage for:
+      - residual trend earnings not being misread as `turning_point_watch` on earnings-empty days
+      - strong `hundred_only` chart-pattern names surfacing into front focus rows
+      - hundred-day chart fields surviving CSV -> bundle load
+- Verification:
+  - `.\.venv\Scripts\python.exe -m pytest tests/test_fast_review_daily_bundle.py -q`
+    - 76 passed
+  - Real replay:
+    - `.\.venv\Scripts\python.exe scripts/run_fast_review_bundle.py --snapshot-date 2026-05-19 --output-dir data/manual_runs/fast_review_20260519_empty_earnings_mode_v3_20260519 --log-level INFO`
+    - Result: front `strategy_focus` rows changed from “almost all trend-only names” to:
+      - first 2: `trend_leader ∩ hundred_day_high`
+      - next 4: chart-driven `hundred_only` names
+      - only then `trend_only` continuations such as `胜宏科技 / 中际旭创 / 剑桥科技 / 东山精密`
+
+## 2026-05-18 (fast review AI wording tighten + hundred-day reading rebalance)
+
+- Scope: tighten fast-review reading-layer wording after the real `2026-05-18` daily replay showed a strong perception skew: the front rows looked “all AI” even though the underlying `hundred_day_high` pool still contained many non-AI names.
+- Why:
+  - The actual pool was mixed, but the front `strategy_focus` rows were dominated by `trend_leader` technology names.
+  - For those names, `display_reason_summary` still kept broad labels such as `AI主线扩散 / AI上游材料扩散` in the same compact sentence as the real industry anchor, which visually overpowered `PCB / 光模块 / 光通信 / 电子材料`.
+  - The dedicated `百日新高 Top N` section already existed, but it sat behind `策略精简焦点`, so users saw the AI-heavy front rows first.
+  - `hundred_day_high` snapshot text still prioritized raw financial fields over `business/chart` hints, so pure hundred-day names remained harder to scan quickly.
+- Changes:
+  - Updated [`src/services/signal_cause_analysis_service.py`](d:\bb\daily_stock_analysis\src\services\signal_cause_analysis_service.py)
+    - `_derive_mainline_judgement(...)` now prefers `业绩兑现` when a row is already business-grounded and earnings-grounded, instead of defaulting to a broad AI mainline label just because an AI theme mapping also exists
+  - Updated [`scripts/run_fast_review_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_fast_review_bundle.py)
+    - added a post-processor that removes broad `AI主线扩散 / AI上游材料扩散` clauses from compact `display_reason_summary` when the same sentence already has a clearer `当前更像是 ... / 业务更偏 ...` anchor
+    - moved `百日新高 Top N` ahead of `策略精简焦点` inside `fast_review_summary.md`
+    - changed `_build_hundred_day_snapshot_summary(...)` so the compact snapshot prefers `业务提示 / 图形标签 / PE` ahead of less scan-friendly trailing finance fields
+- Verification:
+  - Red:
+    - `.\.venv\Scripts\python.exe -m pytest tests/test_fast_review_daily_bundle.py -q -k "business_hint_before_pe or spotlight_before_strategy_focus_section or deemphasizes_broad_ai_mainline"`
+    - `.\.venv\Scripts\python.exe -m pytest tests/test_signal_cause_analysis_service.py -q -k "prefers_earnings_over_broad_ai_theme"`
+  - Green:
+    - `.\.venv\Scripts\python.exe -m pytest tests/test_fast_review_daily_bundle.py -q -k "business_hint_before_pe or spotlight_before_strategy_focus_section or deemphasizes_broad_ai_mainline"`
+    - `.\.venv\Scripts\python.exe -m pytest tests/test_signal_cause_analysis_service.py -q -k "prefers_earnings_over_broad_ai_theme"`
+    - `.\.venv\Scripts\python.exe -m pytest tests/test_fast_review_daily_bundle.py -q -k "hundred_day or display_reason_summary or rise_reason_section"`
+    - `.\.venv\Scripts\python.exe -m pytest tests/test_fast_review_daily_bundle.py -q`
+    - `.\.venv\Scripts\python.exe -m pytest tests/test_signal_cause_analysis_service.py -q`
+- Notes:
+  - This round intentionally does not retune selector thresholds.
+  - The goal is reading-order and wording calibration, not shrinking the AI chain itself out of the pool.
+
+## 2026-05-15 (fast-review spot cache fallback no longer blocks on listing metadata)
+
+- Scope: continue the fast-review runtime investigation after the external-heartbeat watchdog fix, and remove the next confirmed startup bottleneck shared by `earnings_surprise`, `hundred_day_high`, and `trend_leader_unified`.
+- Why:
+  - After the bundle-layer watchdog fix, small-scope probes still showed all three selectors spending their early runtime inside `src/services/kline_selector_service.py::get_spot_enriched_a_share_universe()`.
+  - Direct timing and staged probes confirmed the shared failure chain:
+    - fresh spot reference cache was empty
+    - stale disk spot reference cache existed and loaded quickly
+    - live `spot` fetch failed after about `5-6s`
+    - old fallback logic then still tried to enrich that stale cache with `listing metadata`
+    - `tushare listing meta` failed quickly due rate limit, but `baostock listing meta` could hang for `20s+`
+  - This meant the daily fast-review startup path kept paying a long tail even after it had already decided to accept stale/disk `spot` cache as the quote fallback.
+- Root cause:
+  - `get_spot_enriched_a_share_universe()` treated stale/disk `spot` cache as a usable quote fallback, but still forced a best-effort `listing metadata` merge on top of that cache.
+  - In the current Windows/network environment, the `listing metadata` provider chain was the real long tail:
+    - `tushare` -> fast rate-limit failure
+    - `baostock` -> slow/hanging fallback
+- Changes:
+  - Updated [`src/services/kline_selector_service.py`](d:\bb\daily_stock_analysis\src\services\kline_selector_service.py)
+    - when `prefer_stale_spot_universe_reference_cache` is used, stale/disk `spot` cache is now accepted directly as the fast path
+    - when live `spot` fetch fails and the service falls back to disk cached `spot` snapshot, it no longer blocks on `listing metadata` merge before returning that fallback snapshot
+    - generic-provider fallback still keeps the old `listing metadata` merge behavior
+  - Updated [`tests/test_kline_selector_service.py`](d:\bb\daily_stock_analysis\tests\test_kline_selector_service.py)
+    - added regression coverage that incomplete stale preferred cache should no longer trigger listing-metadata fetch
+    - added regression coverage that incomplete stale disk-cache failure fallback should no longer trigger listing-metadata fetch
+- Verification:
+  - Red:
+    - `.\.venv\Scripts\python.exe -m pytest tests/test_kline_selector_service.py -k "incomplete_stale_disk_cache or incomplete_stale_disk_reference_cache"`
+    - result before fix: `2 failed`
+    - failure showed `_fetch_listing_dates_dataframe()` was still being called in both stale-cache paths
+  - Green:
+    - `.\.venv\Scripts\python.exe -m pytest tests/test_kline_selector_service.py -k "incomplete_stale_disk_cache or incomplete_stale_disk_reference_cache or can_prefer_stale_disk_reference_cache or uses_stale_disk_cache_for_failure_fallback"`
+    - result: `4 passed`
+  - Runtime probes:
+    - preferred stale cache path:
+      - `prefer_cache_get_spot_enriched ok 0.21s len 1`
+    - default path with live spot failure:
+      - `default_get_spot_enriched ok 6.766s len 1`
+      - this confirms the long `listing metadata` hang is gone and runtime is now dominated by the single live-spot failure attempt
+    - end-to-end `limit=1` probes after fix:
+      - `trend_leader`: universe prepare now completes and exits normally in about `1-2s` after startup logs
+      - `earnings_surprise`: completes `limit=1` run in about `8s`
+      - `hundred_day_high`: completes `limit=1` run in about `6-7s`
+- Notes:
+  - This round deliberately does not change the selector thresholds or daily strategy profile.
+  - Residual startup cost still exists on selectors that first attempt a live `spot` fetch before falling back to disk cache; the remaining cost is now the `live spot` failure itself rather than `listing metadata` tail blocking.
+
+## 2026-05-15 (fast-review external heartbeat watchdog)
+
+- Scope: fix the false `idle timeout after 1800s` failures observed in `Fast Review` daily runs when external signal scripts stayed alive but went quiet for a long time.
+- Why:
+  - Real replay evidence on `2026-05-14` showed all three external signals:
+    - `earnings_surprise`
+    - `hundred_day_high`
+    - `trend_leader_unified`
+    were started successfully, printed early startup logs, then entered long quiet phases and got killed by the bundle's stdout-idle watchdog.
+  - The issue was not script import deadlock:
+    - `--help` for all three scripts returned quickly
+    - direct module imports also completed quickly
+  - Short background probes confirmed the pattern:
+    - `earnings`: reached `recent-event prefilter enabled` and `spot-enriched universe fallback to disk cached spot snapshot`, then stayed alive without further output for at least 60s
+    - `hundred_day_high`: printed startup plus `spot-enriched universe fallback...`, then stayed alive without further output for at least 60s
+    - `trend_leader`: printed startup/config logs, then stayed alive without further output for at least 60s
+- Root cause:
+  - `scripts/run_fast_review_bundle.py::_run_command(...)` treated “no child stdout for 1800 seconds” as a hard failure even after the child had already proven liveness by emitting startup logs.
+  - For these selectors, legitimate long silent phases exist after startup, so the watchdog semantics were too aggressive.
+- Changes:
+  - Updated `scripts/run_fast_review_bundle.py`
+    - added `DEFAULT_EXTERNAL_COMMAND_HEARTBEAT_SEC` / `EXTERNAL_COMMAND_HEARTBEAT_SEC`
+    - added CLI/profile arg `--external-command-heartbeat-sec` (default `300`)
+    - once an external child has emitted at least one output line, the bundle now:
+      - emits parent-side `external heartbeat` lines every `heartbeat_sec`
+      - no longer treats later silence as `idle timeout`
+      - still enforces `total timeout`
+    - `idle timeout` is now kept only for the stricter case where the child never emitted any output at all
+  - Updated `tests/test_fast_review_daily_bundle.py`
+    - preserved the regression that a completely silent child still raises `idle timeout`
+    - added coverage that a child which prints one startup line and then sleeps is no longer killed by idle timeout and now emits heartbeat text
+    - added parse/default assertions for `external_command_heartbeat_sec`
+- Verification:
+  - `.\.venv\Scripts\python.exe -m pytest tests/test_fast_review_daily_bundle.py -k "no_output_timeout or post_start_silence_with_heartbeat" -q`
+  - `.\.venv\Scripts\python.exe -m pytest tests/test_fast_review_daily_bundle.py -k "fast_review_defaults_when_profile_missing or reads_fast_review_defaults_from_profile or post_start_silence_with_heartbeat or no_output_timeout" -q`
+  - `.\.venv\Scripts\python.exe -m py_compile scripts/run_fast_review_bundle.py tests/test_fast_review_daily_bundle.py`
+- Notes:
+  - This round fixes the watchdog semantics in the bundle layer; it does not yet add child-side heartbeat logs inside each selector's deep scan loop.
+  - Residual risk remains that a truly hung child which already printed startup logs will now wait until `total timeout` instead of `idle timeout`.
+
+## 2026-05-14 (hundred_day_high chart-pattern labels)
+
+- Scope: add a reading-layer chart classification for `hundred_day_high` without changing the selector's main inclusion rules.
+- Why:
+  - The current pool can already catch many new-high names, but daily review still cannot quickly separate:
+    - flat-base breakout names
+    - healthy 45-degree trend names
+    - plain/noisy new-high names
+  - The user explicitly wanted `hundred_day_high` to remain intact while adding a visible “图形好不好看” marker.
+- Changes:
+  - Updated `scripts/select_hundred_day_high_candidates.py`
+    - added `classify_hundred_day_chart_pattern(...)` and lightweight chart-shape scoring
+    - added durable metrics:
+      - `chart_pattern_label`
+      - `chart_pattern_score`
+      - `chart_pattern_summary`
+      - `base_breakout_score`
+      - `healthy_trend_score`
+    - merged the new fields into hundred-day selected metrics, signal snapshot payload, CSV export, and Markdown export
+    - added a compact `图形标签` column into `hundred_day_high_candidates.md`
+  - Updated `scripts/run_fast_review_bundle.py`
+    - hundred-day spotlight snapshot now renders compact chart text such as `横盘突破型 / 健康慢涨型 / 图形一般`
+    - within the same existing priority tier, `百日新高 Top N` now prefers better chart labels over plain breakouts
+  - Updated `tests/test_hundred_day_high_signal_flow.py`
+    - added regression coverage for `base_breakout / healthy_trend / plain_breakout`
+    - added export-column assertions for the new chart fields
+  - Updated `tests/test_fast_review_daily_bundle.py`
+    - added snapshot rendering coverage for chart-pattern summaries
+    - added spotlight ordering coverage for better chart labels inside pure hundred-day rows
+- Verification:
+  - `.\.venv\Scripts\python.exe -m pytest tests/test_hundred_day_high_signal_flow.py -k "chart_pattern or includes_breakout_quality_fields or keeps_csv_headers_when_no_selection" -q`
+  - `.\.venv\Scripts\python.exe -m pytest tests/test_fast_review_daily_bundle.py -k "chart_pattern_summary or prioritizes_better_chart_patterns" -q`
+- Notes:
+  - This round intentionally does not change the `hundred_day_high` selector threshold or default daily strategy set.
+  - Fail-open remains `plain_breakout`, so uncertain shapes stay visible rather than being filtered out.
+
+## 2026-05-11 (fast-review explicit snapshot-date rollback fix)
+
+- Scope:
+  - fix the daily fast-review date split where `trend_leader` and `earnings` silently rolled an explicit trading date back to the previous session
+  - keep holiday fallback behavior, but stop rolling back an explicitly requested trading day like `2026-05-11`
+- Root cause:
+  - `scripts/select_trend_leader_candidates.py` and `scripts/select_earnings_surprise_candidates.py` both parsed `--snapshot-date` through `get_effective_trading_date("cn", current_time=datetime.combine(parsed, datetime.min.time()))`
+  - that means an explicit trading day was reinterpreted as `00:00` intraday, so the trading-calendar helper treated it as “market not closed yet” and returned the previous completed session
+  - `scripts/select_hundred_day_high_candidates.py` does not do this rollback, so the bundle could end up with:
+    - `trend_leader = 2026-05-08`
+    - `earnings = 2026-05-08`
+    - `hundred_day_high = 2026-05-11`
+- Changes:
+  - Updated `scripts/select_trend_leader_candidates.py`
+    - explicit `datetime` input is now forwarded as-is into `get_effective_trading_date(...)`
+    - explicit `date` / ISO string input is now resolved with `23:59:59.999999` instead of `00:00:00`
+  - Updated `scripts/select_earnings_surprise_candidates.py`
+    - same fix as above for explicit `datetime`, `date`, and ISO-string inputs
+  - Updated `tests/test_snapshot_date_resolution.py`
+    - added regression coverage for explicit trading-day strings on both `trend_leader` and `earnings`
+    - the tests assert that the helper receives end-of-day timestamps instead of midnight timestamps
+- Verification:
+  - Red:
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests\test_snapshot_date_resolution.py -q`
+    - result before fix: `2 failed, 4 passed`
+    - failure showed `current_time == datetime(2026, 5, 11, 0, 0)` instead of `datetime(2026, 5, 11, 23, 59, 59, 999999)`
+  - Green:
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests\test_snapshot_date_resolution.py -q`
+      - result: `6 passed`
+    - `python -m py_compile scripts\select_trend_leader_candidates.py scripts\select_earnings_surprise_candidates.py tests\test_snapshot_date_resolution.py`
+    - real replay:
+      - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\run_fast_review_bundle.py --strategy-profile-file config\local_strategy_profile.json --snapshot-date 2026-05-11 --output-dir data\manual_runs\fast_review_20260511_date_fix_verify_20260511_233939 --log-level INFO`
+      - replay logs now show:
+        - `earnings_surprise_selector: ... snapshot_date=2026-05-11`
+        - `trend_leader_selector: ... snapshot_date=2026-05-11`
+        - `hundred_day_high_selector: ... snapshot_date=2026-05-11`
+      - replay artifact summary now shows:
+        - `earnings = 2`
+        - `hundred_day_high = 256 (export 30)`
+        - `trend_leader = 9`
+- Notes:
+  - this fix only changes explicit-date resolution for completed daily-review runs
+  - no change was made to the holiday/non-trading fallback regression already covered in `tests/test_snapshot_date_resolution.py`
+
+## 2026-05-11 (fast-review hundred-day-high summary spotlight)
+
+- Scope:
+  - improve daily-review visibility for `hundred_day_high` without widening the main `strategy_focus` ranking or changing A/B classification
+  - add a dedicated summary-level spotlight block so users can directly scan more `百日新高` names from the top summary
+- Why:
+  - the real `2026-05-11` replay still produced a large raw `hundred_day_high` pool (`257`)
+  - but the main fast-review reading surface only exposed the clipped focus rows, which made the user feel “百日新高处理得少了”
+  - the requested direction was explicit:
+    - keep current focus logic
+    - add a separate summary display block for this signal line
+- Changes:
+  - Updated `scripts/run_fast_review_bundle.py`
+    - added `DEFAULT_HUNDRED_DAY_SUMMARY_SPOTLIGHT_LIMIT = 15`
+    - added `_build_hundred_day_snapshot_summary(...)` to build a compact spotlight snapshot
+    - added `_append_hundred_day_high_spotlight_markdown(...)` to render a dedicated `百日新高 Top N` section in `fast_review_summary.md` and `fast_review_summary_latest.md`
+    - the spotlight title now uses the real visible count instead of always printing the configured limit
+    - when the same code already exists in today's `strategy_focus_rows`, the spotlight now reuses that enriched daily snapshot first
+    - only when raw `hundred_day_high` rows still do not carry enriched `涨幅 / PE / 报告期 / 净利` and there is no matching focus row, the snapshot gracefully falls back to raw breakout fields such as `收盘`
+  - Updated `tests/test_fast_review_daily_bundle.py`
+    - added `test_build_summary_markdown_includes_hundred_day_high_spotlight_section`
+    - added `test_build_hundred_day_snapshot_summary_falls_back_to_breakout_fields`
+- Verification:
+  - Red:
+    - `百日新高 Top` section was previously absent from the summary markdown
+    - after the first implementation, the real artifact still had 2 display issues:
+      - title showed `Top 15` even when only `10` rows were exported
+      - spotlight `snapshot` cells were all `--`
+  - Green:
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests\test_fast_review_daily_bundle.py -q -k "hundred_day_high_spotlight_section or build_hundred_day_snapshot_summary_falls_back_to_breakout_fields or shows_source_and_export_count_when_clipped or includes_earnings_focus_section"`
+      - result: `4 passed`
+    - `python -m py_compile scripts\run_fast_review_bundle.py tests\test_fast_review_daily_bundle.py`
+    - real replay:
+      - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\run_fast_review_bundle.py --strategy-profile-file config\local_strategy_profile.json --snapshot-date 2026-05-11 --output-dir data\manual_runs\fast_review_20260511_hundred_summary_spotlight_verify_20260511_b --include-signals hundred_day_high --hundred-day-output-limit 10 --skip-persist-snapshots --log-level INFO`
+      - replay result:
+        - summary now contains `## 百日新高 Top 10`
+        - the block renders `603045 福达合金 / 603618 杭电股份 / 688167 炬光科技` and other names directly in the top summary
+        - the spotlight snapshot now directly shows enriched values such as:
+          - `福达合金 = 涨幅 9.99% / PE 31.5 / 2026Q1 / 净利 1.81亿`
+          - `杭电股份 = 涨幅 -0.85% / PE -107.8 / 2026Q1 / 净利 0.81亿`
+        - fallback `收盘` still remains available for future runs where focus enrichment is missing
+- Notes:
+  - this is a reading-surface enhancement only
+  - it does not change:
+    - `strategy_focus` ranking
+    - A类 / B类 classification
+    - `兑现 / 半兑现 / 拐点 / 纯轮动` staging
+  - the original signal count remains explicitly visible as `257 (export 10)` in the summary table so “raw count” and “summary display count” stay distinguishable
+
+## 2026-05-11 (fast-review hundred-day-high spotlight ranking tighten)
+
+- Scope:
+  - tighten the display order inside the `百日新高 Top N` summary block
+  - keep the block as a visibility layer, but make its front rows closer to what the user actually wants to review first
+- Why:
+  - after the first spotlight rollout, the snapshot quality was already good, but the row order still inherited the raw `hundred_day_high` export order
+  - this meant important overlap cases such as `福晶科技 / 通鼎互联` could still appear behind pure `hundred_day_high-only` names like `福达合金`
+- Changes:
+  - Updated `scripts/run_fast_review_bundle.py`
+    - the spotlight now builds a merged row set from raw `hundred_day_high` rows plus same-day `strategy_focus_rows`
+    - the block sorts by:
+      - whether the code already entered `strategy_focus`
+      - `A类` before `B类`
+      - `trend_leader + hundred_day_high` intersections before weaker signal combinations
+      - higher `score / priority_score`
+      - stronger same-day涨幅
+    - raw breakout order is now only used as a final stable tiebreaker
+  - Updated tests:
+    - `tests/test_fast_review_daily_bundle.py`
+      - added `test_hundred_day_spotlight_prioritizes_focus_intersections_and_a_bucket`
+- Verification:
+  - Red:
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests\test_fast_review_daily_bundle.py -q -k "hundred_day_spotlight_prioritizes_focus_intersections_and_a_bucket"`
+      - failed before the fix because `HundredOnly` still stayed ahead of `IntersectA`
+  - Green:
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests\test_fast_review_daily_bundle.py -q -k "hundred_day_spotlight_prioritizes_focus_intersections_and_a_bucket or hundred_day_high_spotlight_section or build_hundred_day_snapshot_summary_falls_back_to_breakout_fields"`
+      - result: `3 passed`
+    - `python -m py_compile scripts\run_fast_review_bundle.py tests\test_fast_review_daily_bundle.py`
+    - full replay:
+      - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\run_fast_review_bundle.py --strategy-profile-file config\local_strategy_profile.json --snapshot-date 2026-05-11 --output-dir data\manual_runs\fast_review_20260511_today_review_20260511_002148 --log-level INFO`
+      - replay highlight:
+        - `百日新高 Top 15` now starts with:
+          - `002491 通鼎互联`
+          - `002222 福晶科技`
+        - pure `hundred_day_high-only` rows such as `603045 福达合金` are pushed behind those overlap focus names
+- Notes:
+  - this still does not alter the underlying `strategy_focus` ranking
+  - it only makes the dedicated `百日新高 Top N` block read more like a real review shortlist instead of a raw export tail
+
+## 2026-05-11 (fast-review hundred-day-high split sections + top30)
+
+- Scope:
+  - expand the spotlight from the previous `Top 15` default to `Top 30`
+  - split the spotlight into two reading sections so intersections and pure 100D-high names are no longer mixed together
+- Why:
+  - even after the ranking tighten, mixing overlap names and pure `hundred_day_high` names in one flat table still made the scan path less clear
+  - the user explicitly requested:
+    - show `Top 30`
+    - split into `交叉强样本` and `纯百日新高`
+- Changes:
+  - Updated `scripts/run_fast_review_bundle.py`
+    - changed `DEFAULT_HUNDRED_DAY_SUMMARY_SPOTLIGHT_LIMIT` from `15` to `30`
+    - the spotlight now renders:
+      - `### 交叉强样本`
+      - `### 纯百日新高`
+    - the total visible budget is shared across the two sections:
+      - intersections consume the first slots
+      - the remaining slots are filled by pure `hundred_day_high` rows
+    - each section now shows `top visible / total_in_bucket`
+  - Updated tests:
+    - `tests/test_fast_review_daily_bundle.py`
+      - extended the intersection-order test to require the two section headings
+      - added `test_hundred_day_spotlight_uses_combined_limit_across_two_sections`
+- Verification:
+  - Red:
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests\test_fast_review_daily_bundle.py -q -k "hundred_day_spotlight_prioritizes_focus_intersections_and_a_bucket or hundred_day_spotlight_uses_combined_limit_across_two_sections"`
+      - failed before the fix because:
+        - there was no `交叉强样本 / 纯百日新高` section split
+        - the runtime default limit still stayed at `15`
+  - Green:
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests\test_fast_review_daily_bundle.py -q -k "hundred_day_spotlight_prioritizes_focus_intersections_and_a_bucket or hundred_day_spotlight_uses_combined_limit_across_two_sections or hundred_day_high_spotlight_section or build_hundred_day_snapshot_summary_falls_back_to_breakout_fields"`
+      - result: `4 passed`
+    - `python -m py_compile scripts\run_fast_review_bundle.py tests\test_fast_review_daily_bundle.py`
+    - full replay:
+      - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\run_fast_review_bundle.py --strategy-profile-file config\local_strategy_profile.json --snapshot-date 2026-05-11 --output-dir data\manual_runs\fast_review_20260511_today_review_20260511_002148 --log-level INFO`
+      - replay result in `fast_review_summary_latest.md`:
+        - `## 百日新高 Top 30`
+        - `### 交叉强样本（top 2 / 2）`
+          - `002491 通鼎互联`
+          - `002222 福晶科技`
+        - `### 纯百日新高（top 28 / 28）`
+          - starts from `光智科技 / 炬光科技 / 福达合金 ...`
+- Notes:
+  - the split is still a summary-layer reading aid
+  - it does not change signal selection, only how the daily review digest is organized
+
+## 2026-05-10 (fast-review cable wide-industry clause normalization)
+
+- Scope:
+  - finish the next visible residual family after the optics and special-paper cleanup
+  - normalize the remaining wide-industry export clause leaking into `industry_logic`
+- Why:
+  - the real `2026-05-10` fast-review replay still had a visible residual sample:
+    - `603618 杭电股份`
+    - `industry_logic = 宽口径行业标签仍归在 电线电缆的研发、生产、销售和服务，但交易辨识度更偏 ...`
+  - this showed the business-label normalization path had improved, but one export-only clause could still preserve the raw sentence in persisted review artifacts
+- Changes:
+  - Updated `src/services/signal_cause_analysis_service.py`
+    - extended `_normalize_business_label_text(...)` so `电线电缆 / 线缆 / 电缆 / 电网设备` all normalize into `电力设备`
+  - Updated `scripts/run_fast_review_bundle.py`
+    - added `_normalize_export_reason_fields(row)`
+    - the bundle writer now normalizes `industry_logic` before CSV/Markdown persistence
+    - the helper is applied in both `strategy_focus` and `earnings_focus` export paths
+    - normalization happens before heavy enrichment so old-style wide-industry text is still cleaned even when downstream enrichment fail-opens
+  - Updated tests:
+    - `tests/test_signal_cause_analysis_service.py`
+      - added `test_normalize_business_label_text_normalizes_cable_industry_sentence`
+    - `tests/test_fast_review_daily_bundle.py`
+      - added `test_write_strategy_focus_outputs_normalizes_wide_industry_clause_before_export`
+- Verification:
+  - Red:
+    - `pytest tests/test_fast_review_daily_bundle.py -q -k "normalizes_wide_industry_clause_before_export"`
+      - failed before the fix because the exported `industry_logic` still kept `电线电缆的研发、生产、销售和服务`
+  - Green:
+    - `pytest tests/test_signal_cause_analysis_service.py -q -k "normalizes_cable_industry_sentence"`
+    - `pytest tests/test_fast_review_daily_bundle.py -q -k "normalizes_wide_industry_clause_before_export"`
+    - `pytest tests/test_signal_cause_analysis_service.py tests/test_fast_review_daily_bundle.py tests/test_fast_review_focus_api.py -q`
+      - result: `100 passed`
+    - `python -m py_compile src/services/signal_cause_analysis_service.py scripts/run_fast_review_bundle.py`
+    - real replay:
+      - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\run_fast_review_bundle.py --strategy-profile-file config\local_strategy_profile.json --snapshot-date 2026-05-10 --output-dir data\manual_runs\fast_review_20260510_cable_clause_normalize_verify_20260510_v3 --log-level INFO`
+      - `rg -n "603618|杭电股份|宽口径行业标签仍归在|电力设备" data\manual_runs\fast_review_20260510_cable_clause_normalize_verify_20260510_v3\2026-05-10\review\fast_review_strategy_focus.csv`
+      - `rg -n "电线电缆的研发、生产、销售和服务" data\manual_runs\fast_review_20260510_cable_clause_normalize_verify_20260510_v3`
+      - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\audit_fast_review_label_quality.py --root data\manual_runs\fast_review_20260510_cable_clause_normalize_verify_20260510_v3 --limit 20`
+      - replay observation:
+        - `603618 杭电股份` now lands on `宽口径行业标签仍归在 电力设备`
+        - the old cable sentence no longer appears anywhere in the replay root
+        - audit result: `files=1 findings=0`
+
+## 2026-05-10 (fast-review optics-component normalization + label quality audit)
+
+- Scope:
+  - finish the next remaining long business-text family found in the live fast-review replay after the special-paper cleanup
+  - add one lightweight audit script so the same class of regressions can be checked automatically on future replay outputs
+- Why:
+  - the previous replay still had a visible residual sample:
+    - `蓝特光学`
+    - `preferred_industry_label = 光学元器件的研发、生产和销售`
+    - `reason_summary = 当前更像是 光学元器件的研发、生产和销售 方向走强...`
+  - this meant the explanation main path had already improved for several families, but the optics-component family was still leaking a raw business sentence into daily review
+- Changes:
+  - Updated `src/services/signal_cause_analysis_service.py`
+    - added `光学元器件 -> 光学元器件` extraction support in `BUSINESS_LABEL_RULES`
+    - added `光学元器件的研发、生产和销售 -> 光学元器件` normalization in the business-label normalization path
+  - Added `scripts/audit_fast_review_label_quality.py`
+    - scans persisted fast-review focus CSV artifacts for residual long business-sentence labels
+    - defaults to auditing only label-like fields such as `preferred_industry_label / business_summary / peer_group_label` to avoid false positives from normal prose
+  - Updated tests:
+    - `tests/test_signal_cause_analysis_service.py`
+      - added `test_merge_reason_payload_normalizes_optics_component_long_business_text`
+    - `tests/test_fast_review_focus_api.py`
+      - extended the remaining-long-text peer-group regression with `光学元器件的研发、生产和销售 -> 光学`
+    - `tests/test_audit_fast_review_label_quality.py`
+      - added coverage for the new replay-audit helper
+- Verification:
+  - Red:
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests\test_signal_cause_analysis_service.py -q -k "normalizes_optics_component_long_business_text"`
+      - failed before the fix because `reason_summary` still fell back to `光学光电子`
+  - Green:
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests\test_signal_cause_analysis_service.py -q -k "normalizes_optics_component_long_business_text"`
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests\test_fast_review_focus_api.py -q -k "normalizes_remaining_long_text_single_name_groups"`
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests\test_signal_cause_analysis_service.py tests\test_fast_review_focus_api.py tests\test_fast_review_daily_bundle.py tests\test_audit_fast_review_label_quality.py -q`
+      - result: `101 passed`
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m py_compile src\services\signal_cause_analysis_service.py src\services\fast_review_focus_service.py scripts\audit_fast_review_label_quality.py`
+    - real replay:
+      - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\run_fast_review_bundle.py --strategy-profile-file config\local_strategy_profile.json --snapshot-date 2026-05-10 --output-dir data\manual_runs\fast_review_20260510_optics_normalize_verify_20260510 --log-level INFO`
+      - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\audit_fast_review_label_quality.py --root data\manual_runs\fast_review_20260510_optics_normalize_verify_20260510 --limit 20`
+      - result: `files=1 findings=0`
+      - replay highlight:
+        - `蓝特光学` now renders:
+          - `preferred_industry_label = 光学元器件`
+          - `business_summary = 光学元器件`
+          - `peer_group_label = 光学`
+- Notes:
+  - this keeps the daily-review main explanation and the lightweight peer-grouping behavior intentionally separate:
+    - explanation identity stays at `光学元器件`
+    - peer corroboration still compacts to the broader `光学` bucket
+  - the audit script is intended as a replay-quality guardrail, not a full semantic review tool
+
+## 2026-05-10 (fast-review special-paper tail normalization)
+
+- Scope:
+  - close the next remaining long business-text tail found in the live fast-review replay after the soft-magnetic / resin cleanup
+- Why:
+  - the previous replay still had one visible residual sample:
+    - `顺灏股份`
+    - `preferred_industry_label = 特种环保纸的研发、生产及销售`
+    - `peer_group_label = 特种环保纸的研发、生产及销售`
+    - `reason_summary = 当前更像是 特种环保纸的研发、生产及销售 方向走强...`
+  - this was now the same issue appearing in both:
+    - the explanation main path
+    - the `Peer Check` grouping path
+- Changes:
+  - Updated `src/services/signal_cause_analysis_service.py`
+    - added `特种环保纸 / 环保纸 / 特种纸 -> 特种环保纸` normalization in the business-label extraction + normalization path
+  - Updated `src/services/fast_review_focus_service.py`
+    - added the same `特种环保纸` compaction in peer-group normalization
+  - Updated tests:
+    - `tests/test_signal_cause_analysis_service.py`
+      - added `test_merge_reason_payload_normalizes_special_paper_long_business_text`
+    - `tests/test_fast_review_focus_api.py`
+      - extended the remaining-long-text peer-group regression with a `特种环保纸` case
+- Verification:
+  - Red:
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests\test_signal_cause_analysis_service.py -q -k "normalizes_special_paper_long_business_text"`
+      - failed before the rule because `reason_summary` still fell back to `轻工制造`
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests\test_fast_review_focus_api.py -q -k "normalizes_remaining_long_text_single_name_groups"`
+      - failed before the rule because `特种环保纸的研发、生产及销售 != 特种环保纸`
+  - Green:
+    - same targeted commands after the fix
+      - both passed
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests\test_signal_cause_analysis_service.py tests\test_fast_review_focus_api.py tests\test_fast_review_daily_bundle.py -q`
+      - result: `96 passed`
+    - real replay:
+      - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\run_fast_review_bundle.py --strategy-profile-file config\local_strategy_profile.json --snapshot-date 2026-05-10 --output-dir data\manual_runs\fast_review_20260510_special_paper_normalize_verify_20260510_v2 --log-level INFO`
+      - result highlights:
+        - `顺灏股份` now renders:
+          - `preferred_industry_label = 特种环保纸`
+          - `business_summary = 特种环保纸`
+          - `peer_group_label = 特种环保纸`
+        - exported markdown/CSV no longer shows the full business sentence for this sample
+- Notes:
+  - this confirms the remaining tail from the previous replay was not a separate pipeline bug; it was just one more missing normalization family
+  - there may still be additional small families, but the obvious current live sample has been removed
+
+## 2026-05-10 (fast-review reason-summary business-label normalization)
+
+- Scope:
+  - normalize a remaining class of long business-description labels in the fast-review explanation main path itself, not just in `Peer Check`
+- Why:
+  - replay evidence showed `Peer Check` grouping had already been shortened, but `reason_summary / preferred_industry_label` could still inherit raw business sentences
+  - representative live sample before this fix:
+    - `天通股份`
+    - `preferred_industry_label = 软磁材料及磁心的研发、生产与销售`
+    - `reason_summary = 当前更像是 软磁材料及磁心的研发、生产与销售 方向走强...`
+  - similar residual pattern also existed for resin-style business text such as:
+    - `聚酯树脂系列产品的生产销售`
+- Changes:
+  - Updated `src/services/signal_cause_analysis_service.py`
+    - narrowed the business-label normalization so it only targets unwanted long-text buckets instead of disturbing stable labels such as `PCB / 光模块 / 光通信 / AI服务器`
+    - normalized the explanation-path business labels:
+      - `软磁材料及磁心...` / `软磁铁氧体磁粉...` -> `软磁材料/磁性材料`
+      - `聚酯树脂系列产品的生产销售` -> `树脂/化工材料`
+      - also keeps lightweight normalization entries for `航运` / `卫星/航天` / `房地产/建筑施工`
+    - applied the normalization in:
+      - `_resolve_business_structure_fields(...)`
+      - `_extract_business_core_label(...)`
+      - `_resolve_preferred_industry_label(...)`
+  - Updated `tests/test_signal_cause_analysis_service.py`
+    - added explicit red/green regressions for:
+      - `天通股份` soft-magnetic long business text
+      - `神剑股份` resin long business text
+- Verification:
+  - Red:
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests\test_signal_cause_analysis_service.py -q -k "normalizes_soft_magnetic_long_business_text or normalizes_resin_long_business_text"`
+      - result before the fix: `2 failed`
+  - Green:
+    - same targeted command after the fix
+      - result: `2 passed`
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests\test_signal_cause_analysis_service.py tests\test_fast_review_focus_api.py tests\test_fast_review_daily_bundle.py -q`
+      - result: `95 passed`
+    - `cd apps/dsa-web && npm.cmd test -- --run src/pages/__tests__/SignalsPage.fastReview.test.tsx`
+      - result: `1 passed`
+    - real replay:
+      - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe scripts\run_fast_review_bundle.py --strategy-profile-file config\local_strategy_profile.json --snapshot-date 2026-05-10 --output-dir data\manual_runs\fast_review_20260510_long_text_normalize_verify_20260510_v1 --log-level INFO`
+      - result highlights:
+        - `天通股份` now renders `preferred_industry_label = 软磁材料/磁性材料`
+        - `天通股份` no longer emits the raw long sentence in `reason_summary`
+        - `东山精密 / 胜宏科技 / 华工科技 / 杭电股份` kept their compact AI-chain labels without regression
+- Notes:
+  - this round fixes the main explanation path for the covered label families
+  - live replay still shows a few other long business sentences outside these families, so the long-text normalization backlog is smaller but not fully exhausted
+  - representative remaining tail from the same replay: `顺灏股份`
+
+## 2026-05-10 (fast-review exported display summaries + clipped-count wording fix)
+
+- Scope:
+  - fix one reporting inconsistency in the fast-review summary layer
+  - make the exported markdown/csv use the same compact daily-review wording already shown in the UI layer
+- Why:
+  - live replay evidence showed a confusing mismatch:
+    - runtime log: `hundred_day_high count=226`
+    - summary markdown: `count=30`
+  - root cause:
+    - the external selector returned `226`
+    - bundle export then clipped the hundred-day rows to the configured output cap `30`
+    - summary markdown only saw the clipped `SignalResult.rows`, while the runtime log reported the pre-clip count
+  - at the same time, the UI had already switched to `display_reason_summary`, but exported markdown/csv still mostly showed the raw `reason_summary`
+- Changes:
+  - Updated `scripts/run_fast_review_bundle.py`
+    - extended `SignalResult` with `source_row_count`
+    - preserved the pre-clip count when `_apply_signal_output_limits(...)` trims `hundred_day_high`
+    - summary markdown now renders clipped cases as:
+      - `226 (export 30)`
+    - terminal summary prints:
+      - `signal_<key>_count=<source count>`
+      - plus `signal_<key>_export_count=<clipped count>` when they differ
+    - added `_prefer_display_reason_summary(...)`
+    - strategy/earnings export now computes and persists `display_reason_summary`
+    - strategy focus markdown, rise-reason summary markdown, and earnings-focus markdown now prefer `display_reason_summary`
+  - Updated `tests/test_fast_review_daily_bundle.py`
+    - added a regression for clipped-count wording in summary markdown
+    - added export/markdown regression proving `display_reason_summary` is persisted and preferred
+    - updated summary-markdown regressions to expect compact display-layer reason text when present
+- Verification:
+  - Red:
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests\test_fast_review_daily_bundle.py -q -k "source_and_export_count_when_clipped or persists_display_reason_summary_and_uses_it_in_markdown or includes_earnings_focus_section or includes_rise_reason_section"`
+      - result before the fix: `4 failed`
+      - failure shapes:
+        - `SignalResult` had no `source_row_count`
+        - CSV had no `display_reason_summary`
+        - summary markdown still rendered raw `reason_summary`
+  - Green:
+    - same targeted command after the fix
+      - result: `4 passed`
+- Notes:
+  - raw `reason_summary` is intentionally kept for compatibility
+  - exported markdown now reads closer to the UI, but without changing the old raw field contract
+
+## 2026-05-10 (fast-review compact explanation + authority display fallback + lighter first screen)
+
+- Scope:
+  - tighten the last-mile daily fast-review reading experience without changing the persisted raw explanation contract
+- Why:
+  - the current fast-review detail was still noisy in 3 ways:
+    - compact reason text could keep `trend leader` / generic boom clauses while dropping the more useful `主线判断` or real trigger clause
+    - some rows still rendered as if authority was missing even when earnings evidence was already strong enough for a practical read-layer confirmation
+    - the first screen carried too many always-open explanation blocks
+- Changes:
+  - Updated `src/services/signal_cause_analysis_service.py`
+    - refined `_compact_daily_review_reason_summary(...)`
+    - new priority is:
+      - industry direction
+      - business orientation
+      - mainline judgement
+      - real trigger (`创出...日新高` / `命中 ... 信号`)
+      - entry-reason fallback only as supplement
+    - weak/noisy clauses such as neutral-news filler or generic boom wording are now more likely to be dropped first
+  - Updated `src/services/fast_review_focus_service.py`
+    - aligned `display_reason_summary` compaction with the backend raw compactor
+    - kept the new display-layer fallback fields:
+      - `display_reason_summary`
+      - `display_authority_judgement`
+      - `display_authority_summary`
+      - `display_peer_summary`
+    - when raw authority is still empty/unverified but earnings evidence is clearly strong, the read layer can now promote the card to a lightweight `财报确认`
+  - Updated `api/v1/schemas/signals.py`
+    - exposed the display-layer fields to the API schema
+  - Updated `apps/dsa-web/src/types/signals.ts`
+    - added the display-layer fields to the web payload typing
+  - Updated `apps/dsa-web/src/pages/SignalsPage.tsx`
+    - switched fast-review detail rendering to the display-layer summaries
+    - kept `Authority Details` and `Peer Check Details` collapsed by default for a lighter first screen
+  - Updated tests:
+    - `tests/test_signal_cause_analysis_service.py`
+    - `tests/test_fast_review_focus_api.py`
+    - `apps/dsa-web/src/pages/__tests__/SignalsPage.fastReview.test.tsx`
+- Verification:
+  - Red:
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests\test_signal_cause_analysis_service.py tests\test_fast_review_focus_api.py -q -k "analyze_signal_uses_signal_pool_and_business_fallbacks_for_industry_and_summary or compacts_reason_summary_for_daily_review or compacts_display_reason_summary_with_mainline_and_real_trigger"`
+      - result before the fix: `3 failed`
+      - failure shape:
+        - `20 日新高` was dropped from compact reason text
+        - `主线判断更偏` was dropped from raw/display compact summaries
+  - Green:
+    - same targeted command after the fix
+      - result: `3 passed`
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests\test_signal_cause_analysis_service.py tests\test_fast_review_focus_api.py tests\test_fast_review_daily_bundle.py -q`
+      - result: `91 passed`
+    - `cd apps/dsa-web && npm.cmd run test -- --run src/pages/__tests__/SignalsPage.fastReview.test.tsx`
+      - result: `1 passed`
+    - `cd apps/dsa-web && npm.cmd run build`
+      - result: `build succeeded`
+- Notes:
+  - this round deliberately does not overwrite the raw persisted authority fields; it improves the read layer first
+  - the intent is daily review readability, not turning fast review into a long-form research page
+
+## 2026-05-10 (peer-group normalization for residual business-sentence tail)
+
+- Scope:
+  - clean the next remaining one-off peer-group tail after the previous long-text and industry-tail passes
+- Why:
+  - the latest replay had already removed blank groups and `环保设备Ⅲ`
+  - one raw business sentence still remained as a peer-group label:
+    - `聚酯树脂系列产品的生产销售`
+- Changes:
+  - Updated `src/services/fast_review_focus_service.py`
+    - added a lightweight normalization rule:
+      - `聚酯树脂系列产品的生产销售` / `聚酯树脂*` / `树脂*` -> `树脂/化工材料`
+  - Updated `tests/test_fast_review_focus_api.py`
+    - extended the residual-tail normalization regression with an explicit resin-business case
+- Verification:
+  - Red:
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_fast_review_focus_api.py -q -k "normalizes_remaining_long_text_single_name_groups"`
+      - result before the fix: `1 failed`
+      - failure shape: `聚酯树脂系列产品的生产销售 != 树脂/化工材料`
+  - Green:
+    - same command after the fix
+      - result: `1 passed`
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_fast_review_focus_api.py tests/test_fast_review_daily_bundle.py -q`
+      - result: `79 passed`
+- Notes:
+  - this keeps the same lightweight replay-focused `Peer Check` design
+  - the goal is readability and reuse, not a more complex chemicals taxonomy
+
+## 2026-05-10 (peer-group normalization for residual industry-tail labels)
+
+- Scope:
+  - finish the last remaining readable-but-not-reusable peer-group tail after the long-text cleanup pass
+- Why:
+  - the replay had already eliminated blank peer buckets and most full-sentence business labels
+  - one last non-ideal single-name bucket still remained in real artifacts:
+    - `环保设备Ⅲ`
+- Changes:
+  - Updated `src/services/fast_review_focus_service.py`
+    - added a final lightweight normalization rule:
+      - `环保设备Ⅲ` / `环保设备*` -> `再生资源/环保设备`
+  - Updated `tests/test_fast_review_focus_api.py`
+    - extended the long-text/tail normalization regression with an explicit `环保设备Ⅲ` case
+- Verification:
+  - Red/Green anchor:
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_fast_review_focus_api.py -q -k "normalizes_remaining_long_text_single_name_groups"`
+      - result after the rule landed: `1 passed`
+- Notes:
+  - this keeps `Peer Check` in the same lightweight replay-oriented shape
+  - the goal is simply to avoid leaving a lone CSI-style industry suffix as a pseudo peer bucket in historical fast-review artifacts
+
+## 2026-05-10 (peer-group tail cleanup for remaining blank buckets)
+
+- Scope:
+  - finish the last peer-group cleanup pass after normalization had already landed
+- Why:
+  - the previous replay still left 5 blank peer buckets, mainly because business descriptions existed but the keyword map did not yet cover them
+- Changes:
+  - Updated `src/services/fast_review_focus_service.py`
+    - removed the duplicate `_resolve_peer_group_label(...)` definition and kept a single effective resolver
+    - added extra business-keyword buckets for:
+      - `建筑减隔震/基建`
+      - `环保/汽车尾气`
+      - `纺织/新材料`
+      - `表面处理/化学品`
+      - `磁悬浮/高端装备`
+    - tightened the `环保/汽车尾气` matcher so generic `环保` wording inside surface-treatment sentences no longer hijacks the bucket
+  - Updated `tests/test_fast_review_focus_api.py`
+    - added red/green coverage for the five new business-description fallback cases
+- Verification:
+  - Red:
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_fast_review_focus_api.py -q -k "derives_additional_peer_groups_from_business_keywords"`
+      - initial failure before the final matcher tighten: surface-treatment text was incorrectly classified into `环保/汽车尾气`
+  - Green:
+    - same command after the fix
+      - result: `1 passed`
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_fast_review_focus_api.py tests/test_fast_review_daily_bundle.py -q`
+      - result: `78 passed`
+- Notes:
+  - this round keeps the lightweight `Peer Check` contract unchanged; it only makes the same-day peer buckets less sparse and less noisy
+
+## 2026-05-10 (peer-group normalization for long-text single-name buckets)
+
+- Scope:
+  - compress the remaining readable-but-too-long single-name `Peer Check` groups into shorter reusable buckets
+- Why:
+  - after blank peer buckets were removed, the main remaining issue was not missing groups but overlong one-off labels such as full business-description sentences
+  - representative leftovers included:
+    - `房地产开发业务和建筑施工业务`
+    - `海上运输业务`
+    - `软磁材料及磁心的研发、生产和销售`
+    - `软磁铁氧体磁粉的研发、生产和销售`
+- Changes:
+  - Updated `src/services/fast_review_focus_service.py`
+    - normalized the long labels above into:
+      - `房地产/建筑施工`
+      - `航运`
+      - `软磁材料/磁性材料`
+      - `环保设备Ⅲ` -> `再生资源/环保设备`
+      - `聚酯树脂系列产品的生产销售` -> `树脂/化工材料`
+    - also added an explicit `锂电/精密组件` normalization entry so short business aliases stop drifting back to raw text variants
+  - Updated `tests/test_fast_review_focus_api.py`
+    - added red/green coverage for the long-text single-name normalization cases
+- Verification:
+  - Red:
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_fast_review_focus_api.py -q -k "normalizes_remaining_long_text_single_name_groups"`
+      - result before the fix: `1 failed`
+      - failure shape: `房地产开发业务和建筑施工业务 != 房地产/建筑施工`
+  - Green:
+    - same command after the fix
+      - result: `1 passed`
+- Notes:
+  - this round targets readability and group reuse, not a new ranking or UI contract
+
+## 2026-05-10 (peer-group normalization and business-description fallback)
+
+- Scope:
+  - tighten `Fast Review Focus` peer grouping quality without changing the existing `Peer Check` rendering contract
+- Why:
+  - live replay on `2026-05-10` showed the persisted peer fields were present, but group labels were still too fragmented
+  - representative issues included:
+    - `光模块` / `光模块/光通信` / `光模块/光通信/半导体` being split apart
+    - `光通信/电力设备` / `海缆/电力设备/光通信` / `通信设备/电力设备` not being merged into a usable telecom-power peer bucket
+    - rows with missing structured labels falling back to no peer group at all, even though the business description already contained usable clues such as `卫星` or `机器人/智能制造`
+- Changes:
+  - Updated `src/services/fast_review_focus_service.py`
+    - added a lightweight peer-group normalization layer before group assignment
+    - normalized common replay lanes such as:
+      - `光模块 / 光模块/光通信 / 光模块/光通信/半导体` -> `光模块/光通信`
+      - `光通信/电力设备 / 海缆/电力设备/光通信 / 通信设备/电力设备 / 电力电子` -> `通信/电力设备`
+      - `铜箔 / 电子级玻纤布 / 电子材料 / 电工材料 / 石英材料` -> `AI上游材料/电子材料`
+    - added business-description keyword fallback when `preferred_industry_label / chain_role_label / theme_label / business_summary` are all too weak or missing
+    - new fallback examples include `卫星/航天` and `机器人/智能制造`
+  - Updated `tests/test_fast_review_focus_api.py`
+    - added red/green coverage for optical AI-chain normalization
+    - added red/green coverage for telecom-power and upstream-material normalization
+    - added red/green coverage for business-description fallback
+- Verification:
+  - Red:
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_fast_review_focus_api.py -q -k "normalizes_optical_ai_variants or normalizes_material_and_telecom_power_variants or derives_peer_group_from_business_description"`
+      - result before the fix: `3 failed`
+  - Green:
+    - same command after the fix
+      - result: `3 passed`
+- Notes:
+  - this round only adjusts peer-group assignment
+  - existing `peer_resonance_summary / leader_position_summary / turning_point_peer_summary` sentence generation remains unchanged
+
+## 2026-05-10 (peer check persistence into fast review CSV artifacts)
+
+- Scope:
+  - persist the already-generated `Peer Check` fields into fast-review export artifacts, instead of keeping them only in the read/API layer
+- Why:
+  - live validation showed `FastReviewFocusService` could build peer corroboration for replay and UI use, but raw CSV artifacts still had no
+    - `peer_group_label`
+    - `peer_resonance_summary`
+    - `leader_position_summary`
+    - `turning_point_peer_summary`
+  - that created a mismatch: API/UI could show peer context, but historical CSV replay could not retain it
+- Changes:
+  - Updated `scripts/run_fast_review_bundle.py`
+    - added the four peer fields to `fast_review_strategy_focus.csv`
+    - added the same four peer fields to `fast_review_earnings_focus.csv`
+    - export behavior stays fail-open for old files; only new artifacts gain the persisted columns
+- Verification:
+  - Red:
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_fast_review_daily_bundle.py -q -k "persists_peer_check_fields"`
+      - result before the fix: `2 failed`
+      - failure shape: `KeyError: 'peer_group_label'`
+  - Green:
+    - same command after the fix
+      - result: `2 passed`
+- Notes:
+  - this round does not change peer-grouping logic itself
+  - it only closes the persistence gap between read-layer enrichment and CSV artifacts
+
+## 2026-05-10 (authority explanation quality + lightweight peer corroboration)
+
+- Scope:
+  - upgrade `Fast Review Focus` explanation readability first, then add a compact peer-check layer for same-day industry corroboration
+- Why:
+  - the previous authority stack had become structurally correct, but still read too flat for replay use
+  - users still could not quickly answer:
+    - is this AI-chain name moving because of boom / orders / shortage / capacity ramp?
+    - is this stock the leader or just one of several names in the same lane?
+    - for `拐点` rows, is the turn confirmed by peers or still just a single-stock trial move?
+- Changes:
+  - Updated `src/services/signal_cause_analysis_service.py`
+    - `authority_reason_summary` now appends richer boom/catalyst clauses instead of stopping at `公告确认 / 财报确认 / 研报强化`
+    - authority summaries now explicitly surface nearby catalyst clues such as:
+      - `客户导入`
+      - `供不应求`
+      - `产能爬坡`
+      - `订单放量`
+      - `景气上行`
+    - these catalyst clues are merged with existing `business_summary / theme_label / mainline_judgement` context, so rows read more like “why it rose” instead of only “which authority bucket it belongs to”
+  - Updated `src/services/fast_review_focus_service.py`
+    - added lightweight same-day peer grouping based on:
+      - `preferred_industry_label`
+      - fallback `chain_role_label`
+      - fallback `theme_label`
+      - fallback first `business_label`
+    - each focus row now gets:
+      - `peer_group_label`
+      - `peer_resonance_summary`
+      - `leader_position_summary`
+      - `turning_point_peer_summary`
+    - this is intentionally read-layer aggregation over the current fast-review focus set, not a heavyweight full-market industry engine
+  - Updated `api/v1/schemas/signals.py`
+    - exposed the new peer-check fields through `/api/v1/signals/fast-review-focus`
+  - Updated `apps/dsa-web/src/types/signals.ts` and `apps/dsa-web/src/pages/SignalsPage.tsx`
+    - added a compact `Peer Check` block to the fast-review detail panel
+    - UI still stays terse: one block, four short rows, no extra drill-down or industry panel
+- Verification:
+  - Red:
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_signal_cause_analysis_service.py tests/test_fast_review_focus_api.py -q`
+      - initially failed because:
+        - enriched authority summaries still did not include catalyst words like `订单放量 / 产能爬坡 / 供不应求`
+        - `FastReviewFocusService` had no peer-context generation
+    - `npm.cmd run test -- --run src/pages/__tests__/SignalsPage.fastReview.test.tsx`
+      - initially failed because the new `Peer Check` block did not exist in the page
+  - Green:
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_signal_cause_analysis_service.py tests/test_fast_review_focus_api.py -q`
+      - result: `25 passed`
+    - `npm.cmd run test -- --run src/pages/__tests__/SignalsPage.fastReview.test.tsx`
+      - result: `1 passed`
+- Notes:
+  - this round does **not** claim full-industry coverage or a complete sector model
+  - the new peer summaries only answer the daily-review question: “is this move isolated, co-moving, leading, or starting to confirm as a group?”
+
+## 2026-05-10 (authority evidence windows split by source type)
+
+- Scope:
+  - relax the `Fast Review Focus` authority research lookback without changing the authority priority or the existing export/API field contract
+- Why:
+  - the previous fixed `7-day` window was too tight for research-backed trend names
+  - representative rows such as `300476 胜宏科技` could already have valid Eastmoney research text on `2026-04-30`, but still show no `market_analysis` on a `2026-05-09` replay
+  - that made the authority layer understate “研报仍在强化逻辑” even when the stock had fresh quarter numbers and nearby institutional follow-up
+- Changes:
+  - Updated `src/services/signal_cause_analysis_service.py`
+    - kept `authority_time_window_days=7` for backward-compatible export/API semantics
+    - added split internal windows:
+      - `announcements`: `7` days
+      - `market_analysis` / research: `21` days
+      - `earnings`: still follows current-report-season logic instead of a hard recent-days cutoff
+    - `_collect_authority_intel(...)` and authority normalization now filter by dimension-specific windows
+    - `research_evidence_summary` and `财报确认` follow-up copy now explicitly render the extended research window text, e.g. `近21天...`
+    - `暂无权威验证` summary now keeps the old `近7天未见足够强的公告/财报/研报验证` anchor while additionally stating that `近21天机构研报也未形成一致强化`
+  - Updated `tests/test_signal_cause_analysis_service.py`
+    - added `test_collect_authority_intel_keeps_research_items_within_extended_window`
+    - added `test_merge_reason_payload_uses_extended_research_window_for_earnings_confirmation`
+- Verification:
+  - Red:
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_signal_cause_analysis_service.py -k "extended_research_window or keeps_research_items_within_extended_window" -q`
+    - failed before the code change because:
+      - `intel["market_analysis"] == []` for the `2026-04-30 -> 2026-05-09` research sample
+      - `authority_reason_summary` did not include the extended research-window wording
+  - Green:
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m py_compile src/services/signal_cause_analysis_service.py tests/test_signal_cause_analysis_service.py`
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_signal_cause_analysis_service.py -k "extended_research_window or keeps_research_items_within_extended_window" -q`
+      - result: `2 passed`
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_fast_review_daily_bundle.py tests/test_fast_review_focus_api.py -q`
+      - result: `71 passed`
+    - combined run was also started with all three files together; it timed out at 120s without failures, so the suite was re-run in split batches
+  - Notes:
+    - this round intentionally did not expand schema fields such as `research_time_window_days`; the compact summaries now self-describe `近21天`
+    - if later we want the UI to show multiple explicit windows, that should be a separate schema/UI change rather than overloading `authority_time_window_days`
+
+## 2026-05-09 (direct Eastmoney research fallback for authority intel)
+
+- Scope:
+  - add a direct Eastmoney research-report fallback for `Fast Review Focus` authority intel when the Akshare wrapper returns malformed/empty research data
+- Why:
+  - live debugging showed a split between source truth and wrapper behavior:
+    - direct requests to `https://reportapi.eastmoney.com/report/list` returned valid rows for representative names such as `002384 东山精密`
+    - but `akshare.stock_research_report_em(...)` often returned either:
+      - an empty-looking dataframe with row indexes but no usable columns, or
+      - a direct parsing exception
+  - that meant `market_analysis` could incorrectly stay empty even when Eastmoney research data actually existed within the 7-day authority window
+- Changes:
+  - Updated `src/services/signal_cause_analysis_service.py`
+    - `_fetch_structured_research_items(...)` now treats malformed Akshare research frames as unusable instead of silently accepting them
+    - added `_fetch_direct_eastmoney_research_items(...)`
+      - calls `https://reportapi.eastmoney.com/report/list`
+      - normalizes `title / orgSName / industry / publishDate / count / infoCode`
+      - generates stable `published_date` and PDF URL fields
+    - added `_normalize_authority_date_text(...)` for Eastmoney datetime normalization
+  - Updated `tests/test_signal_cause_analysis_service.py`
+    - added `test_collect_authority_intel_uses_direct_eastmoney_research_api_when_akshare_wrapper_is_malformed`
+- Verification:
+  - Red:
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_signal_cause_analysis_service.py -q -k "direct_eastmoney_research_api_when_akshare_wrapper_is_malformed"`
+    - failed before implementation because `intel["market_analysis"] == []`
+  - Green:
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_signal_cause_analysis_service.py tests/test_fast_review_daily_bundle.py tests/test_fast_review_focus_api.py -q`
+      - result: `112 passed`
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m py_compile src/services/signal_cause_analysis_service.py tests/test_signal_cause_analysis_service.py`
+      - result: success
+    - direct online checks:
+      - Eastmoney report API returned valid authority research rows for:
+        - `002384 东山精密`: latest row `2026-05-05`, title about `2026Q1业绩高增` and `光模块+AIPCB`
+        - `300476 胜宏科技`: latest row `2026-04-30`, outside the fixed 7-day window
+      - single-stock authority payload check for `002384 东山精密` on `signal_date=2026-05-07` now yields:
+        - `authority_judgement=财报确认`
+        - `authority_reason_summary` includes `近7天机构观点仍在强化这条逻辑`
+        - non-empty `research_evidence_summary`
+  - Replay note:
+    - `2026-05-09` full fast-review rerun completed at `data/manual_runs/fast_review_20260509_direct_eastmoney_research_fallback_20260509_v22`
+    - representative research-visible names were still scarce in that day’s focus export because `002384` did not enter the final focus rows on `2026-05-09`
+    - `2026-05-07` full replay was started for visible-row verification but did not complete within the allotted runtime; single-stock authority validation was used to confirm the behavior instead
+
+## 2026-05-09 (authority partial-dimension search merge)
+
+- Scope:
+  - fix the authority-intel short-circuit so `Fast Review Focus` can keep searching missing authority dimensions even after one structured source already hit
+- Why:
+  - after the previous authority-summary refinements, the remaining real-world gap was no longer classification wording, but source coverage
+  - root cause:
+    - `_collect_authority_intel(...)` returned immediately once any structured dimension existed
+    - in practice, many rows already had structured `earnings`
+    - so `announcements` / `market_analysis` never reached `search_comprehensive_intel(...)`
+  - that meant a row could already be `财报确认`, but still lose the more specific “why it is rising” explanation from authority announcement/research text
+- Changes:
+  - Updated `src/services/signal_cause_analysis_service.py`
+    - `_collect_authority_intel(...)` now only short-circuits when:
+      - authority search is disabled, or
+      - all three dimensions already have structured evidence
+    - partial structured hits now continue into the comprehensive search layer and merge only the missing dimensions
+  - Updated `tests/test_signal_cause_analysis_service.py`
+    - added `test_collect_authority_intel_still_searches_missing_dimensions_when_earnings_exist`
+    - regression locks the concrete bug: structured earnings exist, structured research is empty, and search-backed `market_analysis` must still merge in
+- Verification:
+  - Red:
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_signal_cause_analysis_service.py -q -k "still_searches_missing_dimensions_when_earnings_exist"`
+    - failed before implementation because `intel["market_analysis"] == []`
+  - Green:
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_signal_cause_analysis_service.py tests/test_fast_review_daily_bundle.py tests/test_fast_review_focus_api.py -q`
+      - result: `111 passed`
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m py_compile src/services/signal_cause_analysis_service.py tests/test_signal_cause_analysis_service.py`
+      - result: success
+    - live rerun:
+      - output dir: `data/manual_runs/fast_review_20260509_authority_partial_search_merge_20260509_v21`
+      - authority distribution: `公告确认=5 / 财报确认=29 / 暂无权威验证=17`
+      - direct observation:
+        - short-circuit is fixed; authority search now actually executes on partial-hit rows
+        - however `research_evidence_summary` stayed `0/51`
+        - online spot check showed the new blocker is upstream search availability, not local merge logic:
+          - `search_comprehensive_intel(...)` was called
+          - `SearXNG` public-instance discovery failed
+          - `机构分析 / 公司公告 / 行业分析` search dimensions therefore returned no usable text
+
+## 2026-05-09 (authority catalyst summary refinement)
+
+- Scope:
+  - refine `Fast Review Focus` authority evidence summaries so official-announcement and research-backed names explain the concrete catalyst more clearly
+  - keep the existing authority priority and gate unchanged
+- Why:
+  - after the earlier `authority` rollout, the classification was materially better, but some explanations were still too flat
+  - the remaining gap was not “missing a level”, but “missing the concrete reason”:
+    - announcement-backed rows often stopped at `重大订单 / 扩产`
+    - research-backed rows often only echoed the first title
+  - the user explicitly cares about distinguishing:
+    - `业绩兑现`
+    - `题材扩散`
+    - `供不应求 / 客户导入 / 产能爬坡 / 订单放量` 这类更接近真实上涨逻辑的催化
+- Changes:
+  - Updated `src/services/signal_cause_analysis_service.py`
+    - introduced a shared catalyst extraction layer for authority summaries
+    - `announcement_evidence_summary` now combines strong event labels with fine-grained catalysts when both exist
+      - example shape: `重大订单、客户导入`
+      - example shape: `扩产、产能爬坡`
+    - `research_evidence_summary` now scans both titles and snippets for finer catalysts instead of only replaying the first headline
+      - can now surface `供不应求 / 产能爬坡 / 订单放量 / 景气上行`
+    - retained the headline mainline when catalyst labels exist, so the summary does not lose `AI / PCB / 光模块` context
+  - Updated `tests/test_signal_cause_analysis_service.py`
+    - added regression coverage for:
+      - announcement path: `重大订单 + 客户导入`
+      - research path: `供不应求 + 产能爬坡`
+- Verification:
+  - Red:
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_signal_cause_analysis_service.py -q -k "specific_announcement_catalysts or specific_research_catalysts"`
+    - failed before implementation because:
+      - announcement summary only returned `重大订单`
+      - research summary only returned the first generic title
+  - Green:
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_signal_cause_analysis_service.py -q`
+      - result: `39 passed`
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_signal_cause_analysis_service.py tests/test_fast_review_daily_bundle.py tests/test_fast_review_focus_api.py -q`
+      - result: `110 passed`
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m py_compile src/services/signal_cause_analysis_service.py tests/test_signal_cause_analysis_service.py`
+      - result: success
+    - live rerun:
+      - output dir: `data/manual_runs/fast_review_20260509_authority_catalyst_summary_20260509_v20`
+      - authority distribution: `公告确认=5 / 财报确认=26 / 暂无权威验证=17`
+      - interpretation:
+        - classification stayed stable relative to the previous tightening pass
+        - the new gain is explanation specificity when announcement/research text exists
+        - today many representative `财报确认` names still have empty `research_evidence_summary`, which means the current bottleneck is source availability rather than summary formatting
+
+## 2026-05-09 (authority earnings gate tightened + fast-review detail compacted)
+
+- Scope:
+  - tighten `Fast Review Focus` authority classification so weak quarterly numbers no longer default to `财报确认`
+  - compact the fast-review detail panel so the first screen emphasizes `权威结论 / 主线判断 / 今日涨幅 / PE / 报告期 / 净利润`
+- Why:
+  - live replay still exposed a calibration gap: once `earnings_evidence_summary` existed, many rows were promoted to `财报确认` even when the quarter was weak
+  - representative false-positive cases included:
+    - `600118 中国卫星`: `净利润为负 + 净利同比-77.1%`
+    - `002929 润建股份`: `营收同比-23.5% + 净利同比-81.8%`
+    - `002903 宇环数控`: `净利润为负 + 营收同比-18.1% + 净利同比-358.2%`
+    - `000977 浪潮信息`: `营收同比-24.3%`
+  - UI side still had repeated explanation blocks; `Quick Read` / `Authority` duplicated the same sentence and pushed the real key numbers below the fold
+- Changes:
+  - Updated `src/services/signal_cause_analysis_service.py`
+    - added an explicit earnings authority gate before assigning `authority_judgement=财报确认`
+    - `财报确认` now requires supportive in-season earnings evidence instead of merely “a quarter exists”
+    - kept `earnings_evidence_summary` fail-open so weak rows still retain quarter snapshots for review
+    - added a compact fallback `authority_reason_summary` for `暂无权威验证`:
+      - `近7天未见足够强的公告/财报/研报验证`
+      - plus `业务方向 / 主题映射 / 主线暂按...理解`
+      - ending with `现阶段更像交易驱动、题材扩散或趋势延续`
+  - Updated `tests/test_signal_cause_analysis_service.py`
+    - added `test_merge_reason_payload_rejects_weak_earnings_as_authority_confirmation`
+    - added `test_news_theme_authority_summary_explains_lack_of_strong_validation`
+    - refreshed the older positive-path fixture so it still represents a truly supportive quarter
+  - Updated `apps/dsa-web/src/pages/SignalsPage.tsx`
+    - moved `Verified Logic` and `Mainline` to the top of `Quick Read`
+    - removed `Priority / Event Date` from the first-screen block
+    - changed `Authority` to compact `Announcement / Earnings / Research` cards only
+    - compressed `Logic` into a denser stacked layout
+  - Updated `apps/dsa-web/src/pages/__tests__/SignalsPage.fastReview.test.tsx`
+    - added regression checks for `Verified Logic`, `Announcement/Earnings/Research`, and absence of `Priority / Event Date`
+- Verification:
+  - Red:
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_signal_cause_analysis_service.py -k "rejects_weak_earnings_as_authority_confirmation" -q`
+    - failed before code change because the weak sample still returned `authority_level=earnings`
+  - Green:
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_signal_cause_analysis_service.py tests/test_fast_review_daily_bundle.py tests/test_fast_review_focus_api.py -q`
+      - result: `108 passed`
+    - `npm.cmd run test -- --run src/pages/__tests__/SignalsPage.fastReview.test.tsx`
+      - result: `1 passed`
+    - `npm.cmd run build`
+      - result: success
+    - live rerun:
+      - output dir: `data/manual_runs/fast_review_20260509_authority_gate_tighten_ui_20260509_v16`
+      - authority distribution: `公告确认=5 / 财报确认=25 / 暂无权威验证=16`
+      - representative rows after tightening:
+        - kept as `财报确认`: `东山精密 / 胜宏科技 / 光迅科技 / 杭电股份`
+        - demoted to `暂无权威验证`: `中国卫星 / 润建股份 / 宇环数控 / 浪潮信息 / 汇绿生态`
+    - follow-up rerun for non-authoritative summary fill:
+      - output dir: `data/manual_runs/fast_review_20260509_unverified_authority_summary_20260509_v19`
+      - representative rows now render non-empty authority explanations:
+        - `中国卫星`: `暂无权威验证：近7天未见足够强的公告/财报/研报验证；主线暂按 业绩兑现 理解；现阶段更像交易驱动、题材扩散或趋势延续`
+        - `浪潮信息`: `暂无权威验证：近7天未见足够强的公告/财报/研报验证；业务方向更偏 AI服务器，偏AI算力供应链；主线暂按 AI主线扩散 理解；现阶段更像交易驱动、题材扩散或趋势延续`
+
+## 2026-05-09 (authority earnings summary carries mainline context)
+
+- Scope: tighten the `Fast Review Focus` authority explanation so `财报确认` rows do not stop at quarter numbers when the same stock already has a clearer AI-chain/mainline interpretation.
+- Why:
+  - Live `2026-05-09` samples were directionally correct but still too flat in the first authority sentence.
+  - `东山精密 / 胜宏科技 / 光迅科技` were already classified as `财报确认`, but `authority_reason_summary` only said `Q1 profit + YoY growth + 业绩兑现`.
+  - Root cause:
+    - `SignalCauseAnalysisService._build_authority_reason_summary(...)` used a single hardcoded branch for `财报确认`
+    - it ignored already-available `business_summary`, `mainline_judgement`, and `research_evidence_summary`
+    - so the system knew `AI上游材料扩散 / PCB / 光模块` in other fields, but dropped that context from the compact authority sentence
+- Changes:
+  - Updated `src/services/signal_cause_analysis_service.py`
+    - `_derive_authority_payload(...)` now accepts `mainline_judgement`
+    - `财报确认` summaries now append compact context when available:
+      - `业务方向更偏 ...`
+      - `主线判断更偏 ...`
+      - `近7天机构观点仍在强化这条逻辑`
+    - cleaned the join path to avoid `。；` punctuation in enriched summaries
+  - Updated `tests/test_signal_cause_analysis_service.py`
+    - added `test_merge_reason_payload_enriches_earnings_authority_summary_with_mainline_context`
+    - the regression locks the real sample shape: earnings confirmation plus AI-chain context plus aligned research reinforcement
+- Verification:
+  - Red:
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_signal_cause_analysis_service.py -k "enriches_earnings_authority_summary_with_mainline_context" -q`
+    - failed before the code change because `authority_reason_summary` did not contain `AI`
+  - Green:
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m py_compile src/services/signal_cause_analysis_service.py tests/test_signal_cause_analysis_service.py`
+    - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_signal_cause_analysis_service.py tests/test_fast_review_daily_bundle.py tests/test_fast_review_focus_api.py -q`
+      - result: `106 passed`
+    - live rerun:
+      - output dir: `data/manual_runs/fast_review_20260509_authority_context_enriched_20260509_v14`
+      - representative rows:
+        - `002384 东山精密`: `财报确认 ... 业务方向更偏 PCB/光模块/电子材料，偏AI上游材料链；主线判断更偏 AI上游材料扩散；近7天机构观点仍在强化这条逻辑`
+        - `300476 胜宏科技`: `财报确认 ... 业务方向更偏 PCB，偏AI算力供应链；主线判断更偏 AI主线扩散`
+        - `002281 光迅科技`: `财报确认 ... 业务方向更偏 光模块/光通信，偏AI算力供应链；主线判断更偏 AI主线扩散`
+
+## 2026-05-09 (strategy focus cold EM warmup + Tencent batch prefetch)
+
+- Scope: fix the remaining `today_change_pct / pe_ratio` starvation in `fast_review_strategy_focus.csv` after the earlier full-row lightweight quote backfill.
+- Why:
+  - The previous export fix had already expanded lightweight market enrichment from visible rows to all export rows.
+  - But live evidence from `data/manual_runs/fast_review_20260509_full_row_quote_backfill_verify_20260509_v10` showed a second bottleneck:
+    - rows `1-17` had `today_change_pct / pe_ratio`
+    - rows `18-51` were all blank on both fields
+    - the blank rows were concentrated in lower-priority `trend_leader_watchlist / earnings_surprise / hundred_day_high`
+  - Root cause:
+    - `FastReviewFocusService._load_batch_quote_payloads(...)` only reused EM batch quotes when the global EM realtime cache was already warm
+    - in a cold-cache run, quote filling degraded to per-row Tencent / manager fallback
+    - that path consumed the total quote deadline before later rows were reached, so the tail rows were not actually attempted
+- Changes:
+  - Updated `src/services/fast_review_focus_service.py`
+    - `_load_batch_quote_payloads(...)` now attempts EM batch warmup whenever there are at least 2 A-share rows needing quote fill
+    - this allows the first EM request to populate the shared realtime cache, then lets the remaining rows reuse the same snapshot instead of timing out one by one
+    - when EM warmup still returns empty, the service now prefetches lightweight Tencent quotes in a small batch before the per-row deadline logic starts
+    - this prevents the export tail from degenerating into strict one-by-one fallback under the same 90-second quote budget
+  - Updated `tests/test_fast_review_focus_api.py`
+    - added `test_focus_service_warms_em_batch_quote_cache_when_cold_and_multiple_rows_need_quotes`
+    - this reproduces the cold-cache case where Tencent is unavailable but EM warmup should still fill multiple rows without falling back to manager realtime
+    - added `test_focus_service_prefetches_tencent_batch_quotes_before_deadline_when_em_batch_warmup_fails`
+    - this locks the real `2026-05-09` scenario where EM returns empty and the export still needs to fill multiple rows before the quote deadline
+- Verification:
+  - Red:
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_focus_api.py -q -k warms_em_batch_quote_cache_when_cold_and_multiple_rows_need_quotes`
+    - failed before the code change because `em_calls == []`
+  - Green:
+    - `.\\.venv\\Scripts\\python.exe -m py_compile src/services/fast_review_focus_service.py tests/test_fast_review_focus_api.py`
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_focus_api.py -q`
+      - result: `15 passed`
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_daily_bundle.py -q`
+      - result: `56 passed`
+    - live rerun:
+      - output dir: `data/manual_runs/fast_review_20260509_tencent_batch_prefetch_verify_20260509_v12`
+      - `fast_review_strategy_focus.csv`: `rows=50`, missing `today_change_pct / pe_ratio = 0`
+      - representative tail rows now filled:
+        - `002384 东山精密`: `0.15 / 189.79 / 2026Q1 / 11.10亿`
+        - `603618 杭电股份`: `10.0 / -108.77 / 2026Q1 / 0.81亿`
+        - `301531 春光集团`: `0.0 / 21.89 / 2026Q1 / 0.30亿`
+      - compared with `v11`, the quote-fill tail no longer breaks at row `18`
+
+## 2026-05-09 (strategy focus full-row lightweight quote backfill)
+
+- Scope: reduce the remaining `today_change_pct / pe_ratio` holes in `fast_review_strategy_focus.csv` after the authority snapshot backfill work had already fixed `report period / report date / net profit`.
+- Why:
+  - The previous fix only normalized all export rows locally, but still limited real market enrichment to the visible markdown subset.
+  - Result: hidden rows could now show `2026Q1 / 净利`, but still frequently stayed blank on `today_change_pct / pe_ratio`.
+  - Root cause was now clear:
+    - `strategy_focus` row assembly already tried to carry quote fields through
+    - but most rows still depended on export-time fill
+    - and export-time fill for quotes was still effectively visible-row-only
+- Changes:
+  - Updated `src/services/fast_review_focus_service.py`
+    - added `enrich_market_fields(...)` as a lightweight market-only enrichment entry
+    - split quote filling into `_enrich_market_only(...)`
+    - kept heavy earnings/report/valuation work inside `enrich_items(...)`
+  - Updated `scripts/run_fast_review_bundle.py`
+    - `strategy_focus` export now runs `enrich_market_fields(export_rows)` for all rows first
+    - then still limits `enrich_items(...)` to the visible subset selected by `_select_strategy_focus_export_enrichment_rows(...)`
+  - Updated `tests/test_fast_review_daily_bundle.py`
+    - added `test_write_strategy_focus_outputs_backfills_hidden_rows_market_fields_without_expanding_heavy_scope`
+- Verification:
+  - Red:
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_daily_bundle.py -q -k "backfills_hidden_rows_market_fields_without_expanding_heavy_scope"`
+    - failed before the fix with hidden-row `today_change_pct == ''`
+  - Green:
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_daily_bundle.py -q -k "backfills_hidden_rows_market_fields_without_expanding_heavy_scope"`
+      - result: `1 passed`
+    - `.\\.venv\\Scripts\\python.exe -m py_compile src/services/fast_review_focus_service.py scripts/run_fast_review_bundle.py tests/test_fast_review_daily_bundle.py tests/test_fast_review_focus_api.py`
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_daily_bundle.py -q`
+      - result: `55 passed`
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_focus_api.py -q`
+      - result: `13 passed`
+
+## 2026-05-09 (fast review authority snapshot backfill + hidden-row export scope fix)
+
+- Scope: close the remaining fast-review display gap where authority earnings judgement was already correct, but the review snapshot still failed to show `report period / report date / net profit` for many rows.
+- Why:
+  - The earlier authority work had already produced usable text such as `2026Q1，2026-03-31，净利润12.88亿元...`, but `FastReviewFocusService` still treated snapshot补齐 as a network-enrichment-only problem.
+  - Root cause was split in two:
+    - read/export layers were not reusing existing `authority_reason_summary / earnings_evidence_summary`
+    - `scripts/run_fast_review_bundle.py` only normalized/enriched the visible `strategy_focus` subset, so hidden rows like `603618 杭电股份` stayed blank even after top rows looked correct
+- Changes:
+  - Updated `src/services/fast_review_focus_service.py`
+    - `_normalize_missing_fields(...)` now also tries a local prefill from:
+      - `earnings_evidence_summary`
+      - `authority_reason_summary`
+    - added:
+      - `_prefill_snapshot_fields_from_authority_summaries(...)`
+      - `_extract_snapshot_fields_from_authority_texts(...)`
+      - `_extract_named_amount_from_text(...)`
+    - relaxed the heavy-refetch gate so rows with recovered `report_date / report_period_label` and at least one amount field no longer re-enter costly network enrichment by default
+  - Updated `scripts/run_fast_review_bundle.py`
+    - `strategy_focus` export now instantiates one `FastReviewFocusService`
+    - runs `_normalize_missing_fields(...)` across all `export_rows`
+    - keeps expensive `enrich_items(...)` limited to visible rows only
+    - preserves the existing performance intent while fixing hidden-row snapshot holes
+  - Updated tests:
+    - `tests/test_fast_review_focus_api.py`
+      - `test_focus_service_backfills_snapshot_fields_from_authority_earnings_summary_without_refetch`
+    - `tests/test_fast_review_daily_bundle.py`
+      - `test_write_strategy_focus_outputs_prefills_hidden_rows_from_authority_summary`
+- Verification:
+  - `.\\.venv\\Scripts\\python.exe -m py_compile src/services/fast_review_focus_service.py tests/test_fast_review_focus_api.py`
+  - `.\\.venv\\Scripts\\python.exe -m py_compile scripts/run_fast_review_bundle.py src/services/fast_review_focus_service.py tests/test_fast_review_daily_bundle.py tests/test_fast_review_focus_api.py`
+  - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_focus_api.py -q`
+    - result: `13 passed`
+  - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_daily_bundle.py -q`
+    - result: `54 passed`
+  - Live rerun:
+    - `.\\.venv\\Scripts\\python.exe scripts/run_fast_review_bundle.py --strategy-profile-file config\\local_strategy_profile.json --snapshot-date 2026-05-09 --output-dir data\\manual_runs\\fast_review_20260509_snapshot_backfill_hidden_rows_fix_20260509_v8 --log-level INFO`
+    - rerun completed successfully
+    - log showed `strategy focus export enrichment scope: visible_rows=14 total_rows=51`
+    - `fast_review_strategy_focus.csv` post-check:
+      - rows: `51`
+      - missing `report_period_label`: `0`
+      - missing `net_profit_amount`: `8`
+      - missing `today_change_pct`: `40`
+      - missing `pe_ratio`: `40`
+    - representative rows now carry recovered snapshot fields directly in the CSV:
+      - `300476 胜宏科技` -> `2026Q1 / 2026-03-31 / 12.88亿`
+      - `002281 光迅科技` -> `2026Q1 / 2026-03-31 / 2.40亿`
+      - `600522 中天科技` -> `2026Q1 / 2026-03-31 / 9.19亿`
+      - `603629 利通电子` -> `2026Q1 / 2026-03-31 / 2.71亿`
+      - `603618 杭电股份` -> `2026Q1 / 2026-03-31 / 8084.19万` even though it was outside the visible enrichment subset
+
+## 2026-05-09 (fast review bundle stdout encoding alignment)
+
+- Scope: fix the actual full-run blocker encountered while replaying the `2026-05-09` fast review after the authority earnings supplement work had already landed.
+- Why:
+  - The authority logic itself was already usable, but the new live replay hit an execution-layer bug in `scripts/run_fast_review_bundle.py`.
+  - Root cause:
+    - parent process used `subprocess.Popen(..., text=True)` with Windows default decoding
+    - child Python scripts could emit UTF-8 stdout
+    - `_stream_process_stdout(...)` then crashed with `UnicodeDecodeError: 'gbk' codec can't decode byte 0x80...`
+  - This was not a strategy result issue; it was a parent/child stdout encoding mismatch that could break any long bundle replay on Windows.
+- Changes:
+  - Updated `scripts/run_fast_review_bundle.py`
+    - `_run_command(...)` now launches child processes with:
+      - `encoding="utf-8"`
+      - `errors="replace"`
+      - `env["PYTHONIOENCODING"]="utf-8"`
+    - parent/child stdout decoding is now aligned and fail-soft for stray bytes
+  - Updated `tests/test_fast_review_daily_bundle.py`
+    - added regression coverage asserting the child process is started with UTF-8 decoding and inherited `PYTHONIOENCODING=utf-8`
+- Verification:
+  - Red:
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_daily_bundle.py -q -k "utf8_decoding_for_child_stdout"`
+    - failed before the fix with `assert None == 'utf-8'`
+  - Green:
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_daily_bundle.py -q -k "utf8_decoding_for_child_stdout"`
+      - result: `1 passed`
+    - `.\\.venv\\Scripts\\python.exe -m py_compile scripts/run_fast_review_bundle.py tests/test_fast_review_daily_bundle.py`
+  - Live rerun:
+    - `.\\.venv\\Scripts\\python.exe scripts/run_fast_review_bundle.py --strategy-profile-file config\\local_strategy_profile.json --snapshot-date 2026-05-09 --output-dir data\\manual_runs\\fast_review_20260509_post_authority_downloaded_verify_20260509_v6 --log-level INFO`
+    - runtime about `553s`
+    - bundle completed successfully
+    - `fast_review_strategy_focus.csv` rows: `49`
+    - authority distribution:
+      - `公告确认: 5`
+      - `财报确认: 44`
+    - no stdout reader thread crashed in this rerun
+
+## 2026-05-09 (authority downloaded earnings supplement)
+
+- Scope: remove the last practical blocker where authority earnings judgement still depended on live fundamental bundle success for a few representative trend names.
+- Why:
+  - After the short-circuit fix, the logic path was already correct, but `胜宏科技` still occasionally stayed in `暂无权威验证` because the authority layer could still end up with no usable earnings facts when both:
+    - general fundamental context was thin
+    - earnings-only refetch still hit `fundamental_bundle timeout`
+  - The user explicitly chose the pragmatic path: no manual intervention, just download supplementary earnings evidence automatically.
+- Changes:
+  - Updated `src/services/signal_cause_analysis_service.py`
+    - added `_fetch_structured_earnings_items(...)`
+    - reused `scripts/select_earnings_surprise_candidates.py` existing recent-event catalog logic instead of creating a second downloader:
+      - `build_recent_earnings_event_catalog(...)`
+      - `filter_recent_event_catalog_by_scope(...)`
+      - `resolve_current_report_period(...)`
+    - when authority earnings evidence is still empty, now downloads current-report-period `actual report / quick report / forecast` items and normalizes them into the authority `earnings` dimension
+    - preserved extra fields such as `report_date / report_periods / revenue_yoy / net_profit_yoy / net_profit_parent` through normalization so summaries can use them directly
+    - allowed current reporting-season earnings catalog items to bypass the strict 7-day prune when they clearly belong to the active reporting season
+  - Updated `tests/test_signal_cause_analysis_service.py`
+    - added coverage for downloaded earnings catalog fallback when the fundamental bundle is missing
+    - added coverage for downloaded earnings catalog fallback when bundle fetch times out
+- Verification:
+  - `.\\.venv\\Scripts\\python.exe -m py_compile src/services/signal_cause_analysis_service.py tests/test_signal_cause_analysis_service.py`
+  - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_signal_cause_analysis_service.py -q`
+    - result: `34 passed`
+  - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_daily_bundle.py -q`
+    - result: `52 passed`
+  - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_focus_api.py -q`
+    - result: `12 passed`
+  - Live rerun:
+    - `.\\.venv\\Scripts\\python.exe scripts/run_fast_review_bundle.py --strategy-profile-file config\\local_strategy_profile.json --snapshot-date 2026-05-09 --output-dir data\\manual_runs\\fast_review_20260509_authority_downloaded_earnings_20260509_v4 --log-level INFO`
+    - `fast_review_strategy_focus.csv` now shows `49` rows with:
+      - `公告确认: 5`
+      - `财报确认: 44`
+    - representative rows now all upgrade into `财报确认`:
+      - `300476 胜宏科技`
+      - `002281 光迅科技`
+      - `603618 杭电股份`
+      - `600522 中天科技`
+      - `603629 利通电子`
+    - `胜宏科技` example row now reads:
+      - `authority_judgement=财报确认`
+      - `authority_reason_summary=财报确认：2026Q1，2026-03-31，净利润12.88亿元，营收同比+28.0%，净利同比+40.0%，上涨更偏业绩兑现驱动。`
+
+## 2026-05-09 (authority fallback short-circuit fix + live rerun verification)
+
+- Scope: fix the remaining real-run authority regression after the structured-fallback work landed but representative AI-chain names still stayed in `暂无权威验证`.
+- Why:
+  - The new structured authority layer was already in place, but a live `2026-05-09` rerun still showed no improvement for `胜宏科技 / 光迅科技 / 杭电股份 / 中天科技 / 利通电子`.
+  - Root-cause probing showed a specific short-circuit bug:
+    - `get_fundamental_context(...)` often returned `status=partial`
+    - `growth / earnings` were empty
+    - but `earnings_quality.data` still carried default placeholder metrics such as `gross_margin_trend=insufficient_history`, `cycle_phase=unavailable`, `cycle_score=0`
+    - `_has_meaningful_earnings_context(...)` treated those defaults as meaningful, so `_ensure_earnings_context(...)` returned early and never merged the successful `get_earnings_fundamental_context(...)` fallback result
+- Changes:
+  - Updated `src/services/signal_cause_analysis_service.py`
+    - tightened `_has_meaningful_fundamental_block(...)` for the `verdict=unavailable` path
+    - added `_has_meaningful_quality_metrics(...)`
+    - default placeholder metrics no longer count as valid earnings context
+    - only substantive quality metrics such as `revenue_yoy / net_profit_yoy / report_date / latest_single_quarter_* / TTM growth` can block the earnings-only fallback merge
+  - Updated `tests/test_signal_cause_analysis_service.py`
+    - added a red-green regression using a real-world-shaped manager fixture:
+      - general context only has `unavailable` default metrics
+      - earnings-only fallback still has valid `2026Q1` report data
+      - expected result is `authority_judgement=财报确认`
+- Verification:
+  - Red:
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_signal_cause_analysis_service.py -q -k "general_metrics_are_only_unavailable_defaults"`
+    - failed before the fix with `暂无权威验证 != 财报确认`
+  - Green:
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_signal_cause_analysis_service.py -q`
+      - result: `32 passed`
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_daily_bundle.py -q`
+      - result: `52 passed`
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_focus_api.py -q`
+      - result: `12 passed`
+    - `.\\.venv\\Scripts\\python.exe -m py_compile src/services/signal_cause_analysis_service.py tests/test_signal_cause_analysis_service.py`
+  - Live rerun:
+    - `.\\.venv\\Scripts\\python.exe scripts/run_fast_review_bundle.py --strategy-profile-file config\\local_strategy_profile.json --snapshot-date 2026-05-09 --output-dir data\\manual_runs\\fast_review_20260509_authority_fix_rerun_20260509_v3 --log-level INFO`
+    - runtime about `599s`
+    - authority distribution changed from:
+      - `暂无权威验证: 44`
+      - `公告确认: 5`
+      - `财报确认: 1`
+    - to:
+      - `暂无权威验证: 40`
+      - `公告确认: 5`
+      - `财报确认: 5`
+    - representative rows upgraded:
+      - `002281 光迅科技` -> `财报确认`
+      - `603618 杭电股份` -> `财报确认`
+      - `600522 中天科技` -> `财报确认`
+      - `603629 利通电子` -> `财报确认`
+    - remaining gap:
+      - `300476 胜宏科技` still stayed in `暂无权威验证`
+      - direct probe shows `get_earnings_fundamental_context('300476', ...)` still returns `fundamental_bundle timeout` even with a larger budget, so the remaining issue is source availability / upstream timeout, not the authority fallback logic itself
+
+## 2026-05-09 (authority structured fallback + earnings-only refetch)
+
+- Scope: strengthen the authority-first explanation path for `Fast Review Focus` after the first real replay still left many AI-chain trend names in `暂无权威验证`.
+- Why:
+  - The earlier authority-first layer already exposed `announcement / earnings / research` summaries, but real rows such as `胜宏科技 / 光迅科技 / 杭电股份 / 中天科技 / 利通电子` still rarely upgraded into `公告确认 / 财报确认 / 研报强化`.
+  - Root cause was not only search coverage. In real runs, `manager.get_fundamental_context(stock_code)` often returned `status=partial` with empty `growth / earnings`, so the authority layer had no usable earnings facts to judge from.
+- Changes:
+  - Updated `src/services/signal_cause_analysis_service.py`
+    - added structured announcement fallback via `akshare.stock_gsrl_gsdt_em(date=...)`, cached by day
+    - added structured research fallback via `akshare.stock_research_report_em(symbol=...)`, cached by stock
+    - merged structured authority evidence ahead of generic search results, while keeping search as supplement
+    - improved earnings-summary assembly so current report-season growth/profit snippets can directly support `财报确认`
+    - added `_ensure_earnings_context(...)`:
+      - when `get_fundamental_context(...)` lacks meaningful `growth / earnings / earnings_quality`
+      - refetches `get_earnings_fundamental_context(stock_code, budget_seconds=1.2, enabled_blocks=("financial", "forecast", "quick_report"))`
+      - merges the earnings-only fallback blocks back into the main context before authority judgement
+  - Updated `tests/test_signal_cause_analysis_service.py`
+    - added coverage for structured announcement fallback
+    - added coverage for structured research fallback
+    - added coverage for current-season structured earnings confirmation without search hits
+    - added coverage for earnings-only refetch when general fundamental context is too thin
+- Verification:
+  - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_signal_cause_analysis_service.py -q`
+    - result: `31 passed`
+  - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_daily_bundle.py -q`
+    - result: `52 passed`
+  - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_focus_api.py -q`
+    - result: `12 passed`
+  - `.\\.venv\\Scripts\\python.exe -m py_compile src/services/signal_cause_analysis_service.py tests/test_signal_cause_analysis_service.py`
+- Notes:
+  - This round verifies the fallback chain and judgement logic offline.
+  - A fresh online `run_fast_review_bundle.py` replay is still required to confirm whether representative names now upgrade out of `暂无权威验证`.
+
+## 2026-05-09 (fast review authority-first explanation)
+
+- Scope: add an authority-first explanation layer for `Fast Review Focus` only, without expanding to the global `/signals` detail pages.
+- Why:
+  - The previous fast-review explanation could summarize business and theme logic, but it still did not clearly separate `有公告/财报/研报支持` from `普通新闻/题材映射`.
+  - The user wanted a more defensible answer to “为什么这票涨得有逻辑，不是瞎炒”, while keeping the UI compact and review-oriented.
+- Changes:
+  - Updated `src/services/signal_cause_analysis_service.py`
+    - added authority evidence collection via `search_comprehensive_intel(...)`
+    - normalized `announcements / earnings / market_analysis` into a fixed 7-day authority window
+    - added authority priority judgement fields:
+      - `authority_judgement`
+      - `authority_level`
+      - `authority_reason_summary`
+      - `authority_evidence_digest`
+      - `announcement_evidence_summary`
+      - `earnings_evidence_summary`
+      - `research_evidence_summary`
+      - `authority_time_window_days`
+    - priority is now `announcement > earnings > research > news_theme`
+  - Updated `scripts/run_fast_review_bundle.py`
+    - exported authority fields into both `fast_review_strategy_focus.csv` and `fast_review_earnings_focus.csv`
+    - kept old fields intact and fail-open for older rows
+  - Updated `src/services/fast_review_focus_service.py`
+    - read layer now passes authority fields through and treats missing legacy fields as optional
+  - Updated `api/v1/schemas/signals.py`, `apps/dsa-web/src/types/signals.ts`
+    - exposed authority fields through `/api/v1/signals/fast-review-focus`
+  - Updated `apps/dsa-web/src/pages/SignalsPage.tsx`
+    - added a compact `Authority` block in fast-review detail
+    - UI only shows judgement and compressed summaries, without raw links
+  - Updated tests:
+    - `tests/test_signal_cause_analysis_service.py`
+    - `tests/test_fast_review_daily_bundle.py`
+    - `tests/test_fast_review_focus_api.py`
+    - `apps/dsa-web/src/pages/__tests__/SignalsPage.fastReview.test.tsx`
+- Verification:
+  - `.\\.venv\\Scripts\\python.exe -m py_compile src/services/signal_cause_analysis_service.py src/services/fast_review_focus_service.py scripts/run_fast_review_bundle.py api/v1/schemas/signals.py tests/test_signal_cause_analysis_service.py tests/test_fast_review_daily_bundle.py tests/test_fast_review_focus_api.py`
+  - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_signal_cause_analysis_service.py -q`
+    - result: `27 passed`
+  - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_daily_bundle.py -q`
+    - result: `52 passed`
+  - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_focus_api.py -q`
+    - result: `12 passed`
+  - `cd apps/dsa-web && npm.cmd run test -- --run src/pages/__tests__/SignalsPage.fastReview.test.tsx`
+    - result: `1 passed`
+  - `cd apps/dsa-web && npm.cmd run build`
+    - result: success
+
+
+## 2026-05-09 (fast review mainline judgement export + UI display)
+
+- Scope: make fast-review explanations more explicit for business-vs-industry conflicts, AI boom reasoning, and UI readability.
+- Why:
+  - The fallback explanation had improved wording, but `fast_review_strategy_focus.csv` still did not export the new structure fields, so `/signals` could not display them explicitly.
+  - Wide `industry` labels such as `新能源` could still sit ahead of a more accurate business identity like `光通信/电力设备`, which made names such as `中天科技` read incorrectly at a glance.
+- Changes:
+  - Updated `src/services/signal_cause_analysis_service.py`
+    - added `preferred_industry_label`, `mainline_judgement`, and `mainline_evidence_sources`
+    - fallback logic now opens with the business-led label when it is more specific than the wide industry bucket
+    - AI-chain / AI-upstream wording now carries an explicit judgement clause with evidence-source labels
+  - Updated `scripts/run_fast_review_bundle.py`
+    - exported `mainline_judgement / mainline_evidence_sources / preferred_industry_label` into `fast_review_strategy_focus.csv` and `fast_review_earnings_focus.csv`
+  - Updated `src/services/fast_review_focus_service.py`, `api/v1/schemas/signals.py`, `apps/dsa-web/src/types/signals.ts`, `apps/dsa-web/src/pages/SignalsPage.tsx`
+    - exposed the new structure fields through `/api/v1/signals/fast-review-focus`
+    - `Fast Review Focus` detail panel now shows compact `Mainline` and `Evidence` cards instead of forcing users to infer them from long paragraphs
+  - Updated tests:
+    - `tests/test_signal_cause_analysis_service.py`
+    - `apps/dsa-web/src/pages/__tests__/SignalsPage.fastReview.test.tsx`
+- Verification:
+  - `python -m py_compile scripts/run_fast_review_bundle.py src/services/signal_cause_analysis_service.py src/services/fast_review_focus_service.py api/v1/schemas/signals.py`
+  - `.\\.venv\\Scripts\\python.exe -m unittest tests.test_signal_cause_analysis_service.SignalCauseAnalysisServiceTestCase.test_build_logic_breakdown_prefers_business_summary_when_industry_is_too_broad tests.test_signal_cause_analysis_service.SignalCauseAnalysisServiceTestCase.test_merge_reason_payload_adds_mainline_structure_fields`
+  - `cd apps/dsa-web && npm.cmd run test -- --run src/pages/__tests__/SignalsPage.fastReview.test.tsx`
+  - `cd apps/dsa-web && npm.cmd run build`
+  - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_daily_bundle.py -q`
+  - `.\\.venv\\Scripts\\python.exe scripts/run_fast_review_bundle.py --strategy-profile-file config\\local_strategy_profile.json --snapshot-date 2026-05-09 --output-dir data\\manual_runs\\fast_review_20260509_mainline_ui_20260509_v2 --log-level INFO`
+    - runtime around `311.7s`
+    - representative rows now export:
+      - `600522 中天科技`: `preferred_industry_label=光通信/电力设备`, `mainline_judgement=业绩兑现`
+      - `300476 胜宏科技`: `preferred_industry_label=PCB`, `mainline_judgement=AI主线扩散`
+      - `603618 杭电股份`: `mainline_judgement=AI上游材料扩散`
+
+## 2026-05-08 (fast review visible export quote-budget scaling)
+
+- Scope: improve snapshot completeness for visible `strategy_focus` rows during daily fast-review export.
+- Why:
+  - The refreshed `2026-05-08` artifact showed that visible watch rows such as `300442 润泽科技` and `300476 胜宏科技` could still miss `today_change_pct / pe_ratio` even though the enrichment service could fetch them successfully in isolation.
+  - Root cause was export-time budget starvation, not wrong stock selection:
+    - `strategy focus export enrichment scope` had `visible_rows=16`
+    - `FastReviewFocusService` still used a fixed `25s` total quote budget
+    - realtime quote enrichment runs sequentially when batch cache is cold, so earlier core rows consumed most of the budget before later visible watch rows were reached
+- Changes:
+  - Updated `src/services/fast_review_focus_service.py`
+    - added dynamic total quote budget sizing for export/read enrichment
+    - budget now scales with the number of rows that still miss `today_change_pct` or `pe_ratio`
+    - keeps the old default floor, but adds a capped upper bound so visible rows are less likely to starve while avoiding unbounded runtime growth
+  - Updated `tests/test_fast_review_focus_api.py`
+    - added `test_focus_service_scales_total_quote_budget_with_missing_visible_rows`
+- Verification:
+  - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_focus_api.py -k "scales_total_quote_budget_with_missing_visible_rows or enrich_items_treats_blank_strings_as_missing or prefers_akshare_em_snapshot_for_multi_a_share_quote_enrichment or uses_lightweight_tencent_quote_when_em_cache_is_cold"`
+    - result: `4 passed`
+
+## 2026-05-08 (fast review resource-theme false positive suppression for copper-conductor component text)
+
+- Scope: remove a remaining theme-mapping false positive discovered from the refreshed `2026-05-08` daily review artifact.
+- Why:
+  - After the previous explanation tightening, `600487 亨通光电` no longer looked like `AI算力供应链`, but it was still being tagged as `有色 / 涨价资源`.
+  - Root cause was not board noise anymore. The actual `business_profile.product_type/product_name` contained `铜导体`, and the generic `铜` keyword was enough to trigger the resource theme even though the company’s higher-level business identity remained `海缆 / 电力设备 / 光通信`.
+- Changes:
+  - Updated `src/services/signal_cause_analysis_service.py`
+    - added a resource-theme suppression gate inside `_map_overseas_theme(...)`
+    - when `有色 / 涨价资源` evidence comes only from low-signal business component fields (`main_business / product_type / product_name`) and the company’s explicit business identity is still infrastructure/communications (`海缆 / 电力设备 / 光通信 / 通信设备`), the theme is now suppressed
+    - this keeps true resource-facing names available while blocking `铜导体`-style component noise
+  - Updated `tests/test_signal_cause_analysis_service.py`
+    - added `test_map_overseas_theme_does_not_treat_copper_conductor_component_as_resource_theme`
+- Verification:
+  - `.\\.venv\\Scripts\\python.exe -m py_compile src/services/signal_cause_analysis_service.py tests/test_signal_cause_analysis_service.py`
+  - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_signal_cause_analysis_service.py -k "copper_conductor_component or second_tier_business_summaries or generic_optical_communication"`
+    - result: `3 passed`
+
+## 2026-05-08 (fast review explanation accuracy tighten for earnings bias + second-tier business summaries)
+
+- Scope: tighten daily fast-review explanation accuracy without changing the underlying selection universe or A/B/stage scoring rules.
+- Why:
+  - The remaining practical gap had shifted from missing numbers to misread explanations:
+    - some `trend_leader` rows were still showing `supply_demand_bias=earnings` only because `cause_tags` contained `earnings`
+    - second-tier names such as `宏和科技 / 润泽科技 / 烽火通信 / 亨通光电` still lacked stable `business_summary`
+    - `688235 百济神州` could still surface a degraded `earnings_anchor=2026-05-07` instead of `2026Q1@2026-05-07` when old CSV rows already carried the short form
+- Changes:
+  - Updated `src/services/signal_cause_analysis_service.py`
+    - added stricter earnings-dominance gating for `supply_demand_bias`
+    - expanded business-label coverage with `数据中心 / 通信设备 / 海缆 / 电力设备`
+    - added/extended alias overrides for `603256 宏和科技`, `300442 润泽科技`, `600498 烽火通信`, `600487 亨通光电`
+    - changed `光通信` handling so it no longer auto-falls into `偏AI算力供应链` without extra AI-specific clues
+  - Updated `src/services/fast_review_focus_service.py`
+    - read layer now rebuilds preferred canonical `earnings_anchor`
+    - legacy rows no longer derive `supply_demand_bias=earnings` from `cause_tags` alone when the explanation text is clearly trend/rotation-led
+  - Updated `scripts/run_fast_review_bundle.py`
+    - export-layer structure-field resolver now uses the same canonical-earnings-anchor and earnings-dominance rules as the read layer
+  - Updated tests:
+    - `tests/test_signal_cause_analysis_service.py`
+    - `tests/test_fast_review_focus_api.py`
+    - `tests/test_fast_review_daily_bundle.py`
+- Verification:
+  - `.\\.venv\\Scripts\\python.exe -m py_compile src/services/signal_cause_analysis_service.py src/services/fast_review_focus_service.py scripts/run_fast_review_bundle.py tests/test_signal_cause_analysis_service.py tests/test_fast_review_focus_api.py tests/test_fast_review_daily_bundle.py`
+  - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_signal_cause_analysis_service.py tests/test_fast_review_daily_bundle.py tests/test_fast_review_focus_api.py`
+    - result: `76 passed`
+
+## 2026-05-08 (fast review explanation-structure fields for business/theme/earnings anchors)
+
+- Scope: turn the fast-review explanation layer from mostly free-form text into a semi-structured payload that can still coexist with the current `reason_summary / industry_logic / news_logic / technical_logic`.
+- Why:
+  - The user’s next bottleneck was no longer missing PE/quarter numbers, but missing explanation structure: cases like `胜宏科技=PCB` or `东山精密=AI上游材料/供需偏紧` were still mostly trapped inside prose.
+  - For daily review, the practical need is to explicitly tell whether a name is being read as `主营驱动 / 供需景气 / 业绩锚定 / 题材映射`, rather than only outputting a smoother sentence.
+- Changes:
+  - Updated `src/services/signal_cause_analysis_service.py`
+    - normalized `business_profile` into top-level explanation fields even in fallback mode:
+      - `business_labels`
+      - `business_summary`
+      - `chain_role_label`
+      - `theme_source`
+      - `earnings_anchor`
+      - `supply_demand_bias`
+    - `theme_source` now coarsens mapping evidence into readable source buckets such as `business / news / board / fundamental / signal_pool`
+    - `earnings_anchor` now summarizes the current report/event anchor as `报告期@事件日` when earnings context exists
+  - Updated `scripts/run_fast_review_bundle.py`
+    - `strategy_focus` / `earnings_focus` rows now carry the structured explanation fields into CSV/Markdown exports
+    - when an older row is reused without re-running cause analysis, the bundle derives fallback structure from existing `reason_summary / industry_logic / technical_logic` text so the new fields do not require forced full refresh on every row
+  - Updated `src/services/fast_review_focus_service.py`
+    - `fast_review_strategy_focus.csv` read layer now parses the new structure fields into the API payload
+  - Updated `api/v1/schemas/signals.py`
+  - Updated `apps/dsa-web/src/types/signals.ts`
+  - Updated `apps/dsa-web/src/pages/SignalsPage.tsx`
+    - the `/signals` -> `Fast Review Focus` detail panel now adds an `Explanation Structure` block so the user can directly read `业务标签 / 业务摘要 / 链条角色 / 题材来源 / 业绩锚点 / bias`
+- Verification:
+  - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_signal_cause_analysis_service.py::SignalCauseAnalysisServiceTestCase::test_analyze_signal_uses_business_and_supply_demand_clues_in_fallback_summary tests/test_fast_review_daily_bundle.py::test_build_strategy_focus_rows_propagates_explanation_structure_fields tests/test_fast_review_daily_bundle.py::test_write_earnings_focus_outputs_writes_csv_and_markdown tests/test_fast_review_focus_api.py::FastReviewFocusApiTestCase::test_fast_review_focus_endpoint_returns_summary_and_items`
+    - result: `4 passed`
+
+## 2026-05-08 (fast review quick-report event-aligned snapshot correction)
+
+- Scope: stop `earnings_focus` / `Fast Review Focus` enrichment from carrying stale annual-report amounts into a newer quick-report event quarter.
+- Why:
+  - After the export-enrichment backfill, `688235 百济神州` no longer looked blank, but the refreshed artifact exposed a deeper correctness issue: the row was showing `2025FY` revenue/net profit beside a `2026-05-07` quick-report event.
+  - For daily review this is worse than an empty amount, because it makes a current-quarter event look like it already has confirmed current-quarter profit numbers.
+- Changes:
+  - Updated `src/services/fast_review_focus_service.py`
+    - widened the earnings-context request from `("financial",)` to `("financial", "quick_report")` for the read/export enrichment path
+    - added event-aligned quarter correction so `event_date` / `quick_report_announcement_date` can override a stale existing `report_date`
+    - when the corrected quarter has no matching financial row yet, the service now clears `revenue_amount / net_profit_amount` instead of keeping mismatched annual values
+  - Updated `tests/test_fast_review_focus_api.py`
+    - added `test_focus_service_prefers_event_aligned_quarter_over_stale_annual_report_for_quick_report_samples`
+    - added `test_focus_service_corrects_existing_stale_annual_report_snapshot_for_quick_report_samples`
+- Artifact refresh:
+  - refreshed `data/manual_runs/fast_review_20260508_after_earnings_focus_snapshot_20260508/2026-05-08/review/fast_review_earnings_focus.csv`
+  - refreshed `data/manual_runs/fast_review_20260508_after_earnings_focus_snapshot_20260508/2026-05-08/review/fast_review_earnings_focus.md`
+  - refreshed `data/manual_runs/fast_review_20260508_after_earnings_focus_snapshot_20260508/2026-05-08/review/fast_review_summary.md`
+  - refreshed `data/manual_runs/fast_review_20260508_after_earnings_focus_snapshot_20260508/fast_review_summary_latest.md`
+  - confirmed refreshed examples:
+    - `688216 气派科技`: `涨幅 1.51% / PE -80.6 / 2026Q1 / 营收 2.23亿 / 净利 -0.04亿`
+    - `688235 百济神州`: `涨幅 -2.71% / PE 120.6 / 2026Q1`
+    - `688235` amounts are now intentionally blank because the old `2025FY` annual amounts no longer match the current quick-report quarter
+- Verification:
+  - `.\\.venv\\Scripts\\python.exe -m py_compile src/services/fast_review_focus_service.py tests/test_fast_review_focus_api.py scripts/run_fast_review_bundle.py tests/test_fast_review_daily_bundle.py`
+  - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_daily_bundle.py tests/test_fast_review_focus_api.py`
+    - result: `56 passed`
+
+## 2026-05-08 (fast review earnings focus export enrichment backfill)
+
+- Scope: make the `earnings_focus` export path backfill the same compact market/fundamental snapshot fields that were already available in the `strategy_focus` read layer.
+- Why:
+  - Real `2026-05-08` output still had `688216 气派科技` / `688235 百济神州` showing blank or half-blank `snapshot` values inside `fast_review_earnings_focus.csv/.md` and `fast_review_summary_latest.md`.
+  - Root cause: `_build_earnings_focus_rows(...)` only carried what the raw earnings row already had, while `_write_earnings_focus_outputs(...)` did not run the later `FastReviewFocusService` enrichment pass used by `strategy_focus`.
+- Changes:
+  - Updated `scripts/run_fast_review_bundle.py`
+    - `_write_earnings_focus_outputs(...)` now runs `FastReviewFocusService().enrich_items(...)` before writing CSV/Markdown
+    - this backfills `today_change_pct / pe_ratio / report_date / report_period_label / revenue_amount / net_profit_amount` when the earnings row itself is sparse
+  - Updated `tests/test_fast_review_daily_bundle.py`
+    - added `test_write_earnings_focus_outputs_enriches_missing_market_and_earnings_fields`
+  - Updated `tests/test_fast_review_focus_api.py`
+    - stabilized two quote-enrichment tests with fake `AkshareFetcher` payloads so they no longer depend on local realtime cache / live quote state
+- Artifact refresh:
+  - refreshed `data/manual_runs/fast_review_20260508_after_earnings_focus_snapshot_20260508/2026-05-08/review/fast_review_earnings_focus.csv`
+  - refreshed `data/manual_runs/fast_review_20260508_after_earnings_focus_snapshot_20260508/2026-05-08/review/fast_review_earnings_focus.md`
+  - refreshed `data/manual_runs/fast_review_20260508_after_earnings_focus_snapshot_20260508/2026-05-08/review/fast_review_summary.md`
+  - refreshed `data/manual_runs/fast_review_20260508_after_earnings_focus_snapshot_20260508/fast_review_summary_latest.md`
+  - confirmed refreshed examples:
+    - `688216 气派科技`: `涨幅 1.51% / PE -80.6 / 2026Q1 / 营收 2.23亿 / 净利 -0.04亿`
+    - `688235 百济神州`: `涨幅 -2.71% / PE 120.6 / 2025FY / 营收 382.25亿 / 净利 14.61亿`
+- Verification:
+  - `.\\.venv\\Scripts\\python.exe -m py_compile scripts/run_fast_review_bundle.py tests/test_fast_review_daily_bundle.py tests/test_fast_review_focus_api.py`
+  - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_daily_bundle.py tests/test_fast_review_focus_api.py`
+    - result: `54 passed`
+
+## 2026-05-08 (fast review earnings focus snapshot surfacing)
+
+- Scope: surface compact market/fundamental snapshot fields directly inside the daily `earnings_focus` reading area, not only in `strategy_focus`.
+- Why:
+  - After the previous `福达合金` fix, the user still had to jump back to CSV/detail views to answer simple daily-review questions like “today's move”, “which quarter”, and “roughly how much net profit”.
+  - The raw fields already existed in nearby review/export paths, but `earnings_focus` rows were not carrying or rendering them.
+- Changes:
+  - Updated `scripts/run_fast_review_bundle.py`
+    - `_build_earnings_focus_rows(...)` now also carries:
+      - `today_change_pct`
+      - `pe_ratio`
+      - `report_date`
+      - `report_period_label`
+      - `revenue_amount`
+      - `net_profit_amount`
+    - `_write_earnings_focus_outputs(...)` now exports those snapshot fields into `fast_review_earnings_focus.csv`
+    - `_append_earnings_focus_markdown(...)` now adds a compact `snapshot` column beside `resonance`, reusing the same formatter as `strategy_focus`
+    - current default display is compact: `涨幅 / PE / 报告期 / 营收 / 净利` when available
+  - Updated `tests/test_fast_review_daily_bundle.py`
+    - added red-green coverage proving:
+      - earnings-focus row building keeps the quote/report/profit fields
+      - markdown summary shows the new `snapshot` column
+      - csv export includes the new fields
+- Verification:
+  - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_daily_bundle.py -k "build_summary_markdown_includes_earnings_focus_section or build_earnings_focus_rows_prioritizes_earnings_and_trend_resonance or write_earnings_focus_outputs_writes_csv_and_markdown"`
+    - result: `3 passed`
+
+## 2026-05-08 (fast review board-only theme suppression + earnings/hundred cross-source reason repair)
+
+- Scope: fix the remaining `福达合金`-style daily review gap where a row could still carry noisy theme mapping from concept boards, and where an `earnings + hundred_day_high` focus row kept the old numeric earnings summary without the later-added business hint.
+- Why:
+  - Real `603045 福达合金` exposed two practical read-layer issues:
+    - `SignalCauseAnalysisService` could still map the name through noisy concept boards like `新能源车 / 充电桩 / 电池`, even though the company’s main clues are `电工材料 / 含银合金电工材料 / 触头材料`.
+    - `run_fast_review_bundle.py` only augmented earnings summaries when the selected focus source itself was `earnings`; for `earnings + hundred_day_high` rows whose sort source became `hundred_day_high`, the read layer returned early and kept the bare numeric summary.
+- Changes:
+  - Updated `src/services/signal_cause_analysis_service.py`
+    - tightened `_map_overseas_theme(...)` so board-only matches no longer qualify as a final theme mapping
+    - this specifically removes the earlier `福达合金 -> 新能源车/充电桩/电池` false-positive path unless non-board evidence also supports it
+  - Updated `scripts/run_fast_review_bundle.py`
+    - added `_first_non_empty_field_signal_key(...)`
+    - `_resolve_focus_rise_reason_fields(...)` now distinguishes “focus sorting source” from “existing summary source”
+    - when the existing `reason_summary` actually comes from the `earnings` row, the read layer continues to enrich from that `earnings` payload even if the focus row itself is currently anchored by `hundred_day_high`
+    - this lets cross-signal rows append `业务侧先按 ... 跟踪；当前先按业绩驱动看待` and fill `cause_tags / industry_logic / news_logic / technical_logic`
+  - Updated `tests/test_signal_cause_analysis_service.py`
+    - added regression coverage proving board-only noise no longer wins against a materials-business sample
+  - Updated `tests/test_fast_review_daily_bundle.py`
+    - added regression coverage for the real `earnings + hundred_day_high` cross-source case
+  - Refreshed artifact:
+    - `data/manual_runs/fast_review_20260507_fudajin_reason_refresh_20260508_v2/2026-05-07/review/fast_review_strategy_focus.csv`
+    - confirmed `603045 福达合金` now shows:
+      - preserved earnings numbers
+      - appended business hint `触头材料/复层触头/触头元件`
+      - explicit `当前先按业绩驱动看待`
+      - filled `cause_tags / industry_logic / news_logic / technical_logic`
+- Follow-up:
+  - Updated `scripts/run_fast_review_bundle.py` again so `fast_review_earnings_focus.csv/.md` and the `今日业绩焦点` block inside `fast_review_summary.md` also carry:
+    - `reason_summary`
+    - `cause_tags`
+    - `cause_tags_zh`
+  - This keeps the main reading artifact aligned with the already-fixed `strategy_focus` row, instead of forcing the user to open CSV details just to see the business-side explanation.
+- Readable summary artifact refresh:
+  - `data/manual_runs/fast_review_20260507_fudajin_reason_refresh_20260508_v4/2026-05-07/review/fast_review_earnings_focus.csv`
+  - `data/manual_runs/fast_review_20260507_fudajin_reason_refresh_20260508_v4/fast_review_summary_latest.md`
+  - confirmed `603045 绂忚揪鍚堥噾` is now visible inside the `浠婃棩涓氱哗鐒︾偣` block with the same business-side explanation, not only inside `strategy_focus.csv`
+- Verification:
+  - `.\\.venv\\Scripts\\python.exe -m py_compile src/services/signal_cause_analysis_service.py scripts/run_fast_review_bundle.py tests/test_signal_cause_analysis_service.py tests/test_fast_review_daily_bundle.py`
+  - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_signal_cause_analysis_service.py -k "map_overseas_theme_does_not_use_board_only_noise_against_material_business or generic_high_speed_material_text_as_ai_upstream_material_chain or apply_business_alias_overrides_marks_dongshan or apply_business_alias_overrides_marks_shenghong"`
+    - result: `4 passed`
+  - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_daily_bundle.py -k "reuses_existing_reason_fields_for_non_alias_names or refreshes_existing_reason_fields_for_alias_names or augments_existing_earnings_reason_with_business_hint or uses_earnings_reason_source_even_with_hundred_overlay"`
+    - result: `4 passed`
+  - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_daily_bundle.py -k "build_summary_markdown_includes_earnings_focus_section or write_earnings_focus_outputs_writes_csv_and_markdown or build_earnings_focus_rows_prioritizes_earnings_and_trend_resonance"`
+    - result: `3 passed`
+
+## 2026-05-08 (fast review generic advanced-electronic-material fallback widening)
+
+- Scope: widen the non-alias fallback so repeatedly seen `电子材料` names can still land in `AI上游材料链` wording even when upstream business text does not explicitly say `PCB / 光模块 / 服务器`.
+- Why:
+  - The alias layer fixed `东山精密 / 胜宏科技 / 华工科技 / 光迅科技`, but the next practical gap remained: names whose raw business text mainly says `高频高速覆铜板 / 载板 / 封装材料` were still too easy to collapse back to plain `电子材料`.
+  - For daily review, these are usually the exact cases the user wants treated as AI upstream materials rather than generic topic mapping.
+- Changes:
+  - Updated `src/services/signal_cause_analysis_service.py`
+    - extended `电子材料` keyword coverage with `封装载板 / ABF / CCL`
+    - widened `_is_ai_upstream_material_chain(...)` so text containing explicit advanced-electronic-material clues such as `覆铜板 / 载板 / 封装载板 / 高频高速 / 高速材料 / 光模块材料 / 封装材料` can be recognized as `AI上游材料链` even without an extra downstream `PCB/光模块/服务器` token
+  - Updated `tests/test_signal_cause_analysis_service.py`
+    - added regression coverage proving generic `高频高速覆铜板 + 载板 + 电子材料` text now builds a business summary ending in `AI上游材料链`
+- Verification:
+  - `.\\.venv\\Scripts\\python.exe -m py_compile src/services/signal_cause_analysis_service.py tests/test_signal_cause_analysis_service.py`
+  - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_signal_cause_analysis_service.py -k "generic_high_speed_material_text_as_ai_upstream_material_chain or apply_business_alias_overrides_marks_dongshan or apply_business_alias_overrides_marks_shenghong or uses_business_and_supply_demand_clues_in_fallback_summary"`
+    - result: `4 passed`
+
+## 2026-05-08 (fast review alias-name reason refresh in strategy_focus)
+
+- Scope: keep the existing fast-review read-layer semantics for most names, but stop stale `strategy_focus` CSV reason text from masking the newer AI-chain business alias wording on repeatedly reviewed names.
+- Why:
+  - After adding `BUSINESS_ALIAS_OVERRIDES`, real `2026-05-07` fast-review artifacts still showed old generic wording on some rows because `run_fast_review_bundle.py` reused existing `reason_summary` whenever it was already populated.
+  - The practical gap was most visible on `002281 光迅科技`; the code path could now explain it as `光模块/光通信，偏AI算力供应链`, but the read layer still surfaced the older generic text.
+- Changes:
+  - Updated `scripts/run_fast_review_bundle.py`
+    - imported `BUSINESS_ALIAS_OVERRIDES`
+    - added a narrow `_should_refresh_existing_focus_reason_fields(...)` gate
+    - `strategy_focus` now keeps the old reuse behavior for ordinary names, but forces a fresh cause-analysis pass for names covered by the curated alias override map before finalizing `reason_summary / cause_tags / industry_logic / news_logic / technical_logic`
+  - Updated `tests/test_fast_review_daily_bundle.py`
+    - renamed the old reuse regression to explicitly cover non-alias names
+    - added regression coverage proving alias-covered names refresh existing reason text instead of keeping stale CSV wording
+  - Refreshed artifact:
+    - `data/manual_runs/fast_review_20260507_summary_alias_refresh_20260508_v2/fast_review_summary_latest.md`
+    - confirmed updated rows:
+      - `002281 光迅科技`
+      - `000988 华工科技`
+      - `300476 胜宏科技`
+- Verification:
+  - `.\\.venv\\Scripts\\python.exe -m py_compile scripts/run_fast_review_bundle.py tests/test_fast_review_daily_bundle.py`
+  - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_daily_bundle.py -k "reuses_existing_reason_fields_for_non_alias_names or refreshes_existing_reason_fields_for_alias_names or enriches_missing_reason_fields or fails_open_when_reason_enrichment_errors"`
+    - result: `4 passed`
+  - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_daily_bundle.py -k "reuses_existing_reason_fields_for_non_alias_names or refreshes_existing_reason_fields_for_alias_names"`
+    - result: `2 passed`
+- Notes:
+  - `002384 东山精密` is now covered by the alias refresh rule as well, but it did not appear in the refreshed `2026-05-07 strategy_focus` export, so this round only validated the three names above in the visible read-layer artifact.
+
+## 2026-05-08 (fast review business alias overrides for common AI-chain names)
+
+- Scope: reduce explanation volatility for a small set of repeatedly reviewed AI-chain names whose raw business text is often too noisy or too generic for stable fallback wording.
+- Why:
+  - Even after adding `AI上游材料链 / 供需景气` wording, the user still pointed out a practical gap: names like `东山精密` should be recognized more stably, not only when the fetched business text happens to be clean.
+  - A small curated alias layer is a cheaper and more reliable fix than trying to infer everything from inconsistent upstream text every time.
+- Changes:
+  - Updated `src/services/signal_cause_analysis_service.py`
+    - added `BUSINESS_ALIAS_OVERRIDES` for a first small set of common AI-chain names:
+      - `002384 东山精密`
+      - `300476 胜宏科技`
+      - `000988 华工科技`
+      - `002281 光迅科技`
+    - added `_apply_business_alias_overrides(...)`
+    - integrated alias overrides into `_fetch_business_profile(...)` so the fetched profile is normalized before later fallback reasoning runs
+    - current stable outputs include:
+      - `东山精密 -> PCB/光模块/电子材料，偏AI上游材料链`
+      - `胜宏科技 -> PCB，偏AI算力供应链`
+      - `华工科技 -> 光模块/光通信，偏AI算力供应链`
+      - `光迅科技 -> 光模块/光通信，偏AI算力供应链`
+  - Updated `tests/test_signal_cause_analysis_service.py`
+    - added red-green regression coverage for:
+      - `东山精密` alias override
+      - `胜宏科技` alias override
+  - Updated `docs/LOCAL_STRATEGY_CATALOG.md`
+  - Updated `docs/CHANGELOG.md`
+- Verification:
+  - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_signal_cause_analysis_service.py -k "apply_business_alias_overrides_marks_dongshan or apply_business_alias_overrides_marks_shenghong or business_and_supply_demand_clues or map_overseas_theme_avoids_false_positive"`
+    - result: `4 passed`
+- Notes:
+  - This is intentionally a small curated alias layer, not a broad industry taxonomy system.
+
+## 2026-05-08 (fast review AI-upstream-material cause wording)
+
+- Scope: make fast-review fallback explanations better distinguish `AI上游材料链` from broader generic `AI供应链` wording, especially for names closer to `PCB / 光模块材料 / 电子材料 / 精密组件`.
+- Why:
+  - The user explicitly pointed out a practical reading gap: names like `东山精密` should not only be described as generic `AI供应链` or `PCB` names.
+  - For daily review, the more useful distinction is whether the stock is acting like an upstream material/component bottleneck with `供不应求 / 景气上行`, rather than a vague thematic move.
+- Changes:
+  - Updated `src/services/signal_cause_analysis_service.py`
+    - added extra business-label coverage for:
+      - `电子材料`
+      - `精密组件`
+    - extended `business_summary` generation so qualifying names can be summarized as:
+      - `...，偏AI上游材料链`
+    - added stronger fallback wording in `industry_logic` / `news_logic`:
+      - `更接近AI上游材料链景气驱动，不像纯题材空转`
+      - `更像AI上游材料供需偏紧或景气上行`
+    - kept the logic fail-open: if the upstream-material clues are weak, the service still falls back to the older broader wording
+  - Updated `tests/test_signal_cause_analysis_service.py`
+    - strengthened the `东山精密`-style regression case so fallback output now has to surface:
+      - `AI上游材料链`
+      - `AI上游材料`
+      - `供需`
+      - `景气驱动`
+  - Updated `docs/LOCAL_STRATEGY_CATALOG.md`
+  - Updated `docs/CHANGELOG.md`
+- Verification:
+  - `.\\.venv\\Scripts\\python.exe -m py_compile src/services/signal_cause_analysis_service.py tests/test_signal_cause_analysis_service.py`
+    - passed
+  - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_signal_cause_analysis_service.py -k "business_and_supply_demand_clues or map_overseas_theme_avoids_false_positive"`
+    - result: `2 passed`
+- Notes:
+  - This round improves fallback wording and business-layer differentiation; it still depends on upstream business text / news evidence quality and does not guarantee perfect real-world company taxonomy.
+
+## 2026-05-08 (fast review focus enrichment total-budget guard)
+
+- Scope: keep the fast-review focus read/export layer practical after adding market and earnings snapshot enrichment, by preventing slow per-row fundamental backfills from expanding without bound.
+- Why:
+  - The previous round improved explanation quality and added `today_change_pct / PE / report period / revenue / net profit`, but real `strategy_focus` export still spent most of its wall time in serial `financial` enrichment.
+  - The same enrichment path is also used when `/api/v1/signals/fast-review-focus` reads existing CSV artifacts, so an unbounded fallback could slow both markdown rebuilds and page loads.
+- Changes:
+  - Updated `src/services/fast_review_focus_service.py`
+    - added total-budget guards for export/read-time fallback enrichment:
+      - `DEFAULT_EXPORT_TOTAL_QUOTE_BUDGET_SECONDS = 25.0`
+      - `DEFAULT_EXPORT_TOTAL_EARNINGS_BUDGET_SECONDS = 12.0`
+      - `DEFAULT_EXPORT_TOTAL_VALUATION_BUDGET_SECONDS = 4.0`
+    - `Akshare EM` batch quote reuse is now gated on a warm all-market realtime cache; cold starts no longer trigger the full-market snapshot refresh just to fill a small visible focus slice
+    - cold-cache A-share quote fallback now prefers budgeted single-name lightweight quote enrichment before considering heavier manager fallback
+    - quote enrichment still runs first, but quote/report/valuation backfill now stops fail-open once the corresponding shared budget is exhausted
+    - this keeps earlier focus rows eligible for enrichment while preventing tail rows from dragging the whole request
+  - Updated `tests/test_fast_review_focus_api.py`
+    - added regression coverage for:
+      - warm-cache batch quote reuse
+      - cold-cache lightweight quote fallback
+      - exhausted-budget path where quote fields can still be filled while report/valuation enrichment is skipped cleanly
+  - Updated `docs/LOCAL_STRATEGY_CATALOG.md`
+  - Updated `docs/CHANGELOG.md`
+- Verification:
+  - `.\\.venv\\Scripts\\python.exe -m py_compile src/services/fast_review_focus_service.py tests/test_fast_review_focus_api.py`
+    - passed
+  - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_focus_api.py -k "blank_strings_as_missing or returns_summary_and_items or prefers_akshare_em_snapshot_for_multi_a_share_quote_enrichment or uses_lightweight_tencent_quote_when_em_cache_is_cold or skips_report_and_valuation_enrichment_when_total_budgets_are_exhausted"`
+    - result: `5 passed`
+  - cold-start export refresh benchmark:
+    - source artifact: `data/manual_runs/fast_review_20260507_after_trend_prefilter_tighten_20260507/2026-05-07/review/fast_review_strategy_focus.csv`
+    - output artifact: `data/manual_runs/fast_review_strategy_focus_export_perf_cold_quote_budgeted_20260508/`
+    - result: `143` rows exported in about `30.45s`
+    - filled snapshot fields after export:
+      - `today_change_pct=6`
+      - `pe_ratio=6`
+      - `report_date=3`
+      - `report_period_label=3`
+      - `revenue_amount=2`
+      - `net_profit_amount=2`
+  - real `2026-05-08` fast review rerun:
+    - output root: `data/manual_runs/fast_review_20260508_after_focus_perf_tune_20260508/`
+    - latest summary: `data/manual_runs/fast_review_20260508_after_focus_perf_tune_20260508/fast_review_summary_latest.md`
+    - signal elapsed summary:
+      - `earnings=111.67s`
+      - `hundred_day_high=150.84s`
+      - `trend_leader=275.65s`
+      - `signal_total=538.2s`
+    - final focus coverage:
+      - `61` focus rows
+      - `today_change_pct=6`
+      - `pe_ratio=6`
+      - `report_date=3`
+      - `report_period_label=3`
+      - `revenue_amount=2`
+      - `net_profit_amount=2`
+- Notes:
+  - This change intentionally prefers bounded latency over full backfill completeness for lower-priority rows.
+
+## 2026-05-08 (fast review markdown snapshot summary)
+
+- Scope: make the fast-review markdown artifacts themselves carry the key market/earnings snapshot fields, instead of only exposing them in CSV/API/UI detail views.
+- Why:
+  - The prior round fixed the data path and the web detail panel, but the user still reads `fast_review_summary_latest.md` directly during daily review.
+  - If the markdown table still only shows generic reason text, the reading experience remains incomplete even when `today_change_pct / PE / report period / revenue / net profit` already exist in the underlying row payload.
+- Changes:
+  - Updated `scripts/run_fast_review_bundle.py`
+    - added compact markdown-format helpers for:
+      - `today_change_pct`
+      - `pe_ratio`
+      - `report_period_label`
+      - `revenue_amount`
+      - `net_profit_amount`
+    - changed `strategy_focus` markdown export to include a compact `snapshot` summary column
+    - constrained export-time enrichment to the markdown-visible focus rows (`core top 10 + watch top 10 + low_priority top 5`) instead of enriching the entire focus pool on every rebuild
+    - the summary now shows values in the form:
+      - `涨幅 xx.xx%`
+      - `PE x.x`
+      - `2026Q1`
+      - `营收 xx.xx亿`
+      - `净利 xx.xx亿`
+  - Updated `tests/test_fast_review_daily_bundle.py`
+    - added regression assertions for markdown output and summary output so these snapshot fields remain visible in future refactors
+  - Updated `docs/LOCAL_STRATEGY_CATALOG.md`
+  - Updated `docs/CHANGELOG.md`
+- Verification:
+  - `.\\.venv\\Scripts\\python.exe -m py_compile scripts/run_fast_review_bundle.py tests/test_fast_review_daily_bundle.py src/services/fast_review_focus_service.py tests/test_fast_review_focus_api.py`
+    - passed
+  - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_daily_bundle.py -k "write_strategy_focus_outputs_enriches_missing_market_and_earnings_fields or write_strategy_focus_outputs_limits_export_enrichment_scope or build_summary_markdown_includes_concise_strategy_focus"`
+    - result: `3 passed`
+  - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_focus_api.py -k "blank_strings_as_missing or returns_summary_and_items"`
+    - result: `2 passed`
+  - targeted artifact refresh:
+    - regenerated markdown-focused `2026-05-07` review outputs from existing focus/review artifacts at:
+      - `data/manual_runs/fast_review_20260507_summary_from_existing_focus_20260508/`
+    - manually enriched key names for reading verification:
+      - `300476 胜宏科技`
+      - `001309 德明利`
+      - `002281 光迅科技`
+- Notes:
+  - This round improves the markdown reading layer only; it does not by itself increase upstream earnings-data coverage for rows whose source signals genuinely lack report-period revenue/net-profit fields.
+
+## 2026-05-07 (fast review focus metrics + cause explanation refinement)
+
+- Scope: improve fast-review reading accuracy and readability by enriching the focus payload with market/earnings snapshot fields and tightening the fallback explanation chain for rise reasons.
+- Why:
+  - The user explicitly pointed out that the current explanation text was still too generic for names such as `胜宏科技` and `东山精密`: the review should say things like `PCB`, `光模块材料`, `AI供应链`, rather than only echoing raw main-business text.
+  - The web reading layer also lacked a compact way to see the most practical daily review numbers: today's change, PE, the relevant quarter/year, net profit amount, and revenue amount.
+  - Existing `overseas_theme` fallback matching could still be misled by weak text clues; business identity needed to be a stronger signal than incidental keyword overlap.
+- Changes:
+  - Updated `scripts/run_fast_review_bundle.py`
+    - propagated additional row fields into `fast_review_strategy_focus.csv`:
+      - `today_change_pct`
+      - `pe_ratio`
+      - `report_date`
+      - `report_period_label`
+      - `revenue_amount`
+      - `net_profit_amount`
+  - Updated `src/services/fast_review_focus_service.py`
+    - parsed the new focus CSV columns
+    - added fail-open enrichment fallback so older CSVs can still hydrate quote/fundamental snapshot fields on read
+  - Updated `api/v1/schemas/signals.py`
+    - extended `FastReviewFocusItem` with the new market/earnings fields
+  - Updated `apps/dsa-web/src/types/signals.ts`
+    - added matching frontend types
+  - Updated `apps/dsa-web/src/pages/SignalsPage.tsx`
+    - added the `Market & Earnings` block in the right-side detail panel
+    - shows today's change, PE, report period, net profit, and revenue
+  - Updated `src/services/signal_cause_analysis_service.py`
+    - added `business_labels` / `business_summary` extraction from `主营业务 + 产品类型 + 产品名称`
+    - increased business-label weight in `overseas_theme` mapping to favor direct business clues such as `PCB / 光模块 / 光通信 / AI服务器 / 半导体`
+    - improved fallback `industry_logic / news_logic / technical_logic` generation so `供需/景气` and `涨价` are stated explicitly when those tags are present
+    - reduced the chance that weak single-source text matches produce misleading theme mappings
+  - Updated tests:
+    - `tests/test_fast_review_daily_bundle.py`
+    - `tests/test_fast_review_focus_api.py`
+    - `tests/test_signal_cause_analysis_service.py`
+    - `apps/dsa-web/src/pages/__tests__/SignalsPage.fastReview.test.tsx`
+  - Updated `docs/LOCAL_STRATEGY_CATALOG.md`
+  - Updated `docs/CHANGELOG.md`
+- Verification:
+  - `.\\.venv\\Scripts\\python.exe -m py_compile src/services/signal_cause_analysis_service.py`
+    - passed
+  - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_signal_cause_analysis_service.py -k "business_and_supply_demand_clues or map_overseas_theme_avoids_false_positive"`
+    - result: `2 passed`
+  - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_daily_bundle.py -k propagates_market_and_earnings_snapshot_fields`
+    - result: `1 passed`
+  - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_focus_api.py -k returns_summary_and_items`
+    - result: `1 passed`
+  - `cd apps/dsa-web && npm.cmd test -- --run src/pages/__tests__/SignalsPage.fastReview.test.tsx`
+    - result: `1 passed`
+- Notes:
+  - This round improves the reading layer and fallback explanation quality; it does not claim that every stock will now have perfect, real-world business-theme attribution in the absence of reliable upstream data.
+  - A fresh same-day fast-review rerun is still needed if the user wants the existing `2026-05-07` artifacts refreshed with the new explanation text.
+
+## 2026-05-07 (fast-review trend_leader width tightening to ~736 names)
+
+- Scope: tighten only the repo-level fast-review defaults for `trend_leader_unified` so the daily review queue is materially narrower, without changing selector CLI defaults or trend scoring rules.
+- Why:
+  - After the latest `earnings` startup optimization, the next user request was to push down the `trend_leader` review width itself, not just explain the runtime.
+  - Direct `2026-05-07` probing with current repo defaults still showed `scan_prefilter_stats.after=1089`, which was wider than the intended manual-review capacity.
+  - Threshold sensitivity checks on the same prepared universe showed that `listed_days=120 + 60d_change=17.0 + turnover_rate=1.5 + positive day` narrows the prepared universe to about `736`, which matches the requested target band.
+- Changes:
+  - Updated `config/local_strategy_profile.json`
+    - raised the repo-level daily fast-review `trend_leader` prefilter defaults from `60d_change>=8.0 / turnover_rate>=1.2` to `60d_change>=17.0 / turnover_rate>=1.5`
+    - kept `listed_days>=120` and `require_positive_change=true` unchanged
+    - kept direct `select_trend_leader_candidates.py` CLI defaults unchanged; this is only the repo fast-review profile
+  - Updated `tests/test_fast_review_daily_bundle.py`
+    - tightened the repo-profile parse-args expectation so the bundle-level default forwarding remains pinned to the new profile values
+  - Updated `docs/LOCAL_STRATEGY_CATALOG.md`
+  - Updated `docs/CHANGELOG.md`
+- Verification:
+  - Red:
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_daily_bundle.py -q -k "repo_strategy_profile_tighter_trend_prefilter_defaults"`
+      - failed before implementation because the repo strategy profile still exposed `trend_scan_prefilter_min_change_pct_60d=8.0` and `trend_scan_prefilter_min_turnover_rate=1.2`
+  - Green:
+    - threshold probe on `2026-05-07`:
+      - `8.0 / 1.2 -> after=1089`
+      - `15.0 / 1.5 -> after=790`
+      - `17.0 / 1.5 -> after=736`
+      - `18.0 / 1.5 -> after=719`
+    - direct scan with existing repo-like settings before tightening:
+      - `scan_trend_leader_candidates_with_stats(...)` observed `elapsed_seconds=60.6455`, `prep_universe_elapsed_sec=21.3295`, `scan_eval_elapsed_sec=39.049653`, `phase_timing_sec.history_fetch=32.919728`, `scan_prefilter_stats.after=1089`
+    - direct scan with tightened width target:
+      - `scan_trend_leader_candidates_with_stats(...)` observed `total_universe=736`, `selected_count=11`, `watch_selected_count=20`
+- Notes:
+  - This round intentionally optimizes review width first. It does not claim a guaranteed cold-start speedup.
+  - The same `736`-name probe also showed a cold-cache cliff in `fundamental_fetch`, so the next performance round should treat prefilter width and enrichment cache behavior as separate levers.
+
+## 2026-05-07 (earnings fast-review current-period catalog narrowing)
+
+- Scope: reduce `earnings_surprise` fast-review cold-start latency by narrowing the recent-event catalog fetch width when the run already declares `recent_event_scope=latest_report_period`.
+- Why:
+  - Root-cause tracing on the verified `2026-05-07` fast-review replay showed the dominant `earnings` cost no longer lived inside candidate evaluation. Checkpoint phase totals were sub-second, which ruled out per-symbol scoring as the real bottleneck.
+  - The actual slow path was `build_recent_earnings_event_catalog(...)` during startup. The fast-review path was still fetching multiple historical report periods and then filtering back down to the latest report period afterward.
+  - The user wanted the next optimization to stay minimal and avoid changing pass/fail thresholds, scoring, or reading-layer semantics.
+- Changes:
+  - Updated `scripts/select_earnings_surprise_candidates.py`
+    - added optional `period_list_override` support to `build_recent_earnings_event_catalog(...)`
+    - when `scan_market(...)` runs with `recent_event_scope="latest_report_period"`, it now forwards only the current completed report period into the recent-event catalog builder
+    - kept downstream `recent_event_max_age_days` filtering, candidate prefiltering, scoring, and lightweight enrichment semantics unchanged
+  - Updated `tests/test_earnings_surprise_signal_flow.py`
+    - added regression coverage proving a period override fetches only the target report period
+    - added regression coverage proving `scan_market(... latest_report_period ...)` forwards the current report period override into the catalog builder
+  - Updated `docs/LOCAL_STRATEGY_CATALOG.md`
+  - Updated `docs/CHANGELOG.md`
+- Verification:
+  - Red:
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_earnings_surprise_signal_flow.py -q -k "period_override_limits_fetch_to_target_period or requests_current_period_catalog_only"`
+      - failed before implementation because `build_recent_earnings_event_catalog(...)` did not accept `period_list_override`, and `scan_market(...)` did not forward any period narrowing intent
+  - Green:
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_earnings_surprise_signal_flow.py -q -k "period_override_limits_fetch_to_target_period or requests_current_period_catalog_only"`
+      - result: `2 passed`
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_earnings_surprise_signal_flow.py -q`
+      - result: `62 passed`
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_daily_bundle.py -q`
+      - result: `41 passed`
+    - `.\\.venv\\Scripts\\python.exe -m py_compile scripts/select_earnings_surprise_candidates.py tests/test_earnings_surprise_signal_flow.py`
+      - passed
+    - replay:
+      - `.\\.venv\\Scripts\\python.exe scripts/select_earnings_surprise_candidates.py --snapshot-date 2026-05-07 --strategy-profile balanced --scan-depth low --recent-event-scope latest_report_period --recent-event-max-age-days 7 --output-dir data\\manual_runs\\earnings_20260507_period_tighten_20260507\\2026-05-07\\signals\\earnings --max-workers 1 --skip-db-persist --log-level INFO`
+      - observed:
+        - wall time about `125.43s`
+        - startup log: `recent-event prefilter enabled: scope=latest_report_period catalog_size=1177`
+        - compared with the earlier same-date fast-review observation (`earnings=254.23s` inside the bundle replay), the single-signal cold replay materially narrowed the earnings startup tail while preserving `selected=88`
+    - full bundle replay:
+      - `.\\.venv\\Scripts\\python.exe scripts/run_fast_review_bundle.py --snapshot-date 2026-05-07 --skip-persist-snapshots --output-dir data\\manual_runs\\fast_review_20260507_after_earnings_prefilter_20260507 --log-level INFO`
+      - observed from `fast_review_summary_latest.md`:
+        - total signal elapsed: `447.5s` (previous observed baseline: `619.7s`)
+        - `earnings`: `108.38s` (previous observed baseline: `254.23s`)
+        - `hundred_day_high`: `146.11s`
+        - `trend_leader`: `192.98s`
+        - focus totals unchanged at `143`, with `A=6`, `B=137`, `兑现=2`, `半兑现=1`, `拐点=113`, `纯轮动=27`
+- Notes:
+  - This optimization only narrows the recent-event catalog width for the fast-review latest-report-period path. It does not change the default `lookback` behavior or the underlying `earnings_surprise` scoring model.
+  - The next dominant runtime is now `trend_leader`, not `earnings`.
+
+## 2026-05-07 (fast review hundred-day-high prefilter forwarding)
+
+- Scope: tighten only the fast-review entry path for `hundred_day_high` by explicitly forwarding a narrower quote-level prefilter from the bundle layer, without changing the selector's core breakout rule set.
+- Why:
+  - Recent fast-review observations showed `hundred_day_high` runtime was dominated by a wide prepared universe plus history-fetch tail latency.
+  - The bundle had been relying on internal selector defaults, which made the fast-review path less explicit and harder to calibrate against observed replay cost.
+  - The user wanted the fast-review universe width reduced first, before attempting deeper structural optimization.
+- Changes:
+  - Updated `scripts/run_fast_review_bundle.py`
+    - added explicit fast-review CLI/profile defaults for `hundred_day_high` prefilter forwarding
+    - fast-review now forwards:
+      - `min_listed_days=120`
+      - `min_change_pct_60d=12.0`
+      - `min_turnover_rate=0.8`
+      - `require_positive_change=True`
+      - `exclude_st=True`
+    - kept `breakout_loose` as the fast-review price-rule profile, so only the input width changes
+  - Updated `config/local_strategy_profile.json`
+    - added repo-level defaults for the new `hundred_day_high` fast-review prefilter knobs
+  - Updated `tests/test_fast_review_daily_bundle.py`
+    - added regression coverage proving the bundle command now forwards the tighter hundred-day prefilter flags
+    - added parse-args coverage proving both missing-profile defaults and repo strategy-profile defaults expose the new knobs
+  - Updated `docs/LOCAL_STRATEGY_CATALOG.md`
+  - Updated `docs/CHANGELOG.md`
+- Verification:
+  - Red:
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_daily_bundle.py -q`
+      - failed before implementation because `build_hundred_day_high_command(...)` did not forward any hundred-day prefilter flags and `parse_args(...)` had no corresponding options
+  - Green:
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_daily_bundle.py -q`
+      - result: `41 passed`
+    - `.\\.venv\\Scripts\\python.exe -m py_compile scripts/run_fast_review_bundle.py tests/test_fast_review_daily_bundle.py`
+      - passed
+    - replay:
+      - `.\\.venv\\Scripts\\python.exe scripts/select_hundred_day_high_candidates.py --snapshot-date 2026-05-07 --profile breakout_loose --output-dir data\\manual_runs\\hundred_day_20260507_prefilter_tighten_20260507\\2026-05-07\\signals\\hundred_day_high --checkpoint-path data\\manual_runs\\hundred_day_20260507_prefilter_tighten_20260507\\2026-05-07\\signals\\hundred_day_high\\hundred_day_high_checkpoint.json --max-workers 2 --min-listed-days-prefilter 120 --min-60d-change-pct-prefilter 12.0 --min-turnover-rate-prefilter 0.8 --require-positive-change-prefilter --exclude-st-prefilter --skip-cause-analysis --skip-db-persist --log-level INFO`
+      - observed:
+        - wall time about `139.6s`
+        - selector summary log: `universe=5147, evaluated=818, skipped_by_market_cap=75, skipped_by_prefilter=4634, selected=236`
+        - compared with the earlier same-date fast-review observation, this materially reduced runtime versus the previous `hundred_day_high` stage around `475.78s`, while only trimming selected rows from `256` to `236`
+- Notes:
+  - This change is limited to the fast-review bundle entry path. Direct `select_hundred_day_high_candidates.py` CLI defaults are unchanged.
+  - The exported checkpoint still does not fully surface shared-scan prefilter counts; the reliable evidence for this iteration is the selector runtime log plus the exported candidate set.
+
+## 2026-05-07 (fast review A-bucket tightening for price-confirmed names)
+
+- Scope: tighten the fast-review `strategy_focus` A/B reading layer so `A` is reserved for names with actual price confirmation, instead of letting `tier=core` implicitly promote many `trend_leader only` or `earnings only` rows.
+- Why:
+  - Real replay comparison showed too many `trend_leader only` names still remained in `A / 拐点`, which diluted the core review pool and made A-class less actionable.
+  - After the earlier stage split, the next practical problem was bucket quality, not more labels: the user wanted `兑现 / 半兑现 / 拐点 / 纯轮动` to remain, but wanted `A类` itself to reflect stronger confirmation.
+  - Replay evidence on `2026-05-06` also showed that a naive `earnings_delivery -> A` rule would incorrectly lift large numbers of `earnings only` rows, so the fix had to require price confirmation rather than earnings strength alone.
+- Changes:
+  - Updated `scripts/run_fast_review_bundle.py`
+    - moved driver classification ahead of final `ab_bucket` assignment
+    - removed the old `tier=core -> A` shortcut
+    - tightened `ab_bucket` so `A` now mainly requires one of:
+      - `trend_leader + earnings`
+      - `earnings + hundred_day_high`
+      - `trend_leader + hundred_day_high`
+      - explicit `event_driven` plus price confirmation
+    - kept `trend_leader only` and `earnings only` rows in `B` unless they already have the required price-confirmed structure
+  - Updated `tests/test_fast_review_ab_driver_classification.py`
+    - added regression coverage proving hard-event rows can stay in `A`
+    - added regression coverage proving `trend_leader only + turning_point_watch` is demoted to `B`
+    - added regression coverage proving `intersection + turning_point_watch` remains `A`
+    - added regression coverage proving `earnings only` delivery stays in `B`
+    - updated the older hard-event expectation from `B` to `A` to match the new reading-layer intent
+  - Updated `docs/LOCAL_STRATEGY_CATALOG.md`
+  - Updated `docs/CHANGELOG.md`
+- Verification:
+  - Red:
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_ab_driver_classification.py -q`
+      - failed before implementation because hard-event samples still stayed in `B`
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_ab_driver_classification.py -q`
+      - failed again after the first patch because `earnings only` rows were incorrectly lifted into `A`
+  - Green:
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_ab_driver_classification.py -q`
+      - result: `11 passed`
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_daily_bundle.py -q`
+      - result: `41 passed`
+    - `.\\.venv\\Scripts\\python.exe -m py_compile scripts/run_fast_review_bundle.py tests/test_fast_review_ab_driver_classification.py tests/test_fast_review_daily_bundle.py`
+      - passed
+    - replay:
+      - `.\\.venv\\Scripts\\python.exe scripts/run_fast_review_bundle.py --snapshot-date 2026-05-06 --skip-persist-snapshots --output-dir data\\manual_runs\\fast_review_20260506_after_ab_tighten_v2_20260507 --log-level INFO`
+      - observed:
+        - `A=23, B=450`
+        - `trend_only_A=0`
+        - `earnings_only_A=0`
+        - representative retained `A` names: `西部材料 / 通鼎互联 / 寒武纪 / 德明利 / 华工科技`
+        - representative demoted names: `利通电子(B/拐点/earnings only)`、`天齐锂业(B/拐点/earnings only)`
+- Notes:
+  - This is a reading-layer calibration only. It does not change the underlying `earnings_surprise` / `hundred_day_high` / `trend_leader_unified` selector thresholds.
+  - The `review_stage_label` distribution is still dominated by `拐点`, so the next meaningful iteration should focus on `driver_type` semantics or additional stage evidence, not on re-widening `A`.
+
+## 2026-05-07 (fast review focus API + signals reading view)
+
+- Scope: expose the existing `fast_review_strategy_focus.csv` reading layer through a dedicated API and a compact `/signals` page mode, without merging those rows into the normal snapshot list.
+- Why:
+  - The fast-review reading layer already had useful `A/B`, `stage`, `driver`, and priority fields, but they were only visible in CSV/Markdown artifacts.
+  - The user wanted these results visible in the web UI, while also keeping the existing `/signals` snapshot page from becoming too noisy.
+- Changes:
+  - Added `src/services/fast_review_focus_service.py`
+    - locates the latest matching `fast_review_strategy_focus.csv` for a given `snapshot_date`
+    - parses row-level fields such as `signal_keys`, `risk_flags`, `priority_score`, and source paths
+    - builds summary counts for `ab`, `stage`, and `driver`
+  - Updated `api/v1/schemas/signals.py`
+    - added `FastReviewFocusItem`
+    - added `FastReviewFocusResponse`
+  - Updated `api/v1/endpoints/signals.py`
+    - added `GET /api/v1/signals/fast-review-focus`
+  - Updated `apps/dsa-web/src/types/signals.ts`
+    - added frontend types for the new API payload
+  - Updated `apps/dsa-web/src/api/signals.ts`
+    - added `signalsApi.getFastReviewFocus(...)`
+  - Updated `apps/dsa-web/src/pages/SignalsPage.tsx`
+    - added `snapshots / fast_review` data-mode toggle
+    - added a compact `Fast Review Focus` view with summary cards, concise left list, and right-side detail panel
+    - kept the existing snapshot mode intact
+  - Added `apps/dsa-web/src/pages/__tests__/SignalsPage.fastReview.test.tsx`
+    - covers toggling into fast-review mode, loading the compact list, summary cards, and detail panel rendering
+  - Updated `docs/LOCAL_STRATEGY_CATALOG.md`
+  - Updated `docs/CHANGELOG.md`
+- Verification:
+  - Red:
+    - `npm.cmd run build`
+      - failed before the final page fix because TypeScript flagged unreachable `dataMode` comparisons inside the narrowed branches
+  - Green:
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_focus_api.py -q`
+      - result: `2 passed`
+    - `npm.cmd run test -- --run src/pages/__tests__/SignalsPage.fastReview.test.tsx`
+      - result: `1 passed`
+    - `npm.cmd run build`
+      - pending rerun after the final `SignalsPage.tsx` branch fix
+
+## 2026-05-06 (earnings fast-review priority enrichment throttling)
+
+- Scope: continue the `earnings_surprise` fast-review optimization round by shrinking the remaining cold-run tail after the recent-event bootstrap fix, with focus on `capital_profile` and post-selection market-expectation enrichment.
+- Why:
+  - The previous low-depth bootstrap change had already removed most per-symbol fundamental fetch waste, but a real `2026-04-30` replay still showed the dominant tail had moved to `capital_profile` plus market-expectation post-processing.
+  - On the prior replay, the selector-stage evidence showed `Phase timing (capital_profile): 152.453s` while `fundamental_fetch` had already dropped near zero, so the next step needed to reduce heavy enrichment fan-out rather than keep tuning the same fundamental path.
+  - The user wanted faster daily review output, but without changing `earnings_surprise` pass/fail thresholds, score lines, or the current reading-layer interpretation.
+- Changes:
+  - Updated [`scripts/select_earnings_surprise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_earnings_surprise_candidates.py)
+    - added `DEFAULT_FAST_REVIEW_PRIORITY_ENRICHMENT_TOP_N = 15`
+    - added explicit fast-review markers:
+      - `FAST_REVIEW_SKIPPED_STATUS = "skipped_fast_review"`
+      - `FAST_REVIEW_LIGHTWEIGHT_CAPITAL_PROFILE_MODE = "lightweight_fast_review"`
+      - `FAST_REVIEW_FULL_PRIORITY_CAPITAL_PROFILE_MODE = "full_priority_refresh"`
+    - `load_or_refresh_signal_capital_profile(...)` now supports `lightweight_only=True`, so low/medium `db=None` fast-review runs can build a quote-only lightweight capital profile without triggering the heavy capital-flow fetch path for every passed name
+    - `scan_market(...)` now auto-enables that lightweight mode for `db=None + low/medium`, then upgrades only the current priority top `15` passed names to a full capital-profile refresh after selection
+    - added priority ranking helpers used to pick those full-refresh names without changing the main selection thresholds
+    - `enrich_selected_market_expectation_reference(...)` now supports `limit`, and the same fast-review path only enriches market expectation for the priority top `15`; non-priority rows are explicitly marked `skipped_fast_review`
+    - fixed a follow-up bug found in real replay where failed candidates could still hit an uninitialized `capital_profile_mode` reference
+  - Updated [`tests/test_earnings_surprise_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_earnings_surprise_signal_flow.py)
+    - added regression coverage proving non-priority fast-review rows can skip market-expectation enrichment cleanly
+    - added regression coverage proving low-depth `db=None` scans only full-refresh the priority capital-profile subset
+    - added regression coverage proving failed candidates do not require `capital_profile_mode`
+  - Updated [`docs/LOCAL_STRATEGY_CATALOG.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_CATALOG.md)
+  - Updated [`docs/LOCAL_STRATEGY_BASELINE.md`](d:\bb\daily_stock_analysis\docs\LOCAL_STRATEGY_BASELINE.md)
+  - Updated [`docs/CHANGELOG.md`](d:\bb\daily_stock_analysis\docs\CHANGELOG.md)
+- Verification:
+  - Red:
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_earnings_surprise_signal_flow.py -k "skip_non_priority_fast_review_rows or full_refreshes_priority_capital_profiles or failed_candidate_does_not_require_capital_profile_mode" -q`
+      - failed before implementation because the selector still full-refreshed every passed capital profile, did not support expectation limiting, and could reference `capital_profile_mode` before assignment on failed rows
+  - Green:
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_earnings_surprise_signal_flow.py -q`
+      - result: `60 passed`
+    - `.\\.venv\\Scripts\\python.exe -m py_compile scripts/select_earnings_surprise_candidates.py tests/test_earnings_surprise_signal_flow.py`
+      - passed
+    - real replay:
+      - `.\\.venv\\Scripts\\python.exe scripts/run_fast_review_bundle.py --snapshot-date 2026-04-30 --include-signals earnings --skip-persist-snapshots --output-dir data\\manual_runs\\fast_review_earnings_verify_20260430_priority_opt_r2 --log-level INFO`
+      - observed:
+        - `signal_earnings_count=387`
+        - `signal_earnings_elapsed_sec=136.57`
+        - bundle wall clock `__ELAPSED_SEC__=168.55`
+        - selector markdown `Elapsed seconds: 130.872`
+        - selector markdown `Phase timing (fundamental_fetch): 0.354s`
+        - selector markdown `Phase timing (capital_profile): 2.545s`
+        - runtime log: `fast-review lightweight earnings enrichment upgraded priority capital profiles: count=15 top_n=15`
+- Notes:
+  - This round intentionally degrades only auxiliary review enrichment for non-priority rows in fast-review cold runs; it does not change the main `earnings_surprise` scoring logic.
+  - Relative to the earlier cold replay baseline (`signal_earnings_elapsed_sec=466.33s`), the optimized path reduced the same signal stage to `136.57s` on the verified `2026-04-30` replay.
+
+## 2026-05-06 (earnings low-depth recent-event bootstrap)
+
+- Scope: reduce `earnings_surprise` low-depth tail latency on dense disclosure days by allowing recent-event overlays to bootstrap a lightweight bundle before falling back to per-symbol fundamental fetch.
+- Why:
+  - Manual observation on the `2026-04-30` fast-review replay showed the real bottleneck had shifted into `select_earnings_surprise_candidates.py`, not `hundred_day_high` or final bundle export.
+  - Root-cause tracing showed `2026-04-30` resolves to effective CN trading date `2026-04-29`, and under `low + latest_report_period + recent_event_max_age_days=7` the recent-event filter still left thousands of eligible names.
+  - With that many names, the old path still performed per-symbol `fresh_bundle_fetch` even when the recent-event catalog already contained enough report/forecast/quick-report fields to build a usable low-depth payload.
+- Changes:
+  - Updated [`scripts/select_earnings_surprise_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_earnings_surprise_candidates.py)
+    - added `_build_recent_event_bootstrap_bundle(...)`
+    - `load_or_fetch_signal_fundamental_snapshot(...)` now prefers cached same-day / cross-day snapshots first, then uses `recent_event_overlay_only` bootstrap for `low/medium` scans when recent-event payload is already sufficient, and only falls back to adapter bundle fetch afterward
+  - Updated [`tests/test_earnings_surprise_signal_flow.py`](d:\bb\daily_stock_analysis\tests\test_earnings_surprise_signal_flow.py)
+    - added regression coverage proving low-depth can bootstrap directly from recent actual-report overlay without touching adapter fetch
+    - added end-to-end `scan_market(..., db=None, scan_depth=low)` regression coverage for the same path
+    - updated the older low-depth overlay expectation to match the new bootstrap-first behavior
+- Verification:
+  - Red:
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_earnings_surprise_signal_flow.py -k "bootstrap_from_recent_actual_report_without_fetch" -q`
+      - failed before implementation with `AssertionError: adapter fetch should be skipped`
+  - Green:
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_earnings_surprise_signal_flow.py -k "bootstrap_from_recent_actual_report_without_fetch" -q`
+      - result: `1 passed`
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_earnings_surprise_signal_flow.py -k "recent_actual_overlay_skips_bundle_fetch_for_dbless_run" -q`
+      - result: `1 passed`
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_earnings_surprise_signal_flow.py -k "load_or_fetch_low_depth or scan_market_low_depth" -q`
+      - result: `5 passed, 52 deselected`
+    - `.\\.venv\\Scripts\\python.exe -m py_compile scripts/select_earnings_surprise_candidates.py tests/test_earnings_surprise_signal_flow.py`
+      - passed
+
+## 2026-05-06 (fast review manual calibration samples)
+
+- Scope: add a lightweight manual-label calibration layer to `run_fast_review_bundle.py` so real review samples can be compared against the current A/B and driver classification rules.
+- Why:
+  - The reading-layer classification was already usable, but the next bottleneck was no longer implementation; it was iteration speed on real review dates.
+  - The user needed a practical way to mark a few real names as `业绩兑现型 / 拐点观察型 / 事件驱动型 / 题材情绪型` and quickly see where current rules still overfit or underfit.
+- Changes:
+  - Updated `scripts/run_fast_review_bundle.py`
+    - added `--manual-review-labels-file`
+    - added manual sample loading filtered by `snapshot_date`
+    - added calibration comparison rows against `strategy_focus` actual outputs
+    - added `fast_review_manual_calibration.csv/.md`
+    - added `人工复盘校准` section in `fast_review_summary.md`
+  - Added `config/manual_fast_review_labels.example.json`
+    - provides a minimal example schema for `snapshot_date / code / expected_ab_bucket / expected_driver_type / expected_driver_label / notes`
+  - Updated `tests/test_fast_review_daily_bundle.py`
+    - covers manual label loading by date
+    - covers expected-vs-actual comparison output
+    - covers summary section rendering
+    - covers main-path artifact generation
+  - Updated `docs/LOCAL_STRATEGY_CATALOG.md`
+  - Updated `docs/LOCAL_STRATEGY_BASELINE.md`
+  - Updated `docs/CHANGELOG.md`
+- Verification:
+  - Red:
+    - `pytest tests/test_fast_review_daily_bundle.py -k "manual_review_label_rows or manual_review_calibration or manual_review_calibration_section" -q`
+      - failed before implementation with missing helper functions and missing `_build_summary_markdown(...)` parameters
+  - Green:
+    - `pytest tests/test_fast_review_daily_bundle.py -k "manual_review_label_rows or manual_review_calibration or manual_review_calibration_section or manual_review_calibration_outputs" -q`
+      - result: `4 passed, 36 deselected`
+    - `python -m py_compile scripts/run_fast_review_bundle.py tests/test_fast_review_daily_bundle.py`
+      - passed
+
+## 2026-05-06 (fast review A/B buckets and driver labels)
+
+- Scope: add A/B review bucketing plus four driver labels to the fast-review reading layer, without changing the three daily selector strategies.
+- Why:
+  - The existing daily bundle could already aggregate `earnings_surprise`, `hundred_day_high`, and `trend_leader_unified`, but it still mixed together “already confirmed” names and “early-stage watch” names.
+  - The user also needed the review layer to distinguish `业绩兑现型 / 拐点观察型 / 事件驱动型 / 题材情绪型`, especially for off-season earnings interpretation.
+- Changes:
+  - Updated `scripts/run_fast_review_bundle.py`
+    - added reading-layer helper logic for `ab_bucket` classification
+    - added driver classification output: `driver_type / driver_label / driver_reason`
+    - extended `fast_review_strategy_focus.csv/.md` and `fast_review_summary.md` rendering to show bucket and driver information
+  - Added `tests/test_fast_review_ab_driver_classification.py`
+    - covers `A/B` assignment
+    - covers earnings-delivery priority over other driver types
+    - covers hard-event keyword detection
+    - covers summary and CSV output wiring
+  - Updated `docs/LOCAL_STRATEGY_CATALOG.md`
+    - documented that these new labels belong to the fast-review reading layer only
+  - Updated `docs/CHANGELOG.md`
+    - added the user-visible summary entry
+- Verification:
+  - Red:
+    - `pytest tests/test_fast_review_ab_driver_classification.py -q`
+      - failed before implementation with missing `ab_bucket`, `driver_type`, and summary/export fields
+    - `pytest tests/test_fast_review_ab_driver_classification.py -k "generic_price_theme" -q`
+      - failed before the refinement because a generic `涨价资源` theme phrase was still being classified as `event_driven`
+  - Green:
+    - `pytest tests/test_fast_review_ab_driver_classification.py -q`
+      - result: `7 passed`
+    - `pytest tests/test_fast_review_ab_driver_classification.py tests/test_fast_review_daily_bundle.py -k "build_strategy_focus_rows or build_summary_markdown_includes_concise_strategy_focus or write_strategy_focus_outputs_include_ab_bucket_and_driver_columns or build_summary_markdown_includes_ab_bucket_and_driver_label or prefers_event_driven_over_turning_point or generic_price_theme" -q`
+      - result: `13 passed, 30 deselected`
+    - `python -m py_compile scripts/run_fast_review_bundle.py tests/test_fast_review_ab_driver_classification.py tests/test_fast_review_daily_bundle.py`
+      - passed
+    - real smoke run:
+      - `.\.venv\Scripts\python.exe scripts/run_fast_review_bundle.py --snapshot-date 2026-05-05 --output-dir data/fast_review_daily_smoke_refined --include-signals earnings,hundred_day_high,trend_leader --limit 5 --skip-persist-snapshots`
+      - result:
+        - generated `review/fast_review_strategy_focus.csv/.md` and `review/fast_review_summary.md`
+        - summary now shows `A类/B类` counts plus driver labels in both focus and rise-reason tables
+        - on this specific smoke date, only `hundred_day_high` produced rows, so the bundle correctly showed `A类=0 / B类=30`
+        - previously misclassified names such as `西部材料 / 德方纳米 / 中英科技` no longer get promoted to `事件驱动型` merely because the reason text contains a generic `涨价资源` theme mapping; they now stay in `题材情绪型`
+
+## 2026-05-07 (fast review stage split + tighter trend prefilter defaults)
+
+- Scope: refine the fast-review reading layer by keeping the existing driver labels but splitting focus rows into four explicit review stages, and tighten the repo-level daily `trend_leader` prefilter defaults so the prepared universe is materially smaller.
+- Why:
+  - The existing `A/B + driver_label` layer still mixed together names that had already confirmed earnings delivery with names that were only at a turning-point or pure rotation stage, which made daily review less actionable.
+  - The user explicitly wanted a separate reading-layer distinction for `兑现 / 半兑现 / 拐点 / 纯轮动`, while keeping the original `driver_label` semantics for cause attribution.
+  - Real `prepare_scan_universe(...)` sampling on `2026-05-06` showed the current repo-level daily trend prefilter was still too wide for fast review, with roughly `759` prepared names under `listed=120 / 60d=4.0 / turnover=1.0 / positive=true`.
+- Changes:
+  - Updated `scripts/run_fast_review_bundle.py`
+    - added `_classify_review_stage(...)`
+    - `strategy_focus` rows now export `review_stage_type / review_stage_label / review_stage_reason`
+    - `fast_review_strategy_focus.csv/.md` and `fast_review_summary.md` now show stage counts and per-row stage values in addition to the existing `driver_label`
+  - Updated `config/local_strategy_profile.json`
+    - changed repo daily trend fast-review defaults from `60d=4.0 / turnover=1.0` to `60d=8.0 / turnover=1.2`
+    - kept `listed_days=120` and `require_positive_change=true`
+  - Updated `tests/test_fast_review_ab_driver_classification.py`
+    - added coverage for the new four-stage reading-layer output
+  - Updated `tests/test_fast_review_daily_bundle.py`
+    - added coverage that repo profile parsing now reflects the tighter daily trend prefilter defaults
+  - Updated `docs/LOCAL_STRATEGY_CATALOG.md`
+  - Updated `docs/LOCAL_STRATEGY_BASELINE.md`
+  - Updated `docs/CHANGELOG.md`
+- Verification:
+  - Red:
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_ab_driver_classification.py -k "review_stage or write_strategy_focus_outputs_include_ab_bucket_and_driver_columns or build_summary_markdown_includes_ab_bucket_and_driver_label" -q`
+      - failed before implementation because `review_stage_*` fields were not exported yet
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_daily_bundle.py -k "repo_strategy_profile_tighter_trend_prefilter_defaults" -q`
+      - failed before implementation because repo defaults were still `4.0 / 1.0`
+  - Green:
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_ab_driver_classification.py -k "review_stage or write_strategy_focus_outputs_include_ab_bucket_and_driver_columns or build_summary_markdown_includes_ab_bucket_and_driver_label" -q`
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_daily_bundle.py -k "repo_strategy_profile_tighter_trend_prefilter_defaults" -q`
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_ab_driver_classification.py tests/test_fast_review_daily_bundle.py -q`
+    - `.\\.venv\\Scripts\\python.exe -m py_compile scripts/run_fast_review_bundle.py tests/test_fast_review_ab_driver_classification.py tests/test_fast_review_daily_bundle.py`
+  - Universe-sizing evidence used for the new repo default:
+    - current repo default before change: `listed=120 / 60d=4.0 / turnover=1.0 / positive=true -> after=759`
+    - chosen new repo default: `listed=120 / 60d=8.0 / turnover=1.2 / positive=true -> after=607`
+    - more aggressive alternatives were tested (`after=590` and `after=533`), but not chosen yet to avoid over-tightening the first daily default step.
+
+## 2026-05-07 (fast review semi-delivery tightening)
+
+- Scope: tighten the reading-layer `半兑现` stage so it no longer absorbs most `earnings + non-trend` names.
+- Why:
+  - A real `2026-05-06` fast-review run after the four-stage split showed the new stage distribution was still too lopsided: `兑现=5 / 半兑现=429 / 拐点=14 / 纯轮动=18`.
+  - The main problem was semantic, not selector width: many `earnings_delivery` rows without any trend confirmation were still being labeled `半兑现`, which made the stage less useful for daily review.
+- Changes:
+  - Updated `scripts/run_fast_review_bundle.py`
+    - `earnings_delivery` now stays `半兑现` only when `trend_leader` is already present but still short of full confirmation
+    - `earnings_delivery` rows without trend confirmation now fall to `拐点` instead of `半兑现`
+  - Updated `tests/test_fast_review_ab_driver_classification.py`
+    - added a trend-linked weak-confirmation sample that remains `半兑现`
+    - changed the `earnings + hundred_day_high` sample expectation from `半兑现` to `拐点`
+- Verification:
+  - Red:
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_ab_driver_classification.py -k "adds_review_stage_labels" -q`
+      - failed before implementation because the `earnings + non-trend` sample still returned `semi_delivery`
+  - Green:
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_ab_driver_classification.py -k "adds_review_stage_labels" -q`
+      - result: `1 passed`
+    - `.\\.venv\\Scripts\\python.exe -m pytest tests/test_fast_review_ab_driver_classification.py -k "review_stage or write_strategy_focus_outputs_include_ab_bucket_and_driver_columns or build_summary_markdown_includes_ab_bucket_and_driver_label" -q`
+      - result: `3 passed`
+
 ## 2026-05-06 (shortline CLI db-manager injection for snapshot-backed driver evidence)
 
 - Scope: fix the real `shortline_hub` process/CLI path so snapshot-backed hard-logic evidence actually reaches the orchestrator during real replays.
@@ -6388,3 +9077,49 @@
 - Notes:
   - This change is intentionally summary-layer only; it does not alter the underlying shortline artifacts.
   - The practical effect is that bundle root and runs-summary root now tell the same “latest shortline run” story.
+
+## 2026-05-09 (fast review AI boom wording refinement + EV-theme false-positive suppression)
+
+- Scope: continue tightening daily fast-review explanation readability and theme precision for the `2026-05-09` reading flow.
+- Why:
+  - The previous round already made `PCB / ??? / ???? / AI?????` explanations more stable, but the wording still stopped one layer too early for the actual review need.
+  - The remaining gap was: the system could say a stock is in the AI chain, but not clearly express that it is moving inside an `AI mainline industry boom / ????` context.
+  - A second residual precision issue remained on `600522 ????`: after removing the earlier AI false positive, weak `?????` text could still force the row into `?? / ???? / ??` even though the business identity was still closer to `??? / ????`.
+- Changes:
+  - Updated [`src/services/signal_cause_analysis_service.py`](d:b\daily_stock_analysis\src\services\signal_cause_analysis_service.py):
+    - refined `_derive_boom_context_clause(...)` so AI-chain fallback text now explicitly uses `AI mainline industry boom / expansion` wording
+    - AI upstream-material samples now say the move looks like `AI mainline industry boom expanding into upstream materials`
+    - added a new low-signal suppression branch for `?? / ???? / ??`
+    - weak component-only business text such as `?? / ?????` no longer wins when the row's stronger business identity is still infrastructure / communications
+  - Updated [`tests/test_signal_cause_analysis_service.py`](d:b\daily_stock_analysis	ests	est_signal_cause_analysis_service.py):
+    - added `test_build_logic_breakdown_surfaces_industry_level_ai_boom_clause`
+    - added `test_map_overseas_theme_does_not_treat_infra_auto_component_name_as_ev_theme`
+- Verification:
+  - Red:
+    - `.\.venv\Scripts\python.exe -m pytest tests\test_signal_cause_analysis_service.py -k "industry_level_ai_boom_clause or infra_auto_component_name_as_ev_theme"`
+      - failed as expected before the code change:
+        - AI explanation still lacked explicit `industry` boom wording
+        - `????`-style sample still mapped to `?? / ???? / ??`
+  - Green:
+    - `.\.venv\Scripts\python.exe -m py_compile src\services\signal_cause_analysis_service.py tests\test_signal_cause_analysis_service.py`
+      - passed
+    - `.\.venv\Scripts\python.exe -m pytest tests\test_signal_cause_analysis_service.py -k "generic_optical_power_infra or ai_upstream_infra_copper_foil or infra_copper_product_name or copper_conductor_component or keeps_true_resource_theme or industry_level_ai_boom_clause or infra_auto_component_name_as_ev_theme"`
+      - result: `7 passed`
+  - Real artifact refresh:
+    - re-ran:
+      - `.\.venv\Scripts\python.exe scripts\run_fast_review_bundle.py --strategy-profile-file config\local_strategy_profile.json --snapshot-date 2026-05-09 --output-dir data\fast_review_daily --log-level INFO`
+    - runtime:
+      - `elapsed_sec=323.8`
+      - log: [`data/manual_runs/fast_review_20260509_explanation_refine_20260509.log`](d:b\daily_stock_analysis\data\manual_runsast_review_20260509_explanation_refine_20260509.log)
+    - checked refreshed artifacts:
+      - [`fast_review_strategy_focus.md`](d:b\daily_stock_analysis\dataast_review_daily6-05-09
+eviewast_review_strategy_focus.md)
+      - [`fast_review_summary.md`](d:b\daily_stock_analysis\dataast_review_daily6-05-09
+eviewast_review_summary.md)
+    - confirmed examples:
+      - `300476 ????`: `PCB??AI?????` + `??AI??????????????`
+      - `603618 ????`: `???/????/????AI?????` + `??AI??????????????`
+      - `600522 ????`: `theme_label` cleared; no longer mapped to `?? / ???? / ??`
+- Notes:
+  - This round tightens explanation semantics only; it does not widen the candidate universe or change A/B/stage scoring.
+  - `600522 ????` still carries `industry=???` in the source row, so the remaining possible next step is to decide whether the reading layer should further prefer business-summary wording over broad source-industry labels in conflict cases.

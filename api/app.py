@@ -39,7 +39,9 @@ _INDEX_ASSET_REF_PATTERN = re.compile(
     r"""(?:src|href)\s*=\s*["'](/assets/[^"']+)["']""",
     re.IGNORECASE,
 )
-_SAFE_MISSING_ASSET_MEDIA_TYPES = frozenset({"text/css", "text/javascript"})
+_SAFE_MISSING_ASSET_MEDIA_TYPES = frozenset(
+    {"text/css", "text/javascript", "application/javascript"}
+)
 
 
 def _check_frontend_assets_consistency(static_dir: Path) -> List[str]:

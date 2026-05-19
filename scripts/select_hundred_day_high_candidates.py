@@ -83,6 +83,13 @@ BREAKOUT_QUALITY_METRIC_KEYS: List[str] = [
     "minervini_template_passed",
     "breakout_follow_through_score",
 ]
+CHART_PATTERN_METRIC_KEYS: List[str] = [
+    "chart_pattern_label",
+    "chart_pattern_score",
+    "chart_pattern_summary",
+    "base_breakout_score",
+    "healthy_trend_score",
+]
 OUTPUT_DIR_LOCK_FILENAME = "hundred_day_high_run.lock"
 INDUSTRY_STRENGTH_METRIC_KEYS: List[str] = [
     "industry_strength_score",
@@ -836,6 +843,159 @@ def _compute_breakout_follow_through_score(close: pd.Series, *, breakout_high: O
     return round(min(6.0, max(0.0, score)), 2)
 
 
+def _empty_chart_pattern_metrics() -> Dict[str, Any]:
+    return {
+        "chart_pattern_label": "plain_breakout",
+        "chart_pattern_score": 0.0,
+        "chart_pattern_summary": "图形一般",
+        "base_breakout_score": 0.0,
+        "healthy_trend_score": 0.0,
+    }
+
+
+def _compute_trailing_max_drawdown_pct(close: pd.Series) -> float:
+    if close is None or len(close) < 2:
+        return 0.0
+    rolling_peak = close.cummax().replace(0, pd.NA)
+    drawdown_pct = ((rolling_peak - close) / rolling_peak * 100.0).fillna(0.0)
+    return round(float(drawdown_pct.max() or 0.0), 2)
+
+
+def classify_hundred_day_chart_pattern(
+    history: pd.DataFrame,
+    *,
+    breakout_metrics: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    payload = _empty_chart_pattern_metrics()
+    if history is None or history.empty:
+        return payload
+
+    numeric = history.copy()
+    for column in ("close", "high", "low"):
+        numeric[column] = pd.to_numeric(numeric[column], errors="coerce")
+    if "volume" in numeric.columns:
+        numeric["volume"] = pd.to_numeric(numeric["volume"], errors="coerce")
+    numeric = numeric.dropna(subset=["close", "high", "low"]).copy()
+    if len(numeric) < 60:
+        return payload
+
+    metrics = dict(breakout_metrics or {})
+    if not metrics:
+        metrics = compute_breakout_quality_metrics(numeric)
+
+    close = numeric["close"].astype(float)
+    ma20 = close.rolling(20).mean()
+    ma60 = close.rolling(60).mean()
+    close_20 = close.tail(min(20, len(close)))
+    close_60 = close.tail(min(60, len(close)))
+
+    latest_close = float(close.iloc[-1])
+    base_20 = float(close_20.iloc[0]) if len(close_20) else latest_close
+    base_60 = float(close_60.iloc[0]) if len(close_60) else latest_close
+    return_20_pct = ((latest_close / base_20 - 1.0) * 100.0) if base_20 > 0 else 0.0
+    return_60_pct = ((latest_close / base_60 - 1.0) * 100.0) if base_60 > 0 else 0.0
+
+    positive_days_20 = float((close_20.diff().fillna(0.0) > 0).mean()) if len(close_20) >= 2 else 0.0
+    drawdown_20_pct = _compute_trailing_max_drawdown_pct(close_20)
+    drawdown_60_pct = _compute_trailing_max_drawdown_pct(close_60)
+
+    latest_ma20 = float(ma20.iloc[-1]) if pd.notna(ma20.iloc[-1]) else None
+    latest_ma60 = float(ma60.iloc[-1]) if pd.notna(ma60.iloc[-1]) else None
+    ma20_prev = float(ma20.iloc[-11]) if len(ma20) >= 11 and pd.notna(ma20.iloc[-11]) else latest_ma20
+    ma20_slope_pct = ((latest_ma20 / ma20_prev - 1.0) * 100.0) if latest_ma20 and ma20_prev else 0.0
+
+    range_60_pct = (
+        (float(close_60.max()) - float(close_60.min())) / float(close_60.min()) * 100.0
+        if len(close_60) and float(close_60.min()) > 0
+        else 0.0
+    )
+    contraction_ratio = float(metrics.get("breakout_contraction_ratio") or 1.0)
+    volume_ratio = float(metrics.get("breakout_volume_ratio") or 0.0)
+    distance_to_new_high_pct = float(metrics.get("distance_to_new_high_pct") or 99.0)
+    follow_through_score = float(metrics.get("breakout_follow_through_score") or 0.0)
+    breakout_quality_score = float(metrics.get("breakout_quality_score") or 0.0)
+
+    base_breakout_score = 0.0
+    if distance_to_new_high_pct <= 1.0:
+        base_breakout_score += 4.0
+    if contraction_ratio <= 0.85:
+        base_breakout_score += 4.0
+    if contraction_ratio <= 0.70:
+        base_breakout_score += 2.0
+    if volume_ratio >= 1.2:
+        base_breakout_score += 2.0
+    if volume_ratio >= 1.5:
+        base_breakout_score += 1.0
+    if contraction_ratio <= 0.78 and volume_ratio >= 1.2:
+        base_breakout_score += 2.0
+    if follow_through_score >= 3.0:
+        base_breakout_score += 2.0
+    if distance_to_new_high_pct <= 0.6 and follow_through_score >= 5.0:
+        base_breakout_score += 1.0
+    if breakout_quality_score >= 10.0:
+        base_breakout_score += 2.0
+    if range_60_pct <= 25.0:
+        base_breakout_score += 1.0
+
+    healthy_trend_score = 0.0
+    if return_20_pct >= 6.0:
+        healthy_trend_score += 3.0
+    if return_60_pct >= 15.0:
+        healthy_trend_score += 3.0
+    if positive_days_20 >= 0.55:
+        healthy_trend_score += 2.0
+    if drawdown_20_pct <= 6.0:
+        healthy_trend_score += 3.0
+    if drawdown_60_pct <= 12.0:
+        healthy_trend_score += 2.0
+    if latest_ma20 is not None and latest_ma60 is not None and latest_close >= latest_ma20 >= latest_ma60:
+        healthy_trend_score += 3.0
+    if ma20_slope_pct >= 1.5:
+        healthy_trend_score += 2.0
+
+    base_breakout_score = round(min(18.0, max(0.0, base_breakout_score)), 2)
+    healthy_trend_score = round(min(16.0, max(0.0, healthy_trend_score)), 2)
+
+    if (
+        base_breakout_score >= 14.0
+        and contraction_ratio <= 0.78
+        and breakout_quality_score >= 10.0
+    ) or (base_breakout_score >= 11.0 and base_breakout_score > healthy_trend_score):
+        payload.update(
+            {
+                "chart_pattern_label": "base_breakout",
+                "chart_pattern_score": base_breakout_score,
+                "chart_pattern_summary": "横盘突破型",
+                "base_breakout_score": base_breakout_score,
+                "healthy_trend_score": healthy_trend_score,
+            }
+        )
+        return payload
+
+    if healthy_trend_score >= 10.0:
+        payload.update(
+            {
+                "chart_pattern_label": "healthy_trend",
+                "chart_pattern_score": healthy_trend_score,
+                "chart_pattern_summary": "健康慢涨型",
+                "base_breakout_score": base_breakout_score,
+                "healthy_trend_score": healthy_trend_score,
+            }
+        )
+        return payload
+
+    payload.update(
+        {
+            "chart_pattern_label": "plain_breakout",
+            "chart_pattern_score": round(max(base_breakout_score, healthy_trend_score), 2),
+            "chart_pattern_summary": "图形一般",
+            "base_breakout_score": base_breakout_score,
+            "healthy_trend_score": healthy_trend_score,
+        }
+    )
+    return payload
+
+
 def compute_breakout_quality_metrics(history: pd.DataFrame) -> Dict[str, Any]:
     empty_payload = {
         "breakout_quality_score": 0.0,
@@ -933,6 +1093,12 @@ def _empty_breakout_quality_metrics() -> Dict[str, Any]:
     }
 
 
+def _empty_breakout_and_chart_pattern_metrics() -> Dict[str, Any]:
+    payload = _empty_breakout_quality_metrics()
+    payload.update(_empty_chart_pattern_metrics())
+    return payload
+
+
 def _compute_breakout_quality_for_stock(
     stock_code: str,
     *,
@@ -941,10 +1107,17 @@ def _compute_breakout_quality_for_stock(
     try:
         history_df, _ = manager.get_daily_data(stock_code, days=180)
         prepared = KlineSelectorService._prepare_history(history_df)
-        return True, compute_breakout_quality_metrics(prepared)
+        breakout_metrics = compute_breakout_quality_metrics(prepared)
+        chart_pattern_metrics = classify_hundred_day_chart_pattern(
+            prepared,
+            breakout_metrics=breakout_metrics,
+        )
+        merged_metrics = dict(breakout_metrics)
+        merged_metrics.update(chart_pattern_metrics)
+        return True, merged_metrics
     except Exception as exc:
         logger.debug("breakout quality enrich failed for %s: %s", stock_code, exc)
-        return False, _empty_breakout_quality_metrics()
+        return False, _empty_breakout_and_chart_pattern_metrics()
 
 
 def _build_breakout_quality_metrics_map(
@@ -967,7 +1140,7 @@ def _build_breakout_quality_metrics_map(
 
     if primary_manager is None and not parallel_enabled:
         for evaluation in evaluations:
-            metrics_by_code[evaluation.stock_code] = (False, _empty_breakout_quality_metrics())
+            metrics_by_code[evaluation.stock_code] = (False, _empty_breakout_and_chart_pattern_metrics())
         return metrics_by_code, {
             "breakout_quality_parallel_enabled": False,
             "breakout_quality_parallel_workers": 0,
@@ -1006,7 +1179,7 @@ def _build_breakout_quality_metrics_map(
                 metrics_by_code[resolved_code] = (quality_available, breakout_metrics)
             except Exception as exc:
                 logger.debug("breakout quality parallel worker failed for %s: %s", stock_code, exc)
-                metrics_by_code[stock_code] = (False, _empty_breakout_quality_metrics())
+                metrics_by_code[stock_code] = (False, _empty_breakout_and_chart_pattern_metrics())
 
     return metrics_by_code, {
         "breakout_quality_parallel_enabled": True,
@@ -1037,7 +1210,7 @@ def _enrich_run_result_with_breakout_quality(
     for evaluation in run_result.selected:
         quality_available, breakout_metrics = metrics_by_code.get(
             evaluation.stock_code,
-            (False, _empty_breakout_quality_metrics()),
+            (False, _empty_breakout_and_chart_pattern_metrics()),
         )
 
         merged_metrics = dict(evaluation.metrics or {})
@@ -1109,6 +1282,8 @@ def build_selected_dataframe(run_result: KlineSelectorRunResult) -> pd.DataFrame
             selected_df[key] = selected_df["code"].map(lambda code: metrics_by_code.get(code, {}).get(key))
         for key in BREAKOUT_QUALITY_METRIC_KEYS:
             selected_df[key] = selected_df["code"].map(lambda code: metrics_by_code.get(code, {}).get(key))
+        for key in CHART_PATTERN_METRIC_KEYS:
+            selected_df[key] = selected_df["code"].map(lambda code: metrics_by_code.get(code, {}).get(key))
         for key in INDUSTRY_STRENGTH_METRIC_KEYS:
             selected_df[key] = selected_df["code"].map(lambda code: metrics_by_code.get(code, {}).get(key))
         selected_df = selected_df.sort_values(
@@ -1135,6 +1310,9 @@ def build_signal_metrics_payload(
         "history_source": evaluation.history_source,
     }
     for key in BREAKOUT_QUALITY_METRIC_KEYS:
+        if key in metrics:
+            payload[key] = metrics.get(key)
+    for key in CHART_PATTERN_METRIC_KEYS:
         if key in metrics:
             payload[key] = metrics.get(key)
     for key in QUALITY_OVERLAY_METRIC_KEYS:
@@ -1611,18 +1789,19 @@ def build_markdown_report(
         [
             "## 命中结果",
             "",
-            "| 代码 | 名称 | 行业 | 最新 high | 收盘 | 突破质量 | 行业强度 | 上涨原因 | 标签 | 海外主题 | 上次命中 | 历史次数 | 距上次(天) | 数据源 |",
-            "|------|------|------|----------:|-----:|----------:|----------:|----------|------|----------|----------|----------:|-----------:|--------|",
+            "| 代码 | 名称 | 行业 | 最新 high | 收盘 | 图形标签 | 突破质量 | 行业强度 | 上涨原因 | 标签 | 海外主题 | 上次命中 | 历史次数 | 距上次(天) | 数据源 |",
+            "|------|------|------|----------:|-----:|----------|----------:|----------:|----------|------|----------|----------|----------:|-----------:|--------|",
         ]
     )
     for row in selected_df.itertuples(index=False):
         lines.append(
-            "| {code} | {name} | {industry} | {latest_high} | {close} | {breakout_quality_score} | {industry_strength_score} | {reason_summary} | {cause_tags} | {theme_label} | {latest_previous_hit_date} | {previous_hit_count} | {days_since_previous_hit} | {history_source} |".format(
+            "| {code} | {name} | {industry} | {latest_high} | {close} | {chart_pattern_summary} | {breakout_quality_score} | {industry_strength_score} | {reason_summary} | {cause_tags} | {theme_label} | {latest_previous_hit_date} | {previous_hit_count} | {days_since_previous_hit} | {history_source} |".format(
                 code=_markdown_cell(row.code),
                 name=_markdown_cell(row.name),
                 industry=_markdown_cell(getattr(row, "industry", "")),
                 latest_high=f"{float(row.latest_high):.2f}" if pd.notna(row.latest_high) else "-",
                 close=f"{float(row.close):.2f}" if pd.notna(row.close) else "-",
+                chart_pattern_summary=_markdown_cell(getattr(row, "chart_pattern_summary", "")),
                 breakout_quality_score=f"{float(getattr(row, 'breakout_quality_score', 0.0)):.2f}"
                 if pd.notna(getattr(row, "breakout_quality_score", None))
                 else "-",
@@ -1695,6 +1874,11 @@ def export_results(
         "minervini_template_score",
         "minervini_template_passed",
         "breakout_follow_through_score",
+        "chart_pattern_label",
+        "chart_pattern_score",
+        "chart_pattern_summary",
+        "base_breakout_score",
+        "healthy_trend_score",
         "history_source",
         "reason_summary",
         "industry_logic",

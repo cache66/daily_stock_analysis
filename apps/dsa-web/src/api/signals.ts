@@ -1,6 +1,7 @@
 import apiClient from './index';
 import { toCamelCase } from './utils';
 import type {
+  FastReviewFocusResponse,
   SignalSnapshotCountsResponse,
   SignalSnapshotHistoryResponse,
   SignalSnapshotListResponse,
@@ -33,6 +34,10 @@ export interface GetSignalSnapshotCountsParams {
   code?: string;
   codes?: string[];
   signalTypes?: string[];
+}
+
+export interface GetFastReviewFocusParams {
+  snapshotDate: string;
 }
 
 export interface SendSignalSelectionParams {
@@ -102,6 +107,19 @@ export const signalsApi = {
       },
     });
     return toCamelCase<SignalSnapshotCountsResponse>(response.data);
+  },
+
+  getFastReviewFocus: async (
+    params: GetFastReviewFocusParams,
+    options?: SignalsRequestOptions,
+  ): Promise<FastReviewFocusResponse> => {
+    const response = await apiClient.get<Record<string, unknown>>('/api/v1/signals/fast-review-focus', {
+      signal: options?.signal,
+      params: {
+        snapshot_date: params.snapshotDate,
+      },
+    });
+    return toCamelCase<FastReviewFocusResponse>(response.data);
   },
 
   sendSelection: async (

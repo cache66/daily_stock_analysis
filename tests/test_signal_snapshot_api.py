@@ -5,7 +5,7 @@ import os
 import sys
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -681,9 +681,13 @@ class SignalSnapshotApiTestCase(unittest.TestCase):
             self.assertEqual(payload["error"], "invalid_request")
 
     def test_history_endpoint_returns_desc_items_and_summaries(self) -> None:
-        self._seed_snapshot("2026-04-04", latest_high=1818.0, close=1780.0)
-        self._seed_snapshot("2026-04-03", latest_high=1790.0, close=1770.0)
-        self._seed_snapshot("2026-04-02", latest_high=1760.0, close=1755.0)
+        latest_day = date.today() - timedelta(days=1)
+        prior_day = date.today() - timedelta(days=2)
+        third_day = date.today() - timedelta(days=3)
+
+        self._seed_snapshot(latest_day.isoformat(), latest_high=1818.0, close=1780.0)
+        self._seed_snapshot(prior_day.isoformat(), latest_high=1790.0, close=1770.0)
+        self._seed_snapshot(third_day.isoformat(), latest_high=1760.0, close=1755.0)
 
         response = self.client.get(
             "/api/v1/signals/kline-snapshots/hundred_day_high/600519",
@@ -693,7 +697,7 @@ class SignalSnapshotApiTestCase(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload["total"], 3)
-        self.assertEqual(payload["items"][0]["signal_date"], "2026-04-04")
+        self.assertEqual(payload["items"][0]["signal_date"], latest_day.isoformat())
         self.assertEqual(payload["continuity"]["current_streak_count"], 3)
         self.assertEqual(payload["drawdown"]["max_signal_high"], 1818.0)
 

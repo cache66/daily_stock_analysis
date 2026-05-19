@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -203,3 +203,72 @@ class SignalSnapshotHistoryResponse(BaseModel):
     continuity: SignalContinuitySummary
     drawdown: SignalDrawdownSummary
     items: List[SignalSnapshotHistoryItem] = Field(default_factory=list, description="Items")
+
+
+class FastReviewFocusItem(BaseModel):
+    code: str = Field(..., description="Stock code")
+    name: Optional[str] = Field(None, description="Stock name")
+    tier: Optional[str] = Field(None, description="Fast-review tier such as core/watch")
+    ab_bucket: Optional[str] = Field(None, description="Fast-review A/B bucket")
+    priority_score: Optional[float] = Field(None, description="Fast-review priority score")
+    signal_keys: List[str] = Field(default_factory=list, description="Source signal keys")
+    signal_types: List[str] = Field(default_factory=list, description="Source signal types")
+    trend_hundred_relation: Optional[str] = Field(None, description="Trend vs hundred-day-high relation")
+    focus_reason: Optional[str] = Field(None, description="Compact focus reason")
+    reason_summary: Optional[str] = Field(None, description="Readable reason summary")
+    display_reason_summary: Optional[str] = Field(None, description="Compact reason summary for daily review UI")
+    industry_logic: Optional[str] = Field(None, description="Industry logic")
+    news_logic: Optional[str] = Field(None, description="News logic")
+    technical_logic: Optional[str] = Field(None, description="Technical logic")
+    business_labels: List[str] = Field(default_factory=list, description="Structured business labels")
+    business_summary: Optional[str] = Field(None, description="Structured business summary")
+    chain_role_label: Optional[str] = Field(None, description="Resolved business chain role")
+    theme_label: Optional[str] = Field(None, description="Resolved theme label")
+    theme_source: Optional[str] = Field(None, description="Theme evidence source summary")
+    mainline_judgement: Optional[str] = Field(None, description="Mainline judgement")
+    mainline_evidence_sources: List[str] = Field(default_factory=list, description="Structured evidence sources")
+    authority_judgement: Optional[str] = Field(None, description="Authority-first judgement")
+    authority_level: Optional[str] = Field(None, description="Authority evidence level")
+    authority_reason_summary: Optional[str] = Field(None, description="Compact authority-first summary")
+    display_authority_judgement: Optional[str] = Field(None, description="Display-layer authority judgement")
+    display_authority_summary: Optional[str] = Field(None, description="Display-layer authority summary")
+    authority_evidence_digest: Optional[str] = Field(None, description="Compressed authority evidence digest")
+    announcement_evidence_summary: Optional[str] = Field(None, description="Announcement evidence summary")
+    earnings_evidence_summary: Optional[str] = Field(None, description="Earnings evidence summary")
+    research_evidence_summary: Optional[str] = Field(None, description="Research evidence summary")
+    authority_time_window_days: Optional[int] = Field(None, description="Authority evidence window in days")
+    preferred_industry_label: Optional[str] = Field(None, description="Preferred business-led industry label")
+    peer_group_label: Optional[str] = Field(None, description="Peer corroboration group label")
+    display_peer_summary: Optional[str] = Field(None, description="Display-layer peer summary")
+    peer_resonance_summary: Optional[str] = Field(None, description="Compact peer resonance summary")
+    leader_position_summary: Optional[str] = Field(None, description="Compact peer leadership summary")
+    turning_point_peer_summary: Optional[str] = Field(None, description="Peer-based turning-point confirmation summary")
+    earnings_anchor: Optional[str] = Field(None, description="Quarter/event anchor for earnings-driven names")
+    supply_demand_bias: Optional[str] = Field(None, description="Structured supply-demand bias")
+    trend_label: Optional[str] = Field(None, description="Trend label")
+    selection_mode: Optional[str] = Field(None, description="Trend selection mode")
+    risk_flags: List[str] = Field(default_factory=list, description="Risk flags")
+    review_stage_type: Optional[str] = Field(None, description="Internal review stage type")
+    review_stage_label: Optional[str] = Field(None, description="Review stage label")
+    review_stage_reason: Optional[str] = Field(None, description="Review stage reason")
+    driver_type: Optional[str] = Field(None, description="Internal driver type")
+    driver_label: Optional[str] = Field(None, description="Driver label")
+    driver_reason: Optional[str] = Field(None, description="Driver reason")
+    event_date: Optional[str] = Field(None, description="Related event date")
+    today_change_pct: Optional[float] = Field(None, description="Today's percentage change")
+    pe_ratio: Optional[float] = Field(None, description="PE ratio")
+    report_date: Optional[str] = Field(None, description="Latest report date")
+    report_period_label: Optional[str] = Field(None, description="Latest report period label")
+    revenue_amount: Optional[float] = Field(None, description="Latest reported revenue amount")
+    net_profit_amount: Optional[float] = Field(None, description="Latest reported net profit amount")
+
+
+class FastReviewFocusResponse(BaseModel):
+    snapshot_date: str = Field(..., description="Snapshot date")
+    total: int = Field(..., description="Total focus rows")
+    source_run_dir: str = Field(..., description="Resolved run directory")
+    source_csv_path: str = Field(..., description="Resolved focus CSV path")
+    ab_summary: Dict[str, int] = Field(default_factory=dict, description="A/B summary")
+    stage_summary: Dict[str, int] = Field(default_factory=dict, description="Stage summary")
+    driver_summary: Dict[str, int] = Field(default_factory=dict, description="Driver summary")
+    items: List[FastReviewFocusItem] = Field(default_factory=list, description="Focus rows")

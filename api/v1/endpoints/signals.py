@@ -11,6 +11,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from api.deps import get_database_manager
 from api.v1.schemas.common import ErrorResponse
 from api.v1.schemas.signals import (
+    FastReviewFocusItem,
+    FastReviewFocusResponse,
     SignalContinuitySummary,
     SignalDrawdownSummary,
     SignalSnapshotCompareItem,
@@ -22,12 +24,55 @@ from api.v1.schemas.signals import (
     SignalSnapshotListResponse,
     SignalSnapshotStreakItem,
 )
+from src.services.fast_review_focus_service import FastReviewFocusService
 from src.services.signal_snapshot_service import SignalSnapshotService
 from src.storage import DatabaseManager
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+@router.get(
+    "/fast-review-focus",
+    response_model=FastReviewFocusResponse,
+    responses={
+        200: {"description": "Fast-review focus rows"},
+        400: {"description": "Invalid request", "model": ErrorResponse},
+        500: {"description": "Internal server error", "model": ErrorResponse},
+    },
+    summary="Get fast-review focus rows",
+    description="Return the latest fast-review focus artifact for the given snapshot date.",
+)
+def get_fast_review_focus(
+    snapshot_date: str = Query(..., description="Snapshot date (YYYY-MM-DD)"),
+) -> FastReviewFocusResponse:
+    try:
+        service = FastReviewFocusService()
+        data = service.get_focus(snapshot_date=snapshot_date)
+        return FastReviewFocusResponse(
+            snapshot_date=data["snapshot_date"],
+            total=data["total"],
+            source_run_dir=data["source_run_dir"],
+            source_csv_path=data["source_csv_path"],
+            ab_summary=data.get("ab_summary", {}),
+            stage_summary=data.get("stage_summary", {}),
+            driver_summary=data.get("driver_summary", {}),
+            items=[FastReviewFocusItem(**item) for item in data.get("items", [])],
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_request", "message": str(exc)},
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Query fast-review focus failed: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "internal_error", "message": f"Query fast-review focus failed: {str(exc)}"},
+        )
 
 
 @router.get(

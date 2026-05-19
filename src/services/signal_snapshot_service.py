@@ -34,6 +34,7 @@ class SignalSnapshotService:
         "hundred_day_high",
         "earnings_surprise",
         "monthly_slow_rise",
+        "daily_slow_rise",
         "earnings_observation_registry",
         "earnings_observation_active",
         "hundred_day_high_with_earnings",
@@ -929,6 +930,11 @@ class SignalSnapshotService:
             return {
                 "group": "strategy",
                 "display_label": "月线慢牛",
+            }
+        if signal_type == "daily_slow_rise":
+            return {
+                "group": "strategy",
+                "display_label": "日线慢涨",
             }
         if signal_type == "hundred_day_high_with_earnings":
             return {

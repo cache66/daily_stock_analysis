@@ -111,7 +111,8 @@ class CommodityBeneficiarySnapshotFlowTestCase(unittest.TestCase):
         rows = self.db.get_signal_snapshots(
             signal_type=signal_type,
             code="601869",
-            days=10,
+            start_date="2026-04-10",
+            end_date="2026-04-11",
         )
         self.assertEqual(len(rows), 2)
 
@@ -215,7 +216,11 @@ class CommodityBeneficiarySnapshotMetricsTestCase(unittest.TestCase):
             db=self.db,
         )
 
-        rows = self.db.get_signal_snapshots(signal_type=signal_type, code="601869", days=10)
+        rows = self.db.get_signal_snapshots(
+            signal_type=signal_type,
+            signal_date="2026-04-10",
+            code="601869",
+        )
         self.assertEqual(len(rows), 1)
         metrics_payload = json.loads(rows[0].metrics_payload or "{}")
         self.assertEqual(metrics_payload["theme_key"], "optical_communication")

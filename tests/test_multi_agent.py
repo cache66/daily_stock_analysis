@@ -450,7 +450,18 @@ class TestIntelAgentPostProcess(unittest.TestCase):
         }
         ```"""
 
-        opinion = agent.post_process(ctx, raw)
+        mock_json_repair = MagicMock()
+        mock_json_repair.repair_json.return_value = json.dumps(
+            {
+                "signal": "hold",
+                "confidence": 0.72,
+                "reasoning": "情绪中性偏谨慎",
+                "risk_alerts": ["股东减持"],
+                "positive_catalysts": ["行业复苏"],
+            }
+        )
+        with patch.dict(sys.modules, {"json_repair": mock_json_repair}):
+            opinion = agent.post_process(ctx, raw)
 
         self.assertIsNotNone(opinion)
         self.assertEqual(opinion.signal, "hold")

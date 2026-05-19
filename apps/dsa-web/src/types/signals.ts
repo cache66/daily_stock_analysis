@@ -182,3 +182,72 @@ export interface SignalSnapshotCountsResponse {
   signalDateTo?: string | null;
   items: SignalSnapshotCountItem[];
 }
+
+export interface FastReviewFocusItem {
+  code: string;
+  name?: string | null;
+  tier?: string | null;
+  abBucket?: string | null;
+  priorityScore?: number | null;
+  signalKeys: string[];
+  signalTypes: string[];
+  trendHundredRelation?: string | null;
+  focusReason?: string | null;
+  reasonSummary?: string | null;
+  displayReasonSummary?: string | null;
+  industryLogic?: string | null;
+  newsLogic?: string | null;
+  technicalLogic?: string | null;
+  businessLabels: string[];
+  businessSummary?: string | null;
+  chainRoleLabel?: string | null;
+  themeLabel?: string | null;
+  themeSource?: string | null;
+  mainlineJudgement?: string | null;
+  mainlineEvidenceSources?: string[];
+  authorityJudgement?: string | null;
+  authorityLevel?: string | null;
+  authorityReasonSummary?: string | null;
+  displayAuthorityJudgement?: string | null;
+  displayAuthoritySummary?: string | null;
+  authorityEvidenceDigest?: string | null;
+  announcementEvidenceSummary?: string | null;
+  earningsEvidenceSummary?: string | null;
+  researchEvidenceSummary?: string | null;
+  authorityTimeWindowDays?: number | null;
+  preferredIndustryLabel?: string | null;
+  peerGroupLabel?: string | null;
+  displayPeerSummary?: string | null;
+  peerResonanceSummary?: string | null;
+  leaderPositionSummary?: string | null;
+  turningPointPeerSummary?: string | null;
+  earningsAnchor?: string | null;
+  supplyDemandBias?: string | null;
+  trendLabel?: string | null;
+  selectionMode?: string | null;
+  riskFlags: string[];
+  reviewStageType?: string | null;
+  reviewStageLabel?: string | null;
+  reviewStageReason?: string | null;
+  driverType?: string | null;
+  driverLabel?: string | null;
+  driverReason?: string | null;
+  eventDate?: string | null;
+  todayChangePct?: number | null;
+  peRatio?: number | null;
+  reportDate?: string | null;
+  reportPeriodLabel?: string | null;
+  revenueAmount?: number | null;
+  netProfitAmount?: number | null;
+}
+
+export interface FastReviewFocusResponse {
+  snapshotDate: string;
+  total: number;
+  sourceRunDir: string;
+  sourceCsvPath: string;
+  abSummary: Record<string, number>;
+  stageSummary: Record<string, number>;
+  driverSummary: Record<string, number>;
+  items: FastReviewFocusItem[];
+}

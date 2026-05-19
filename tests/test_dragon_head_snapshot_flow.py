@@ -82,7 +82,12 @@ class DragonHeadSnapshotFlowTestCase(unittest.TestCase):
         self.assertEqual(second_df.iloc[0]["previous_hit_count"], 1)
         self.assertEqual(second_df.iloc[0]["latest_previous_hit_date"], "2026-04-11")
 
-        rows = self.db.get_signal_snapshots(signal_type=DEFAULT_SIGNAL_TYPE, code="600001", days=10)
+        rows = self.db.get_signal_snapshots(
+            signal_type=DEFAULT_SIGNAL_TYPE,
+            code="600001",
+            start_date="2026-04-11",
+            end_date="2026-04-12",
+        )
         self.assertEqual(len(rows), 2)
         metrics_payload = json.loads(rows[0].metrics_payload or "{}")
         self.assertEqual(metrics_payload["leader_type"], "hybrid_leader")

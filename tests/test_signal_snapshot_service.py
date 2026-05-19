@@ -4,6 +4,7 @@
 import os
 import tempfile
 import unittest
+from datetime import date, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -142,7 +143,11 @@ class SignalSnapshotServiceTestCase(unittest.TestCase):
         self.assertAlmostEqual(item["ytd_return_pct"], 85.27, places=2)
 
     def test_get_signal_history_supports_composite_new_high_with_earnings(self) -> None:
-        for signal_day in ("2026-04-04", "2026-04-05"):
+        recent_days = [
+            (date.today() - timedelta(days=2)).isoformat(),
+            (date.today() - timedelta(days=1)).isoformat(),
+        ]
+        for signal_day in recent_days:
             self.db.upsert_signal_snapshot(
                 signal_type="hundred_day_high",
                 signal_date=signal_day,
@@ -163,7 +168,7 @@ class SignalSnapshotServiceTestCase(unittest.TestCase):
                 cause_payload={"reason_summary": "涓氱哗鍚戝ソ"},
                 history_payload={"previous_hit_count": 0, "days_since_previous_hit": None},
             )
-        self._seed_daily_bar(code="600488", bar_date="2026-01-02", close=4.14)
+        self._seed_daily_bar(code="600488", bar_date=date(date.today().year, 1, 2).isoformat(), close=4.14)
 
         result = self.service.get_signal_history(
             signal_type="hundred_day_high_with_earnings",
@@ -176,11 +181,16 @@ class SignalSnapshotServiceTestCase(unittest.TestCase):
         self.assertEqual(result["items"][0]["event_date"], "2026-04-04")
 
     def test_get_signal_history_builds_continuity_and_drawdown(self) -> None:
-        self._seed_snapshot(signal_date="2026-04-04", latest_high=1818.0, close=1780.0)
-        self._seed_snapshot(signal_date="2026-04-03", latest_high=1790.0, close=1770.0)
-        self._seed_snapshot(signal_date="2026-04-02", latest_high=1760.0, close=1755.0)
-        self._seed_snapshot(signal_date="2026-03-28", latest_high=1825.0, close=1800.0)
-        self._seed_daily_bar(code="600519", bar_date="2026-01-02", close=1500.0)
+        latest_day = date.today() - timedelta(days=1)
+        prior_day = date.today() - timedelta(days=2)
+        streak_start_day = date.today() - timedelta(days=3)
+        earlier_day = date.today() - timedelta(days=8)
+
+        self._seed_snapshot(signal_date=latest_day.isoformat(), latest_high=1818.0, close=1780.0)
+        self._seed_snapshot(signal_date=prior_day.isoformat(), latest_high=1790.0, close=1770.0)
+        self._seed_snapshot(signal_date=streak_start_day.isoformat(), latest_high=1760.0, close=1755.0)
+        self._seed_snapshot(signal_date=earlier_day.isoformat(), latest_high=1825.0, close=1800.0)
+        self._seed_daily_bar(code="600519", bar_date=date(date.today().year, 1, 2).isoformat(), close=1500.0)
 
         result = self.service.get_signal_history(
             signal_type="hundred_day_high",
@@ -191,12 +201,12 @@ class SignalSnapshotServiceTestCase(unittest.TestCase):
         self.assertEqual(result["total"], 4)
         self.assertTrue(result["continuity"]["is_current_streak"])
         self.assertEqual(result["continuity"]["current_streak_count"], 3)
-        self.assertEqual(result["continuity"]["current_streak_start_date"], "2026-04-02")
-        self.assertEqual(result["continuity"]["current_streak_end_date"], "2026-04-04")
+        self.assertEqual(result["continuity"]["current_streak_start_date"], streak_start_day.isoformat())
+        self.assertEqual(result["continuity"]["current_streak_end_date"], latest_day.isoformat())
         self.assertEqual(result["continuity"]["longest_streak_count"], 3)
         self.assertEqual(result["drawdown"]["anchor_close"], 1780.0)
         self.assertEqual(result["drawdown"]["max_signal_high"], 1825.0)
-        self.assertEqual(result["drawdown"]["max_signal_high_date"], "2026-03-28")
+        self.assertEqual(result["drawdown"]["max_signal_high_date"], earlier_day.isoformat())
         self.assertAlmostEqual(result["drawdown"]["distance_from_max_signal_high_pct"], -2.47, places=2)
         self.assertAlmostEqual(result["drawdown"]["distance_from_latest_signal_high_pct"], -2.09, places=2)
         self.assertAlmostEqual(result["items"][0]["ytd_return_pct"], 18.67, places=2)

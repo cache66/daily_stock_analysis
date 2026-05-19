@@ -27,6 +27,9 @@ if str(SCRIPT_DIR) not in sys.path:
 check_static_assets = importlib.import_module("check_static_assets")
 
 
+_JS_MEDIA_PREFIXES = ("text/javascript", "application/javascript")
+
+
 def _write_index(static_dir: Path, body: str) -> None:
     static_dir.mkdir(parents=True, exist_ok=True)
     (static_dir / "index.html").write_text(body, encoding="utf-8")
@@ -165,7 +168,7 @@ def test_missing_asset_returns_safe_404_content_types(tmp_path: Path) -> None:
 
     assert js_response.status_code == 404
     assert js_response.text == "asset not found"
-    assert js_response.headers["content-type"].startswith("text/javascript")
+    assert js_response.headers["content-type"].startswith(_JS_MEDIA_PREFIXES)
 
     assert css_response.status_code == 404
     assert css_response.text == "asset not found"
@@ -195,7 +198,7 @@ def test_existing_asset_is_served_from_explicit_assets_route(tmp_path: Path) -> 
 
     assert js_response.status_code == 200
     assert js_response.text == "console.log('ok')"
-    assert js_response.headers["content-type"].startswith("text/javascript")
+    assert js_response.headers["content-type"].startswith(_JS_MEDIA_PREFIXES)
 
     assert css_response.status_code == 200
     assert css_response.text == "body{color:#fff}"
@@ -228,7 +231,7 @@ def test_existing_asset_supports_head_and_conditional_requests(tmp_path: Path) -
     assert head_response.status_code == 200
     assert head_response.content == b""
     assert head_response.headers["etag"] == etag
-    assert head_response.headers["content-type"].startswith("text/javascript")
+    assert head_response.headers["content-type"].startswith(_JS_MEDIA_PREFIXES)
 
     assert cached_response.status_code == 304
     assert cached_response.content == b""

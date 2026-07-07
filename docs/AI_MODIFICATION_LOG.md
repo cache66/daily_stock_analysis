@@ -1,5 +1,127 @@
 # AI Modification Log
 
+## 2026-05-22 (fast review liton-style follow-up pool)
+
+- Scope: `scripts/run_fast_review_bundle.py`, `tests/test_fast_review_liton_style.py`, `docs/LOCAL_STRATEGY_CATALOG.md`, `docs/AI_MODIFICATION_LOG.md`, and `docs/CHANGELOG.md`.
+- Why:
+  - The current fast-review reading layer still mixed together two user-wanted structures:
+    - smooth continuation names that keep rising in a clean way
+    - horizontal/base-breakout names that are worth watching but should not crowd the same top bucket
+  - The user explicitly wanted a more practical replay layout:
+    - prioritize “走势顺”
+    - keep only names with basic fundamental evidence
+    - retain breakout/base names as a separate observation layer instead of deleting them
+    - export a broader pool, ideally around `50` names, for continued follow-up
+- Changes:
+  - Updated [`scripts/run_fast_review_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_fast_review_bundle.py)
+    - added `利通电子风格跟踪池` export outputs:
+      - `fast_review_liton_style_pool.csv`
+      - `fast_review_liton_style_pool.md`
+    - added three reading tiers:
+      - `最像利通电子`
+      - `次像`
+      - `观察`
+    - the new tiering is shape-first and only keeps rows with positive fundamental evidence
+    - horizontal/base-breakout structures are intentionally retained inside `观察`, not removed
+    - `观察` rows now include explicit platform diagnostics:
+      - `横盘多久`
+      - `突破横盘多少`
+      - `平台位置（低位/中位/高位）`
+    - the follow-up pool now defaults to `Top 50`, while the homepage summary keeps only concise tiered slices
+  - Added [`tests/test_fast_review_liton_style.py`](d:\bb\daily_stock_analysis\tests\test_fast_review_liton_style.py)
+    - covers tier construction
+    - covers summary markdown rendering
+    - covers dedicated pool export writing
+- Verification:
+  - `d:\bb\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_fast_review_liton_style.py -q`
+  - `d:\bb\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_fast_review_daily_bundle.py tests/test_fast_review_ab_driver_classification.py tests/test_fast_review_liton_style.py -q`
+
+## 2026-05-21 (fast review long-base-release replay lane)
+
+- Scope: `scripts/select_long_base_release_candidates.py`, `scripts/run_fast_review_bundle.py`, `src/services/signal_snapshot_service.py`, `config/local_strategy_profile.json`, `tests/test_long_base_release_candidates.py`, `tests/test_long_base_release_fast_review_integration.py`, `tests/test_fast_review_daily_bundle.py`, `tests/test_signal_snapshot_service.py`, `docs/LOCAL_STRATEGY_CATALOG.md`, and `docs/CHANGELOG.md`.
+- Why:
+  - The existing replay already had `hundred_day_high` and `daily_slow_rise`, but it still missed an important user-preferred structure:
+    - long horizontal base first
+    - then either small-candle steady release
+    - or sudden breakout / limit-up style release
+  - Root cause:
+    - `daily_slow_rise` is intentionally stricter and will reject names like `300069` when the release leg contains a larger single-day acceleration
+    - `hundred_day_high` can still include many names whose chart shape is less readable, so the user wanted a separate “长横盘释放” lane rather than diluting either existing strategy
+- Changes:
+  - Added [`scripts/select_long_base_release_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_long_base_release_candidates.py)
+    - new signal type: `long_base_release`
+    - new subtypes:
+      - `long_base_slow_push`
+      - `long_base_breakout`
+    - exports CSV / Markdown / TXT plus snapshot persistence payloads
+  - Updated [`scripts/run_fast_review_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_fast_review_bundle.py)
+    - registered `long_base_release` in default fast-review signals and CLI handling
+    - added external command builder and job wiring
+    - preserves long-base subtype fields when loading signal CSVs
+    - annotates `hundred_day_high` spotlight rows when the same code also hits `long_base_release`
+    - adds a standalone summary block `长横盘释放候选` for names that do not overlap with `hundred_day_high`
+  - Updated [`src/services/signal_snapshot_service.py`](d:\bb\daily_stock_analysis\src\services\signal_snapshot_service.py)
+    - added snapshot metadata for `long_base_release`, so historical replay/count views can show a stable display label
+  - Updated [`config/local_strategy_profile.json`](d:\bb\daily_stock_analysis\config\local_strategy_profile.json)
+    - repo default `include_signals` now also includes `long_base_release`
+    - added `long_base_release_profile=default`
+    - added `long_base_release_max_workers=3`
+- Verification:
+  - `python -m py_compile scripts/run_fast_review_bundle.py src/services/signal_snapshot_service.py tests/test_fast_review_daily_bundle.py tests/test_long_base_release_fast_review_integration.py tests/test_signal_snapshot_service.py`
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_long_base_release_candidates.py -q`
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_long_base_release_fast_review_integration.py -q`
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_fast_review_daily_bundle.py -k long_base_release -q`
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_signal_snapshot_service.py -k long_base_release -q`
+
+## 2026-05-20 (fast review hundred-day pretty-trend spotlight)
+
+- Scope: `scripts/run_fast_review_bundle.py`, `tests/test_fast_review_daily_bundle.py`, `docs/LOCAL_STRATEGY_CATALOG.md`, and `docs/CHANGELOG.md`.
+- Why:
+  - The daily replay already showed `hundred_day_high` and `daily_slow_rise`, but the user still had to mentally intersect the two sections.
+  - What the user wanted to see first was narrower: among the hundred-day-high names, which ones also have the cleaner `30-45 degree` slow-rise structure.
+- Changes:
+  - Updated [`scripts/run_fast_review_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_fast_review_bundle.py)
+    - added a dedicated summary block: `百日新高中的30-45度强图形`
+    - the block only includes names that simultaneously hit `hundred_day_high` and `daily_slow_rise`
+    - ordering is intentionally display-first rather than selection-first:
+      - `base_breakout` before `healthy_trend`
+      - `base_to_trend` before `steady_rise`
+      - then stronger breakout / advance / lower drawdown
+    - this is a summary-layer enhancement only; it does not change any underlying stock-picking threshold
+  - Updated [`tests/test_fast_review_daily_bundle.py`](d:\bb\daily_stock_analysis\tests\test_fast_review_daily_bundle.py)
+    - added regression coverage that asserts:
+      - the new section appears when the two signals intersect
+      - stronger chart rows sort ahead of weaker ones
+      - pure `hundred_day_high` rows without slow-rise confirmation do not leak into the new block
+- Verification:
+  - `python -m py_compile scripts/run_fast_review_bundle.py tests/test_fast_review_daily_bundle.py`
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_fast_review_daily_bundle.py -k pretty_trend_section -q`
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_fast_review_daily_bundle.py -k "hundred_day_spotlight or daily_slow_rise or pretty_trend_section" -q`
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_fast_review_daily_bundle.py -q`
+
+## 2026-05-19 (fast review trend leader diagnostics persistence)
+
+- Scope: `scripts/select_trend_leader_candidates.py`, `scripts/run_fast_review_bundle.py`, `tests/test_trend_leader_signal_flow.py`, `tests/test_fast_review_daily_bundle.py`, `docs/LOCAL_STRATEGY_CATALOG.md`, and `docs/CHANGELOG.md`.
+- Why:
+  - The latest `2026-05-19` replay regression was no longer a candidate-count problem.
+  - Measured evidence from replay artifacts showed:
+    - `daily_slow_rise` kept the same `universe=1438 / processed=1314`, but `history_fetch_avg` rose from `0.1675s` to `0.2028s`
+    - `hundred_day_high` kept the same `universe=678 / processed=629`, but `history_fetch_avg` rose from `0.0872s` to `0.1074s`
+    - selected `trend_leader` rows also showed worse `history_fetch` and `fundamental_fetch`, while `_fundamental_cache_source=disk` dropped from `5` hits to `0`
+  - The missing piece was observability: fast review persisted full checkpoint/summary for `hundred_day_high` and `daily_slow_rise`, but `trend_leader` still exported only candidate CSV/TXT, which made future regressions harder to attribute.
+- Changes:
+  - Updated [`scripts/select_trend_leader_candidates.py`](d:\bb\daily_stock_analysis\scripts\select_trend_leader_candidates.py)
+    - `export_results(...)` now writes `trend_leader_unified_run_summary.json`
+    - when a checkpoint path is supplied, the exported run now also persists `trend_leader_unified_checkpoint.json`
+    - the summary stores `selected_count`, `watch_selected_count`, and raw `run_stats`, so later analysis can directly inspect `processed_count`, `phase_timing_sec`, cache-hit counts, and elapsed splits
+  - Updated [`scripts/run_fast_review_bundle.py`](d:\bb\daily_stock_analysis\scripts\run_fast_review_bundle.py)
+    - `build_trend_leader_command(...)` now passes an explicit checkpoint path under the day-level fast-review signal directory
+    - this makes trend-leader replays leave behind the same kind of diagnostic artifacts already available for the other K-line strategies
+- Verification:
+  - `python -m py_compile scripts/select_trend_leader_candidates.py scripts/run_fast_review_bundle.py tests/test_trend_leader_signal_flow.py tests/test_fast_review_daily_bundle.py`
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_trend_leader_signal_flow.py -k export_results_writes_watchlist_sidecar_files -q`
+  - `E:\Apps\daily_stock_analysis\.venv\Scripts\python.exe -m pytest tests/test_fast_review_daily_bundle.py -k test_build_commands_forward_skip_db_persist -q`
+
 ## 2026-05-19 (fast review authority structured settle before broad search)
 
 - Scope: `src/services/signal_cause_analysis_service.py`, `tests/test_signal_cause_analysis_service.py`, and `docs/CHANGELOG.md`.

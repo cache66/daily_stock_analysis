@@ -81,3 +81,9 @@ static/
 
 # local git worktrees under docs
 /docs/.worktrees/
+
+# local planning scratch docs
+/docs/superpowers/
+
+# local one-off helper scripts
+/_run_review*

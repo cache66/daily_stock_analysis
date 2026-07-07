@@ -471,6 +471,29 @@ class SignalSnapshotServiceTestCase(unittest.TestCase):
         self.assertEqual(item["group"], "monthly_slow_rise")
         self.assertEqual(item["display_label"], "月线慢牛·均衡")
 
+    def test_get_snapshot_counts_includes_long_base_release_signal(self) -> None:
+        self.db.upsert_signal_snapshot(
+            signal_type="long_base_release",
+            signal_date="2026-04-10",
+            code="300069",
+            name="金利华电",
+            criteria_payload={"profile_name": "default"},
+            metrics_payload={
+                "release_pattern_label": "long_base_slow_push",
+                "release_return_pct": 18.4,
+                "release_max_drawdown_pct": 4.4,
+            },
+            cause_payload={"reason_summary": "长横盘后慢推释放"},
+            history_payload={"previous_hit_count": 0, "days_since_previous_hit": None},
+        )
+
+        result = self.service.get_snapshot_counts(signal_date="2026-04-10")
+
+        item = next(row for row in result["items"] if row["signal_type"] == "long_base_release")
+        self.assertEqual(item["total"], 1)
+        self.assertEqual(item["group"], "strategy")
+        self.assertEqual(item["display_label"], "长横盘释放")
+
     def test_get_snapshot_list_returns_monthly_slow_rise_fields(self) -> None:
         self.db.upsert_signal_snapshot(
             signal_type="monthly_slow_rise_profile__strict",

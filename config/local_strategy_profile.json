@@ -4,7 +4,8 @@
       "earnings",
       "hundred_day_high",
       "trend_leader",
-      "daily_slow_rise"
+      "daily_slow_rise",
+      "long_base_release"
     ],
     "exclude_signals": [],
     "persist_snapshots": true,
@@ -38,6 +39,8 @@
     "trend_scan_prefilter_min_turnover_rate": 1.5,
     "trend_scan_prefilter_require_positive_change": true,
     "daily_profile": "accelerating",
+    "long_base_release_profile": "default",
+    "long_base_release_max_workers": 3,
     "continuous_up_lookback_days": 10,
     "continuous_up_min_ratio": 0.7,
     "continuous_up_streak_days": 3,

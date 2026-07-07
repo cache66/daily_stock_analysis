@@ -3287,11 +3287,15 @@ def export_results(
     *,
     output_dir: Path,
     watchlist: Optional[List[Dict[str, Any]]] = None,
-) -> None:
+    run_stats: Optional[Dict[str, Any]] = None,
+    checkpoint_path: Optional[Path] = None,
+) -> Dict[str, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     df = build_selected_dataframe(results)
     csv_path = output_dir / "trend_leader_unified_candidates.csv"
     txt_path = output_dir / "trend_leader_unified_candidates.txt"
+    summary_path = output_dir / "trend_leader_unified_run_summary.json"
+    checkpoint_export_path = output_dir / "trend_leader_unified_checkpoint.json"
     df.to_csv(csv_path, index=False, encoding="utf-8-sig")
     txt_path.write_text(
         ("\n".join(df["code"].astype(str).tolist()) + "\n") if not df.empty else "",
@@ -3329,6 +3333,36 @@ def export_results(
     logger.info("已导出 trend leader watchlist CSV: %s", watch_csv_path)
     logger.info("已导出 trend leader watchlist TXT: %s", watch_txt_path)
     logger.info("已导出 trend leader watchlist MD: %s", watch_md_path)
+
+
+    summary_payload = {
+        "selected_count": len(results),
+        "watch_selected_count": len(watchlist or []),
+        "run_stats": dict(run_stats or {}),
+    }
+    summary_path.write_text(
+        json.dumps(summary_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    logger.info("宸插鍑?trend leader run summary JSON: %s", summary_path)
+    if checkpoint_path is not None and checkpoint_path.exists():
+        if checkpoint_path.resolve() == checkpoint_export_path.resolve():
+            logger.info("trend leader checkpoint 已保存在输出目录: %s", checkpoint_export_path)
+        else:
+            checkpoint_export_path.write_text(
+                checkpoint_path.read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            logger.info("已复制 trend leader checkpoint 到输出目录: %s", checkpoint_export_path)
+    return {
+        "csv": csv_path,
+        "txt": txt_path,
+        "run_summary": summary_path,
+        "checkpoint": checkpoint_export_path,
+        "watch_csv": watch_csv_path,
+        "watch_txt": watch_txt_path,
+        "watch_md": watch_md_path,
+    }
 
 
 def main() -> int:
@@ -3410,7 +3444,13 @@ def main() -> int:
     )
     selected = [item for item in payload.get("selected", []) if isinstance(item, dict)]
     watchlist = [item for item in payload.get("watchlist", []) if isinstance(item, dict)]
-    export_results(selected, output_dir=Path(args.output_dir), watchlist=watchlist)
+    export_results(
+        selected,
+        output_dir=Path(args.output_dir),
+        watchlist=watchlist,
+        run_stats=payload.get("run_stats") if isinstance(payload, dict) else None,
+        checkpoint_path=Path(args.checkpoint_path) if args.checkpoint_path else None,
+    )
 
     if not args.skip_db_persist:
         db = DatabaseManager.get_instance()

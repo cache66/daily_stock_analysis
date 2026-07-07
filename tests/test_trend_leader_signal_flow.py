@@ -741,6 +741,8 @@ def test_export_results_writes_watchlist_sidecar_files() -> None:
     temp_dir = tempfile.TemporaryDirectory()
     try:
         output_dir = Path(temp_dir.name)
+        checkpoint_path = output_dir / "source_checkpoint.json"
+        checkpoint_path.write_text('{"version": 1, "processed_codes": ["300408"]}', encoding="utf-8")
         export_results(
             [
                 {
@@ -750,6 +752,7 @@ def test_export_results_writes_watchlist_sidecar_files() -> None:
                     "selection_mode": "strict",
                 }
             ],
+            run_stats={"elapsed_seconds": 12.3, "processed_count": 18},
             output_dir=output_dir,
             watchlist=[
                 {
@@ -760,12 +763,15 @@ def test_export_results_writes_watchlist_sidecar_files() -> None:
                     "watch_reason": "trend_structure_missing",
                 }
             ],
+            checkpoint_path=checkpoint_path,
         )
 
         assert (output_dir / "trend_leader_unified_candidates.csv").exists()
         assert (output_dir / "trend_leader_unified_watchlist.csv").exists()
         assert (output_dir / "trend_leader_unified_watchlist.txt").exists()
         assert (output_dir / "trend_leader_unified_watchlist.md").exists()
+        assert (output_dir / "trend_leader_unified_run_summary.json").exists()
+        assert (output_dir / "trend_leader_unified_checkpoint.json").exists()
     finally:
         temp_dir.cleanup()
 

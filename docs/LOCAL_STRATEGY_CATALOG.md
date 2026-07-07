@@ -1,6 +1,97 @@
 # 本地策略目录（Local Strategy Catalog）
 
-最后更新：2026-05-19
+最后更新：2026-05-22
+
+2026-05-22 addendum (fast review liton-style follow-up pool):
+
+- This round does not change the underlying stock-picking thresholds of `trend_leader`, `hundred_day_high`, `daily_slow_rise`, or `long_base_release`.
+- It adds a new reading layer for the user’s preferred “利通电子式” continuation shape:
+  - shape first
+  - fundamentals only as a filter
+  - keep both smooth continuation names and horizontal-base breakout names in the same follow-up pool
+- Current behavior:
+  - `scripts/run_fast_review_bundle.py` now exports a dedicated follow-up pool:
+    - `fast_review_liton_style_pool.csv`
+    - `fast_review_liton_style_pool.md`
+  - the pool is capped at `Top 50` by default, so daily replay can keep more names for later tracking instead of only showing a tiny shortlist
+  - the homepage summary uses three tiers:
+    - `最像利通电子`
+    - `次像`
+    - `观察`
+  - the filtering rule is intentionally simple:
+    - `走势形态优先`
+    - rows must also carry positive fundamental confirmation before they can stay in the pool
+  - horizontal/base-breakout names are not removed anymore; they are deliberately retained inside `观察`
+  - for the `观察` layer, fast review now explicitly shows:
+    - `横盘多久`
+    - `相对横盘突破了多少`
+    - `横盘位置（低位平台 / 中位平台 / 高位平台）`
+- Practical meaning:
+  - smooth trend continuation names can stay in `最像利通电子 / 次像`
+  - “先横一段、再突破或慢推”的样本 can still be tracked instead of being mixed away or dropped
+  - the summary page stays concise, while the exported pool remains broad enough for ongoing watchlist follow-up
+
+2026-05-21 addendum (long-base-release structure in fast review):
+
+- This round adds a new standalone replay signal: `long_base_release`.
+- It is intentionally separate from `daily_slow_rise`.
+  - `daily_slow_rise` still models the cleaner `30-45 degree` continuation path.
+  - `long_base_release` now covers the user’s other preferred structure:
+    - long horizontal base first
+    - then either dense small-green-candle push
+    - or sudden breakout / limit-up style release
+- Current behavior:
+  - new selector entry: `scripts/select_long_base_release_candidates.py`
+  - subtypes:
+    - `long_base_slow_push`
+    - `long_base_breakout`
+  - fast-review default bundle now includes `long_base_release`
+  - display rule:
+    - if a name also hits `hundred_day_high`, it stays inside the `hundred_day_high` spotlight block and gets annotated with its long-base subtype
+    - if it does not hit `hundred_day_high`, it appears in a standalone summary block:
+      - `长横盘释放候选`
+- Practical meaning:
+  - we keep the broader `hundred_day_high` replay intact
+  - we keep the cleaner `daily_slow_rise` replay intact
+  - and we now add a third lane for “long base first, then release”, which is closer to names such as `300069` / `603779`
+
+2026-05-20 addendum (hundred-day pretty-trend spotlight in fast review):
+
+- This round does not change `hundred_day_high` or `daily_slow_rise` thresholds.
+- It only improves fast-review readability for the user’s preferred chart shape:
+  - a name first hits `hundred_day_high`
+  - and is then additionally confirmed by `daily_slow_rise`
+  - so the replay can surface “百日新高里图形最好看的一组” directly instead of asking the user to manually cross-read two sections
+- Current behavior:
+  - `scripts/run_fast_review_bundle.py` now adds a dedicated summary block:
+    - `百日新高中的30-45度强图形`
+  - inclusion rule:
+    - intersection of `hundred_day_high` and `daily_slow_rise`
+  - display priority:
+    - `base_breakout` > `healthy_trend`
+    - `base_to_trend` > `steady_rise`
+    - then stronger breakout / higher advance / shallower drawdown
+- Practical meaning:
+  - `hundred_day_high` still keeps the broader new-high replay line
+  - `daily_slow_rise` still keeps the standalone 30-45 degree structure line
+  - the new block is the readable overlap between the two, meant for users who want to scan “好看图形” first
+
+2026-05-19 addendum (fast review trend leader diagnostics persistence):
+
+- This round does not change any `trend_leader` stock-picking threshold.
+- It only fixes a replay diagnostics blind spot:
+  - `daily_slow_rise` and `hundred_day_high` already exported checkpoint-style artifacts that make post-run timing analysis straightforward
+  - `trend_leader` still left only candidate CSV/TXT in fast-review outputs, so when runtime regressed we could not directly inspect `processed_count`, `phase_timing`, or cache-hit splits from the run artifact itself
+- Current behavior:
+  - `scripts/run_fast_review_bundle.py` now always passes an explicit day-level checkpoint path into `trend_leader`
+  - `scripts/select_trend_leader_candidates.py` now exports:
+    - `trend_leader_unified_run_summary.json`
+    - `trend_leader_unified_checkpoint.json` when checkpoint is enabled
+- Why this matters:
+  - the latest `2026-05-19` replay slowdown showed signal-stage regressions without any candidate-count expansion
+  - `daily_slow_rise` and `hundred_day_high` both proved the slowdown was in per-stock history fetch latency, not wider universes
+  - selected `trend_leader` rows also showed worse `history_fetch` and `fundamental_fetch`, plus a drop in fundamental disk-cache hits
+  - after this change, the next slow replay can be diagnosed directly from the persisted trend-leader artifact instead of re-running or inferring from tail logs
 
 2026-05-19 addendum (fast review authority structured settle before broad search):
 

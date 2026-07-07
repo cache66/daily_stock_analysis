@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > Detailed internal change log and run evidence: [docs/AI_MODIFICATION_LOG.md](./AI_MODIFICATION_LOG.md)
 
 ## [Unreleased]
+- [改进] `scripts/run_fast_review_bundle.py` 新增 `利通电子风格跟踪池` 分层阅读与 `Top 50` 导出，按 `最像利通电子 / 次像 / 观察` 展示“走势顺 + 有基本面证据”的样本，并为横盘突破观察补充 `横盘多久 / 突破多少 / 平台位置`。
+- [新功能] `scripts/select_long_base_release_candidates.py` 新增长横盘释放信号，并将 `long_base_release` 默认接入每日 `fast review`；同名样本若同时命中 `hundred_day_high` 会在百日新高区块内标注 `长横盘慢推型/长横盘突破型`，未重叠样本则单独展示在 `长横盘释放候选` 区块。
+- [改进] `scripts/run_fast_review_bundle.py` 现在会在每日复盘摘要里新增 `百日新高中的30-45度强图形` 分组，专门展示同时命中 `hundred_day_high` 与 `daily_slow_rise` 的强图形样本，并按 `base_breakout / healthy_trend / base_to_trend / steady_rise` 优先级排序。
+- [改进] `scripts/select_trend_leader_candidates.py` 现在会随导出结果额外落盘 `trend_leader_unified_run_summary.json`，并支持把 scan checkpoint 一并复制到同日产物目录，便于复盘时直接查看 `processed_count / phase_timing / cache hit`。
+- [改进] `scripts/run_fast_review_bundle.py` 现在会为 `trend_leader` 快复盘显式下传 `--checkpoint-path` 到当日 `signals/trend_leader/` 目录，后续慢跑可以直接基于产物做诊断，不再只剩候选 CSV。
 - [改进] `src/services/signal_cause_analysis_service.py` 现会在 `Fast Review Focus` 的 authority 解释链路里先用结构化 `公告 / 财报 / 研报` 判断是否已足够形成 `公告确认 / 财报确认 / 研报强化`；若已能成立，则不再因为缺少其他维度而继续触发整轮 `search_comprehensive_intel(...)`，减少快复盘解释尾段耗时且不改变候选股口径。
 - [改进] `scripts/run_fast_review_bundle.py` 现在会在同一轮 `strategy_focus` 解释构建里复用单个 `SignalCauseAnalysisService`，让公告/财报/研报目录缓存能在 bundle 内共享，减少逐行重建 cause service 带来的 authority 解释尾段耗时。
 - [改进] `src/services/fast_review_focus_service.py` 继续收紧 fast review 尾段行情补全：当东财 `EM` 冷启动首轮就返回空时，不再对后续标的重复做无效 `EM` 读取；同时，对已做过腾讯批量预抓但仍 miss 的标的不再逐票重复打一遍轻量腾讯，减少 `strategy_focus` 读层/导出层的尾部长耗时。

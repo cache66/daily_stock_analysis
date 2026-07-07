@@ -35,6 +35,7 @@ class SignalSnapshotService:
         "earnings_surprise",
         "monthly_slow_rise",
         "daily_slow_rise",
+        "long_base_release",
         "earnings_observation_registry",
         "earnings_observation_active",
         "hundred_day_high_with_earnings",
@@ -935,6 +936,11 @@ class SignalSnapshotService:
             return {
                 "group": "strategy",
                 "display_label": "日线慢涨",
+            }
+        if signal_type == "long_base_release":
+            return {
+                "group": "strategy",
+                "display_label": "长横盘释放",
             }
         if signal_type == "hundred_day_high_with_earnings":
             return {

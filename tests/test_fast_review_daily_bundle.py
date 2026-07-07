@@ -68,6 +68,9 @@ def test_build_commands_forward_skip_db_persist() -> None:
         monthly_signal_type="monthly_slow_rise",
         monthly_profile="balanced",
         monthly_max_workers=2,
+        long_base_release_signal_type="long_base_release",
+        long_base_release_profile="default",
+        long_base_release_max_workers=3,
         trend_signal_type="trend_leader_unified",
         trend_max_workers=2,
         trend_fallback_top_n=20,
@@ -108,6 +111,11 @@ def test_build_commands_forward_skip_db_persist() -> None:
         snapshot_date=snapshot_date,
         output_dir=Path("tmp/monthly"),
     )
+    long_base_cmd = fast_bundle.build_long_base_release_command(
+        args,
+        snapshot_date=snapshot_date,
+        output_dir=Path("tmp/long_base_release"),
+    )
     trend_cmd = fast_bundle.build_trend_leader_command(
         args,
         snapshot_date=snapshot_date,
@@ -129,6 +137,7 @@ def test_build_commands_forward_skip_db_persist() -> None:
     assert earnings_cmd[earnings_cmd.index("--limit") + 1] == "100"
     assert "--skip-db-persist" in hundred_cmd
     assert "--skip-db-persist" in monthly_cmd
+    assert "--skip-db-persist" in long_base_cmd
     assert "--skip-db-persist" in trend_cmd
     assert "--skip-cause-analysis" in hundred_cmd
     assert "--checkpoint-path" in hundred_cmd
@@ -148,6 +157,14 @@ def test_build_commands_forward_skip_db_persist() -> None:
     assert "--limit" not in hundred_cmd
     assert "--profile" in monthly_cmd
     assert monthly_cmd[monthly_cmd.index("--profile") + 1] == "balanced"
+    assert "--profile" in long_base_cmd
+    assert long_base_cmd[long_base_cmd.index("--profile") + 1] == "default"
+    assert "--signal-type" in long_base_cmd
+    assert long_base_cmd[long_base_cmd.index("--signal-type") + 1] == "long_base_release"
+    assert "--max-workers" in long_base_cmd
+    assert long_base_cmd[long_base_cmd.index("--max-workers") + 1] == "3"
+    assert "--limit" in long_base_cmd
+    assert long_base_cmd[long_base_cmd.index("--limit") + 1] == "100"
     assert "--max-workers" in monthly_cmd
     assert monthly_cmd[monthly_cmd.index("--max-workers") + 1] == "2"
     assert "--limit" in monthly_cmd
@@ -156,6 +173,10 @@ def test_build_commands_forward_skip_db_persist() -> None:
     assert "--disable-second-stage-business-profile" in trend_cmd
     assert "--enrich-top-n" in trend_cmd
     assert trend_cmd[trend_cmd.index("--enrich-top-n") + 1] == "0"
+    assert "--checkpoint-path" in trend_cmd
+    assert trend_cmd[trend_cmd.index("--checkpoint-path") + 1] == str(
+        Path("tmp/trend") / "trend_leader_unified_checkpoint.json"
+    )
     assert "--watch-top-n" in trend_cmd
     assert trend_cmd[trend_cmd.index("--watch-top-n") + 1] == "12"
     assert "--max-workers" in trend_cmd
@@ -2651,6 +2672,161 @@ def test_append_daily_slow_rise_markdown_uses_selector_metrics() -> None:
     assert "10.03" in markdown
 
 
+def test_summary_adds_hundred_day_pretty_trend_section_for_slow_rise_intersection(tmp_path: Path) -> None:
+    summary = fast_bundle._build_summary_markdown(
+        snapshot_date=date(2026, 4, 20),
+        signal_results=[
+            fast_bundle.SignalResult(
+                key=fast_bundle.SIGNAL_HUNDRED_DAY_HIGH,
+                signal_type="hundred_day_high",
+                label="hundred",
+                rows=[
+                    {
+                        "code": "600001",
+                        "name": "BaseBreakout",
+                        "pct_change": 8.8,
+                        "chart_pattern_label": "base_breakout",
+                        "chart_pattern_summary": "横盘突破型",
+                    },
+                    {
+                        "code": "600002",
+                        "name": "HealthyTrend",
+                        "pct_change": 7.7,
+                        "chart_pattern_label": "healthy_trend",
+                        "chart_pattern_summary": "健康慢涨型",
+                    },
+                    {
+                        "code": "600003",
+                        "name": "PlainOnly",
+                        "pct_change": 6.6,
+                        "chart_pattern_label": "plain_breakout",
+                        "chart_pattern_summary": "图形一般",
+                    },
+                ],
+                csv_path=tmp_path / "hundred.csv",
+            ),
+            fast_bundle.SignalResult(
+                key=fast_bundle.SIGNAL_DAILY_SLOW_RISE,
+                signal_type="daily_slow_rise",
+                label="daily",
+                rows=[
+                    {
+                        "code": "600002",
+                        "name": "HealthyTrend",
+                        "trend_pattern_label": "steady_rise",
+                        "advance_return_pct": "58.2",
+                        "advance_max_drawdown_pct": "4.2",
+                        "max_single_day_gain_pct": "7.2",
+                    },
+                    {
+                        "code": "600001",
+                        "name": "BaseBreakout",
+                        "trend_pattern_label": "base_to_trend",
+                        "advance_return_pct": "81.8",
+                        "advance_max_drawdown_pct": "3.4",
+                        "max_single_day_gain_pct": "9.8",
+                    },
+                ],
+                csv_path=tmp_path / "daily.csv",
+            ),
+        ],
+        skipped_signals=[],
+        unified_csv=tmp_path / "fast_review_candidates.csv",
+        resonance_csv=tmp_path / "fast_review_resonance.csv",
+        resonance_md=tmp_path / "fast_review_resonance.md",
+        resonance_rows=[],
+        suggested_windows="1,3,5,10",
+        strategy_focus_csv=tmp_path / "fast_review_strategy_focus.csv",
+        strategy_focus_md=tmp_path / "fast_review_strategy_focus.md",
+        strategy_focus_rows=[],
+    )
+
+    section_start = summary.index("## 百日新高中的30-45度强图形 Top 2")
+    next_section = summary.index("## 日线慢涨候选", section_start)
+    section = summary[section_start:next_section]
+
+    assert "| 600001 | BaseBreakout |" in section
+    assert "| 600002 | HealthyTrend |" in section
+    assert "base_to_trend" in section
+    assert "steady_rise" in section
+    assert "| 600003 | PlainOnly |" not in section
+    assert section.index("| 600001 | BaseBreakout |") < section.index("| 600002 | HealthyTrend |")
+
+
+def test_summary_adds_long_base_release_overlap_and_standalone_sections(tmp_path: Path) -> None:
+    summary = fast_bundle._build_summary_markdown(
+        snapshot_date=date(2026, 4, 20),
+        signal_results=[
+            fast_bundle.SignalResult(
+                key=fast_bundle.SIGNAL_HUNDRED_DAY_HIGH,
+                signal_type="hundred_day_high",
+                label="hundred",
+                rows=[
+                    {
+                        "code": "600001",
+                        "name": "HundredOverlap",
+                        "pct_change": 9.8,
+                        "chart_pattern_label": "healthy_trend",
+                        "chart_pattern_summary": "健康慢涨型",
+                    },
+                    {
+                        "code": "600002",
+                        "name": "HundredOnly",
+                        "pct_change": 6.2,
+                        "chart_pattern_label": "plain_breakout",
+                        "chart_pattern_summary": "图形一般",
+                    },
+                ],
+                csv_path=tmp_path / "hundred.csv",
+            ),
+            fast_bundle.SignalResult(
+                key="long_base_release",
+                signal_type="long_base_release",
+                label="long_base",
+                rows=[
+                    {
+                        "code": "600001",
+                        "name": "HundredOverlap",
+                        "release_pattern_label": "long_base_breakout",
+                        "release_return_pct": "29.8",
+                        "release_max_drawdown_pct": "5.1",
+                        "max_single_day_gain_pct": "10.0",
+                    },
+                    {
+                        "code": "600003",
+                        "name": "StandaloneRelease",
+                        "release_pattern_label": "long_base_slow_push",
+                        "release_return_pct": "18.4",
+                        "release_max_drawdown_pct": "4.4",
+                        "max_single_day_gain_pct": "5.2",
+                    },
+                ],
+                csv_path=tmp_path / "long_base.csv",
+            ),
+        ],
+        skipped_signals=[],
+        unified_csv=tmp_path / "fast_review_candidates.csv",
+        resonance_csv=tmp_path / "fast_review_resonance.csv",
+        resonance_md=tmp_path / "fast_review_resonance.md",
+        resonance_rows=[],
+        suggested_windows="1,3,5,10",
+        strategy_focus_csv=tmp_path / "fast_review_strategy_focus.csv",
+        strategy_focus_md=tmp_path / "fast_review_strategy_focus.md",
+        strategy_focus_rows=[],
+    )
+
+    hundred_start = summary.index("## 百日新高 Top 2")
+    standalone_start = summary.index("## 长横盘释放候选 Top 1")
+    standalone_end = summary.index("## Skipped / No-result Signals", standalone_start)
+    hundred_section = summary[hundred_start:standalone_start]
+    standalone_section = summary[standalone_start:standalone_end]
+
+    assert "长横盘突破型" in hundred_section
+    assert "| 600003 | StandaloneRelease |" in standalone_section
+    assert "长横盘慢推型" in standalone_section
+    assert "| 600001 | HundredOverlap |" not in standalone_section
+
+
 def test_build_earnings_focus_rows_prioritizes_earnings_and_trend_resonance() -> None:
     signal_results = [
         fast_bundle.SignalResult(
@@ -2999,7 +3175,7 @@ def test_parse_args_uses_fast_review_defaults_when_profile_missing(tmp_path: Pat
     missing_profile = tmp_path / "missing_profile.json"
     args = fast_bundle.parse_args(["--strategy-profile-file", str(missing_profile)])
 
-    assert args.include_signals == "earnings,hundred_day_high,trend_leader,daily_slow_rise"
+    assert args.include_signals == "earnings,hundred_day_high,trend_leader,daily_slow_rise,long_base_release"
     assert args.daily_profile == "accelerating"
     assert args.external_parallelism == 3
     assert args.external_command_idle_timeout_sec == 1800
@@ -3010,6 +3186,8 @@ def test_parse_args_uses_fast_review_defaults_when_profile_missing(tmp_path: Pat
     assert args.earnings_recent_event_max_age_days == 7
     assert args.hundred_day_max_workers == 2
     assert args.daily_max_workers == 4
+    assert args.long_base_release_profile == "default"
+    assert args.long_base_release_max_workers == 3
     assert args.hundred_day_prefilter_min_listed_days == 120
     assert args.hundred_day_prefilter_min_change_pct_60d == 12.0
     assert args.hundred_day_prefilter_min_turnover_rate == 0.8
@@ -3026,9 +3204,11 @@ def test_parse_args_uses_fast_review_defaults_when_profile_missing(tmp_path: Pat
 def test_parse_args_uses_repo_strategy_profile_tighter_trend_prefilter_defaults() -> None:
     args = fast_bundle.parse_args([])
 
-    assert args.include_signals == "earnings,hundred_day_high,trend_leader,daily_slow_rise"
+    assert args.include_signals == "earnings,hundred_day_high,trend_leader,daily_slow_rise,long_base_release"
     assert args.daily_profile == "accelerating"
     assert args.daily_max_workers == 4
+    assert args.long_base_release_profile == "default"
+    assert args.long_base_release_max_workers == 3
     assert args.hundred_day_prefilter_min_listed_days == 120
     assert args.hundred_day_prefilter_min_change_pct_60d == 12.0
     assert args.hundred_day_prefilter_min_turnover_rate == 0.8

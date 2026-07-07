@@ -50,6 +50,7 @@ SIGNAL_HUNDRED_DAY_HIGH = "hundred_day_high"
 SIGNAL_TREND_LEADER = "trend_leader"
 SIGNAL_MONTHLY_SLOW_RISE = "monthly_slow_rise"
 SIGNAL_DAILY_SLOW_RISE = "daily_slow_rise"
+SIGNAL_LONG_BASE_RELEASE = "long_base_release"
 SIGNAL_CONTINUOUS_UP_RATIO = "continuous_up_ratio"
 SIGNAL_CONTINUOUS_UP_STREAK = "continuous_up_streak"
 SHORTLINE_SIGNAL_TYPES = [
@@ -63,6 +64,7 @@ DEFAULT_INCLUDE_SIGNALS = [
     SIGNAL_HUNDRED_DAY_HIGH,
     SIGNAL_TREND_LEADER,
     SIGNAL_DAILY_SLOW_RISE,
+    SIGNAL_LONG_BASE_RELEASE,
 ]
 SIGNAL_ALIASES = {
     "continuous_up": [SIGNAL_CONTINUOUS_UP_RATIO, SIGNAL_CONTINUOUS_UP_STREAK],
@@ -116,6 +118,10 @@ HUNDRED_DAY_CHART_PATTERN_PRIORITY = {
     "healthy_trend": 1,
     "plain_breakout": 2,
 }
+DAILY_SLOW_RISE_PATTERN_PRIORITY = {
+    "base_to_trend": 0,
+    "steady_rise": 1,
+}
 REVIEW_DISPLAY_GROUP_LABELS = {
     "intersection": "交叉强样本",
     "hundred_strong_chart": "纯百日新高",
@@ -140,6 +146,7 @@ DEFAULT_HUNDRED_DAY_MAX_WORKERS = 2
 DEFAULT_HUNDRED_DAY_OUTPUT_LIMIT = 30
 DEFAULT_HUNDRED_DAY_SUMMARY_SPOTLIGHT_LIMIT = 30
 DEFAULT_TREND_CONTINUATION_SUMMARY_LIMIT = 12
+DEFAULT_LITON_STYLE_POOL_LIMIT = 50
 DEFAULT_HUNDRED_DAY_PREFILTER_MIN_LISTED_DAYS = 120
 DEFAULT_HUNDRED_DAY_PREFILTER_MIN_CHANGE_PCT_60D = 12.0
 DEFAULT_HUNDRED_DAY_PREFILTER_MIN_TURNOVER_RATE = 0.8
@@ -149,6 +156,8 @@ DEFAULT_MONTHLY_PROFILE = "balanced"
 DEFAULT_MONTHLY_MAX_WORKERS = 2
 DEFAULT_DAILY_SLOW_RISE_PROFILE = "accelerating"
 DEFAULT_DAILY_SLOW_RISE_MAX_WORKERS = 4
+DEFAULT_LONG_BASE_RELEASE_PROFILE = "default"
+DEFAULT_LONG_BASE_RELEASE_MAX_WORKERS = 3
 DEFAULT_EXTERNAL_LOCK_RETRY = 2
 DEFAULT_PROGRESS_EVERY = 25
 DEFAULT_WINDOWS = "1,3,5,10"
@@ -166,6 +175,25 @@ STRATEGY_FOCUS_MARKDOWN_SECTIONS = [
     ("watch", "观察候选", 10),
     ("low_priority", "低优先级候选", 5),
 ]
+
+LITON_STYLE_MARKDOWN_SECTIONS = [
+    ("most_like", "最像利通电子", 10),
+    ("next_like", "次像", 15),
+    ("observe", "观察", 15),
+]
+LITON_STYLE_LABELS = {
+    "most_like": "最像利通电子",
+    "next_like": "次像",
+    "observe": "观察",
+}
+DAILY_TREND_PATTERN_LABELS = {
+    "base_to_trend": "平台转顺趋势",
+    "steady_rise": "平滑慢涨",
+}
+LONG_BASE_PATTERN_LABELS = {
+    "long_base_slow_push": "长横盘慢推型",
+    "long_base_breakout": "长横盘突破型",
+}
 
 EXTERNAL_COMMAND_IDLE_TIMEOUT_SEC = DEFAULT_EXTERNAL_COMMAND_IDLE_TIMEOUT_SEC
 EXTERNAL_COMMAND_TOTAL_TIMEOUT_SEC = DEFAULT_EXTERNAL_COMMAND_TOTAL_TIMEOUT_SEC
@@ -323,7 +351,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=",".join(DEFAULT_INCLUDE_SIGNALS),
         help=(
             "Comma-separated signal keys. Supported keys: "
-            "earnings,hundred_day_high,trend_leader,monthly_slow_rise,daily_slow_rise,"
+            "earnings,hundred_day_high,trend_leader,monthly_slow_rise,daily_slow_rise,long_base_release,"
             "continuous_up_ratio,continuous_up_streak,"
             "continuous_up(alias for both continuous signals)."
         ),
@@ -573,6 +601,24 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help=(
             "Worker count for daily slow-rise scan script. "
             f"default {DEFAULT_DAILY_SLOW_RISE_MAX_WORKERS}."
+        ),
+    )
+    parser.add_argument("--long-base-release-signal-type", default="long_base_release", help="Signal type for long-base-release scan.")
+    parser.add_argument(
+        "--long-base-release-profile",
+        default=DEFAULT_LONG_BASE_RELEASE_PROFILE,
+        help=(
+            "Profile forwarded to long-base-release script. "
+            f"default {DEFAULT_LONG_BASE_RELEASE_PROFILE}."
+        ),
+    )
+    parser.add_argument(
+        "--long-base-release-max-workers",
+        type=int,
+        default=DEFAULT_LONG_BASE_RELEASE_MAX_WORKERS,
+        help=(
+            "Worker count for long-base-release scan script. "
+            f"default {DEFAULT_LONG_BASE_RELEASE_MAX_WORKERS}."
         ),
     )
 
@@ -1089,7 +1135,32 @@ def build_daily_slow_rise_command(args: argparse.Namespace, *, snapshot_date: da
     return command
 
 
+def build_long_base_release_command(args: argparse.Namespace, *, snapshot_date: date, output_dir: Path) -> List[str]:
+    command = [
+        sys.executable,
+        str(PROJECT_ROOT / "scripts" / "select_long_base_release_candidates.py"),
+        "--snapshot-date",
+        snapshot_date.isoformat(),
+        "--signal-type",
+        str(args.long_base_release_signal_type),
+        "--profile",
+        str(getattr(args, "long_base_release_profile", DEFAULT_LONG_BASE_RELEASE_PROFILE)),
+        "--output-dir",
+        str(output_dir),
+        "--max-workers",
+        str(max(1, int(getattr(args, "long_base_release_max_workers", getattr(args, "max_workers", 1))))),
+        "--log-level",
+        str(args.log_level),
+    ]
+    if args.limit is not None and int(args.limit) > 0:
+        command.extend(["--limit", str(int(args.limit))])
+    if not bool(args.persist_snapshots):
+        command.append("--skip-db-persist")
+    return command
+
+
 def build_trend_leader_command(args: argparse.Namespace, *, snapshot_date: date, output_dir: Path) -> List[str]:
+    checkpoint_path = output_dir / "trend_leader_unified_checkpoint.json"
     command = [
         sys.executable,
         str(PROJECT_ROOT / "scripts" / "select_trend_leader_candidates.py"),
@@ -1103,6 +1174,8 @@ def build_trend_leader_command(args: argparse.Namespace, *, snapshot_date: date,
         str(max(0, int(getattr(args, "trend_watch_top_n", DEFAULT_TREND_WATCH_TOP_N)))),
         "--output-dir",
         str(output_dir),
+        "--checkpoint-path",
+        str(checkpoint_path),
         "--max-workers",
         str(max(1, int(getattr(args, "trend_max_workers", args.max_workers)))),
         "--shard-count",
@@ -1193,8 +1266,22 @@ def _load_signal_rows_from_csv(
                 "latest_high",
                 "window_high",
                 "trend_pattern_label",
+                "base_high",
+                "base_low",
+                "base_range_pct",
+                "base_return_pct",
                 "advance_return_pct",
                 "advance_max_drawdown_pct",
+                "full_window_return_pct",
+                "release_pattern_label",
+                "base_high",
+                "base_low",
+                "base_range_pct",
+                "base_return_pct",
+                "release_return_pct",
+                "release_max_drawdown_pct",
+                "full_window_return_pct",
+                "breakout_above_base_pct",
                 "max_single_day_gain_pct",
                 "breakout_quality_score",
                 "chart_pattern_label",
@@ -1935,6 +2022,12 @@ def _build_hundred_day_snapshot_summary(item: Dict[str, Any]) -> str:
     if chart_pattern_summary and chart_pattern_summary != business_hint:
         _append_part(parts, chart_pattern_summary)
 
+    long_base_release_label = str(
+        _pick("long_base_release_label_zh", "_long_base_release_label_zh") or ""
+    ).strip()
+    if long_base_release_label:
+        _append_part(parts, long_base_release_label)
+
     pe_ratio = _format_pe_compact(_pick("pe_ratio", "ttm_pe", "rolling_pe"))
     if pe_ratio != "--":
         _append_part(parts, f"PE {pe_ratio}")
@@ -1968,6 +2061,39 @@ def _build_hundred_day_snapshot_summary(item: Dict[str, Any]) -> str:
     return " / ".join(parts) or "--"
 
 
+def _long_base_release_label_zh(value: Any) -> str:
+    mapping = {
+        "long_base_slow_push": "长横盘慢推型",
+        "long_base_breakout": "长横盘突破型",
+    }
+    return mapping.get(str(value or "").strip(), "")
+
+
+def _build_long_base_release_snapshot_summary(item: Dict[str, Any]) -> str:
+    parts: List[str] = []
+    subtype_label = _long_base_release_label_zh(item.get("release_pattern_label"))
+    if subtype_label:
+        parts.append(subtype_label)
+
+    release_return_pct = _to_optional_float(item.get("release_return_pct"))
+    if release_return_pct is not None:
+        parts.append(f"阶段涨幅 {release_return_pct:.2f}%")
+
+    release_drawdown_pct = _to_optional_float(item.get("release_max_drawdown_pct"))
+    if release_drawdown_pct is not None:
+        parts.append(f"阶段回撤 {release_drawdown_pct:.2f}%")
+
+    max_single_day_gain_pct = _to_optional_float(item.get("max_single_day_gain_pct"))
+    if max_single_day_gain_pct is not None:
+        parts.append(f"单日最大涨幅 {max_single_day_gain_pct:.2f}%")
+
+    breakout_above_base_pct = _to_optional_float(item.get("breakout_above_base_pct"))
+    if breakout_above_base_pct is not None:
+        parts.append(f"突破底部 {breakout_above_base_pct:.2f}%")
+
+    return " / ".join(parts) or "--"
+
+
 def _append_hundred_day_high_spotlight_markdown(
     lines: List[str],
     *,
@@ -1976,6 +2102,7 @@ def _append_hundred_day_high_spotlight_markdown(
     limit: Optional[int] = None,
 ) -> None:
     hundred_result = next((item for item in signal_results if item.key == SIGNAL_HUNDRED_DAY_HIGH), None)
+    long_base_result = next((item for item in signal_results if item.key == SIGNAL_LONG_BASE_RELEASE), None)
     rows = list((hundred_result.rows if hundred_result is not None else []) or [])
     if not rows:
         return
@@ -1985,6 +2112,12 @@ def _append_hundred_day_high_spotlight_markdown(
         code = str(item.get("code") or "").strip()
         if code and code not in focus_rows_by_code:
             focus_rows_by_code[code] = item
+
+    long_base_rows_by_code: Dict[str, Dict[str, Any]] = {}
+    for item in list((long_base_result.rows if long_base_result is not None else []) or []):
+        code = str(item.get("code") or "").strip()
+        if code and code not in long_base_rows_by_code:
+            long_base_rows_by_code[code] = dict(item)
 
     def _bucket_rank(value: Any) -> int:
         text = str(value or "").strip()
@@ -2022,6 +2155,11 @@ def _append_hundred_day_high_spotlight_markdown(
     for index, item in enumerate(rows):
         code = str(item.get("code") or "").strip()
         merged_item = dict(item)
+        long_base_item = long_base_rows_by_code.get(code)
+        if long_base_item is not None:
+            merged_item["_long_base_release_label_zh"] = _long_base_release_label_zh(
+                long_base_item.get("release_pattern_label")
+            )
         focus_item = focus_rows_by_code.get(code)
         if focus_item is not None:
             merged_item.update(focus_item)
@@ -2145,6 +2283,149 @@ def _append_trend_continuation_spotlight_markdown(
                 stage=_safe_cell(item.get("review_stage_label")),
                 snapshot=_safe_cell(_build_focus_snapshot_summary(item)),
                 rise_reason=_safe_cell(_prefer_display_reason_summary(item)),
+            )
+        )
+    lines.append("")
+
+
+def _append_hundred_day_pretty_trend_markdown(
+    lines: List[str],
+    *,
+    signal_results: Sequence[SignalResult],
+    limit: int = 12,
+) -> None:
+    hundred_result = next((item for item in signal_results if item.key == SIGNAL_HUNDRED_DAY_HIGH), None)
+    daily_result = next((item for item in signal_results if item.key == SIGNAL_DAILY_SLOW_RISE), None)
+    if hundred_result is None or daily_result is None:
+        return
+
+    hundred_rows = [dict(item) for item in (hundred_result.rows or []) if isinstance(item, dict)]
+    daily_rows = [dict(item) for item in (daily_result.rows or []) if isinstance(item, dict)]
+    if not hundred_rows or not daily_rows:
+        return
+
+    daily_rows_by_code: Dict[str, Dict[str, Any]] = {}
+    for item in daily_rows:
+        code = str(item.get("code") or "").strip()
+        if code and code not in daily_rows_by_code:
+            daily_rows_by_code[code] = item
+
+    matched_rows: List[Dict[str, Any]] = []
+    for index, item in enumerate(hundred_rows):
+        code = str(item.get("code") or "").strip()
+        if not code:
+            continue
+        daily_item = daily_rows_by_code.get(code)
+        if daily_item is None:
+            continue
+        merged_item = dict(item)
+        merged_item["_daily_row"] = daily_item
+        merged_item["_matched_original_index"] = index
+        matched_rows.append(merged_item)
+
+    if not matched_rows:
+        return
+
+    def _daily_pattern_rank(item: Dict[str, Any]) -> int:
+        daily_item = item.get("_daily_row") if isinstance(item.get("_daily_row"), dict) else {}
+        label = str((daily_item or {}).get("trend_pattern_label") or "").strip()
+        return DAILY_SLOW_RISE_PATTERN_PRIORITY.get(label, 9)
+
+    def _chart_pattern_rank(item: Dict[str, Any]) -> int:
+        label = str(item.get("chart_pattern_label") or "").strip()
+        return HUNDRED_DAY_CHART_PATTERN_PRIORITY.get(label, 9)
+
+    matched_rows.sort(
+        key=lambda item: (
+            _chart_pattern_rank(item),
+            _daily_pattern_rank(item),
+            -_to_float(item.get("breakout_quality_score")),
+            -_to_float((item.get("_daily_row") or {}).get("advance_return_pct")),
+            _to_float((item.get("_daily_row") or {}).get("advance_max_drawdown_pct"), default=999.0),
+            -_to_float(item.get("today_change_pct") or item.get("pct_change") or item.get("change_pct")),
+            int(item.get("_matched_original_index", 0)),
+        )
+    )
+
+    visible_rows = matched_rows[: max(1, int(limit))]
+    lines.append(f"## 百日新高中的30-45度强图形 Top {len(visible_rows)}")
+    lines.append("- 只看同时命中 `hundred_day_high` 和 `daily_slow_rise` 的样本，优先突出前面横盘、后面 30-45 度缓升的强图形。")
+    lines.append("")
+    lines.append(f"### 强图形交叉（top {len(visible_rows)} / {len(matched_rows)}）")
+    lines.append("| code | name | chart | slow_rise_pattern | snapshot |")
+    lines.append("| --- | --- | --- | --- | --- |")
+    for item in visible_rows:
+        daily_item = item.get("_daily_row") if isinstance(item.get("_daily_row"), dict) else {}
+        lines.append(
+            "| {code} | {name} | {chart} | {pattern} | {snapshot} |".format(
+                code=_safe_cell(item.get("code")),
+                name=_safe_cell(item.get("name")),
+                chart=_safe_cell(item.get("chart_pattern_summary") or item.get("chart_pattern_label")),
+                pattern=_safe_cell((daily_item or {}).get("trend_pattern_label")),
+                snapshot=_safe_cell(_build_hundred_day_snapshot_summary(item)),
+            )
+        )
+    lines.append("")
+
+
+def _append_long_base_release_markdown(
+    lines: List[str],
+    *,
+    signal_results: Sequence[SignalResult],
+    limit: int = 12,
+) -> None:
+    long_base_result = next((item for item in signal_results if item.key == SIGNAL_LONG_BASE_RELEASE), None)
+    if long_base_result is None:
+        return
+
+    rows = [dict(item) for item in (long_base_result.rows or []) if isinstance(item, dict)]
+    if not rows:
+        return
+
+    hundred_result = next((item for item in signal_results if item.key == SIGNAL_HUNDRED_DAY_HIGH), None)
+    hundred_codes = {
+        str(item.get("code") or "").strip()
+        for item in list((hundred_result.rows if hundred_result is not None else []) or [])
+        if str(item.get("code") or "").strip()
+    }
+    standalone_rows = [
+        item for item in rows if str(item.get("code") or "").strip() and str(item.get("code") or "").strip() not in hundred_codes
+    ]
+    if not standalone_rows:
+        return
+
+    def _pattern_rank(item: Dict[str, Any]) -> int:
+        label = str(item.get("release_pattern_label") or "").strip()
+        if label == "long_base_breakout":
+            return 0
+        if label == "long_base_slow_push":
+            return 1
+        return 9
+
+    standalone_rows.sort(
+        key=lambda item: (
+            _pattern_rank(item),
+            -_to_float(item.get("release_return_pct")),
+            _to_float(item.get("release_max_drawdown_pct"), default=999.0),
+            -_to_float(item.get("max_single_day_gain_pct")),
+            str(item.get("code") or ""),
+        )
+    )
+
+    visible_rows = standalone_rows[: max(1, int(limit))]
+    lines.append(f"## 长横盘释放候选 Top {len(visible_rows)}")
+    lines.append("- 这里单独展开未命中 `hundred_day_high`、但已经出现长横盘后释放结构的样本，方便补看横盘后慢推或突然突破的日K。")
+    lines.append("")
+    lines.append(f"### 独立候选（top {len(visible_rows)} / {len(standalone_rows)}）")
+    lines.append("| code | name | subtype | snapshot |")
+    lines.append("| --- | --- | --- | --- |")
+    for item in visible_rows:
+        lines.append(
+            "| {code} | {name} | {subtype} | {snapshot} |".format(
+                code=_safe_cell(item.get("code")),
+                name=_safe_cell(item.get("name")),
+                subtype=_safe_cell(_long_base_release_label_zh(item.get("release_pattern_label"))),
+                snapshot=_safe_cell(_build_long_base_release_snapshot_summary(item)),
             )
         )
     lines.append("")
@@ -3757,6 +4038,399 @@ def _append_strategy_focus_markdown(
         lines.append("")
 
 
+def _build_signal_code_map(
+    signal_results: Sequence[SignalResult],
+    signal_key: str,
+) -> Dict[str, Dict[str, Any]]:
+    rows_by_code: Dict[str, Dict[str, Any]] = {}
+    for result in signal_results:
+        if result.key != signal_key:
+            continue
+        for row in result.rows or []:
+            if not isinstance(row, dict):
+                continue
+            code = str(row.get("code") or "").strip()
+            if code:
+                rows_by_code[code] = row
+    return rows_by_code
+
+
+def _has_positive_fundamental_evidence(item: Dict[str, Any]) -> bool:
+    authority_level = str(item.get("authority_level") or "").strip().lower()
+    authority_summary = str(item.get("authority_reason_summary") or "").strip()
+    net_profit_amount = _to_optional_float(item.get("net_profit_amount"))
+    return (
+        authority_level == "earnings"
+        and net_profit_amount is not None
+        and net_profit_amount > 0
+        and "营收同比+" in authority_summary
+        and "净利同比+" in authority_summary
+    )
+
+
+def _resolve_liton_style_drawdown(
+    daily_row: Optional[Dict[str, Any]],
+    long_base_row: Optional[Dict[str, Any]],
+) -> Optional[float]:
+    for row, field in (
+        (daily_row, "advance_max_drawdown_pct"),
+        (long_base_row, "release_max_drawdown_pct"),
+    ):
+        if not row:
+            continue
+        value = _to_optional_float(row.get(field))
+        if value is not None:
+            return value
+    return None
+
+
+def _resolve_liton_style_breakout_pct(
+    daily_row: Optional[Dict[str, Any]],
+    long_base_row: Optional[Dict[str, Any]],
+) -> Optional[float]:
+    for row in (long_base_row, daily_row):
+        if not row:
+            continue
+        value = _to_optional_float(row.get("breakout_above_base_pct"))
+        if value is not None:
+            return round(value, 1)
+    return None
+
+
+def _resolve_liton_style_platform_position(
+    item: Dict[str, Any],
+    daily_row: Optional[Dict[str, Any]],
+    long_base_row: Optional[Dict[str, Any]],
+) -> str:
+    for row in (long_base_row, daily_row):
+        if not row:
+            continue
+        full_window_return_pct = _to_optional_float(row.get("full_window_return_pct"))
+        if full_window_return_pct is None:
+            continue
+        if full_window_return_pct >= 45.0:
+            return "高位平台"
+        if full_window_return_pct >= 20.0:
+            return "中位平台"
+        return "低位平台"
+    relation = str(item.get("trend_hundred_relation") or "").strip()
+    if relation == "intersection":
+        return "高位平台"
+    if relation == "trend_only":
+        return "中位平台"
+    return ""
+
+
+def _resolve_liton_style_base_days(
+    item: Dict[str, Any],
+    daily_row: Optional[Dict[str, Any]],
+    long_base_row: Optional[Dict[str, Any]],
+) -> Optional[int]:
+    if long_base_row and str(long_base_row.get("release_pattern_label") or "").strip():
+        return 60
+    if daily_row and str(daily_row.get("trend_pattern_label") or "").strip():
+        return 30
+    if str(item.get("chart_pattern_label") or "").strip() == "base_breakout":
+        return 30
+    return None
+
+
+def _build_liton_style_observation_summary(
+    *,
+    item: Dict[str, Any],
+    daily_row: Optional[Dict[str, Any]],
+    long_base_row: Optional[Dict[str, Any]],
+    base_days: Optional[int],
+    breakout_pct: Optional[float],
+    base_position_label: str,
+) -> str:
+    parts: List[str] = []
+    pattern_label = str(item.get("chart_pattern_summary") or "").strip()
+    if long_base_row:
+        pattern_key = str(long_base_row.get("release_pattern_label") or "").strip()
+        pattern_label = LONG_BASE_PATTERN_LABELS.get(pattern_key, pattern_label)
+    elif daily_row:
+        pattern_key = str(daily_row.get("trend_pattern_label") or "").strip()
+        pattern_label = DAILY_TREND_PATTERN_LABELS.get(pattern_key, pattern_label)
+    if pattern_label:
+        parts.append(pattern_label)
+    if base_days is not None:
+        parts.append(f"横盘{int(base_days)}天")
+    if breakout_pct is not None:
+        parts.append(f"突破{float(breakout_pct):.1f}%")
+    if base_position_label:
+        parts.append(base_position_label)
+    return "，".join(parts)
+
+
+def _score_liton_style_row(
+    item: Dict[str, Any],
+    daily_row: Optional[Dict[str, Any]],
+    long_base_row: Optional[Dict[str, Any]],
+) -> float:
+    relation = str(item.get("trend_hundred_relation") or "").strip()
+    signal_types = str(item.get("signal_types") or "").strip()
+    chart_label = str(item.get("chart_pattern_label") or "").strip()
+    daily_pattern_label = str((daily_row or {}).get("trend_pattern_label") or "").strip()
+    long_base_pattern_label = str((long_base_row or {}).get("release_pattern_label") or "").strip()
+    breakout_pct = _resolve_liton_style_breakout_pct(daily_row, long_base_row)
+    drawdown_pct = _resolve_liton_style_drawdown(daily_row, long_base_row)
+    score = 0.0
+
+    relation_bonus = {
+        "trend_only": 20.0,
+        "intersection": 16.0,
+        "hundred_only": 8.0,
+    }
+    score += relation_bonus.get(relation, 0.0)
+    if "trend_leader_unified" in signal_types:
+        score += 18.0
+    if chart_label == "healthy_trend":
+        score += 10.0
+    elif chart_label == "base_breakout":
+        score += 4.0
+    if daily_pattern_label == "steady_rise":
+        score += 16.0
+    elif daily_pattern_label == "base_to_trend":
+        score += 11.0
+    if long_base_pattern_label == "long_base_slow_push":
+        score += 12.0
+    elif long_base_pattern_label == "long_base_breakout":
+        score += 8.0
+    if drawdown_pct is not None:
+        if drawdown_pct <= 4.5:
+            score += 10.0
+        elif drawdown_pct <= 7.5:
+            score += 6.0
+        elif drawdown_pct <= 10.0:
+            score += 3.0
+    if breakout_pct is not None:
+        if breakout_pct >= 20.0:
+            score += 8.0
+        elif breakout_pct >= 10.0:
+            score += 4.0
+        elif breakout_pct >= 3.0:
+            score += 2.0
+    if _has_positive_fundamental_evidence(item):
+        score += 10.0
+    authority_summary = str(item.get("authority_reason_summary") or "").strip()
+    research_summary = str(item.get("research_evidence_summary") or "").strip()
+    if "近21天机构观点仍在强化" in authority_summary or research_summary:
+        score += 4.0
+    return round(score, 2)
+
+
+def _classify_liton_style_tier(
+    item: Dict[str, Any],
+    daily_row: Optional[Dict[str, Any]],
+    long_base_row: Optional[Dict[str, Any]],
+    liton_style_score: float,
+) -> str:
+    if not _has_positive_fundamental_evidence(item):
+        return ""
+
+    relation = str(item.get("trend_hundred_relation") or "").strip()
+    signal_types = str(item.get("signal_types") or "").strip()
+    chart_label = str(item.get("chart_pattern_label") or "").strip()
+    daily_pattern_label = str((daily_row or {}).get("trend_pattern_label") or "").strip()
+    long_base_pattern_label = str((long_base_row or {}).get("release_pattern_label") or "").strip()
+    observe_candidate = (
+        chart_label == "base_breakout"
+        or long_base_pattern_label in {"long_base_breakout", "long_base_slow_push"}
+    )
+
+    if (
+        not observe_candidate
+        and "trend_leader_unified" in signal_types
+        and relation in {"trend_only", "intersection"}
+        and liton_style_score >= 55.0
+    ):
+        return "most_like"
+    if liton_style_score >= 36.0 and (
+        "trend_leader_unified" in signal_types
+        or chart_label == "healthy_trend"
+        or daily_pattern_label in {"steady_rise", "base_to_trend"}
+    ):
+        return "next_like"
+    if observe_candidate or liton_style_score >= 24.0:
+        return "observe"
+    return ""
+
+
+def _build_liton_style_watch_rows(
+    *,
+    strategy_focus_rows: Sequence[Dict[str, Any]],
+    signal_results: Sequence[SignalResult],
+) -> List[Dict[str, Any]]:
+    daily_rows_by_code = _build_signal_code_map(signal_results, SIGNAL_DAILY_SLOW_RISE)
+    long_base_rows_by_code = _build_signal_code_map(signal_results, SIGNAL_LONG_BASE_RELEASE)
+    rows: List[Dict[str, Any]] = []
+
+    for base_item in strategy_focus_rows or []:
+        if not isinstance(base_item, dict):
+            continue
+        item = dict(base_item)
+        code = str(item.get("code") or "").strip()
+        if not code:
+            continue
+        daily_row = daily_rows_by_code.get(code)
+        long_base_row = long_base_rows_by_code.get(code)
+        liton_style_score = _score_liton_style_row(item, daily_row, long_base_row)
+        liton_style_tier = _classify_liton_style_tier(item, daily_row, long_base_row, liton_style_score)
+        if not liton_style_tier:
+            continue
+        base_days = _resolve_liton_style_base_days(item, daily_row, long_base_row)
+        breakout_pct = _resolve_liton_style_breakout_pct(daily_row, long_base_row)
+        base_position_label = _resolve_liton_style_platform_position(item, daily_row, long_base_row)
+        observation_summary = _build_liton_style_observation_summary(
+            item=item,
+            daily_row=daily_row,
+            long_base_row=long_base_row,
+            base_days=base_days,
+            breakout_pct=breakout_pct,
+            base_position_label=base_position_label,
+        )
+        item.update(
+            {
+                "liton_style_tier": liton_style_tier,
+                "liton_style_label": LITON_STYLE_LABELS.get(liton_style_tier, liton_style_tier),
+                "liton_style_score": liton_style_score,
+                "base_observation_days": base_days,
+                "base_breakout_pct": breakout_pct,
+                "base_position_label": base_position_label,
+                "base_observation_summary": observation_summary,
+            }
+        )
+        rows.append(item)
+
+    tier_priority = {"most_like": 0, "next_like": 1, "observe": 2}
+    rows.sort(
+        key=lambda item: (
+            tier_priority.get(str(item.get("liton_style_tier") or "").strip(), 99),
+            -_to_float(item.get("liton_style_score")),
+            -_to_float(item.get("priority_score")),
+            str(item.get("code") or ""),
+        )
+    )
+    return rows[:DEFAULT_LITON_STYLE_POOL_LIMIT]
+
+
+def _append_liton_style_markdown(
+    lines: List[str],
+    *,
+    liton_style_rows: Sequence[Dict[str, Any]],
+    liton_style_csv: Optional[Path] = None,
+    liton_style_md: Optional[Path] = None,
+) -> None:
+    rows = list(liton_style_rows or [])
+    if not rows:
+        return
+
+    counts = {
+        key: sum(1 for item in rows if str(item.get("liton_style_tier") or "").strip() == key)
+        for key, _, _ in LITON_STYLE_MARKDOWN_SECTIONS
+    }
+    lines.append("## 利通电子风格跟踪池")
+    if liton_style_csv is not None:
+        lines.append(f"- 跟踪池 CSV：`{liton_style_csv}`")
+    if liton_style_md is not None:
+        lines.append(f"- 跟踪池 Markdown：`{liton_style_md}`")
+    lines.append(f"- 跟踪总数：`{len(rows)}`")
+    lines.append(f"- 最像利通电子：`{counts['most_like']}`")
+    lines.append(f"- 次像：`{counts['next_like']}`")
+    lines.append(f"- 观察：`{counts['observe']}`")
+    lines.append("")
+
+    for tier_key, title, limit in LITON_STYLE_MARKDOWN_SECTIONS:
+        tier_rows = [item for item in rows if str(item.get("liton_style_tier") or "").strip() == tier_key]
+        lines.append(f"## {title} Top {min(limit, len(tier_rows))}")
+        if not tier_rows:
+            lines.append("- none")
+            lines.append("")
+            continue
+        if tier_key == "observe":
+            lines.append("| code | name | score | 平台观察 | snapshot | signals | rise_reason | tags |")
+            lines.append("| --- | --- | ---: | --- | --- | --- | --- | --- |")
+            for item in tier_rows[:limit]:
+                lines.append(
+                    "| {code} | {name} | {score:.2f} | {platform} | {snapshot} | {signals} | {rise_reason} | {tags} |".format(
+                        code=_safe_cell(item.get("code")),
+                        name=_safe_cell(item.get("name")),
+                        score=_to_float(item.get("liton_style_score")),
+                        platform=_safe_cell(item.get("base_observation_summary")),
+                        snapshot=_safe_cell(_build_focus_snapshot_summary(item)),
+                        signals=_safe_cell(item.get("signal_types") or item.get("signal_keys")),
+                        rise_reason=_safe_cell(_prefer_display_reason_summary(item)),
+                        tags=_safe_cell(item.get("cause_tags_zh") or item.get("cause_tags")),
+                    )
+                )
+        else:
+            lines.append("| code | name | score | snapshot | signals | rise_reason | tags |")
+            lines.append("| --- | --- | ---: | --- | --- | --- | --- |")
+            for item in tier_rows[:limit]:
+                lines.append(
+                    "| {code} | {name} | {score:.2f} | {snapshot} | {signals} | {rise_reason} | {tags} |".format(
+                        code=_safe_cell(item.get("code")),
+                        name=_safe_cell(item.get("name")),
+                        score=_to_float(item.get("liton_style_score")),
+                        snapshot=_safe_cell(_build_focus_snapshot_summary(item)),
+                        signals=_safe_cell(item.get("signal_types") or item.get("signal_keys")),
+                        rise_reason=_safe_cell(_prefer_display_reason_summary(item)),
+                        tags=_safe_cell(item.get("cause_tags_zh") or item.get("cause_tags")),
+                    )
+                )
+        lines.append("")
+
+
+def _write_liton_style_outputs(
+    *,
+    rows: Sequence[Dict[str, Any]],
+    csv_path: Path,
+    md_path: Path,
+) -> None:
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    columns = [
+        "code",
+        "name",
+        "liton_style_tier",
+        "liton_style_label",
+        "liton_style_score",
+        "base_observation_days",
+        "base_breakout_pct",
+        "base_position_label",
+        "base_observation_summary",
+        "signal_keys",
+        "signal_types",
+        "trend_hundred_relation",
+        "priority_score",
+        "today_change_pct",
+        "pe_ratio",
+        "report_period_label",
+        "net_profit_amount",
+        "chart_pattern_label",
+        "chart_pattern_summary",
+        "reason_summary",
+        "cause_tags",
+        "cause_tags_zh",
+        "preferred_industry_label",
+        "authority_reason_summary",
+    ]
+    with csv_path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field, "") for field in columns})
+
+    lines: List[str] = []
+    _append_liton_style_markdown(
+        lines,
+        liton_style_rows=list(rows or []),
+        liton_style_csv=csv_path,
+        liton_style_md=md_path,
+    )
+    md_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+
+
 def _build_earnings_focus_rows(
     signal_results: Sequence[SignalResult],
     *,
@@ -4162,6 +4836,9 @@ def _build_summary_markdown(
     strategy_focus_csv: Optional[Path] = None,
     strategy_focus_md: Optional[Path] = None,
     strategy_focus_rows: Optional[Sequence[Dict[str, Any]]] = None,
+    liton_style_csv: Optional[Path] = None,
+    liton_style_md: Optional[Path] = None,
+    liton_style_rows: Optional[Sequence[Dict[str, Any]]] = None,
     earnings_focus_csv: Optional[Path] = None,
     earnings_focus_md: Optional[Path] = None,
     earnings_focus_rows: Optional[Sequence[Dict[str, Any]]] = None,
@@ -4189,10 +4866,24 @@ def _build_summary_markdown(
             f"| {result.key} | {result.signal_type} | {_format_signal_result_count(result)} | {result.duration_sec:.2f} | `{result.csv_path}` |"
         )
     lines.append("")
+    _append_liton_style_markdown(
+        lines,
+        liton_style_rows=list(liton_style_rows or []),
+        liton_style_csv=liton_style_csv,
+        liton_style_md=liton_style_md,
+    )
     _append_hundred_day_high_spotlight_markdown(
         lines,
         signal_results=signal_results,
         strategy_focus_rows=list(strategy_focus_rows or []),
+    )
+    _append_hundred_day_pretty_trend_markdown(
+        lines,
+        signal_results=signal_results,
+    )
+    _append_long_base_release_markdown(
+        lines,
+        signal_results=signal_results,
     )
     _append_trend_continuation_spotlight_markdown(
         lines,
@@ -4245,6 +4936,9 @@ def _build_summary_markdown(
     )
     lines.append(
         f"python scripts/select_daily_slow_rise_candidates.py --snapshot-date {snapshot_date.isoformat()} --profile {DEFAULT_DAILY_SLOW_RISE_PROFILE}"
+    )
+    lines.append(
+        f"python scripts/select_long_base_release_candidates.py --snapshot-date {snapshot_date.isoformat()} --profile {DEFAULT_LONG_BASE_RELEASE_PROFILE}"
     )
     lines.append(
         "python scripts/run_signal_performance_bundle.py "
@@ -4399,8 +5093,9 @@ def _signal_priority(signal_key: str) -> int:
         SIGNAL_HUNDRED_DAY_HIGH: 2,
         SIGNAL_MONTHLY_SLOW_RISE: 3,
         SIGNAL_DAILY_SLOW_RISE: 4,
-        SIGNAL_CONTINUOUS_UP_RATIO: 5,
-        SIGNAL_CONTINUOUS_UP_STREAK: 6,
+        SIGNAL_LONG_BASE_RELEASE: 5,
+        SIGNAL_CONTINUOUS_UP_RATIO: 6,
+        SIGNAL_CONTINUOUS_UP_STREAK: 7,
     }
     return priority_map.get(str(signal_key or "").strip(), 999)
 
@@ -4904,6 +5599,18 @@ def main() -> int:
             )
         )
 
+    if SIGNAL_LONG_BASE_RELEASE in include_signals:
+        long_base_output = signal_dir / SIGNAL_LONG_BASE_RELEASE
+        external_jobs.append(
+            ExternalSignalJob(
+                key=SIGNAL_LONG_BASE_RELEASE,
+                signal_type=str(args.long_base_release_signal_type),
+                signal_label="长横盘释放",
+                command=build_long_base_release_command(args, snapshot_date=snapshot_date, output_dir=long_base_output),
+                csv_path=long_base_output / "long_base_release_candidates.csv",
+            )
+        )
+
     if SIGNAL_TREND_LEADER in include_signals:
         trend_output = signal_dir / SIGNAL_TREND_LEADER
         external_jobs.append(
@@ -5017,6 +5724,10 @@ def main() -> int:
         signal_results,
         trend_watch_rows=trend_watch_rows,
     )
+    liton_style_rows = _build_liton_style_watch_rows(
+        strategy_focus_rows=strategy_focus_rows,
+        signal_results=signal_results,
+    )
     earnings_focus_rows = _build_earnings_focus_rows(signal_results, snapshot_date=snapshot_date)
     manual_review_rows: List[Dict[str, Any]] = []
     manual_review_csv: Optional[Path] = None
@@ -5036,6 +5747,8 @@ def main() -> int:
     resonance_md = report_dir / "fast_review_resonance.md"
     strategy_focus_csv = report_dir / "fast_review_strategy_focus.csv"
     strategy_focus_md = report_dir / "fast_review_strategy_focus.md"
+    liton_style_csv = report_dir / "fast_review_liton_style_pool.csv"
+    liton_style_md = report_dir / "fast_review_liton_style_pool.md"
     earnings_focus_csv = report_dir / "fast_review_earnings_focus.csv"
     earnings_focus_md = report_dir / "fast_review_earnings_focus.md"
     if manual_review_labels_file is not None:
@@ -5047,6 +5760,7 @@ def main() -> int:
     _export_signal_rows(rows=unified_rows, csv_path=unified_csv, txt_path=report_dir / "fast_review_candidates.txt")
     _write_resonance_outputs(rows=resonance_rows, csv_path=resonance_csv, md_path=resonance_md)
     _write_strategy_focus_outputs(rows=strategy_focus_rows, csv_path=strategy_focus_csv, md_path=strategy_focus_md)
+    _write_liton_style_outputs(rows=liton_style_rows, csv_path=liton_style_csv, md_path=liton_style_md)
     _write_earnings_focus_outputs(rows=earnings_focus_rows, csv_path=earnings_focus_csv, md_path=earnings_focus_md)
     if manual_review_csv is not None and manual_review_md is not None:
         _write_manual_review_calibration_outputs(
@@ -5066,6 +5780,9 @@ def main() -> int:
         strategy_focus_csv=strategy_focus_csv,
         strategy_focus_md=strategy_focus_md,
         strategy_focus_rows=strategy_focus_rows,
+        liton_style_csv=liton_style_csv,
+        liton_style_md=liton_style_md,
+        liton_style_rows=liton_style_rows,
         earnings_focus_csv=earnings_focus_csv,
         earnings_focus_md=earnings_focus_md,
         earnings_focus_rows=earnings_focus_rows,
@@ -5115,6 +5832,8 @@ def main() -> int:
     print(f"resonance_md={resonance_md}")
     print(f"strategy_focus_csv={strategy_focus_csv}")
     print(f"strategy_focus_md={strategy_focus_md}")
+    print(f"liton_style_csv={liton_style_csv}")
+    print(f"liton_style_md={liton_style_md}")
     print(f"earnings_focus_csv={earnings_focus_csv}")
     print(f"earnings_focus_md={earnings_focus_md}")
     if manual_review_csv is not None:

@@ -88,3 +88,12 @@ static/
 /apps/dsa-desktop/dist/
 /apps/dsa-desktop/node_modules/
 docs/specs/
+
+# local git worktrees under docs
+/docs/.worktrees/
+
+# local planning scratch docs
+/docs/superpowers/
+
+# local one-off helper scripts
+/_run_review*

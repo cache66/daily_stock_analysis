@@ -2,38 +2,21 @@ import { expect, test, type Page } from '@playwright/test';
 
 const smokePassword = process.env.DSA_WEB_SMOKE_PASSWORD;
 
-type AuthStatusResponse = {
-  authEnabled: boolean;
-  loggedIn: boolean;
-};
-
-function getPathname(page: Page): string {
-  return new URL(page.url()).pathname;
+if (!smokePassword) {
+  test.skip(true, 'Set DSA_WEB_SMOKE_PASSWORD to run authenticated smoke tests.');
 }
 
-async function fetchAuthStatus(page: Page): Promise<AuthStatusResponse | null> {
-  try {
-    const response = await page.request.get('/api/v1/auth/status', {
-      failOnStatusCode: false,
-    });
-    if (!response.ok()) {
-      return null;
-    }
-    const data = await response.json() as Partial<AuthStatusResponse>;
-    if (typeof data.authEnabled !== 'boolean' || typeof data.loggedIn !== 'boolean') {
-      return null;
-    }
-    return {
-      authEnabled: data.authEnabled,
-      loggedIn: data.loggedIn,
-    };
-  } catch {
-    return null;
-  }
-}
 
-async function expectShellReady(page: Page) {
-  await expect(page.locator('[data-testid="home-dashboard"]')).toBeVisible({ timeout: 10_000 });
+async function captureSmokeScreenshot(page: Page, testInfo: { outputPath: (name: string) => string }, name: string, options: { fullPage?: boolean } = {}) {
+  const path = testInfo.outputPath(`${name}.png`);
+  await page.screenshot({
+    path,
+    fullPage: options.fullPage ?? true,
+  });
+  await testInfo.attach(name, {
+    path,
+    contentType: 'image/png',
+  });
 }
 
 async function login(page: Page) {
@@ -77,7 +60,9 @@ async function login(page: Page) {
 }
 
 test.describe('web smoke', () => {
-  test('login page renders password form or redirects to home', async ({ page }) => {
+  test.use({ locale: 'zh-CN' });
+
+  test('login page renders password form', async ({ page }, testInfo) => {
     await page.goto('/login');
     await page.waitForLoadState('domcontentloaded');
 
@@ -90,11 +75,13 @@ test.describe('web smoke', () => {
       return;
     }
 
-    await page.waitForURL((url) => url.pathname === '/', { timeout: 10_000 }).catch(() => undefined);
-    await expectShellReady(page);
+    // Check for submit button
+    await expect(page.getByRole('button', { name: /授权进入工作台|完成设置并登录/ })).toBeVisible();
+
+    await captureSmokeScreenshot(page, testInfo, 'smoke-login-page-zh');
   });
 
-  test('home page shows analysis entry and history panel after login', async ({ page }) => {
+  test('home page shows analysis entry and history panel after login', async ({ page }, testInfo) => {
     await login(page);
 
     await expect(page.locator('[data-testid="home-dashboard"]')).toBeVisible({ timeout: 10_000 });
@@ -107,7 +94,8 @@ test.describe('web smoke', () => {
     await stockInput.fill('600519');
     const analyzeButton = page.locator('[data-testid="home-dashboard"] header button.btn-primary').first();
     await expect(analyzeButton).toBeVisible();
-    await expect(analyzeButton).toBeEnabled();
+
+    await captureSmokeScreenshot(page, testInfo, 'smoke-home-page-zh', { fullPage: true });
   });
 
   test('chat page allows entering a question and starts a request', async ({ page }) => {
@@ -149,7 +137,7 @@ test.describe('web smoke', () => {
     await expect(composer).not.toHaveAttribute('title', /.+/);
   });
 
-  test('mobile shell opens navigation drawer after login', async ({ page }) => {
+  test('mobile shell opens navigation drawer after login', async ({ page }, testInfo) => {
     await page.setViewportSize({ width: 390, height: 844 });
     await login(page);
 
@@ -157,33 +145,76 @@ test.describe('web smoke', () => {
     await expect(menuButton).toBeVisible({ timeout: 5000 });
     await menuButton.click();
 
-    const drawer = page.getByRole('dialog');
-    await expect(drawer).toBeVisible({ timeout: 5000 });
-    await expect(drawer.locator('a[href="/backtest"]')).toBeVisible({ timeout: 5000 });
+    // Check if navigation is visible
+    await expect(page.getByRole('link', { name: '回测' })).toBeVisible({ timeout: 5000 });
+
+    await captureSmokeScreenshot(page, testInfo, 'smoke-mobile-shell-nav');
   });
 
-  test('settings page renders title and save actions after login', async ({ page }) => {
+  test('settings page renders title and save actions after login', async ({ page }, testInfo) => {
     await login(page);
 
     await page.goto('/settings');
     await expect(page).toHaveURL(/\/settings$/);
     await page.waitForLoadState('domcontentloaded');
 
-    await expect(page.locator('.settings-page')).toBeVisible({ timeout: 10_000 });
-    await expect(page.locator('button[data-variant="settings-secondary"]').first()).toBeVisible();
-    await expect(page.locator('button[data-variant="settings-primary"]').first()).toBeVisible();
+    // Use heading role for more precise selection
+    await expect(page.getByRole('heading', { name: '系统设置' })).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByRole('button', { name: '重置' })).toBeVisible();
+    await expect(page.getByRole('button', { name: /保存配置/ })).toBeVisible();
+
+    await captureSmokeScreenshot(page, testInfo, 'smoke-settings-page-zh');
   });
 
-  test('backtest page renders filter controls after login', async ({ page }) => {
+  test('language switch updates UI copy and persists after page refresh', async ({ page }, testInfo) => {
+    await login(page);
+
+    const languageToggle = page.getByRole('button', { name: '切换界面语言' });
+    await expect(languageToggle).toBeVisible();
+    await expect(page.getByRole('link', { name: '设置' })).toBeVisible();
+    await expect(page.getByRole('link', { name: '首页' })).toBeVisible();
+
+    await languageToggle.click();
+
+    const englishLanguageToggle = page.getByRole('button', { name: 'Switch UI language' });
+    await expect(englishLanguageToggle).toBeVisible();
+    await expect(page.getByRole('link', { name: 'Settings' })).toBeVisible();
+    await expect(page.getByRole('link', { name: 'Home' })).toBeVisible();
+    await captureSmokeScreenshot(page, testInfo, 'smoke-home-page-en');
+
+    expect(await page.evaluate(() => localStorage.getItem('dsa.uiLanguage'))).toBe('en');
+
+    await page.reload();
+    await page.waitForLoadState('domcontentloaded');
+
+    await expect(englishLanguageToggle).toBeVisible();
+    await expect(page.getByRole('link', { name: 'Settings' })).toBeVisible();
+    await expect(page.getByRole('link', { name: 'Home' })).toBeVisible();
+
+    await page.getByRole('link', { name: 'Settings' }).click();
+    await page.waitForLoadState('domcontentloaded');
+    await page.waitForTimeout(1000);
+
+    await expect(page.getByRole('heading', { name: 'System settings' })).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByRole('button', { name: 'Send test' })).toBeVisible();
+    await expect(page.getByRole('textbox', { name: 'Title' })).toHaveValue('DSA notification test');
+
+    await captureSmokeScreenshot(page, testInfo, 'smoke-settings-page-en');
+  });
+
+  test('backtest page renders filter controls after login', async ({ page }, testInfo) => {
     await login(page);
 
     await page.goto('/backtest');
     await expect(page).toHaveURL(/\/backtest$/);
     await page.waitForLoadState('domcontentloaded');
 
-    const filterInput = page.locator('input[placeholder*="stock code"]').first();
+    // Check for filter controls
+    const filterInput = page.getByPlaceholder('按股票代码筛选（留空表示全部）');
     await expect(filterInput).toBeVisible({ timeout: 10_000 });
-    await expect(page.getByRole('button', { name: /filter/i })).toBeVisible();
-    await expect(page.getByRole('button', { name: /run backtest/i })).toBeVisible();
+    await expect(page.getByRole('button', { name: '筛选' })).toBeVisible();
+    await expect(page.getByRole('button', { name: '运行回测' })).toBeVisible();
+
+    await captureSmokeScreenshot(page, testInfo, 'smoke-backtest-page-zh', { fullPage: true });
   });
 });

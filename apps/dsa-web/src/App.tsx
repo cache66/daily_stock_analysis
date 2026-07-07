@@ -1,34 +1,40 @@
 import type React from 'react';
-import { Suspense, lazy, useEffect } from 'react';
+import { lazy, useEffect } from 'react';
 import { BrowserRouter as Router, Navigate, Route, Routes, useLocation } from 'react-router-dom';
-import HomePage from './pages/HomePage';
-import LoginPage from './pages/LoginPage';
-import { ApiErrorAlert, Loading, Shell } from './components/common';
+import { ApiErrorAlert, Shell } from './components/common';
+import {
+  PageLoadingFallback,
+  RouteOutletBoundary,
+  StandaloneRouteBoundary,
+} from './components/layout/RouteBoundary';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
+import { UiLanguageProvider, useUiLanguage } from './contexts/UiLanguageContext';
 import { useAgentChatStore } from './stores/agentChatStore';
 import './App.css';
 
-const ChatPage = lazy(() => import('./pages/ChatPage'));
-const SignalsPage = lazy(() => import('./pages/SignalsPage'));
-const PortfolioPage = lazy(() => import('./pages/PortfolioPage'));
+const HomePage = lazy(() => import('./pages/HomePage'));
 const BacktestPage = lazy(() => import('./pages/BacktestPage'));
 const SettingsPage = lazy(() => import('./pages/SettingsPage'));
+const LoginPage = lazy(() => import('./pages/LoginPage'));
 const NotFoundPage = lazy(() => import('./pages/NotFoundPage'));
+const ChatPage = lazy(() => import('./pages/ChatPage'));
+const PortfolioPage = lazy(() => import('./pages/PortfolioPage'));
+const DecisionSignalsPage = lazy(() => import('./pages/DecisionSignalsPage'));
+const AlertsPage = lazy(() => import('./pages/AlertsPage'));
+const TokenUsagePage = lazy(() => import('./pages/TokenUsagePage'));
+const StockScreeningPage = lazy(() => import('./pages/StockScreeningPage'));
 
 const AppContent: React.FC = () => {
   const location = useLocation();
   const { authEnabled, loggedIn, isLoading, loadError, refreshStatus } = useAuth();
+  const { t } = useUiLanguage();
 
   useEffect(() => {
     useAgentChatStore.getState().setCurrentRoute(location.pathname);
   }, [location.pathname]);
 
   if (isLoading) {
-    return (
-      <div className="flex min-h-screen items-center justify-center bg-base">
-        <div className="h-8 w-8 animate-spin rounded-full border-2 border-cyan/20 border-t-cyan" />
-      </div>
-    );
+    return <PageLoadingFallback />;
   }
 
   if (loadError) {
@@ -42,7 +48,7 @@ const AppContent: React.FC = () => {
           className="btn-primary"
           onClick={() => void refreshStatus()}
         >
-          重试
+          {t('common.retry')}
         </button>
       </div>
     );
@@ -50,7 +56,11 @@ const AppContent: React.FC = () => {
 
   if (authEnabled && !loggedIn) {
     if (location.pathname === '/login') {
-      return <LoginPage />;
+      return (
+        <StandaloneRouteBoundary>
+          <LoginPage />
+        </StandaloneRouteBoundary>
+      );
     }
     const redirect = encodeURIComponent(location.pathname + location.search);
     return <Navigate to={`/login?redirect=${redirect}`} replace />;
@@ -67,30 +77,38 @@ const AppContent: React.FC = () => {
   );
 
   return (
-    <Suspense fallback={routeFallback}>
-      <Routes>
-        <Route element={<Shell />}>
-          <Route path="/" element={<HomePage />} />
-          <Route path="/chat" element={<ChatPage />} />
-          <Route path="/signals" element={<SignalsPage />} />
-          <Route path="/portfolio" element={<PortfolioPage />} />
-          <Route path="/backtest" element={<BacktestPage />} />
-          <Route path="/settings" element={<SettingsPage />} />
-          <Route path="*" element={<NotFoundPage />} />
-        </Route>
-        <Route path="/login" element={<LoginPage />} />
-      </Routes>
-    </Suspense>
+    <Routes>
+      <Route
+        element={(
+          <Shell>
+            <RouteOutletBoundary />
+          </Shell>
+        )}
+      >
+        <Route path="/" element={<HomePage />} />
+        <Route path="/chat" element={<ChatPage />} />
+        <Route path="/portfolio" element={<PortfolioPage />} />
+        <Route path="/decision-signals" element={<DecisionSignalsPage />} />
+        <Route path="/screening" element={<StockScreeningPage />} />
+        <Route path="/backtest" element={<BacktestPage />} />
+        <Route path="/alerts" element={<AlertsPage />} />
+        <Route path="/usage" element={<TokenUsagePage />} />
+        <Route path="/settings" element={<SettingsPage />} />
+        <Route path="*" element={<NotFoundPage />} />
+      </Route>
+    </Routes>
   );
 };
 
 const App: React.FC = () => {
   return (
-    <Router>
-      <AuthProvider>
-        <AppContent />
-      </AuthProvider>
-    </Router>
+    <UiLanguageProvider>
+      <Router>
+        <AuthProvider>
+          <AppContent />
+        </AuthProvider>
+      </Router>
+    </UiLanguageProvider>
   );
 };
 

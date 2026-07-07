@@ -1,5 +1,33 @@
 import '@testing-library/jest-dom';
 
+class MemoryStorageMock implements Storage {
+  private readonly values = new Map<string, string>();
+
+  get length() {
+    return this.values.size;
+  }
+
+  clear() {
+    this.values.clear();
+  }
+
+  getItem(key: string) {
+    return this.values.get(key) ?? null;
+  }
+
+  key(index: number) {
+    return Array.from(this.values.keys())[index] ?? null;
+  }
+
+  removeItem(key: string) {
+    this.values.delete(key);
+  }
+
+  setItem(key: string, value: string) {
+    this.values.set(key, String(value));
+  }
+}
+
 class IntersectionObserverMock implements IntersectionObserver {
   readonly root = null;
   readonly rootMargin = '';
@@ -21,43 +49,20 @@ Object.defineProperty(globalThis, 'IntersectionObserver', {
   value: IntersectionObserverMock,
 });
 
-function createStorageMock(initialEntries?: Record<string, string>): Storage {
-  const store = new Map(Object.entries(initialEntries ?? {}));
+const hasLocalStorage = (() => {
+  try {
+    return typeof globalThis.localStorage?.getItem === 'function'
+      && typeof globalThis.localStorage?.setItem === 'function'
+      && typeof globalThis.localStorage?.removeItem === 'function'
+      && typeof globalThis.localStorage?.clear === 'function';
+  } catch {
+    return false;
+  }
+})();
 
-  return {
-    get length() {
-      return store.size;
-    },
-    clear() {
-      store.clear();
-    },
-    getItem(key: string) {
-      return store.has(key) ? store.get(key)! : null;
-    },
-    key(index: number) {
-      return Array.from(store.keys())[index] ?? null;
-    },
-    removeItem(key: string) {
-      store.delete(key);
-    },
-    setItem(key: string, value: string) {
-      store.set(String(key), String(value));
-    },
-  };
-}
-
-const currentLocalStorage = (globalThis as { localStorage?: unknown }).localStorage;
-const hasUsableLocalStorage =
-  !!currentLocalStorage
-  && typeof currentLocalStorage === 'object'
-  && typeof (currentLocalStorage as Partial<Storage>).getItem === 'function'
-  && typeof (currentLocalStorage as Partial<Storage>).setItem === 'function'
-  && typeof (currentLocalStorage as Partial<Storage>).clear === 'function';
-
-if (!hasUsableLocalStorage) {
+if (!hasLocalStorage) {
   Object.defineProperty(globalThis, 'localStorage', {
     configurable: true,
-    writable: true,
-    value: createStorageMock(),
+    value: new MemoryStorageMock(),
   });
 }

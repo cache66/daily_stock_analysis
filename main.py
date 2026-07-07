@@ -21,9 +21,13 @@ A股自选股智能分析系统 - 主调度程序
 - 效率优先：关注筹码集中度好的股票
 - 买点偏好：缩量回踩 MA5/MA10 支撑
 """
+from __future__ import annotations
+
+import json
+import multiprocessing
 import os
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from dotenv import dotenv_values
 from src.config import setup_env
@@ -41,6 +45,19 @@ if os.getenv("GITHUB_ACTIONS") != "true" and os.getenv("USE_PROXY", "false").low
     os.environ["http_proxy"] = proxy_url
     os.environ["https_proxy"] = proxy_url
 
+if os.getenv("DSA_PACKAGED_ALPHASIFT_IMPORT_PROBE") == "1":
+    import importlib
+    import sys
+
+    try:
+        importlib.import_module("alphasift.dsa_adapter")
+    except Exception as exc:
+        print(f"ERROR: packaged AlphaSift adapter import failed: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    print("OK: packaged AlphaSift adapter import succeeded")
+    sys.exit(0)
+
 import argparse
 import json
 import logging
@@ -48,17 +65,18 @@ import sys
 import subprocess
 import time
 import uuid
-from datetime import datetime, timezone, timedelta
-from typing import Any, List, Tuple
+from datetime import date, datetime, timezone, timedelta
 
-from data_provider.base import canonical_stock_code
 from src.webui_frontend import prepare_webui_frontend_assets
 from src.config import get_config, Config
 from src.logging_config import setup_logging
+from src.services.stock_list_parser import split_stock_list
+from src.services.stock_code_utils import resolve_index_stock_code_for_analysis
 
 
 logger = logging.getLogger(__name__)
 _RUNTIME_ENV_FILE_KEYS = set()
+_PUBLIC_BIND_HOSTS = frozenset({"0.0.0.0", "::", "[::]", "*"})
 
 
 def _get_active_env_path() -> Path:
@@ -66,6 +84,33 @@ def _get_active_env_path() -> Path:
     if env_file:
         return Path(env_file)
     return Path(__file__).resolve().parent / ".env"
+
+
+def _is_public_bind_host(host: str) -> bool:
+    return (host or "").strip().lower() in _PUBLIC_BIND_HOSTS
+
+
+def _warn_if_public_webui_without_auth(host: str) -> None:
+    if not _is_public_bind_host(host):
+        return
+
+    from src.auth import is_auth_enabled
+
+    if is_auth_enabled():
+        return
+    logger.warning(
+        "WEBUI_HOST=%s binds the Web UI to a public interface while "
+        "ADMIN_AUTH_ENABLED=false. Keep this service behind a trusted network "
+        "boundary or enable admin authentication before exposing it.",
+        host,
+    )
+
+
+def _resolve_web_service_bind(args: argparse.Namespace, config: Config) -> Tuple[str, int]:
+    """Resolve the effective Web/API bind address from CLI first, then config."""
+    host = args.host if args.host is not None else (config.webui_host or "127.0.0.1")
+    port = args.port if args.port is not None else config.webui_port
+    return host, port
 
 
 def _read_active_env_values() -> Optional[Dict[str, str]]:
@@ -142,6 +187,22 @@ def _setup_bootstrap_logging(debug: bool = False) -> None:
         root.addHandler(handler)
 
 
+def _setup_runtime_logging(log_dir: str, debug: bool = False) -> bool:
+    """Switch to configured logging, falling back to console on file I/O errors."""
+    try:
+        setup_logging(log_prefix="stock_analysis", debug=debug, log_dir=log_dir)
+        return True
+    except OSError as exc:
+        logger.warning(
+            "文件日志初始化失败，已降级为控制台日志输出；日志目录 %r 当前不可写或不可创建: %s。"
+            "官方 Docker 镜像启动入口会自动修复默认挂载目录权限；若仍失败，"
+            "请检查是否使用了 --user、只读挂载、rootless Docker 或 NFS 等限制写入的环境。",
+            log_dir,
+            exc,
+        )
+        return False
+
+
 def _get_stock_analysis_pipeline():
     """Lazily import StockAnalysisPipeline for external consumers.
 
@@ -215,6 +276,7 @@ def parse_arguments() -> argparse.Namespace:
   python main.py --dry-run          # 仅获取数据，不进行 AI 分析
   python main.py --stocks 600519,000001  # 指定分析特定股票
   python main.py --no-notify        # 不发送推送通知
+  python main.py --check-notify     # 检查通知配置，不发送通知
   python main.py --single-notify    # 启用单股推送模式（每分析完一只立即推送）
   python main.py --schedule         # 启用定时任务模式
   python main.py --market-review    # 仅运行大盘复盘
@@ -243,6 +305,12 @@ def parse_arguments() -> argparse.Namespace:
         '--no-notify',
         action='store_true',
         help='不发送推送通知'
+    )
+
+    parser.add_argument(
+        '--check-notify',
+        action='store_true',
+        help='只读检查通知渠道配置，不发送通知'
     )
 
     parser.add_argument(
@@ -315,15 +383,15 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         '--port',
         type=int,
-        default=8000,
-        help='FastAPI 服务端口（默认 8000）'
+        default=None,
+        help='FastAPI 服务端口（默认使用 WEBUI_PORT，未配置时为 8000）'
     )
 
     parser.add_argument(
         '--host',
         type=str,
-        default='0.0.0.0',
-        help='FastAPI 服务监听地址（默认 0.0.0.0）'
+        default=None,
+        help='FastAPI 服务监听地址（默认使用 WEBUI_HOST，未配置时为 127.0.0.1）'
     )
 
     parser.add_argument(
@@ -404,11 +472,199 @@ def _compute_trading_day_filter(
     return (filtered_codes, effective_region, should_skip_all)
 
 
+def _run_market_review_with_shared_lock(
+    config: Config,
+    run_market_review_func: Callable[..., Any],
+    **kwargs: Any,
+) -> Any:
+    from src.core.market_review_lock import (
+        release_market_review_lock,
+        try_acquire_market_review_lock,
+    )
+
+    lock_token = try_acquire_market_review_lock(config)
+    if lock_token is None:
+        logger.warning("大盘复盘正在执行中，跳过本次大盘复盘")
+        return None
+
+    try:
+        params = dict(kwargs)
+        params.setdefault("config", config)
+        return run_market_review_func(**params)
+    finally:
+        release_market_review_lock(lock_token)
+
+
+def _is_multi_market_region(region: str) -> bool:
+    normalized = str(region or "").strip().lower()
+    if not normalized:
+        return False
+    if normalized == "both":
+        return True
+    parts = {item.strip() for item in normalized.split(",") if item.strip()}
+    return len(parts) > 1
+
+
+def _refresh_stock_index_cache_for_analysis(config: Config) -> None:
+    """Best-effort stock-index refresh for CLI/scheduled analysis paths."""
+    try:
+        from src.services.stock_index_remote_service import (
+            refresh_remote_stock_index_cache,
+            settings_from_config,
+        )
+
+        result = refresh_remote_stock_index_cache(settings_from_config(config))
+        if result.refreshed:
+            logger.info("[stock-index] 分析前已刷新股票索引缓存: %s", result.cache_path)
+        elif result.error:
+            logger.debug("[stock-index] 分析前刷新未完成，继续使用本地索引: %s", result.error)
+    except Exception as exc:  # noqa: BLE001 - stock index freshness must not block analysis.
+        logger.warning("[stock-index] 分析前刷新股票索引失败，继续执行分析: %s", exc)
+
+
+def _prime_daily_market_context(
+    config: Config,
+    pipeline: Any,
+    *,
+    region: str,
+    no_market_review: bool,
+    allow_generate: bool,
+    force_refresh: bool = False,
+    target_date: Optional[date] = None,
+    return_full_report: bool = False,
+    require_current_query_match: bool = False,
+) -> Union[str, Tuple[str, str]]:
+    """Load/reuse the run's market context, avoiding unbounded background generation."""
+    if no_market_review or not region:
+        return ("", "") if return_full_report else ""
+
+    from src.services.daily_market_context import DailyMarketContextService
+
+    if not _is_multi_market_region(region):
+        service = getattr(pipeline, "_daily_market_context_service", None)
+        if service is None:
+            service = DailyMarketContextService(db_manager=pipeline.db)
+            pipeline._daily_market_context_service = service
+    else:
+        service = DailyMarketContextService(db_manager=pipeline.db)
+
+    get_context_kwargs = {
+        "region": region,
+        "config": config,
+        "notifier": pipeline.notifier,
+        "analyzer": pipeline.analyzer,
+        "search_service": pipeline.search_service,
+        "force_refresh": force_refresh,
+        "allow_generate": allow_generate,
+        "persist_market_review_history": False,
+        "target_date": target_date,
+        "require_query_id_match": require_current_query_match,
+    }
+    current_query_id = getattr(pipeline, "query_id", None)
+    if isinstance(current_query_id, str) and current_query_id.strip():
+        get_context_kwargs["current_query_id"] = current_query_id
+
+    context = service.get_context(**get_context_kwargs)
+    if context is None:
+        return ("", "") if return_full_report else ""
+
+    # Runtime context generation is preload-only and must not replace the full
+    # market review run, except the query-scoped fallback after that run fails.
+    if context.source != "analysis_history" and not (
+        require_current_query_match and context.source == "market_review_runtime"
+    ):
+        return ("", "") if return_full_report else ""
+
+    summary = str(getattr(context, "summary", ""))
+    full_report = str(getattr(context, "full_report", "") or "")
+    if return_full_report:
+        return summary, full_report
+    return summary
+
+
+def _can_reuse_market_context_for_review(summary: str, region: str) -> bool:
+    if not summary:
+        return False
+    normalized = str(region or "").strip().lower()
+    if normalized == "both":
+        return False
+    parts = {item.strip() for item in normalized.split(",") if item.strip()}
+    return len(parts) <= 1
+
+
+def _resolve_daily_market_context_market(market: str, normalized_region: str) -> str:
+    if "," not in normalized_region:
+        return market
+    parts = [item.strip() for item in normalized_region.split(",") if item.strip()]
+    if parts and all(item in {"jp", "kr"} for item in parts):
+        return parts[0]
+    return market
+
+
+def _resolve_daily_market_context_target_date(
+    region: str,
+    current_time: datetime,
+) -> date:
+    normalized_region = str(region or "cn").strip().lower()
+    market = normalized_region if normalized_region in {"cn", "hk", "us", "jp", "kr"} else "cn"
+
+    from src.core.trading_calendar import get_effective_trading_date
+
+    return get_effective_trading_date(
+        _resolve_daily_market_context_market(market, normalized_region),
+        current_time=current_time,
+    )
+
+
+def _market_review_report_text(review_result: Any) -> str:
+    if review_result is None:
+        return ""
+    report = getattr(review_result, "report", None)
+    if isinstance(report, str):
+        return report
+    return review_result if isinstance(review_result, str) else ""
+
+
+def _save_reused_market_review_report(
+    notifier: Any,
+    market_report: str,
+    *,
+    config: Config,
+    trigger_source: str,
+    region: str,
+) -> None:
+    body = str(market_report or "").strip()
+    if not body:
+        return
+    title = (
+        "# 🎯 Market Review"
+        if str(getattr(config, "report_language", "zh")).strip().lower() == "en"
+        else "# 🎯 大盘复盘"
+    )
+    if not any(body.startswith(item) for item in ("# 🎯 大盘复盘", "# 🎯 Market Review")):
+        body = f"{title}\n\n{body}"
+    try:
+        date_str = datetime.now().strftime('%Y%m%d')
+        report_filename = f"market_review_{date_str}.md"
+        filepath = notifier.save_report_to_file(body, report_filename)
+        logger.info(
+            "[MarketReview] component=market_review action=save_reused_report "
+            "trigger_source=%s region=%s path=%s",
+            trigger_source,
+            region,
+            filepath,
+        )
+    except Exception as exc:
+        logger.warning("复用大盘上下文保存大盘复盘报告失败: %s", exc)
+
+
 def run_full_analysis(
     config: Config,
     args: argparse.Namespace,
-    stock_codes: Optional[List[str]] = None
-):
+    stock_codes: Optional[List[str]] = None,
+    *,
+    raise_errors: bool = False,
+) -> bool:
     """
     执行完整的分析流程（个股 + 大盘复盘）
 
@@ -420,6 +676,8 @@ def run_full_analysis(
     from src.core.pipeline import StockAnalysisPipeline
 
     try:
+        _refresh_stock_index_cache_for_analysis(config)
+
         # Issue #529: Hot-reload STOCK_LIST from .env on each scheduled run
         if stock_codes is None:
             config.refresh_stock_list()
@@ -433,7 +691,7 @@ def run_full_analysis(
             logger.info(
                 "今日所有相关市场均为非交易日，跳过执行。可使用 --force-run 强制执行。"
             )
-            return
+            return True
         if set(filtered_codes) != set(effective_codes):
             skipped = set(effective_codes) - set(filtered_codes)
             logger.info("今日休市股票已跳过: %s", skipped)
@@ -456,51 +714,187 @@ def run_full_analysis(
         if getattr(args, 'no_context_snapshot', False):
             save_context_snapshot = False
         query_id = uuid.uuid4().hex
+        market_review_region = (
+            effective_region
+            if effective_region is not None
+            else (getattr(config, 'market_review_region', 'cn') or 'cn')
+        )
+        should_run_market_review = (
+            config.market_review_enabled
+            and not args.no_market_review
+            and (market_review_region or '') != ''
+        )
+        should_use_daily_market_context = (
+            should_run_market_review
+            and getattr(config, 'daily_market_context_enabled', True)
+        )
+        analysis_reference_time = datetime.now(timezone.utc)
+        daily_market_context_target_date = None
+        if should_use_daily_market_context:
+            daily_market_context_target_date = _resolve_daily_market_context_target_date(
+                market_review_region,
+                analysis_reference_time,
+            )
+        market_report = ""
+        market_context_summary = ""
+        market_context_full_report = ""
+        market_context_generated_during_stock = False
         pipeline = StockAnalysisPipeline(
             config=config,
             max_workers=args.workers,
             query_id=query_id,
             query_source="cli",
-            save_context_snapshot=save_context_snapshot
+            save_context_snapshot=save_context_snapshot,
+            daily_market_context_enabled=should_use_daily_market_context,
+            daily_market_context_allow_generate=should_use_daily_market_context,
         )
+        if should_use_daily_market_context:
+            # Prompt-side context can reuse historical summaries, while full-merge
+            # content must avoid silently reusing unrelated historical reports.
+            _prime_daily_market_context(
+                config,
+                pipeline=pipeline,
+                region=market_review_region,
+                no_market_review=args.no_market_review,
+                allow_generate=False,
+                target_date=daily_market_context_target_date,
+                return_full_report=False,
+            )
+            (
+                market_context_summary,
+                market_context_full_report,
+            ) = _prime_daily_market_context(
+                config,
+                pipeline=pipeline,
+                region=market_review_region,
+                no_market_review=args.no_market_review,
+                allow_generate=False,
+                target_date=daily_market_context_target_date,
+                return_full_report=True,
+                require_current_query_match=True,
+            )
 
         # 1. 运行个股分析
         results = pipeline.run(
             stock_codes=stock_codes,
             dry_run=args.dry_run,
             send_notification=not args.no_notify,
-            merge_notification=merge_notification
+            merge_notification=merge_notification,
+            current_time=analysis_reference_time,
         )
+
+        if should_use_daily_market_context and not market_context_summary:
+            (
+                market_context_summary,
+                market_context_full_report,
+            ) = _prime_daily_market_context(
+                config,
+                pipeline=pipeline,
+                region=market_review_region,
+                no_market_review=args.no_market_review,
+                allow_generate=False,
+                target_date=daily_market_context_target_date,
+                return_full_report=True,
+                require_current_query_match=True,
+            )
+            market_context_generated_during_stock = bool(market_context_summary)
 
         # Issue #128: 分析间隔 - 在个股分析和大盘分析之间添加延迟
         analysis_delay = getattr(config, 'analysis_delay', 0)
-        if (
-            analysis_delay > 0
-            and config.market_review_enabled
-            and not args.no_market_review
-            and effective_region != ''
-        ):
-            logger.info(f"等待 {analysis_delay} 秒后执行大盘复盘（避免API限流）...")
-            time.sleep(analysis_delay)
 
         # 2. 运行大盘复盘（如果启用且不是仅个股模式）
-        market_report = ""
-        if (
-            config.market_review_enabled
-            and not args.no_market_review
-            and effective_region != ''
-        ):
-            review_result = run_market_review(
-                notifier=pipeline.notifier,
-                analyzer=pipeline.analyzer,
-                search_service=pipeline.search_service,
-                send_notification=not args.no_notify,
-                merge_notification=merge_notification,
-                override_region=effective_region,
+        if should_run_market_review:
+            schedule_mode = bool(
+                getattr(args, 'schedule', False)
+                or getattr(config, 'schedule_enabled', False)
             )
+            review_trigger_source = "schedule" if schedule_mode else "cli"
+            can_reuse_market_context = (
+                _can_reuse_market_context_for_review(
+                    market_context_summary,
+                    market_review_region,
+                )
+                if should_use_daily_market_context
+                else False
+            )
+
+            can_skip_market_review = (
+                (merge_notification or market_context_generated_during_stock)
+                and can_reuse_market_context
+                and bool(market_context_full_report or market_context_summary)
+            )
+            if can_skip_market_review:
+                market_report = market_context_full_report or market_context_summary
+                logger.info(
+                    "复盘上下文可复用，跳过重复大盘复盘并复用上下文内容。"
+                )
+                _save_reused_market_review_report(
+                    pipeline.notifier,
+                    market_report,
+                    config=config,
+                    trigger_source=review_trigger_source,
+                    region=market_review_region,
+                )
+                if (
+                    market_context_generated_during_stock
+                    and not merge_notification
+                    and not args.no_notify
+                    and pipeline.notifier.is_available()
+                ):
+                    if pipeline.notifier.send(
+                        f"# 📈 大盘复盘\n\n{market_report}",
+                        email_send_to_all=True,
+                        route_type="report",
+                    ):
+                        logger.info("复用本轮大盘上下文推送大盘复盘成功")
+                    else:
+                        logger.warning("复用本轮大盘上下文推送大盘复盘失败")
+
+            review_result = None
+            if not can_skip_market_review:
+                if analysis_delay > 0:
+                    logger.info(f"等待 {analysis_delay} 秒后执行大盘复盘（避免API限流）...")
+                    time.sleep(analysis_delay)
+
+                review_result = _run_market_review_with_shared_lock(
+                    config,
+                    run_market_review,
+                    notifier=pipeline.notifier,
+                    analyzer=pipeline.analyzer,
+                    search_service=pipeline.search_service,
+                    send_notification=not args.no_notify,
+                    merge_notification=merge_notification,
+                    override_region=market_review_region,
+                    query_id=query_id,
+                    trigger_source=review_trigger_source,
+                )
+                # 如果复盘仍未执行成功，再做一次复用历史/缓存读取（防止与并发运行竞态）。
+                if not review_result and should_use_daily_market_context:
+                    (
+                        market_context_summary,
+                        market_context_full_report,
+                    ) = _prime_daily_market_context(
+                        config,
+                        pipeline=pipeline,
+                        region=market_review_region,
+                        no_market_review=args.no_market_review,
+                        allow_generate=False,
+                        target_date=daily_market_context_target_date,
+                        return_full_report=True,
+                        require_current_query_match=True,
+                    )
+                    can_reuse_market_context = _can_reuse_market_context_for_review(
+                        market_context_summary,
+                        market_review_region,
+                    )
+                elif not review_result:
+                    can_reuse_market_context = False
+
             # 如果有结果，赋值给 market_report 用于后续飞书文档生成
             if review_result:
-                market_report = review_result
+                market_report = _market_review_report_text(review_result)
+            elif can_reuse_market_context:
+                market_report = market_context_full_report or market_context_summary
 
         # Issue #190: 合并推送（个股+大盘复盘）
         if merge_notification and (results or market_report) and not args.no_notify:
@@ -516,7 +910,7 @@ def run_full_analysis(
             if parts:
                 combined_content = "\n\n---\n\n".join(parts)
                 if pipeline.notifier.is_available():
-                    if pipeline.notifier.send(combined_content, email_send_to_all=True):
+                    if pipeline.notifier.send(combined_content, email_send_to_all=True, route_type="report"):
                         logger.info("已合并推送（个股+大盘复盘）")
                     else:
                         logger.warning("合并推送失败")
@@ -567,7 +961,10 @@ def run_full_analysis(
                     logger.info(f"飞书云文档创建成功: {doc_url}")
                     # 可选：将文档链接也推送到群里
                     if not args.no_notify:
-                        pipeline.notifier.send(f"[{now.strftime('%Y-%m-%d %H:%M')}] 复盘文档创建成功: {doc_url}")
+                        pipeline.notifier.send(
+                            f"[{now.strftime('%Y-%m-%d %H:%M')}] 复盘文档创建成功: {doc_url}",
+                            route_type="report",
+                        )
 
         except Exception as e:
             logger.error(f"飞书文档生成失败: {e}")
@@ -592,8 +989,41 @@ def run_full_analysis(
         except Exception as e:
             logger.warning(f"自动回测失败（已忽略）: {e}")
 
+        return True
+
     except Exception as e:
         logger.exception(f"分析流程执行失败: {e}")
+        if raise_errors:
+            raise
+        return False
+
+
+def run_scheduled_analysis(
+    config: Config,
+    args: argparse.Namespace,
+    stock_codes: Optional[List[str]] = None,
+) -> bool:
+    """Run scheduled analysis with failures propagated to the scheduler."""
+    return run_full_analysis(config, args, stock_codes, raise_errors=True)
+
+
+def _run_analysis_with_runtime_scheduler_lock(
+    config: Config,
+    args: argparse.Namespace,
+    stock_codes: Optional[List[str]] = None,
+) -> None:
+    from src.services.runtime_scheduler import run_with_global_analysis_lock
+
+    # Keep startup/triggered analysis in sync with API runtime scheduler and
+    # run-now entrypoint. Blocking is expected here because startup paths should
+    # wait for an in-flight job before returning a response.
+    run_with_global_analysis_lock(
+        task_runner=run_full_analysis,
+        config=config,
+        args=args,
+        stock_codes=stock_codes,
+        blocking=True,
+    )
 
 
 def start_api_server(host: str, port: int, config: Config) -> None:
@@ -605,22 +1035,90 @@ def start_api_server(host: str, port: int, config: Config) -> None:
         port: 监听端口
         config: 配置对象
     """
+    import socket
     import threading
     import uvicorn
 
-    def run_server():
-        level_name = (config.log_level or "INFO").lower()
-        uvicorn.run(
-            "api.app:app",
-            host=host,
-            port=port,
-            log_level=level_name,
-            log_config=None,
+    probe = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind((host, port))
+    except OSError as exc:
+        raise RuntimeError(f"FastAPI port is not available: {host}:{port}") from exc
+    finally:
+        probe.close()
+
+    level_name = (config.log_level or "INFO").lower()
+    use_config_signal_handlers = True
+    uvicorn_kwargs = {
+        "host": host,
+        "port": port,
+        "log_level": level_name,
+        "log_config": None,
+    }
+    # Import the ASGI app object in the calling thread instead of handing uvicorn
+    # the "api.app:app" import string. With the string, uvicorn imports the app
+    # lazily inside the server thread, and that import (litellm + the full app
+    # tree, ~10s+ on constrained hosts) runs inside the startup probe window
+    # below, tripping the 3.0s timeout and causing a restart loop on slower
+    # machines. Importing first keeps the heavy work out of the probe window;
+    # genuine import failures still surface immediately to the caller.
+    from api.app import app as fastapi_app
+
+    try:
+        uvicorn_config = uvicorn.Config(
+            fastapi_app,
+            install_signal_handlers=False,
+            **uvicorn_kwargs,
         )
+    except TypeError:
+        # Older uvicorn versions do not accept install_signal_handlers in
+        # Config; fall back and only disable signal handling via Server attribute
+        # when it's a boolean flag.
+        use_config_signal_handlers = False
+        uvicorn_config = uvicorn.Config(
+            fastapi_app,
+            **uvicorn_kwargs,
+        )
+    uvicorn_server = uvicorn.Server(config=uvicorn_config)
+    if not use_config_signal_handlers:
+        install_signal_handlers = getattr(uvicorn_server, "install_signal_handlers", None)
+        if isinstance(install_signal_handlers, bool):
+            uvicorn_server.install_signal_handlers = False
+
+    startup_error: list[BaseException] = []
+
+    def run_server():
+        try:
+            uvicorn_server.run()
+        except Exception as exc:  # noqa: BLE001 - surface startup issues to caller promptly
+            startup_error.append(exc)
 
     thread = threading.Thread(target=run_server, daemon=True)
     thread.start()
-    logger.info(f"FastAPI 服务已启动: http://{host}:{port}")
+
+    timeout_seconds = 3.0
+    wait_deadline = time.time() + timeout_seconds
+    while time.time() < wait_deadline:
+        if startup_error:
+            raise RuntimeError(
+                f"FastAPI server failed to start: {host}:{port}; {startup_error[0]}"
+            )
+        if uvicorn_server.started:
+            logger.info(f"FastAPI 服务已启动: http://{host}:{port}")
+            return
+        if not thread.is_alive():
+            break
+        time.sleep(0.05)
+
+    if startup_error:
+        raise RuntimeError(f"FastAPI server failed to start: {host}:{port}; {startup_error[0]}")
+    if uvicorn_server.started:
+        logger.info(f"FastAPI 服务已启动: http://{host}:{port}")
+        return
+    if not thread.is_alive():
+        raise RuntimeError(f"FastAPI 服务器启动后立即退出: {host}:{port}")
+
+    raise RuntimeError(f"FastAPI 服务在 {timeout_seconds:.1f}s 内未完成启动: {host}:{port}")
 
 
 def _is_truthy_env(var_name: str, default: str = "true") -> bool:
@@ -705,324 +1203,34 @@ def _build_schedule_time_provider(default_schedule_time: str):
     return _provider
 
 
-def _run_scheduled_subprocess(command: List[str], *, cwd: str) -> None:
-    """Run a scheduled helper script and clean up the child on interrupt."""
-    process = subprocess.Popen(command, cwd=cwd)
-    try:
-        return_code = process.wait()
-    except KeyboardInterrupt:
-        logger.warning("scheduled subprocess interrupted, terminating child: %s", " ".join(command))
-        try:
-            process.terminate()
-        except Exception:
-            logger.debug("failed to terminate scheduled child cleanly", exc_info=True)
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            logger.warning("scheduled child did not exit after terminate, force killing: %s", " ".join(command))
-            process.kill()
-            process.wait(timeout=5)
-        raise
+def _build_schedule_times_provider(default_schedule_time: str):
+    """Read the latest SCHEDULE_TIMES with SCHEDULE_TIME fallback."""
+    from src.core.config_manager import ConfigManager
+    from src.scheduler import normalize_schedule_times
 
-    if return_code != 0:
-        raise subprocess.CalledProcessError(return_code, command)
+    _SYSTEM_DEFAULT_SCHEDULE_TIME = "18:00"
+    manager = ConfigManager()
 
-
-def _run_optional_signal_snapshot_tasks(config: Config) -> None:
-    """Run optional scheduled signal snapshot refresh tasks."""
-    if not getattr(config, "signal_snapshot_hundred_day_high_enabled", False):
-        return
-
-    if getattr(config, "trading_day_check_enabled", True):
-        from src.core.trading_calendar import get_market_now, is_market_open
-
-        market_today = get_market_now("cn").date()
-        if not is_market_open("cn", market_today):
-            logger.info(
-                "今日 A 股为非交易日，跳过定时百日新高快照更新: %s",
-                market_today.isoformat(),
+    def _provider():
+        if "SCHEDULE_TIMES" in _INITIAL_PROCESS_ENV:
+            return normalize_schedule_times(
+                os.getenv("SCHEDULE_TIMES", ""),
+                fallback_time=os.getenv("SCHEDULE_TIME", default_schedule_time),
             )
-            return
-
-    project_root = Path(__file__).resolve().parent
-    script_path = project_root / "scripts" / "select_hundred_day_high_candidates.py"
-    command = [sys.executable, str(script_path)]
-    if not getattr(config, "signal_snapshot_hundred_day_high_cause_analysis_enabled", False):
-        command.append("--skip-cause-analysis")
-    else:
-        # Dual-stage mode for daily stability:
-        # stage-1 full scan remains deterministic; stage-2 enriches selected hits
-        # with fresh news + main-business evidence while still skipping LLM cards.
-        command.append("--disable-llm-reason-card")
-
-    logger.info(
-        "开始执行定时百日新高快照更新: cause_analysis=%s, command=%s",
-        getattr(config, "signal_snapshot_hundred_day_high_cause_analysis_enabled", False),
-        " ".join(command),
-    )
-    try:
-        _run_scheduled_subprocess(command, cwd=str(project_root))
-        logger.info("定时百日新高快照更新完成")
-    except subprocess.CalledProcessError as exc:
-        logger.warning("定时百日新高快照更新失败（fail-open）: exit_code=%s", exc.returncode)
-
-
-def _run_optional_board_recognizability_snapshot_tasks(config: Config) -> None:
-    """Run optional scheduled board recognizability ranking refresh tasks."""
-    if not getattr(config, "board_recognizability_snapshot_enabled", False):
-        return
-
-    if getattr(config, "trading_day_check_enabled", True):
-        from src.core.trading_calendar import get_market_now, is_market_open
-
-        market_today = get_market_now("cn").date()
-        if not is_market_open("cn", market_today):
-            logger.info(
-                "浠婃棩 A 鑲′负闈炰氦鏄撴棩锛岃烦杩囧畾鏃舵澘鍧楄辨瘑搴︽帓鍚嶅揩鐓ф洿鏂? %s",
-                market_today.isoformat(),
-            )
-            return
-
-    source_signal_type = (
-        str(getattr(config, "board_recognizability_snapshot_source_signal_type", "") or "").strip()
-        or "hundred_day_high"
-    )
-    try:
-        top_n = max(1, int(getattr(config, "board_recognizability_snapshot_top_n", 3)))
-    except (TypeError, ValueError):
-        top_n = 3
-
-    project_root = Path(__file__).resolve().parent
-    script_path = project_root / "scripts" / "collect_board_recognizability_rankings.py"
-    command = [
-        sys.executable,
-        str(script_path),
-        "--source-signal-type",
-        source_signal_type,
-        "--top-n",
-        str(top_n),
-    ]
-
-    logger.info(
-        "寮€濮嬫墽琛屽畾鏃舵澘鍧楄辨瘑搴︽帓鍚嶅揩鐓ф洿鏂? source_signal_type=%s, top_n=%s, command=%s",
-        source_signal_type,
-        top_n,
-        " ".join(command),
-    )
-    try:
-        _run_scheduled_subprocess(command, cwd=str(project_root))
-        logger.info(
-            "瀹氭椂鏉垮潡杈ㄨ瘑搴︽帓鍚嶅揩鐓ф洿鏂板畬鎴? source_signal_type=%s, top_n=%s",
-            source_signal_type,
-            top_n,
-        )
-    except subprocess.CalledProcessError as exc:
-        logger.warning(
-            "瀹氭椂鏉垮潡杈ㄨ瘑搴︽帓鍚嶅揩鐓ф洿鏂板け璐ワ紙fail-open锛? source_signal_type=%s, exit_code=%s",
-            source_signal_type,
-            exc.returncode,
-        )
-
-
-def _parse_board_theme_core_snapshot_targets(raw_value: str) -> List[Dict[str, Any]]:
-    text = str(raw_value or "").strip()
-    if not text:
-        return []
-    try:
-        payload = json.loads(text)
-    except Exception as exc:
-        logger.warning("BOARD_THEME_CORE_SNAPSHOT_TARGETS_JSON 解析失败，已跳过: %s", exc)
-        return []
-    if not isinstance(payload, list):
-        logger.warning("BOARD_THEME_CORE_SNAPSHOT_TARGETS_JSON 必须是 JSON 数组，已跳过")
-        return []
-
-    targets: List[Dict[str, Any]] = []
-    for item in payload:
-        if not isinstance(item, dict):
-            continue
-        board_name = str(item.get("board_name") or "").strip()
-        if not board_name:
-            continue
-        board_type = str(item.get("board_type") or "auto").strip().lower() or "auto"
-        if board_type not in {"auto", "concept", "industry"}:
-            board_type = "auto"
-        commodity_hint = str(item.get("commodity_hint") or "").strip() or None
-        try:
-            top_per_subtheme = max(1, int(item.get("top_per_subtheme", 1)))
-        except (TypeError, ValueError):
-            top_per_subtheme = 1
-        minimum_subtheme_core_probability = str(
-            item.get("minimum_subtheme_core_probability") or "medium"
-        ).strip().lower() or "medium"
-        if minimum_subtheme_core_probability not in {"low", "medium", "high"}:
-            minimum_subtheme_core_probability = "medium"
-        targets.append(
-            {
-                "board_name": board_name,
-                "board_type": board_type,
-                "commodity_hint": commodity_hint,
-                "top_per_subtheme": top_per_subtheme,
-                "minimum_subtheme_core_probability": minimum_subtheme_core_probability,
-            }
-        )
-    return targets
-
-
-def _run_optional_board_theme_core_snapshot_tasks(config: Config) -> None:
-    """Run optional scheduled board/theme-core snapshot refresh tasks."""
-    if not getattr(config, "board_theme_core_snapshot_enabled", False):
-        return
-
-    targets = _parse_board_theme_core_snapshot_targets(
-        getattr(config, "board_theme_core_snapshot_targets_json", "")
-    )
-    if not targets:
-        logger.info("模块主题核心快照已启用，但未配置有效目标，跳过更新")
-        return
-
-    if getattr(config, "trading_day_check_enabled", True):
-        from src.core.trading_calendar import get_market_now, is_market_open
-
-        market_today = get_market_now("cn").date()
-        if not is_market_open("cn", market_today):
-            logger.info(
-                "今日 A 股为非交易日，跳过定时模块主题核心快照更新: %s",
-                market_today.isoformat(),
-            )
-            return
-
-    project_root = Path(__file__).resolve().parent
-    script_path = project_root / "scripts" / "collect_board_theme_core_snapshots.py"
-    for target in targets:
-        command = [
-            sys.executable,
-            str(script_path),
-            "--board-name",
-            str(target["board_name"]),
-            "--board-type",
-            str(target["board_type"]),
-            "--top-per-subtheme",
-            str(target["top_per_subtheme"]),
-            "--minimum-subtheme-core-probability",
-            str(target["minimum_subtheme_core_probability"]),
-        ]
-        if target.get("commodity_hint"):
-            command.extend(["--commodity-hint", str(target["commodity_hint"])])
-
-        logger.info(
-            "开始执行定时模块主题核心快照更新: board=%s(%s), commodity_hint=%s, command=%s",
-            target["board_name"],
-            target["board_type"],
-            target.get("commodity_hint") or "",
-            " ".join(command),
-        )
-        try:
-            _run_scheduled_subprocess(command, cwd=str(project_root))
-            logger.info(
-                "定时模块主题核心快照更新完成: board=%s(%s)",
-                target["board_name"],
-                target["board_type"],
-            )
-        except subprocess.CalledProcessError as exc:
-            logger.warning(
-                "定时模块主题核心快照更新失败（fail-open）: board=%s(%s), exit_code=%s",
-                target["board_name"],
-                target["board_type"],
-                exc.returncode,
+        if "SCHEDULE_TIME" in _INITIAL_PROCESS_ENV:
+            return normalize_schedule_times(
+                os.getenv("SCHEDULE_TIMES", ""),
+                fallback_time=os.getenv("SCHEDULE_TIME", default_schedule_time),
             )
 
-
-def _run_optional_trend_leader_unified_snapshot_tasks(config: Config) -> None:
-    """Run optional scheduled trend-leader unified snapshot refresh task."""
-    if not getattr(config, "trend_leader_unified_snapshot_enabled", False):
-        return
-
-    if getattr(config, "trading_day_check_enabled", True):
-        from src.core.trading_calendar import get_market_now, is_market_open
-
-        market_today = get_market_now("cn").date()
-        if not is_market_open("cn", market_today):
-            logger.info(
-                "浠婃棩 A 鑲′负闈炰氦鏄撴棩锛岃烦杩囧畾鏃跺己瓒嬪娍榫欏ご缁熶竴蹇収鏇存柊: %s",
-                market_today.isoformat(),
-            )
-            return
-
-    project_root = Path(__file__).resolve().parent
-    script_path = project_root / "scripts" / "run_trend_leader_daily_bundle.py"
-    command = [sys.executable, str(script_path)]
-
-    try:
-        limit = int(getattr(config, "trend_leader_unified_snapshot_limit", 0) or 0)
-    except (TypeError, ValueError):
-        limit = 0
-    if limit > 0:
-        command.extend(["--limit", str(limit)])
-
-    logger.info(
-        "寮€濮嬫墽琛屽畾鏃跺己瓒嬪娍榫欏ご缁熶竴蹇収鏇存柊: limit=%s, command=%s",
-        limit if limit > 0 else "all",
-        " ".join(command),
-    )
-    try:
-        _run_scheduled_subprocess(command, cwd=str(project_root))
-        logger.info(
-            "瀹氭椂寮鸿秼鍔块緳澶寸粺涓€蹇収鏇存柊瀹屾垚: limit=%s",
-            limit if limit > 0 else "all",
-        )
-    except subprocess.CalledProcessError as exc:
-        logger.warning(
-            "瀹氭椂寮鸿秼鍔块緳澶寸粺涓€蹇収鏇存柊澶辫触锛坒ail-open锛? limit=%s, exit_code=%s",
-            limit if limit > 0 else "all",
-            exc.returncode,
+        config_map = manager.read_config_map()
+        schedule_time = (config_map.get("SCHEDULE_TIME", "") or "").strip() or _SYSTEM_DEFAULT_SCHEDULE_TIME
+        return normalize_schedule_times(
+            config_map.get("SCHEDULE_TIMES", ""),
+            fallback_time=schedule_time,
         )
 
-
-def _run_optional_earnings_observation_snapshot_tasks(config: Config) -> None:
-    """Run optional scheduled earnings-observation snapshot refresh task."""
-    if not getattr(config, "earnings_observation_snapshot_enabled", False):
-        return
-
-    if getattr(config, "trading_day_check_enabled", True):
-        from src.core.trading_calendar import get_market_now, is_market_open
-
-        market_today = get_market_now("cn").date()
-        if not is_market_open("cn", market_today):
-            logger.info(
-                "today is not an A-share trading day, skip scheduled earnings observation refresh: %s",
-                market_today.isoformat(),
-            )
-            return
-
-    project_root = Path(__file__).resolve().parent
-    script_path = project_root / "scripts" / "collect_earnings_observation_snapshots.py"
-    command = [sys.executable, str(script_path)]
-
-    try:
-        max_observation_days = int(getattr(config, "earnings_observation_max_observation_days", 0) or 0)
-    except (TypeError, ValueError):
-        max_observation_days = 0
-    if max_observation_days > 0:
-        command.extend(["--max-observation-days", str(max_observation_days)])
-
-    logger.info(
-        "start scheduled earnings observation refresh: max_observation_days=%s, command=%s",
-        max_observation_days if max_observation_days > 0 else "default",
-        " ".join(command),
-    )
-    try:
-        _run_scheduled_subprocess(command, cwd=str(project_root))
-        logger.info(
-            "scheduled earnings observation refresh finished: max_observation_days=%s",
-            max_observation_days if max_observation_days > 0 else "default",
-        )
-    except subprocess.CalledProcessError as exc:
-        logger.warning(
-            "scheduled earnings observation refresh failed (fail-open): max_observation_days=%s exit_code=%s",
-            max_observation_days if max_observation_days > 0 else "default",
-            exc.returncode,
-        )
+    return _provider
 
 
 def main() -> int:
@@ -1055,7 +1263,7 @@ def main() -> int:
 
     # 配置日志（输出到控制台和文件）
     try:
-        setup_logging(log_prefix="stock_analysis", debug=args.debug, log_dir=config.log_dir)
+        _setup_runtime_logging(config.log_dir, debug=args.debug)
     except Exception as exc:
         logger.exception("切换到配置日志目录失败: %s", exc)
         return 1
@@ -1070,10 +1278,24 @@ def main() -> int:
     for warning in warnings:
         logger.warning(warning)
 
+    if getattr(args, "check_notify", False):
+        from src.services.notification_diagnostics import (
+            format_notification_diagnostics,
+            run_notification_diagnostics,
+        )
+
+        result = run_notification_diagnostics(config)
+        print(format_notification_diagnostics(result))
+        return 0 if result.ok else 1
+
     # 解析股票列表（统一为大写 Issue #355）
     stock_codes = None
     if args.stocks:
-        stock_codes = [canonical_stock_code(c) for c in args.stocks.split(',') if (c or "").strip()]
+        stock_codes = [
+            resolve_index_stock_code_for_analysis(c)
+            for c in split_stock_list(args.stocks)
+            if (c or "").strip()
+        ]
         logger.info(f"使用命令行指定的股票列表: {stock_codes}")
 
     # === 处理 --webui / --webui-only 参数，映射到 --serve / --serve-only ===
@@ -1089,15 +1311,53 @@ def main() -> int:
     # === 启动 Web 服务 (如果启用) ===
     start_serve = (args.serve or args.serve_only) and os.getenv("GITHUB_ACTIONS") != "true"
 
-    # 兼容旧版 WEBUI_HOST/WEBUI_PORT：如果用户未通过 --host/--port 指定，则使用旧变量
     if start_serve:
-        if args.host == '0.0.0.0' and os.getenv('WEBUI_HOST'):
-            args.host = os.getenv('WEBUI_HOST')
-        if args.port == 8000 and os.getenv('WEBUI_PORT'):
-            args.port = int(os.getenv('WEBUI_PORT'))
+        args.host, args.port = _resolve_web_service_bind(args, config)
+        _warn_if_public_webui_without_auth(args.host)
 
     bot_clients_started = False
     if start_serve:
+        from src.services.runtime_scheduler import (
+            CLI_SCHEDULER_OWNER_ENV,
+            RUNTIME_SCHEDULER_ARGS_ENV,
+            RUNTIME_SCHEDULER_FORCE_ENABLED_ENV,
+            RUNTIME_SCHEDULER_RUN_IMMEDIATELY_ENV,
+            RUNTIME_SCHEDULER_SUPPRESS_START_ENV,
+        )
+
+        # The API runtime scheduler owns schedules once the Web/API service starts.
+        # This keeps Web settings, status, and run-now actions attached to the real
+        # scheduler instead of a separate CLI loop.
+        os.environ.pop(CLI_SCHEDULER_OWNER_ENV, None)
+        if args.serve_only:
+            os.environ[RUNTIME_SCHEDULER_SUPPRESS_START_ENV] = "true"
+        else:
+            os.environ.pop(RUNTIME_SCHEDULER_SUPPRESS_START_ENV, None)
+        runtime_schedule_requested = not args.serve_only and (
+            args.schedule or config.schedule_enabled
+        )
+        if not args.serve_only and args.schedule:
+            os.environ[RUNTIME_SCHEDULER_FORCE_ENABLED_ENV] = "true"
+        else:
+            os.environ.pop(RUNTIME_SCHEDULER_FORCE_ENABLED_ENV, None)
+        if runtime_schedule_requested:
+            runtime_run_immediately = config.schedule_run_immediately
+            if getattr(args, 'no_run_immediately', False):
+                runtime_run_immediately = False
+            os.environ[RUNTIME_SCHEDULER_RUN_IMMEDIATELY_ENV] = (
+                "true" if runtime_run_immediately else "false"
+            )
+        else:
+            os.environ.pop(RUNTIME_SCHEDULER_RUN_IMMEDIATELY_ENV, None)
+        os.environ[RUNTIME_SCHEDULER_ARGS_ENV] = json.dumps({
+            "no_notify": bool(getattr(args, "no_notify", False)),
+            "no_market_review": bool(getattr(args, "no_market_review", False)),
+            "dry_run": bool(getattr(args, "dry_run", False)),
+            "force_run": bool(getattr(args, "force_run", False)),
+            "single_notify": bool(getattr(args, "single_notify", False)),
+            "no_context_snapshot": bool(getattr(args, "no_context_snapshot", False)),
+            "workers": getattr(args, "workers", None),
+        })
         if not prepare_webui_frontend_assets():
             logger.warning("前端静态资源未就绪，继续启动 FastAPI 服务（Web 页面可能不可用）")
         try:
@@ -1105,6 +1365,9 @@ def main() -> int:
             bot_clients_started = True
         except Exception as e:
             logger.error(f"启动 FastAPI 服务失败: {e}")
+            if args.serve_only:
+                return 1
+            start_serve = False
 
     if bot_clients_started:
         start_bot_stream_clients(config)
@@ -1143,10 +1406,8 @@ def main() -> int:
 
         # 模式1: 仅大盘复盘
         if args.market_review:
-            from src.analyzer import GeminiAnalyzer
             from src.core.market_review import run_market_review
-            from src.notification import NotificationService
-            from src.search_service import SearchService
+            from src.core.market_review_runtime import build_market_review_runtime
 
             # Issue #373: Trading day check for market-review-only mode.
             # Do NOT use _compute_trading_day_filter here: that helper checks
@@ -1164,45 +1425,34 @@ def main() -> int:
                     return 0
 
             logger.info("模式: 仅大盘复盘")
-            notifier = NotificationService()
+            notifier, analyzer, search_service = build_market_review_runtime(config)
 
-            # 初始化搜索服务和分析器（如果有配置）
-            search_service = None
-            analyzer = None
-
-            if config.has_search_capability_enabled():
-                search_service = SearchService(
-                    bocha_keys=config.bocha_api_keys,
-                    tavily_keys=config.tavily_api_keys,
-                    anspire_keys=config.anspire_api_keys,
-                    brave_keys=config.brave_api_keys,
-                    serpapi_keys=config.serpapi_keys,
-                    minimax_keys=config.minimax_api_keys,
-                    searxng_base_urls=config.searxng_base_urls,
-                    searxng_public_instances_enabled=config.searxng_public_instances_enabled,
-                    news_max_age_days=config.news_max_age_days,
-                    news_strategy_profile=getattr(config, "news_strategy_profile", "short"),
-                )
-
-            if config.gemini_api_key or config.openai_api_key:
-                analyzer = GeminiAnalyzer(api_key=config.gemini_api_key)
-                if not analyzer.is_available():
-                    logger.warning("AI 分析器初始化后不可用，请检查 API Key 配置")
-                    analyzer = None
-            else:
-                logger.warning("未检测到 API Key (Gemini/OpenAI)，将仅使用模板生成报告")
-
-            run_market_review(
+            _run_market_review_with_shared_lock(
+                config,
+                run_market_review,
                 notifier=notifier,
                 analyzer=analyzer,
                 search_service=search_service,
                 send_notification=not args.no_notify,
                 override_region=effective_region,
+                trigger_source="cli",
             )
             return 0
 
         # 模式2: 定时任务模式
         if args.schedule or config.schedule_enabled:
+            if start_serve:
+                logger.info("模式: Web/API runtime scheduler")
+                logger.info(f"Web 服务运行中: http://{args.host}:{args.port}")
+                logger.info("Web/API runtime scheduler 已接管定时任务，保存设置会作用于当前进程")
+                logger.info("按 Ctrl+C 退出...")
+                try:
+                    while True:
+                        time.sleep(1)
+                except KeyboardInterrupt:
+                    logger.info("\n用户中断，程序退出")
+                return 0
+
             logger.info("模式: 定时任务")
             logger.info(f"每日执行时间: {config.schedule_time}")
 
@@ -1218,6 +1468,7 @@ def main() -> int:
             from src.scheduler import run_with_schedule
             scheduled_stock_codes = _resolve_scheduled_stock_codes(stock_codes)
             schedule_time_provider = _build_schedule_time_provider(config.schedule_time)
+            schedule_times_provider = _build_schedule_times_provider(config.schedule_time)
 
             def scheduled_task():
                 runtime_config = _reload_runtime_config()
@@ -1230,38 +1481,40 @@ def main() -> int:
 
             background_tasks = []
             if getattr(config, 'agent_event_monitor_enabled', False):
-                from src.agent.events import build_event_monitor_from_config, run_event_monitor_once
+                from src.services.alert_worker import AlertWorker
 
-                monitor = build_event_monitor_from_config(config)
-                if monitor is not None:
-                    interval_minutes = max(1, getattr(config, 'agent_event_monitor_interval_minutes', 5))
+                interval_minutes = max(1, getattr(config, 'agent_event_monitor_interval_minutes', 5))
+                alert_worker = AlertWorker(config_provider=_reload_runtime_config)
 
-                    def event_monitor_task():
-                        triggered = run_event_monitor_once(monitor)
-                        if triggered:
-                            logger.info("[EventMonitor] 本轮触发 %d 条提醒", len(triggered))
+                def event_monitor_task():
+                    stats = alert_worker.run_once()
+                    triggered_count = stats.get("triggered", 0)
+                    if triggered_count:
+                        logger.info("[EventMonitor] 本轮触发 %d 条提醒", triggered_count)
 
-                    background_tasks.append({
-                        "task": event_monitor_task,
-                        "interval_seconds": interval_minutes * 60,
-                        "run_immediately": True,
-                        "name": "agent_event_monitor",
-                    })
-                else:
-                    logger.info("EventMonitor 已启用，但未加载到有效规则，跳过后台提醒任务")
+                background_tasks.append({
+                    "task": event_monitor_task,
+                    "interval_seconds": interval_minutes * 60,
+                    "run_immediately": True,
+                    "name": "agent_event_monitor",
+                })
 
-            run_with_schedule(
-                task=scheduled_task,
-                schedule_time=config.schedule_time,
-                run_immediately=should_run_immediately,
-                background_tasks=background_tasks,
-                schedule_time_provider=schedule_time_provider,
-            )
+            schedule_kwargs = {
+                "task": scheduled_task,
+                "schedule_time": config.schedule_time,
+                "run_immediately": should_run_immediately,
+                "background_tasks": background_tasks,
+                "schedule_time_provider": schedule_time_provider,
+            }
+            if hasattr(config, "schedule_times"):
+                schedule_kwargs["schedule_times"] = config.schedule_times
+                schedule_kwargs["schedule_times_provider"] = schedule_times_provider
+            run_with_schedule(**schedule_kwargs)
             return 0
 
         # 模式3: 正常单次运行
         if config.run_immediately:
-            run_full_analysis(config, args, stock_codes)
+            _run_analysis_with_runtime_scheduler_lock(config, args, stock_codes)
         else:
             logger.info("配置为不立即运行分析 (RUN_IMMEDIATELY=false)")
 
@@ -1289,4 +1542,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     sys.exit(main())

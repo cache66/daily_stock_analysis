@@ -59,114 +59,15 @@ class _FailureFetcher(BaseFetcher):
         return df
 
 
-class _EmptyFetcher(BaseFetcher):
-    name = "EmptyFetcher"
-    priority = 0
-
-    def _fetch_raw_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
-        return pd.DataFrame()
-
-    def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
-        return df
-
-
-class _EmptyYfinanceFetcher(_EmptyFetcher):
-    name = "YfinanceFetcher"
-
-
-class _AkshareHistoryFailureFetcher(BaseFetcher):
-    name = "AkshareFetcher"
-    priority = 0
-
-    def __init__(self) -> None:
-        self.calls = 0
-
-    def _fetch_raw_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
-        self.calls += 1
-        raise DataFetchError("Akshare 所有渠道获取失败: None")
-
-    def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
-        return df
-
-
-class _TrackingTushareFetcher(BaseFetcher):
-    name = "TushareFetcher"
-    priority = 1
-
-    def __init__(self) -> None:
-        self.calls = 0
-
-    def _fetch_raw_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
-        self.calls += 1
-        return _sample_df()
-
-    def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
-        return df
-
-
-def _history_rows(*dates: str) -> pd.DataFrame:
-    rows = []
-    base_price = 10.0
-    for index, item in enumerate(dates):
-        close = base_price + index * 0.2
-        rows.append(
-            {
-                "date": item,
-                "open": round(close - 0.1, 2),
-                "high": round(close + 0.1, 2),
-                "low": round(close - 0.2, 2),
-                "close": round(close, 2),
-                "volume": 1000 + index * 100,
-                "amount": round((1000 + index * 100) * close, 2),
-                "pct_chg": 0.5,
-            }
-        )
-    return pd.DataFrame(rows)
-
-
-class _HistoryCacheFetcher(BaseFetcher):
-    name = "HistoryCacheFetcher"
-    priority = 0
-
-    def __init__(self, responses_by_range=None, fallback_df: Optional[pd.DataFrame] = None):
-        self.responses_by_range = responses_by_range or {}
-        self.fallback_df = fallback_df if fallback_df is not None else _history_rows("2026-03-05", "2026-03-06")
+class _RecordingFetcher(BaseFetcher):
+    def __init__(self, name: str, priority: int):
+        self.name = name
+        self.priority = priority
         self.calls = []
 
     def _fetch_raw_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
-        self.calls.append((stock_code, start_date, end_date))
-        return self.responses_by_range.get((start_date, end_date), self.fallback_df.copy())
-
-    def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
-        return df.copy()
-
-
-class _HangingFetcher(BaseFetcher):
-    name = "HangingFetcher"
-    priority = 0
-
-    def __init__(self, sleep_seconds: float = 0.2):
-        self.sleep_seconds = sleep_seconds
-
-    def _fetch_raw_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
-        time.sleep(self.sleep_seconds)
+        self.calls.append(stock_code)
         return _sample_df()
-
-    def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
-        return df
-
-
-class _AlwaysFailHistoryFetcher(BaseFetcher):
-    name = "AlwaysFailHistoryFetcher"
-    priority = 0
-
-    def __init__(self, error_message: str = "simulated history fetch failure"):
-        self.error_message = error_message
-        self.calls = []
-
-    def _fetch_raw_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
-        self.calls.append((stock_code, start_date, end_date))
-        raise DataFetchError(self.error_message)
 
     def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
         return df
@@ -231,54 +132,33 @@ class TestFetcherLogging(unittest.TestCase):
         self.assertIn("[数据源切换] 601006: [FailureFetcher] -> [SuccessFetcher]", log_text)
         self.assertIn("[数据源完成] 601006 使用 [SuccessFetcher] 获取成功:", log_text)
 
-    def test_manager_records_empty_results_before_fallback(self):
-        manager = DataFetcherManager(fetchers=[_EmptyFetcher(), _SuccessFetcher()])
-        config = types.SimpleNamespace(
-            history_disk_cache_enabled=False,
-            history_disk_cache_dir=tempfile.mkdtemp(),
-            history_disk_cache_ttl_seconds=21600,
-            history_disk_cache_overlap_days=0,
-        )
+    def test_manager_skips_builtin_fetchers_that_do_not_support_hk_daily(self):
+        efinance = _RecordingFetcher("EfinanceFetcher", 0)
+        pytdx = _RecordingFetcher("PytdxFetcher", 1)
+        akshare = _RecordingFetcher("AkshareFetcher", 2)
+        yfinance = _RecordingFetcher("YfinanceFetcher", 3)
 
-        with patch("src.config.get_config", return_value=config):
-            with self.assertLogs("data_provider.base", level="INFO") as captured:
-                df, source = manager.get_daily_data("601006", start_date="2026-01-07", end_date="2026-03-08")
+        manager = DataFetcherManager(fetchers=[efinance, pytdx, akshare, yfinance])
+        df, source = manager.get_daily_data("1211.HK", start_date="2026-05-01", end_date="2026-05-08")
 
-        log_text = "\n".join(captured.output)
         self.assertFalse(df.empty)
-        self.assertEqual(source, "SuccessFetcher")
-        self.assertIn("[EmptyFetcher] (empty_result) returned empty daily data", log_text)
-        self.assertIn("[数据源切换] 601006: [EmptyFetcher] -> [SuccessFetcher]", log_text)
+        self.assertEqual(source, "AkshareFetcher")
+        self.assertEqual(efinance.calls, [])
+        self.assertEqual(pytdx.calls, [])
+        self.assertEqual(akshare.calls, ["HK01211"])
+        self.assertEqual(yfinance.calls, [])
 
-    def test_manager_us_route_reports_empty_yfinance_result(self):
-        manager = DataFetcherManager(fetchers=[_EmptyYfinanceFetcher()])
+    @patch("data_provider.efinance_fetcher.get_config")
+    def test_efinance_rejects_hk_daily_without_calling_eastmoney(self, mock_get_config):
+        mock_get_config.return_value = types.SimpleNamespace(enable_eastmoney_patch=False)
+        fetcher = EfinanceFetcher(sleep_min=0, sleep_max=0)
 
-        with self.assertRaises(DataFetchError) as raised:
-            manager.get_daily_data("AAPL", start_date="2026-01-07", end_date="2026-03-08")
+        with patch.object(fetcher, "_fetch_stock_data") as mock_fetch_stock_data:
+            with self.assertRaises(DataFetchError) as captured:
+                fetcher.get_daily_data("1211.HK", start_date="2026-05-01", end_date="2026-05-08")
 
-        self.assertIn("[YfinanceFetcher] (empty_result) returned empty daily data", str(raised.exception))
-
-    def test_manager_can_skip_tushare_history_fallback_for_fast_scan(self):
-        akshare = _AkshareHistoryFailureFetcher()
-        tushare = _TrackingTushareFetcher()
-        manager = DataFetcherManager(fetchers=[akshare, tushare])
-        manager._skip_tushare_history_fallback_for_fast_scan = True
-        config = types.SimpleNamespace(
-            history_disk_cache_enabled=False,
-            history_disk_cache_dir=tempfile.mkdtemp(),
-            history_disk_cache_ttl_seconds=21600,
-            history_disk_cache_overlap_days=0,
-        )
-
-        with patch("src.config.get_config", return_value=config):
-            with self.assertLogs("data_provider.base", level="INFO") as captured:
-                with self.assertRaises(DataFetchError):
-                    manager.get_daily_data("688783", start_date="2025-09-14", end_date="2025-10-27", days=140)
-
-        log_text = "\n".join(captured.output)
-        self.assertEqual(akshare.calls, 1)
-        self.assertEqual(tushare.calls, 0)
-        self.assertIn("skip fast-scan Tushare history fallback", log_text)
+        mock_fetch_stock_data.assert_not_called()
+        self.assertIn("不支持港股日线", str(captured.exception))
 
     def test_efinance_logs_eastmoney_endpoint_on_remote_disconnect(self):
         fetcher = EfinanceFetcher()

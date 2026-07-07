@@ -9,18 +9,15 @@
 [![GitHub Actions](https://img.shields.io/badge/GitHub%20Actions-Ready-2088FF?logo=github-actions&logoColor=white)](https://github.com/features/actions)
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white)](https://hub.docker.com/)
 
-<p>
-  <a href="https://trendshift.io/repositories/18527" target="_blank"><img src="https://trendshift.io/api/badge/repositories/18527" alt="ZhuLinsen%2Fdaily_stock_analysis | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
-  <a href="https://hellogithub.com/repository/ZhuLinsen/daily_stock_analysis" target="_blank"><img src="https://api.hellogithub.com/v1/widgets/recommend.svg?rid=6daa16e405ce46ed97b4a57706aeb29f&claim_uid=pfiJMqhR9uvDGlT&theme=neutral" alt="Featured｜HelloGitHub" style="width: 250px; height: 54px;" width="250" height="54" /></a>
+<p align="center">
+  <img src="https://trendshift.io/api/badge/trendshift/repositories/18527/daily?language=Python" alt="#1 Python Repository Of The Day | Trendshift" width="250" height="55"/>&nbsp;<a href="https://hellogithub.com/repository/ZhuLinsen/daily_stock_analysis" target="_blank"><img src="https://api.hellogithub.com/v1/widgets/recommend.svg?rid=6daa16e405ce46ed97b4a57706aeb29f&claim_uid=pfiJMqhR9uvDGlT&theme=neutral" alt="Featured｜HelloGitHub" width="230" /></a>
 </p>
 
-**AI-powered stock analysis system for A-shares / Hong Kong / US stocks**
+**AI-powered stock analysis system for A-shares / Hong Kong / US / Japanese / Korean / Taiwan stocks**
 
 Analyze your watchlist daily → generate a decision dashboard → push to multiple channels (Telegram/Discord/Slack/Email/WeChat Work/Feishu)
 
-**Zero-cost deployment** · Runs on GitHub Actions · No server required
-
-[**Quick Start**](#-quick-start) · [**Key Features**](#-key-features) · [**Sample Output**](#-sample-output) · [**Full Guide**](./full-guide_EN.md) · [**FAQ**](./FAQ_EN.md) · [**Contributing**](./CONTRIBUTING_EN.md) · [**All Docs**](./INDEX_EN.md)
+[**Product Preview**](#-product-preview) · [**Key Features**](#-key-features) · [**Quick Start**](#-quick-start) · [**Sample Output**](#-sample-output) · [**Documentation Index**](./INDEX_EN.md) · [**Full Guide**](./full-guide_EN.md)
 
 English | [简体中文](../README.md) | [繁體中文](README_CHT.md)
 
@@ -29,36 +26,39 @@ English | [简体中文](../README.md) | [繁體中文](README_CHT.md)
 ## 💖 Sponsors
 
 <div align="center">
-  <a href="https://serpapi.com/baidu-search-api?utm_source=github_daily_stock_analysis" target="_blank">
-    <img src="../sources/serpapi_banner_en.png" alt="Easily scrape real-time financial news data from search engines - SerpApi" height="160">
-  </a>
+  <p align="center">
+    <a href="https://open.anspire.cn/?share_code=QFBC0FYC" target="_blank"><img src="assets/anspire.png" alt="Anspire Open all-in-one model and search service" width="300" height="141" style="width: 300px; height: 141px; object-fit: contain;"></a>
+    <a href="https://serpapi.com/baidu-search-api?utm_source=github_daily_stock_analysis" target="_blank"><img src="assets/serpapi_banner_en.png" alt="Easily scrape real-time financial news data from search engines - SerpApi" width="300" height="141" style="width: 300px; height: 141px; object-fit: contain;"></a>
+  </p>
 </div>
-<br>
+
+## 🖥️ Product Preview
+
+<p align="center">
+  <img src="assets/readme_workspace_tour_20260510.gif" alt="DSA Web workspace demo" width="720">
+</p>
 
 ## ✨ Key Features
 
-| Module | Feature | Description |
-|--------|---------|-------------|
-| AI | Decision Dashboard | One-sentence conclusion + precise entry/exit levels + action checklist |
-| Analysis | Multi-dimensional Analysis | Technicals + chip distribution + sentiment + real-time quotes |
-| Market | Global Markets | A-shares, Hong Kong stocks, US stocks |
-| Search | Smart Autocomplete (MVP) | **[Beta]** Home search supports code/name/pinyin/aliases; the local index now covers A-shares, Hong Kong, and US stocks and can be refreshed from Tushare or AkShare data |
-| Review | Market Review | Daily overview, sectors, northbound capital flow |
-| Intel | Announcement + Capital Flow Intelligence | IntelAgent now also pulls listed-company announcements (SSE/SZSE/CNINFO) and A-share main-force capital flow, and exposes `capital_flow_signal` (`inflow/outflow/neutral/not_available`) for flow direction context |
-| Backtest | AI Backtest Validation | Auto-evaluate historical analysis accuracy, with a 1-day next-session validation view for AI prediction vs actual move and accuracy |
-| Agent Q&A | Strategy Chat | Multi-turn strategy chat with 15 built-in trading strategies, including commodity price pass-through (internally loaded as skills) (Web/Bot/API) |
-| Notifications | Multi-channel Push | Telegram, Discord, Slack, Email, WeChat Work, Feishu, etc. |
-| Automation | Scheduled Runs | GitHub Actions scheduled execution, no server required |
+| Capability | Coverage |
+|------------|----------|
+| AI decision reports | Core conclusion, score, trend, entry/exit levels, risk alerts, catalysts, and action checklist |
+| Multi-market data | Covers A-shares, Hong Kong, US, Japanese, Korean, Taiwan stocks, and ETFs, with quotes, K-lines, technical indicators, news, announcements, fundamentals, and report context. Data-source coverage and market boundaries are documented in [market boundaries](market-support.md) |
+| Web / desktop workspace | Manual analysis, task progress, history, full Markdown reports, backtest, portfolio, settings, and light/dark themes |
+| Agent strategy chat | Multi-turn Q&A with 15 built-in strategies across Web/Bot/API |
+| Smart import & autocomplete | Image, CSV/Excel, clipboard import; code/name/pinyin/alias autocomplete |
+| Automation & notifications | GitHub Actions, Docker, local scheduler, FastAPI service, and WeChat Work / Feishu / Telegram / Discord / Slack / Email delivery |
 
 > The Backtest page now includes a 1-day next-session validation view. You can filter by stock code and analysis date range to compare the original AI prediction with the next trading day close and inspect the filtered accuracy rate. This is based on historical analysis plus `eval_window_days=1` backtest data, not real trade execution logs.
 
 ### Tech Stack & Data Sources
 
 | Type | Supported |
-|------|----------|
-| LLMs | Gemini (free), OpenAI-compatible, DeepSeek, Qwen, Claude, Ollama |
-| Market Data | AkShare, Tushare, Pytdx, Baostock, YFinance, [Longbridge](https://open.longbridge.com/) (primary for US/HK when configured) |
-| News Search | Tavily, Anspire、SerpAPI, Bocha, Brave, MiniMax |
+|------|-----------|
+| AI Models | [Anspire](https://open.anspire.cn/?share_code=QFBC0FYC), [AIHubMix](https://aihubmix.com/?aff=CfMq), Gemini, OpenAI-compatible providers, DeepSeek, Qwen, Claude, Ollama |
+| Market Data | [TickFlow](https://tickflow.org/auth/register?ref=WDSGSPS5XC), AkShare, Tushare, Pytdx, Baostock, YFinance, Longbridge |
+| News Search | [Anspire](https://open.anspire.cn/?share_code=QFBC0FYC), [SerpAPI](https://serpapi.com/baidu-search-api?utm_source=github_daily_stock_analysis), [Tavily](https://tavily.com/), [Bocha](https://open.bocha.cn/), [Brave](https://brave.com/search/api/), [MiniMax](https://platform.minimaxi.com/), SearXNG |
+| Social Sentiment | [Stock Sentiment API](https://api.adanos.org/docs) for Reddit / X / Polymarket, US stocks only |
 
 > **Longbridge-first (US/HK only):** With `LONGBRIDGE_APP_KEY` / `LONGBRIDGE_APP_SECRET` / `LONGBRIDGE_ACCESS_TOKEN` set, **daily bars and realtime quotes** for US & HK stocks are fetched from **Longbridge first**; **YFinance / AkShare** are used for **fallback** or **field merge** when Longbridge fails or returns incomplete fields. **If Longbridge is not configured, it is not called** — US/HK still use YFinance / AkShare as before. **US market indices** (e.g. SPX) always prefer **YFinance** (indices are not supported on Longbridge). **A-share** routing is unchanged. See `.env.example` and the [full guide](./full-guide_EN.md).
 
@@ -87,15 +87,16 @@ Go to your forked repo → `Settings` → `Secrets and variables` → `Actions` 
 
 **AI Model Configuration (Choose one)**
 
-> For detailed configuration, see [LLM Config Guide](LLM_CONFIG_GUIDE_EN.md). The default path is: pick a provider, add the API key, then optionally pin a primary model. Use channels only when you need multi-provider routing or fallbacks; advanced YAML routing is optional for expert setups.
+Start with one provider and one API key. For multi-model routing, image recognition, local models, or advanced routing, see the [LLM Config Guide](./LLM_CONFIG_GUIDE_EN.md).
 
 | Secret Name | Description | Required |
-|------------|------|:----:|
-| `GEMINI_API_KEY` | Get free API key from [Google AI Studio](https://aistudio.google.com/) | ✅* |
-| `OPENAI_API_KEY` | OpenAI-compatible API Key (supports DeepSeek, Qwen, etc.) | Optional |
-| `OPENAI_BASE_URL` | OpenAI-compatible API endpoint (e.g., `https://api.deepseek.com/v1`) | Optional |
-| `OPENAI_MODEL` | Model name (e.g., `deepseek-chat`) | Optional |
-| `OLLAMA_API_BASE` | Ollama local service address (e.g. `http://localhost:11434`), for local/Docker deployment; **do not** use `OPENAI_BASE_URL` for Ollama, see [LLM Config Guide - Ollama](LLM_CONFIG_GUIDE_EN.md#example-4-using-ollama-local-models) | Optional |
+|-------------|-------------|:--------:|
+| `ANSPIRE_API_KEYS` | [Anspire](https://open.anspire.cn/?share_code=QFBC0FYC) API key, one key for popular LLMs and web search with free quota for this project | **Recommended** |
+| `AIHUBMIX_KEY` | [AIHubMix](https://aihubmix.com/?aff=CfMq) API key, one key for multiple model families and a 10% top-up discount for this project | **Recommended** |
+| `GEMINI_API_KEY` | Google Gemini API key | Optional |
+| `ANTHROPIC_API_KEY` | Anthropic Claude API key | Optional |
+| `OPENAI_API_KEY` | OpenAI-compatible API key, including DeepSeek and Qwen-compatible services | Optional |
+| `OPENAI_BASE_URL` / `OPENAI_MODEL` | Fill these when using an OpenAI-compatible provider | Optional |
 
 > *Note: Configure at least one of `GEMINI_API_KEY`, `OPENAI_API_KEY`, or `OLLAMA_API_BASE` (local). **Ollama** requires `OLLAMA_API_BASE`; using `OPENAI_BASE_URL` causes 404.
 
@@ -103,30 +104,8 @@ Go to your forked repo → `Settings` → `Secrets and variables` → `Actions` 
 <summary><b>Notification channels</b> (expand, choose at least one)</summary>
 
 | Secret Name | Description | Required |
-|------------|------|:----:|
-| `TELEGRAM_BOT_TOKEN` | Telegram Bot Token (Get from @BotFather) | Optional |
-| `TELEGRAM_CHAT_ID` | Telegram Chat ID | Optional |
-| `TELEGRAM_MESSAGE_THREAD_ID` | Telegram Topic ID (For sending to topics) | Optional |
-| `DISCORD_WEBHOOK_URL` | Discord Webhook URL | Optional |
-| `DISCORD_BOT_TOKEN` | Discord Bot Token (choose one with Webhook) | Optional |
-| `DISCORD_MAIN_CHANNEL_ID` | Discord Channel ID (required when using Bot) | Optional |
-| `DISCORD_INTERACTIONS_PUBLIC_KEY` | Discord Public Key (required only for inbound Interaction/Webhook signature verification) | Optional |
-| `SLACK_BOT_TOKEN` | Slack Bot Token (recommended, supports image upload; takes priority over Webhook when both set) | Optional |
-| `SLACK_CHANNEL_ID` | Slack Channel ID (required when using Bot) | Optional |
-| `SLACK_WEBHOOK_URL` | Slack Incoming Webhook URL (text only, no image support) | Optional |
-| `EMAIL_SENDER` | Sender email (e.g., `xxx@qq.com`) | Optional |
-| `EMAIL_PASSWORD` | Email authorization code (not login password) | Optional |
-| `EMAIL_RECEIVERS` | Receiver emails (comma-separated, leave empty to send to yourself) | Optional |
-| `WECHAT_WEBHOOK_URL` | WeChat Work Webhook URL | Optional |
-| `FEISHU_WEBHOOK_URL` | Feishu Webhook URL | Optional |
-| `PUSHPLUS_TOKEN` | PushPlus Token ([Get it here](https://www.pushplus.plus), Chinese push service) | Optional |
-| `SERVERCHAN3_SENDKEY` | ServerChan v3 SendKey (([Get it here](https://sc3.ft07.com/), Mobile app push notification service) ) | Optional |
-| `CUSTOM_WEBHOOK_URLS` | Custom Webhook URLs (supports DingTalk, etc., comma-separated) | Optional |
-| `CUSTOM_WEBHOOK_BEARER_TOKEN` | Bearer token for custom webhooks (if required) | Optional |
-| `SINGLE_STOCK_NOTIFY` | Send notification immediately after each stock | Optional |
-| `REPORT_TYPE` | `simple`, `full`, or `brief` (Docker recommended: `full`) | Optional |
-| `REPORT_LANGUAGE` | Report output language: `zh` (default Chinese) / `en` (English); affects prompt instructions, Markdown templates, notification fallbacks, and fixed labels in the Web report view. The bundled `daily_analysis.yml` already maps this variable, so setting it in Actions Secrets/Variables works out of the box | Optional |
-| `ANALYSIS_DELAY` | Delay between stocks and market review (seconds) | Optional |
+|-------------|-------------|:--------:|
+| `STOCK_LIST` | Watchlist codes, such as `600519,hk00700,AAPL,7203.T,005930.KS,2330.TW` | ✅ |
 
 > Note: Configure at least one channel; multiple channels will all receive notifications.
 
@@ -135,35 +114,14 @@ Go to your forked repo → `Settings` → `Secrets and variables` → `Actions` 
 **Stock List Configuration**
 
 | Secret Name | Description | Required |
-|------------|------|:----:|
-| `STOCK_LIST` | Watchlist codes, e.g., `600519,AAPL,hk00700` | ✅ |
-| `TAVILY_API_KEYS` | [Tavily](https://tavily.com/) Search API (for news) | Recommended |
-| `ANSPIRE_API_KEYS` | [Anspire AI Search](https://aisearch.anspire.cn/) Specially optimized for Chinese content (effectively enhances A-share analysis) | Optional |
-| `MINIMAX_API_KEYS` | [MiniMax](https://platform.minimaxi.com/) Coding Plan Web Search (structured search results) | Optional |
-| `BRAVE_API_KEYS` | [Brave Search](https://brave.com/search/api/) API (privacy-focused, US stocks optimized) | Optional |
-| `SERPAPI_API_KEYS` | [SerpAPI](https://serpapi.com/baidu-search-api?utm_source=github_daily_stock_analysis) Backup search | Optional |
-| `BOCHA_API_KEYS` | [Bocha Search](https://open.bocha.cn/) Web Search API (Chinese search optimized, supports AI summaries, multiple keys comma-separated) | Optional |
-| `SEARXNG_BASE_URLS` | SearXNG self-hosted instances (quota-free fallback, enable format: json in settings.yml); when empty the app auto-discovers public instances | Optional |
-| `SEARXNG_PUBLIC_INSTANCES_ENABLED` | Auto-discover public SearXNG instances from `searx.space` when `SEARXNG_BASE_URLS` is empty (default `true`) | Optional |
-| `TUSHARE_TOKEN` | [Tushare Pro](https://tushare.pro/weborder/#/login?reg=834638 ) Token | Optional |
-| `TICKFLOW_API_KEY` | [TickFlow](https://tickflow.org) API key (CN market review index enhancement; breadth also uses TickFlow when the plan supports universe queries) | Optional |
-| `LONGBRIDGE_APP_KEY` | [Longbridge OpenAPI](https://open.longbridge.com/) App Key (becomes primary US/HK data source when configured) | Optional |
-| `LONGBRIDGE_APP_SECRET` | Longbridge App Secret | Optional |
-| `LONGBRIDGE_ACCESS_TOKEN` | Longbridge Access Token | Optional |
-| `LONGBRIDGE_STATIC_INFO_TTL_SECONDS` | In-process `static_info` cache TTL in seconds (default `86400`; `0` = no cache) | Optional |
-| `LONGBRIDGE_HTTP_URL` | HTTP API base URL (default `https://openapi.longbridge.com`) | Optional |
-| `LONGBRIDGE_QUOTE_WS_URL` | Quote WebSocket URL (default `wss://openapi-quote.longbridge.com/v2`) | Optional |
-| `LONGBRIDGE_TRADE_WS_URL` | Trade WebSocket URL (default `wss://openapi-trade.longbridge.com/v2`) | Optional |
-| `LONGBRIDGE_REGION` | Override region endpoint; the SDK auto-selects by network (default `hk`); set if wrong (e.g. `cn`, `hk`) | Optional |
-| `LONGBRIDGE_ENABLE_OVERNIGHT` | Overnight session quotes: `true` / `false` (default `false`) | Optional |
-| `LONGBRIDGE_PUSH_CANDLESTICK_MODE` | Candlestick push mode: `realtime` or `confirmed` (default `realtime`) | Optional |
-| `LONGBRIDGE_PRINT_QUOTE_PACKAGES` | Whether to print quote packages on connect (default `false` when unset; set `1`/`true`/`yes` to enable) | Optional |
-| `WECHAT_MSG_TYPE` | WeChat Work message type, default `markdown`, set to `text` for plain markdown text | Optional |
-| `AGENT_MODE` | Enable Agent strategy chat mode (internally normalized as `skill`, `true`/`false`, default `false`) | Optional |
-| `AGENT_LITELLM_MODEL` | Optional Agent-only primary model; when empty it inherits the primary model, and bare names are normalized to `openai/<model>` | Optional |
-| `AGENT_MAX_STEPS` | Max reasoning-step ceiling for Agent mode (default `10`); in orchestrator mode each sub-agent uses `min(its default, AGENT_MAX_STEPS)` instead of a hard override | Optional |
-| `AGENT_SKILLS` | Comma-separated active strategy-skill ids. Leave empty to use the primary default strategy skill declared in metadata (built-in default: `bull_trend`); use `all` to activate every loaded strategy skill. | Optional |
-| `AGENT_SKILL_DIR` | Custom strategy-skill directory (default built-in `strategies/` compatibility path) | Optional |
+|-------------|-------------|:--------:|
+| `ANSPIRE_API_KEYS` | [Anspire AI Search](https://aisearch.anspire.cn/), optimized for Chinese content and A-share analysis; the same key can also be used for Anspire LLM fallback examples | **Recommended** |
+| `SERPAPI_API_KEYS` | [SerpAPI](https://serpapi.com/baidu-search-api?utm_source=github_daily_stock_analysis), search-engine results for realtime financial news | **Recommended** |
+| `TAVILY_API_KEYS` | [Tavily](https://tavily.com/), general news search API | Optional |
+| `BOCHA_API_KEYS` | [Bocha](https://open.bocha.cn/), Chinese search with AI summaries | Optional |
+| `BRAVE_API_KEYS` | [Brave Search](https://brave.com/search/api/), privacy-first search and US-stock news enrichment | Optional |
+| `MINIMAX_API_KEYS` | [MiniMax](https://platform.minimaxi.com/), structured search results | Optional |
+| `SEARXNG_BASE_URLS` | Self-hosted SearXNG instances for quota-free fallback | Optional |
 
 **Stock Code Format**
 
@@ -173,6 +131,18 @@ Go to your forked repo → `Settings` → `Secrets and variables` → `Actions` 
 | BSE (Beijing) | 8/4/92 prefix, 6-digit | `920748`, `838163`, `430047` |
 | HK Stocks | hk + 5-digit number | `hk00700`, `hk09988` |
 | US Stocks | 1-5 uppercase letters | `AAPL`, `TSLA`, `GOOGL` |
+
+**Market data sources (optional)**
+
+> Free sources like AkShare, Baostock, and YFinance are used by default. "Not configured" messages in the logs are informational and do not affect execution.
+> For more stable data, configure the following secrets per market:
+
+| Secret Name | Market | Description |
+|-------------|:------:|-------------|
+| `TUSHARE_TOKEN` | A-shares | Improves historical data stability |
+| `LONGBRIDGE_OAUTH_CLIENT_ID` + `LONGBRIDGE_OAUTH_TOKEN_CACHE_B64` | HK/US stocks | Fills in volume ratio, turnover rate, P/E, and other fields |
+
+> See [Data Source Configuration](./full-guide_EN.md#data-source-configuration).
 
 #### 3. Enable Actions
 
@@ -246,7 +216,13 @@ TAVILY_API_KEYS=your_tavily_key
 # One-time analysis
 python main.py
 
-# Scheduled mode (runs daily at 18:00)
+Common commands:
+
+```bash
+python main.py --debug
+python main.py --dry-run
+python main.py --stocks 600519,hk00700,AAPL,2330.TW
+python main.py --market-review
 python main.py --schedule
 
 # Analyze specific stocks
@@ -307,7 +283,7 @@ Webhook (text only):
 SLACK_WEBHOOK_URL=https://hooks.slack.com/services/T.../B.../xxx
 ```
 
-### 4. Email
+The Web workspace supports settings, task monitoring, manual analysis, history reports, full Markdown reports, Agent strategy chat, backtest, portfolio management, smart import, and light/dark themes.
 
 ```bash
 EMAIL_SENDER=your_email@gmail.com
@@ -327,226 +303,53 @@ Feishu:
 FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/xxx
 ```
 
-### 6. PushPlus
+- Built-in strategies include moving-average crossovers, Chan theory, Elliott wave, bull trend, hot themes, event-driven, growth quality, expectation repricing, and more
+- Calls realtime quotes, K-line data, technical indicators, news, and risk context
+- Supports follow-up questions, session export, notification sending, and background execution
+- Supports custom strategy files and experimental multi-agent orchestration
 
 ```bash
 PUSHPLUS_TOKEN=your_token_here
 ```
 
----
+## 🧩 Related Projects
 
-## 🎨 Sample Output
+> DSA focuses on daily analysis reports. These sibling projects cover stock screening, strategy validation, and strategy evolution for users who want to extend the workflow. They are maintained independently today, with candidate import, backtest validation, and report handoff planned as future integration directions.
 
-### Decision Dashboard Format
+| Project | Focus |
+|---------|-------|
+| [AlphaSift](https://github.com/ZhuLinsen/alphasift) | Multi-factor stock screening and full-market scanning for building candidate watchlists |
+| [AlphaEvo](https://github.com/ZhuLinsen/alphaevo) | Strategy backtesting and self-evolution experiments for validating rules and iteratively exploring strategy parameters and combinations |
 
-```markdown
-# 🎯 2026-01-24 Decision Dashboard
+## 📞 Contact
 
-> Total **3** stocks analyzed | 🟢Buy:1 🟡Hold:1 🔴Sell:1
-
-## 📊 Analysis Summary
-
-🟢 **AAPL(Apple Inc.)**: Buy | Score 85 | Strong Bullish
-🟡 **600519(Kweichow Moutai)**: Hold | Score 65 | Bullish
-🔴 **TSLA(Tesla)**: Sell | Score 35 | Bearish
-
----
-
-## 🟢 AAPL (Apple Inc.)
-
-### 📰 Key Information
-**💭 Sentiment**: Positive news on iPhone 16 sales
-**📊 Earnings**: Q1 2024 earnings beat expectations
-
-### 📌 Core Conclusion
-
-**🟢 Buy** | Strong Bullish
-
-> **One-sentence Decision**: Strong technical setup with positive catalyst, ideal entry point
-
-⏰ **Time Sensitivity**: Within this week
-
-| Position | Action |
-|----------|--------|
-| 🆕 **No Position** | Buy at pullback |
-| 💼 **With Position** | Continue holding |
-
-### 📊 Data Perspective
-
-**MA Alignment**: MA5>MA10>MA20 | Bull Trend: ✅ Yes | Trend Strength: 85/100
-
-| Price Metrics | Value |
-|--------------|-------|
-| Current | $185.50 |
-| MA5 | $183.20 |
-| MA10 | $180.50 |
-| MA20 | $177.80 |
-| Bias (MA5) | +1.26% ✅ Safe |
-| Support | $183.20 |
-| Resistance | $190.00 |
-
-**Volume**: Ratio 1.8 (Moderate increase) | Turnover 2.3%
-💡 *Volume confirms bullish momentum*
-
-### 🎯 Action Plan
-
-**📍 Sniper Points**
-
-| Level Type | Price |
-|-----------|-------|
-| 🎯 Ideal Entry | $183-184 |
-| 🔵 Secondary Entry | $180-181 |
-| 🛑 Stop Loss | $177 |
-| 🎊 Target | $195 |
-
-**💰 Position Sizing**: 20-30% of portfolio
-- Entry Plan: Enter in 2-3 batches
-- Risk Control: Strict stop loss at $177
-
-**✅ Checklist**
-
-- ✅ Bull trend confirmed
-- ✅ Price near MA5 support
-- ✅ Volume confirms trend
-- ⚠️ Monitor market volatility
-
----
-```
-
----
-
-## 🔧 Advanced Configuration
-
-### Environment Variables
-
-```bash
-# === Analysis Behavior ===
-ANALYSIS_DELAY=10              # Delay between analysis (seconds) to avoid API rate limit
-REPORT_TYPE=full               # Report type: simple/full
-SINGLE_STOCK_NOTIFY=true       # Push immediately after each stock analysis
-
-# === Schedule ===
-SCHEDULE_ENABLED=true          # Enable scheduled task
-SCHEDULE_TIME=18:00            # Daily run time (HH:MM, 24-hour format)
-MARKET_REVIEW_ENABLED=true     # Enable market review
-
-# === Data Source ===
-TUSHARE_TOKEN=your_token       # Tushare Pro (priority data source if configured)
-
-# === System ===
-MAX_WORKERS=3                  # Concurrent threads (3 recommended to avoid blocking)
-DEBUG=false                    # Enable debug logging
-```
-
----
-
-## 🧩 FastAPI Web Service (Optional)
-
-Enable the FastAPI service for configuration management and triggering analysis when running locally.
-
-### Startup Methods
-
-| Command | Description |
-|---------|-------------|
-| `python main.py --serve` | Start API service + run full analysis once |
-| `python main.py --serve-only` | Start API service only, manually trigger analysis |
-
-- URL: `http://127.0.0.1:8000`
-- API docs: `http://127.0.0.1:8000/docs`
-
-### Features
-
-- 📝 **Configuration Management** - View/modify watchlist
-- 🚀 **Quick Analysis** - Trigger analysis via API
-- 📊 **Real-time Progress** - Analysis task status updates in real-time, supports parallel tasks
-- 🤖 **Agent Strategy Chat** - Use `/ask`, `/chat`, `/history`, `/strategies`, and `/research` for multi-turn Q&A, history, strategy listing, and deep research (enable with `AGENT_MODE=true`)
-- 🧩 **Intel compatibility** - `capital_flow_signal` is an additive Intel output field; clients that do not consume it can ignore it safely, while existing fields such as `risk_alerts` and `positive_catalysts` remain unchanged.
-- 📈 **Backtest Validation** - Evaluate historical analysis accuracy, query direction win rate and simulated returns
-
-### API Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/v1/analysis/analyze` | POST | Trigger stock analysis |
-| `/api/v1/analysis/tasks` | GET | Query task list |
-| `/api/v1/analysis/status/{task_id}` | GET | Query task status |
-| `/api/v1/history` | GET | Query analysis history |
-| `/api/v1/backtest/run` | POST | Trigger backtest |
-| `/api/v1/backtest/results` | GET | Query backtest results (paginated) |
-| `/api/v1/backtest/performance` | GET | Get overall backtest performance |
-| `/api/v1/backtest/performance/{code}` | GET | Get per-stock backtest performance |
-| `/api/v1/agent/skills` | GET | Get available built-in/custom strategy skills |
-| `/api/v1/agent/chat/stream` | POST (SSE) | Stream multi-turn Agent strategy chat |
-| `/api/health` | GET | Health check |
-
-> Note: `POST /api/v1/analysis/analyze` supports only one stock when `async_mode=false`; batch `stock_codes` requires `async_mode=true`. The async `202` response returns a single `task_id` for one stock, or an `accepted` / `duplicates` summary for batch requests.
-
-> For detailed instructions, see [Full Guide - API Service](./full-guide_EN.md#fastapi-api-service)
-
----
-
-## 🔎 Smart Search Autocomplete (MVP)
-
-The home analysis input now behaves more like a search box, reducing the need to memorize exact symbols.
-
-- **Multi-signal matching**: supports stock code, company name, pinyin abbreviation, and aliases (for example `gzmt` -> 贵州茅台, `tencent` -> 腾讯控股, `aapl` -> Apple Inc.).
-- **Multi-market coverage**: the local index now covers **A-shares, Hong Kong stocks, and US stocks**. It can be regenerated from either Tushare or AkShare source data when needed.
-- **Graceful fallback**:
-  - If the index is outdated, missing a newly listed symbol, or fails to load, the UI falls back to plain manual input without blocking analysis.
-  - If no suggestion matches, pressing Enter still submits the original input directly.
-
-> Tip: to refresh the index, run `python3 scripts/fetch_tushare_stock_list.py` to update the stock-list CSV files, then run `python3 scripts/generate_index_from_csv.py` to rebuild the static index.
-
----
-
-## 📖 Documentation
-
-- [Complete Configuration Guide](./full-guide_EN.md)
-- [FAQ](./FAQ_EN.md)
-- [Deployment Guide](DEPLOY_EN.md)
-- [Bot Command Reference](bot-command.md)
-- [Feishu Bot Setup](bot/feishu-bot-config.md)
-- [DingTalk Bot Setup](bot/dingding-bot-config.md)
-
----
-
-## ☕ Support the Project
-
-| Alipay | WeChat Pay | Xiaohongshu |
-| :---: | :---: | :---: |
-| <img src="../sources/alipay.jpg" width="200" alt="Alipay"> | <img src="../sources/wechatpay.jpg" width="200" alt="WeChat Pay"> | <img src="../sources/xiaohongshu.png" width="200" alt="Xiaohongshu"> |
-
-## 🤝 Contributing
-
-Contributions are welcome! Please:
-
-1. Fork this repository
-2. Create your feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
-
----
+<table>
+  <tr>
+    <td width="92" valign="top"><strong>Email</strong></td>
+    <td valign="top">
+      <a href="mailto:zhuls345@gmail.com">zhuls345@gmail.com</a><br>
+      Project consulting, deployment support, and feature extensions
+    </td>
+    <td align="center" rowspan="3" valign="middle" width="148">
+      <a href="http://xhslink.com/m/tU520DWCKT" target="_blank"><img src="assets/xiaohongshu_tick.jpg" width="112" alt="Xiaohongshu QR code"></a><br>
+      <sub>Follow on Xiaohongshu</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="92" valign="top"><strong>Xiaohongshu</strong></td>
+    <td valign="top"><a href="http://xhslink.com/m/tU520DWCKT">Follow on Xiaohongshu</a></td>
+  </tr>
+  <tr>
+    <td width="92" valign="top"><strong>Feedback</strong></td>
+    <td valign="top"><a href="https://github.com/ZhuLinsen/daily_stock_analysis/issues">GitHub Issues</a> · <a href="https://github.com/ZhuLinsen/daily_stock_analysis/discussions">Discussions</a></td>
+  </tr>
+</table>
 
 ## 📄 License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
----
-
-## ⭐ Star History
-**Made with ❤️ by AI enthusiasts | Star ⭐ this repo if you find it useful!**
-
-
-<a href="https://star-history.com/#ZhuLinsen/daily_stock_analysis&Date">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=ZhuLinsen/daily_stock_analysis&type=Date&theme=dark" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=ZhuLinsen/daily_stock_analysis&type=Date" />
-   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=ZhuLinsen/daily_stock_analysis&type=Date" />
- </picture>
-</a>
+If you use or build on this project, attribution with a link back to this repository is appreciated.
 
 ## ⚠️ Disclaimer
 

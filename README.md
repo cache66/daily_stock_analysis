@@ -9,14 +9,13 @@
 [![GitHub Actions](https://img.shields.io/badge/GitHub%20Actions-Ready-2088FF?logo=github-actions&logoColor=white)](https://github.com/features/actions)
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white)](https://hub.docker.com/)
 
-<p>
-  <a href="https://trendshift.io/repositories/18527" target="_blank"><img src="https://trendshift.io/api/badge/repositories/18527" alt="ZhuLinsen%2Fdaily_stock_analysis | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
-  <a href="https://hellogithub.com/repository/ZhuLinsen/daily_stock_analysis" target="_blank"><img src="https://api.hellogithub.com/v1/widgets/recommend.svg?rid=6daa16e405ce46ed97b4a57706aeb29f&claim_uid=pfiJMqhR9uvDGlT&theme=neutral" alt="Featured｜HelloGitHub" style="width: 250px; height: 54px;" width="250" height="54" /></a>
+<p align="center">
+  <img src="https://trendshift.io/api/badge/trendshift/repositories/18527/daily?language=Python" alt="#1 Python Repository Of The Day | Trendshift" width="250" height="55"/>&nbsp;<a href="https://hellogithub.com/repository/ZhuLinsen/daily_stock_analysis" target="_blank"><img src="https://api.hellogithub.com/v1/widgets/recommend.svg?rid=6daa16e405ce46ed97b4a57706aeb29f&claim_uid=pfiJMqhR9uvDGlT&theme=neutral" alt="Featured｜HelloGitHub" width="230" /></a>
 </p>
 
-> 🤖 基于 AI 大模型的 A股/港股/美股自选股智能分析系统，每日自动分析并推送「决策仪表盘」到企业微信/飞书/Telegram/Discord/Slack/邮箱
+> 🤖 基于 AI 大模型的 A股/港股/美股/日股/韩股/台股自选股智能分析系统，每日自动分析并推送「决策仪表盘」到企业微信/飞书/Telegram/Discord/Slack/邮箱
 
-[**功能特性**](#-功能特性) · [**快速开始**](#-快速开始) · [**推送效果**](#-推送效果) · [**完整指南**](docs/full-guide.md) · [**常见问题**](docs/FAQ.md) · [**更新日志**](docs/CHANGELOG.md)
+[**产品预览**](#-产品预览) · [**功能特性**](#-功能特性) · [**快速开始**](#-快速开始) · [**推送效果**](#-推送效果) · [**文档中心**](docs/INDEX.md) · [**完整指南**](docs/full-guide.md)
 
 简体中文 | [English](docs/README_EN.md) | [繁體中文](docs/README_CHT.md)
 
@@ -24,33 +23,29 @@
 
 ## 💖 赞助商 (Sponsors)
 <div align="center">
-  <a href="https://serpapi.com/baidu-search-api?utm_source=github_daily_stock_analysis" target="_blank">
-    <img src="./sources/serpapi_banner_zh.png" alt="轻松抓取搜索引擎上的实时金融新闻数据 - SerpApi" height="160">
-  </a>
+  <p align="center">
+    <a href="https://open.anspire.cn/?share_code=QFBC0FYC" target="_blank"><img src="./docs/assets/anspire.png" alt="Anspire Open 一站式模型和搜索服务" width="300" height="141" style="width: 300px; height: 141px; object-fit: contain;"></a>
+    <a href="https://serpapi.com/baidu-search-api?utm_source=github_daily_stock_analysis" target="_blank"><img src="./docs/assets/serpapi_banner_zh.png" alt="轻松抓取搜索引擎上的实时金融新闻数据 - SerpApi" width="300" height="141" style="width: 300px; height: 141px; object-fit: contain;"></a>
+  </p>
 </div>
-<br>
 
+
+## 🖥️ 产品预览
+
+<p align="center">
+  <img src="docs/assets/readme_workspace_tour_20260510.gif" alt="DSA Web 工作台演示" width="720">
+</p>
 
 ## ✨ 功能特性
 
-| 模块 | 功能 | 说明 |
-|------|------|------|
-| AI | 决策仪表盘 | 一句话核心结论 + 精确买卖点位 + 操作检查清单 |
-| 分析 | 多维度分析 | 技术面（盘中实时 MA/多头排列）+ 筹码分布 + 舆情情报 + 实时行情 |
-| 市场 | 全球市场 | 支持 A股、港股、美股及美股指数（SPX、DJI、IXIC 等） |
-| 基本面 | 结构化聚合 | 新增 `fundamental_context`（valuation/growth/earnings/institution/capital_flow/dragon_tiger/boards，其中 `earnings.data` 新增 `financial_report` 与 `dividend`，`boards` 表示板块涨跌榜），主链路 fail-open 降级 |
-| 策略 | 市场策略系统 | 内置 A股「三段式复盘策略」与美股「Regime Strategy」，输出进攻/均衡/防守或 risk-on/neutral/risk-off 计划，并附“仅供参考，不构成投资建议”提示 |
-| 统一选股 | 强趋势龙头总榜 | 新增 `trend_leader_unified` 统一策略快照，按 `breakout / pullback / hybrid` 三分制输出 A 股候选池，并可在 `/signals` 回看（详见 `docs/TREND_LEADER_UNIFIED_STRATEGY.md`） |
-| 复盘 | 大盘复盘 | 每日市场概览、板块涨跌；支持 cn(A股)/us(美股)/both(两者) 切换 |
-| 界面 | 双主题工作台 | Web 工作台现支持全新浅色主题与深色主题切换，首页 / 问股 / 回测 / 持仓 / 设置统一升级为同一套视觉与交互体系 |
-| 补全 | 智能补全 (MVP) | **[测试阶段]** 首页搜索框支持代码/名称/拼音/别名联想；索引已覆盖 A股、港股、美股三个市场，支持通过 Tushare 或 AkShare 数据源更新 |
-| 智能导入 | 多源导入 | 支持图片、CSV/Excel 文件、剪贴板粘贴；Vision LLM 提取代码+名称；置信度分层确认；名称→代码解析（本地+拼音+AkShare） |
-| 历史记录 | 批量管理 | 支持多选、全选及批量删除历史分析记录，优化管理效率与 UI/UX 体验 |
-| 回测 | AI 回测验证 | 自动评估历史分析准确率，支持按股票与分析日期查看“AI 预测 vs 次日实际（1 日窗口）”和准确率 |
-| 资讯 | 公司公告 + 资金流 | IntelAgent 新增公告抓取与主力资金流维度（上交所/深交所/cninfo + A 股主力资金流）用于补强舆情链路 |
-| **Agent 问股** | **策略对话** | **多轮策略问答，支持均线金叉/缠论/波浪、商品涨价传导等 15 种内置策略，Web/Bot/API 全链路** |
-| 推送 | 多渠道通知 | 企业微信、飞书、Telegram、Discord、Slack、钉钉、邮件、Pushover |
-| 自动化 | 定时运行 | GitHub Actions 定时执行，无需服务器 |
+| 能力 | 覆盖内容 |
+|------|------|
+| AI 决策报告 | 核心结论、评分、趋势、买卖点位、风险警报、催化因素、操作检查清单 |
+| 多市场数据聚合 | 覆盖 A股、港股、美股、日股、韩股、台股和 ETF，支持行情、K 线、技术指标、新闻、公告、基本面与报告辅助数据；不同市场的数据源和能力边界见 [市场支持边界](docs/market-support.md) |
+| Web / 桌面工作台 | 手动分析、任务进度、历史报告、完整 Markdown、回测、持仓、配置管理、浅色 / 深色主题 |
+| Agent 策略问股 | 多轮追问，支持均线、缠论、波浪、趋势、热点、事件、成长、预期等 15 种内置策略，覆盖 Web/Bot/API |
+| 智能导入与补全 | 图片、CSV/Excel、剪贴板导入；股票代码/名称/拼音/别名补全 |
+| 自动化与推送 | GitHub Actions、Docker、本地定时任务、FastAPI 服务和企业微信/飞书/Telegram/Discord/Slack/邮件推送 |
 
 > 历史报告详情会优先展示 AI 返回的原始「狙击点位」文本，避免区间价、条件说明等复杂内容在历史回看时被压缩成单个数字。
 
@@ -69,9 +64,9 @@
 
 | 类型 | 支持 |
 |------|------|
-| AI 模型 | [AIHubMix](https://aihubmix.com/?aff=CfMq)、Gemini、OpenAI 兼容、DeepSeek、通义千问、Claude、Ollama 本地模型 等（统一通过 [LiteLLM](https://github.com/BerriAI/litellm) 调用，支持多 Key 负载均衡）|
-| 行情数据 | AkShare、Tushare、Pytdx、Baostock、YFinance、[Longbridge](https://open.longbridge.com/)（美股/港股首选数据源） |
-| 新闻搜索 | Anspire、Tavily、SerpAPI、Bocha、Brave、MiniMax |
+| AI 模型 | [Anspire](https://open.anspire.cn/?share_code=QFBC0FYC)、[AIHubMix](https://aihubmix.com/?aff=CfMq)、Gemini、OpenAI 兼容、DeepSeek、通义千问、Claude、Ollama 本地模型等 |
+| 行情数据 | [TickFlow](https://tickflow.org/auth/register?ref=WDSGSPS5XC)、AkShare、Tushare、Pytdx、Baostock、YFinance、Longbridge |
+| 新闻搜索 | [Anspire](https://open.anspire.cn/?share_code=QFBC0FYC)、[SerpAPI](https://serpapi.com/baidu-search-api?utm_source=github_daily_stock_analysis)、[Tavily](https://tavily.com/)、[Bocha](https://open.bocha.cn/)、[Brave](https://brave.com/search/api/)、[MiniMax](https://platform.minimaxi.com/)、SearXNG |
 | 社交舆情 | [Stock Sentiment API](https://api.adanos.org/docs)（Reddit / X / Polymarket，仅美股，可选） |
 
 > **长桥优先策略（仅美/港股）**：在配置 `LONGBRIDGE_APP_KEY` / `LONGBRIDGE_APP_SECRET` / `LONGBRIDGE_ACCESS_TOKEN` 的前提下，美股与港股的 **日线 K 线** 与 **实时行情** 由 **Longbridge 优先拉取**；若长桥失败或部分字段缺失，再由 **YFinance（美股）/ AkShare（港股）** 兜底或合并补全字段。**未配置长桥凭据时不会调用 Longbridge**，美股/港股仍以 YFinance / AkShare 为主数据源（与未集成长桥前的行为一致）。**美股大盘指数**（如 SPX）始终以 YFinance 优先（长桥不提供指数行情）。**A 股**路由不变，仍为 Efinance → AkShare → Tushare → Pytdx → Baostock。详见 `.env.example` 与 [完整指南](docs/full-guide.md) 中长桥说明。
@@ -90,7 +85,7 @@
 
 ## 🚀 快速开始
 
-### 方式一：GitHub Actions（推荐）
+### 方式一：[GitHub Actions（推荐）](https://www.bilibili.com/video/BV11FEb66EXG/)
 
 > 5 分钟完成部署，零成本，无需服务器。
 
@@ -109,14 +104,12 @@
 
 > 现在推荐把多模型配置统一写成 `LLM_CHANNELS + LLM_<NAME>_PROTOCOL/BASE_URL/API_KEY/MODELS/ENABLED`。如需显式指定主模型或备选模型，再额外配置 `LITELLM_MODEL` / `LITELLM_FALLBACK_MODELS`。Web 设置页和 `.env` 使用同一套字段，便于相互切换。
 
-> 💡 **推荐 [AIHubMix](https://aihubmix.com/?aff=CfMq)**：一个 Key 即可使用 Gemini、GPT、Claude、DeepSeek 等全球主流模型，无需科学上网，含免费模型（glm-5、gpt-4o-free 等），付费模型高稳定性无限并发。本项目可享 **10% 充值优惠**。
-
 | Secret 名称 | 说明 | 必填 |
 |------------|------|:----:|
-| `AIHUBMIX_KEY` | [AIHubMix](https://aihubmix.com/?aff=CfMq) API Key，一 Key 切换使用全系模型，免费模型可用 | 可选 |
-| `GEMINI_API_KEY` | [Google AI Studio](https://aistudio.google.com/) 获取免费 Key（需科学上网） | 可选 |
-| `ANTHROPIC_API_KEY` | [Anthropic Claude](https://console.anthropic.com/) API Key | 可选 |
-| `ANTHROPIC_MODEL` | Claude 模型（如 `claude-3-5-sonnet-20241022`） | 可选 |
+| `ANSPIRE_API_KEYS` | [Anspire](https://open.anspire.cn/?share_code=QFBC0FYC) API Key，一Key同时启用全球热门大模型和联网搜索，本项目新用户提供35元等额的免费额度（GLM5.2、GPT等模型特惠中） | **推荐** |
+| `AIHUBMIX_KEY` | [AIHubMix](https://aihubmix.com/?aff=CfMq) API Key，一Key切换使用全系模型，无需科学上网，本项目可享 10% 优惠 | **推荐** |
+| `GEMINI_API_KEY` | Google Gemini API Key | 可选 |
+| `ANTHROPIC_API_KEY` | Anthropic Claude API Key | 可选 |
 | `OPENAI_API_KEY` | OpenAI 兼容 API Key（支持 DeepSeek、通义千问等） | 可选 |
 | `OPENAI_BASE_URL` | OpenAI 兼容 API 地址（如 `https://api.deepseek.com/v1`） | 可选 |
 | `OPENAI_MODEL` | 模型名称（如 `gemini-3.1-pro-preview`、`gemini-3-flash-preview`、`gpt-5.2`） | 可选 |
@@ -180,65 +173,35 @@
 
 | Secret 名称 | 说明 | 必填 |
 |------------|------|:----:|
-| `STOCK_LIST` | 自选股代码，如 `600519,hk00700,AAPL,TSLA` | ✅ |
-| `TAVILY_API_KEYS` | [Tavily](https://tavily.com/) 搜索 API（新闻搜索） | 推荐 |
-| `ANSPIRE_API_KEYS` | [Anspire AI Search](https://aisearch.anspire.cn/) 针对中文内容特别优化 (可有效增强A股分析效果) | 可选 |
-| `MINIMAX_API_KEYS` | [MiniMax](https://platform.minimaxi.com/) Coding Plan Web Search（结构化搜索结果） | 可选 |
-| `SERPAPI_API_KEYS` | [SerpAPI](https://serpapi.com/baidu-search-api?utm_source=github_daily_stock_analysis) 全渠道搜索 | 可选 |
-| `BOCHA_API_KEYS` | [博查搜索](https://open.bocha.cn/) Web Search API（中文搜索优化，支持AI摘要，多个key用逗号分隔） | 可选 |
-| `BRAVE_API_KEYS` | [Brave Search](https://brave.com/search/api/) API（隐私优先，美股优化，多个key用逗号分隔） | 可选 |
-| `SEARXNG_BASE_URLS` | SearXNG 自建实例（无配额兜底，需在 settings.yml 启用 format: json）；留空时默认自动发现公共实例 | 可选 |
-| `SEARXNG_PUBLIC_INSTANCES_ENABLED` | 是否在 `SEARXNG_BASE_URLS` 为空时自动从 `searx.space` 获取公共实例（默认 `true`） | 可选 |
-| `SOCIAL_SENTIMENT_API_KEY` | [Stock Sentiment API](https://api.adanos.org/docs)（Reddit/X/Polymarket 社交舆情，仅美股） | 可选 |
-| `SOCIAL_SENTIMENT_API_URL` | 自定义社交舆情 API 地址（默认 `https://api.adanos.org`） | 可选 |
-| `TUSHARE_TOKEN` | [Tushare Pro](https://tushare.pro/weborder/#/login?reg=834638 ) Token | 可选 |
-| `TICKFLOW_API_KEY` | [TickFlow](https://tickflow.org) API Key（增强 A 股大盘复盘指数；若套餐支持标的池查询，也可增强市场统计） | 可选 |
-| `LONGBRIDGE_APP_KEY` | [Longbridge OpenAPI](https://open.longbridge.com/) App Key（配置后自动成为美股/港股首选数据源） | 可选 |
-| `LONGBRIDGE_APP_SECRET` | Longbridge App Secret | 可选 |
-| `LONGBRIDGE_ACCESS_TOKEN` | Longbridge Access Token | 可选 |
-| `LONGBRIDGE_STATIC_INFO_TTL_SECONDS` | 长桥 `static_info` 进程内缓存秒数，默认 `86400`；`0` 表示不缓存 | 可选 |
-| `LONGBRIDGE_HTTP_URL` | HTTP 接口地址（默认 `https://openapi.longbridge.com`） | 可选 |
-| `LONGBRIDGE_QUOTE_WS_URL` | 行情 WebSocket 地址（默认 `wss://openapi-quote.longbridge.com/v2`） | 可选 |
-| `LONGBRIDGE_TRADE_WS_URL` | 交易 WebSocket 地址（默认 `wss://openapi-trade.longbridge.com/v2`） | 可选 |
-| `LONGBRIDGE_REGION` | 覆盖接入点；SDK 会按网络自动选择，默认 `hk`，若判断不正确可设置（如 `cn`、`hk`） | 可选 |
-| `LONGBRIDGE_ENABLE_OVERNIGHT` | 是否开启夜盘行情 `true` / `false`，默认 `false` | 可选 |
-| `LONGBRIDGE_PUSH_CANDLESTICK_MODE` | K 线推送模式：`realtime` 或 `confirmed`（默认 `realtime`） | 可选 |
-| `LONGBRIDGE_PRINT_QUOTE_PACKAGES` | 连接时是否打印行情包（未设置时默认 `false`；设为 `1`/`true`/`yes` 开启） | 可选 |
-| `PREFETCH_REALTIME_QUOTES` | 实时行情预取开关：设为 `false` 可禁用全市场预取（默认 `true`） | 可选 |
-| `WECHAT_MSG_TYPE` | 企微消息类型，默认 markdown，支持配置 text 类型，发送纯 markdown 文本 | 可选 |
-| `NEWS_STRATEGY_PROFILE` | 新闻策略窗口档位：`ultra_short`(1天) / `short`(3天) / `medium`(7天) / `long`(30天)，默认 `short` | 可选 |
-| `NEWS_MAX_AGE_DAYS` | 新闻最大时效上限（天），默认 3；实际窗口 `effective_days = min(profile_days, NEWS_MAX_AGE_DAYS)`，例如 `ultra_short(1)` + `7` 仍为 `1` 天 | 可选 |
-| `BIAS_THRESHOLD` | 乖离率阈值（%），默认 5.0，超过提示不追高；强势趋势股自动放宽 | 可选 |
-| `AGENT_MODE` | 开启 Agent 策略问股模式（内部统一命名为 skill，`true`/`false`，默认 false） | 可选 |
-| `AGENT_LITELLM_MODEL` | Agent 主模型（可选）；留空继承主模型，无前缀会按 `openai/<model>` 解析 | 可选 |
-| `AGENT_SKILLS` | 激活的策略技能 id（逗号分隔），`all` 启用全部策略技能；留空时使用主默认策略 skill（内置默认是 `bull_trend`），详见 `.env.example` | 可选 |
-| `AGENT_MAX_STEPS` | Agent 最大推理步数上限（默认 10）；多 Agent orchestrator 模式下按 `min(子 Agent 默认值, AGENT_MAX_STEPS)` 生效，不会抬高低默认值 Agent 的步数 | 可选 |
-| `AGENT_SKILL_DIR` | 自定义策略技能目录（默认沿用内置 `strategies/` 兼容路径） | 可选 |
-| `TRADING_DAY_CHECK_ENABLED` | 交易日检查（默认 `true`）：非交易日跳过执行；设为 `false` 或使用 `--force-run` 强制执行 | 可选 |
-| `ENABLE_CHIP_DISTRIBUTION` | 启用筹码分布（Actions 默认 false；需筹码数据时在 Variables 中设为 true，接口可能不稳定） | 可选 |
-| `ENABLE_FUNDAMENTAL_PIPELINE` | 基本面聚合总开关；关闭时保持主流程不变 | 可选 |
-| `FUNDAMENTAL_STAGE_TIMEOUT_SECONDS` | 基本面阶段总预算（秒） | 可选 |
-| `FUNDAMENTAL_FETCH_TIMEOUT_SECONDS` | 单能力源调用超时（秒） | 可选 |
-| `FUNDAMENTAL_RETRY_MAX` | 基本面能力重试次数（包含首次） | 可选 |
-| `FUNDAMENTAL_CACHE_TTL_SECONDS` | 基本面缓存 TTL（秒） | 可选 |
-| `FUNDAMENTAL_CACHE_MAX_ENTRIES` | 基本面缓存最大条目数（避免长时间运行内存增长） | 可选 |
+| `STOCK_LIST` | 自选股代码，如 `600519,hk00700,AAPL,7203.T,005930.KS,2330.TW` | ✅ |
 
-> 基本面超时语义（P0）：
-> - 当前采用 `best-effort` 软超时（fail-open），超时会立即降级并继续主流程；
-> - 不承诺严格硬中断第三方调用线程，因此 `P95 <= 1.5s` 是阶段目标而非硬 SLA；
-> - 若业务需要硬 SLA，可在后续阶段升级为“子进程隔离 + kill”的硬超时方案。
-> - 字段契约：
->   - `fundamental_context.boards.data` = `sector_rankings`（板块涨跌榜，结构 `{top, bottom}`）；
->   - `fundamental_context.earnings.data.financial_report` = 财报摘要（报告期、营收、归母净利润、经营现金流、ROE）；
->   - `fundamental_context.earnings.data.dividend` = 分红指标（仅现金分红税前口径，含 `events`、`ttm_cash_dividend_per_share`、`ttm_dividend_yield_pct`）；
->   - `get_stock_info.belong_boards` = 个股所属板块列表；
->   - `get_stock_info.boards` 为兼容别名，值与 `belong_boards` 相同（未来仅在大版本考虑移除）；
->   - `get_stock_info.sector_rankings` 与 `fundamental_context.boards.data` 保持一致。
-> - 配置 `TICKFLOW_API_KEY` 后，A 股大盘复盘的主要指数行情会优先尝试 TickFlow；若当前套餐支持标的池查询，市场涨跌统计也会优先尝试 TickFlow。失败或权限不足时会回退到现有数据源。
-> - 该行为按能力分层而非仅按“是否有 Key”判断：有限权限套餐仍可获得 TickFlow 指数增强；支持 `CN_Equity_A` 标的池查询的套餐会额外获得 TickFlow 市场统计增强。
-> - TickFlow 官方 quickstart 展示了 `quotes.get(universes=["CN_Equity_A"])` 的正式用法，但真实线上验证确认：不同套餐权限不同，且 `quotes.get(symbols=[...])` 单次有标的数量限制。
-> - TickFlow 返回的 `change_pct` / `amplitude` 在实际接口中为比例值，本项目已统一转换为内部使用的百分比口径，保证与 AkShare / Tushare / efinance 一致。
-> - 板块涨跌榜采用固定回退顺序：`AkShare(EM->Sina) -> Tushare -> efinance`。
+**新闻源配置（推荐）**
+
+新闻源会显著影响舆情、公告、事件和催化因素质量，建议至少配置一个搜索服务。
+
+| Secret 名称 | 说明 | 必填 |
+|------------|------|:----:|
+| `ANSPIRE_API_KEYS` | [Anspire AI Search](https://aisearch.anspire.cn/)：汇聚全球舆情信息，适配A股、美股、港股等新闻和舆情检索；同一Key可复用大模型服务，本项目新用户提供免费35元等额的免费点数 | **推荐** |
+| `SERPAPI_API_KEYS` | [SerpAPI](https://serpapi.com/baidu-search-api?utm_source=github_daily_stock_analysis)：搜索引擎结果补强，适合实时金融新闻 | **推荐** |
+| `TAVILY_API_KEYS` | [Tavily](https://tavily.com/)：通用新闻搜索 API | 可选 |
+| `BOCHA_API_KEYS` | [博查搜索](https://open.bocha.cn/)：中文搜索优化，支持 AI 摘要 | 可选 |
+| `BRAVE_API_KEYS` | [Brave Search](https://brave.com/search/api/)：隐私优先，美股资讯补强 | 可选 |
+| `MINIMAX_API_KEYS` | [MiniMax](https://platform.minimaxi.com/)：结构化搜索结果 | 可选 |
+| `SEARXNG_BASE_URLS` | SearXNG 自建实例：无配额兜底，适合私有部署 | 可选 |
+
+更多搜索源、社交舆情和降级规则见 [搜索服务配置](docs/full-guide.md#搜索服务配置)。
+
+**行情数据源配置（可选）**
+
+> 默认使用 AkShare、Baostock、YFinance 等免费数据源，日志中"未配置"的提示不影响运行。
+> 如需更稳定的行情，可按市场配置以下 Secret：
+
+| Secret 名称 | 适用市场 | 说明 |
+|------------|:--------:|------|
+| `TUSHARE_TOKEN` | A 股 | 提升历史行情稳定性 |
+| `LONGBRIDGE_OAUTH_CLIENT_ID` + `LONGBRIDGE_OAUTH_TOKEN_CACHE_B64` | 港股/美股 | 补齐量比、换手率、PE 等字段 |
+
+> 详见 [数据源配置](docs/full-guide.md#数据源配置)。
 
 #### 3. 启用 Actions
 
@@ -262,7 +225,7 @@
 > - **UI 勾选方式**：仅在 GitHub Actions 手动触发时可见，不影响定时任务，适合临时需求
 > - **断点续传与 `--dry-run` 的数据存在性判断**：会按股票所属市场的本地时区和交易日历解析“最新可复用交易日”；周末/节假日复用最近交易日，交易日盘中复用上一已完成交易日，盘后若当日数据已落库则可直接跳过。详细规则见 [完整指南](docs/full-guide.md)。
 
-### 方式二：本地运行 / Docker 部署
+### 方式二：[客户端配置教程](https://www.bilibili.com/video/BV11FEb66Eyr/) / 本地运行 / Docker 部署
 
 ```bash
 # 克隆项目
@@ -280,13 +243,13 @@ python main.py
 
 如果你不用 Web，推荐直接在 `.env` 里按条写模型渠道：
 
-```env
-LLM_CHANNELS=primary
-LLM_PRIMARY_PROTOCOL=openai
-LLM_PRIMARY_BASE_URL=https://api.deepseek.com/v1
-LLM_PRIMARY_API_KEY=sk-xxxxxxxx
-LLM_PRIMARY_MODELS=deepseek-chat
-LITELLM_MODEL=openai/deepseek-chat
+```bash
+python main.py --debug
+python main.py --dry-run
+python main.py --stocks 600519,hk00700,AAPL,2330.TW
+python main.py --market-review
+python main.py --schedule
+python main.py --serve-only
 ```
 
 保存后也可以在 Web 设置页继续编辑同一组字段；不会要求额外配置文件。
@@ -352,9 +315,7 @@ LITELLM_MODEL=openai/deepseek-chat
 
 ## 🖥️ Web 界面
 
-![img.png](sources/fastapi_server.png)
-
-包含完整的配置管理、任务监控和手动分析功能。
+Web 工作台提供配置管理、任务监控、手动分析、历史报告、完整 Markdown 报告、Agent 问股、回测、持仓管理、智能导入和浅色 / 深色主题。启动方式：
 
 **本轮界面升级亮点：**
 
@@ -367,7 +328,10 @@ LITELLM_MODEL=openai/deepseek-chat
 
 ### 智能导入
 
-在 **设置 → 基础设置** 中找到「智能导入」区块，支持三种方式添加自选股：
+- 支持均线金叉、缠论、波浪理论、多头趋势、热点题材、事件驱动、成长质量、预期重估等内置策略
+- 支持实时行情、K 线、技术指标、新闻和风险信息调用
+- 支持多轮追问、会话导出、发送到通知渠道和后台执行
+- 支持自定义策略文件与多 Agent 编排（实验性）
 
 1. **图片**：拖拽或选择自选股截图（如 APP 持仓页、行情列表），Vision AI 自动识别代码+名称，并给出置信度
 2. **文件**：上传 CSV 或 Excel (.xlsx)，自动解析代码/名称列
@@ -446,70 +410,43 @@ LITELLM_MODEL=openai/deepseek-chat
 
 > 也可以使用 `python main.py --serve` (等效命令)
 
-## 🗺️ Roadmap
+## 🧩 相关项目 (Related Projects)
 
-查看已支持的功能和未来规划：[更新日志](docs/CHANGELOG.md)
+> DSA 聚焦日常分析报告；下面两个同系列项目分别覆盖选股、策略验证与策略进化，适合按需延伸使用。它们当前独立维护，后续会优先探索与 DSA 的候选股导入、回测验证和报告联动。
 
-> 有建议？欢迎 [提交 Issue](https://github.com/ZhuLinsen/daily_stock_analysis/issues)
+| 项目 | 定位 |
+|------|------|
+| [AlphaSift](https://github.com/ZhuLinsen/alphasift) | 多因子选股与全市场扫描，用于从股票池中提取候选标的 |
+| [AlphaEvo](https://github.com/ZhuLinsen/alphaevo) | 策略回测与自我进化，用于验证策略规则，并通过迭代探索策略参数与组合 |
 
-> ⚠️ **UI 调整提示**：项目当前正在持续进行 Web UI 调整与升级，部分页面在过渡阶段可能仍存在样式、交互或兼容性问题。欢迎通过 [Issue](https://github.com/ZhuLinsen/daily_stock_analysis/issues) 反馈问题，或直接提交 [Pull Request](https://github.com/ZhuLinsen/daily_stock_analysis/pulls) 一起完善。
----
+## 📬 联系与合作
 
-## ☕ 支持项目
-
-如果本项目对你有帮助，欢迎支持项目的持续维护与迭代，感谢支持 🙏  
-赞赏可备注联系方式，祝股市长虹
-
-| 支付宝 (Alipay) | 微信支付 (WeChat) | 小红书 |
-| :---: | :---: | :---: |
-| <img src="./sources/alipay.jpg" width="200" alt="Alipay"> | <img src="./sources/wechatpay.jpg" width="200" alt="WeChat Pay"> | <img src="./sources/xiaohongshu.png" width="200" alt="小红书"> |
-
----
-
-## 🤝 贡献
-
-欢迎提交 Issue 和 Pull Request！
-
-详见 [贡献指南](docs/CONTRIBUTING.md)
-
-### 本地门禁（建议先跑）
-
-```bash
-pip install -r requirements.txt
-pip install flake8 pytest
-./scripts/ci_gate.sh
-```
-
-如修改前端（`apps/dsa-web`）：
-
-```bash
-cd apps/dsa-web
-npm ci
-npm run lint
-npm run build
-```
+<table>
+  <tr>
+    <td width="92" valign="top"><strong>合作邮箱</strong></td>
+    <td valign="top">
+      <a href="mailto:zhuls345@gmail.com">zhuls345@gmail.com</a><br>
+      项目咨询、部署支持与功能扩展
+    </td>
+    <td align="center" rowspan="3" valign="middle" width="148">
+      <a href="http://xhslink.com/m/tU520DWCKT" target="_blank"><img src="./docs/assets/xiaohongshu_tick.jpg" width="112" alt="小红书二维码"></a><br>
+      <sub>扫码关注小红书</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="92" valign="top"><strong>小红书</strong></td>
+    <td valign="top"><a href="http://xhslink.com/m/tU520DWCKT">欢迎关注小红书</a></td>
+  </tr>
+  <tr>
+    <td width="92" valign="top"><strong>问题反馈</strong></td>
+    <td valign="top"><a href="https://github.com/ZhuLinsen/daily_stock_analysis/issues">提交 Issue</a></td>
+  </tr>
+</table>
 
 ## 📄 License
 [MIT License](LICENSE) © 2026 ZhuLinsen
 
-如果你在项目中使用或基于本项目进行二次开发，
-非常欢迎在 README 或文档中注明来源并附上本仓库链接。
-这将有助于项目的持续维护和社区发展。
-
-## 📬 联系与合作
-- GitHub Issues：[提交 Issue](https://github.com/ZhuLinsen/daily_stock_analysis/issues)
-- 合作邮箱：zhuls345@gmail.com
-
-## ⭐ Star History
-**如果觉得有用，请给个 ⭐ Star 支持一下！**
-
-<a href="https://star-history.com/#ZhuLinsen/daily_stock_analysis&Date">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=ZhuLinsen/daily_stock_analysis&type=Date&theme=dark" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=ZhuLinsen/daily_stock_analysis&type=Date" />
-   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=ZhuLinsen/daily_stock_analysis&type=Date" />
- </picture>
-</a>
+欢迎在二次开发或引用时注明本仓库来源，感谢支持项目持续维护。
 
 ## ⚠️ 免责声明
 

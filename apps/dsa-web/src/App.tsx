@@ -70,12 +70,6 @@ const AppContent: React.FC = () => {
     return <Navigate to="/" replace />;
   }
 
-  const routeFallback = (
-    <div className="flex min-h-[50vh] items-center justify-center">
-      <Loading label="页面加载中..." className="p-0" />
-    </div>
-  );
-
   return (
     <Routes>
       <Route

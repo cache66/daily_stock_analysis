@@ -844,15 +844,16 @@ class AkshareFetcher(BaseFetcher):
         self._enforce_rate_limit()
 
         try:
-            df = _akshare_call_with_timeout(
-                ak.stock_zh_a_hist_tx,
-                symbol=symbol,
-                start_date=start_date.replace('-', ''),
-                end_date=end_date.replace('-', ''),
-                adjust="qfq",
-                timeout=self._history_call_timeout,
-                call_name="ak.stock_zh_a_hist_tx",
-            )
+            def _call():
+                df = _akshare_call_with_timeout(
+                    ak.stock_zh_a_hist_tx,
+                    symbol=symbol,
+                    start_date=start_date.replace('-', ''),
+                    end_date=end_date.replace('-', ''),
+                    adjust="qfq",
+                    timeout=self._history_call_timeout,
+                    call_name="ak.stock_zh_a_hist_tx",
+                )
 
                 if df is not None and not df.empty:
                     if 'pct_chg' not in df.columns and 'close' in df.columns:

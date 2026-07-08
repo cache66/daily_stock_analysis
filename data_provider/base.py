@@ -23,7 +23,8 @@ import time
 from threading import BoundedSemaphore, RLock, Thread
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
-from typing import Callable, Optional, List, Tuple, Dict, Any
+from pathlib import Path
+from typing import Callable, Optional, List, Tuple, Dict, Any, Iterable
 
 import pandas as pd
 import numpy as np

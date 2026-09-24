@@ -1,4 +1,5 @@
 import logging
+import json
 import os
 import sys
 import tempfile
@@ -73,7 +74,105 @@ class _RecordingFetcher(BaseFetcher):
         return df
 
 
+class _PartialHistoryFetcher(BaseFetcher):
+    name = "PartialHistoryFetcher"
+    priority = 0
+
+    def __init__(self, responses_by_range=None):
+        self.responses_by_range = responses_by_range or {}
+        self.calls = []
+
+    def _fetch_raw_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+        self.calls.append((stock_code, start_date, end_date))
+        key = (start_date, end_date)
+        if key not in self.responses_by_range:
+            raise DataFetchError(f"no history for range {key}")
+        return self.responses_by_range[key].copy()
+
+    def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
+        return df
+
+
+class _NoDataFetcher(BaseFetcher):
+    def __init__(self, name: str, priority: int):
+        self.name = name
+        self.priority = priority
+
+    def _fetch_raw_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+        return pd.DataFrame()
+
+    def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
+        return df
+
+
 class TestFetcherLogging(unittest.TestCase):
+    def setUp(self) -> None:
+        DataFetcherManager.reset_daily_source_health()
+
+    def tearDown(self) -> None:
+        DataFetcherManager.reset_daily_source_health()
+
+    def test_fast_scan_manager_keeps_akshare_fallback_after_tushare_no_data(self):
+        manager = DataFetcherManager(fetchers=[])
+        manager._skip_redundant_history_fallback_for_fast_scan = True
+
+        should_skip = manager._should_skip_fast_scan_tushare_history_fallback(
+            fetcher_name="TushareFetcher",
+            next_fetcher_name="AkshareFetcher",
+            days=62,
+            error_type="DataFetchError",
+            error_reason="[TushareFetcher] 未获取到 001257 的数据",
+        )
+
+        self.assertFalse(should_skip)
+
+    def test_tushare_no_data_plus_akshare_em_backoff_does_not_open_manager_circuit(self):
+        tushare = _NoDataFetcher("TushareFetcher", 0)
+        akshare = AkshareFetcher(
+            sleep_min=0.0,
+            sleep_max=0.0,
+            stock_history_source_priority=("tencent", "em"),
+            stock_history_retry_attempts=1,
+        )
+        akshare.priority = 1
+        manager = DataFetcherManager(fetchers=[tushare, akshare])
+        config = types.SimpleNamespace(
+            history_disk_cache_enabled=False,
+            history_disk_cache_dir=tempfile.mkdtemp(),
+            history_disk_cache_ttl_seconds=21600,
+            history_disk_cache_overlap_days=0,
+        )
+
+        em_calls = {"count": 0}
+
+        def _em_fail(*args, **kwargs):
+            em_calls["count"] += 1
+            raise requests.exceptions.ConnectionError("Remote end closed connection without response")
+
+        with patch(
+            "src.config.get_config",
+            return_value=config,
+        ), patch.object(
+            akshare,
+            "_fetch_stock_data_tx",
+            return_value=pd.DataFrame(),
+        ), patch.object(
+            akshare,
+            "_fetch_stock_data_em",
+            side_effect=_em_fail,
+        ):
+            for stock_code in ("001220", "001221", "001222"):
+                with self.assertRaises(DataFetchError):
+                    manager.get_daily_data(
+                        stock_code,
+                        start_date="2026-03-01",
+                        end_date="2026-03-30",
+                    )
+
+        self.assertEqual(em_calls["count"], 1)
+        self.assertTrue(akshare._stock_history_em_backoff_until_ts > time.time())
+        self.assertTrue(manager._is_daily_source_available(akshare, "cn"))
+
     def test_daily_request_range_defaults_to_double_calendar_span(self):
         manager = DataFetcherManager(fetchers=[_SuccessFetcher()])
 
@@ -293,6 +392,54 @@ class TestFetcherLogging(unittest.TestCase):
         self.assertEqual(len(first_df), 2)
         self.assertEqual(len(second_df), 2)
 
+    def test_manager_history_cache_repairs_legacy_akshare_volume_stored_as_amount(self):
+        manager = DataFetcherManager(fetchers=[])
+        cache_dir = tempfile.mkdtemp()
+        config = types.SimpleNamespace(
+            history_disk_cache_enabled=True,
+            history_disk_cache_dir=cache_dir,
+            history_disk_cache_ttl_seconds=21600,
+            history_disk_cache_overlap_days=0,
+        )
+
+        with patch("src.config.get_config", return_value=config):
+            csv_path, metadata_path = manager._get_history_cache_paths("002407")
+            csv_path.parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame(
+                {
+                    "date": ["2026-07-07", "2026-07-08"],
+                    "open": [46.24, 46.00],
+                    "high": [47.17, 46.17],
+                    "low": [44.76, 41.72],
+                    "close": [45.35, 42.12],
+                    "volume": [0.0, 0.0],
+                    "amount": [1654061.0, 1799828.0],
+                    "pct_chg": [-1.11, -7.12],
+                }
+            ).to_csv(csv_path, index=False, encoding="utf-8")
+            metadata_path.write_text(
+                json.dumps(
+                    {
+                        "stock_code": "002407",
+                        "market": "cn",
+                        "source": "AkshareFetcher",
+                        "updated_at": time.time(),
+                        "rows": 2,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            cached_df, source = manager.get_daily_data(
+                "002407",
+                start_date="2026-07-07",
+                end_date="2026-07-08",
+            )
+
+        self.assertEqual(source, "disk_cache:AkshareFetcher")
+        self.assertEqual(cached_df["volume"].tolist(), [165406100.0, 179982800.0])
+        self.assertAlmostEqual(float(cached_df.iloc[-1]["amount"]), 42.12 * 179982800.0)
+
     def test_manager_history_cache_force_refresh_bypasses_disk(self):
         fetcher = _HistoryCacheFetcher()
         manager = DataFetcherManager(fetchers=[fetcher])
@@ -436,6 +583,53 @@ class TestFetcherLogging(unittest.TestCase):
         self.assertEqual(
             second_df["date"].dt.strftime("%Y-%m-%d").tolist(),
             ["2026-03-06", "2026-03-07"],
+        )
+
+    def test_manager_history_cache_returns_partial_cached_history_when_head_backfill_fails_for_days_request(self):
+        cached_rows = pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-03-06", "2026-03-07", "2026-03-08"]),
+                "open": [10.0, 10.2, 10.4],
+                "high": [10.3, 10.5, 10.6],
+                "low": [9.9, 10.1, 10.3],
+                "close": [10.2, 10.4, 10.5],
+                "volume": [1000, 1200, 1300],
+                "amount": [10200, 12480, 13650],
+                "pct_chg": [1.0, 1.96, 0.96],
+            }
+        )
+        fetcher = _PartialHistoryFetcher(
+            responses_by_range={
+                ("2026-03-06", "2026-03-08"): cached_rows,
+            }
+        )
+        manager = DataFetcherManager(fetchers=[fetcher])
+        config = types.SimpleNamespace(
+            history_disk_cache_enabled=True,
+            history_disk_cache_dir=tempfile.mkdtemp(),
+            history_disk_cache_ttl_seconds=21600,
+            history_disk_cache_overlap_days=0,
+        )
+
+        with patch("src.config.get_config", return_value=config):
+            manager.get_daily_data("601006", start_date="2026-03-06", end_date="2026-03-08")
+            second_df, second_source = manager.get_daily_data(
+                "601006",
+                end_date="2026-03-08",
+                days=10,
+            )
+
+        self.assertEqual(
+            fetcher.calls,
+            [
+                ("601006", "2026-03-06", "2026-03-08"),
+                ("601006", "2026-02-16", "2026-03-05"),
+            ],
+        )
+        self.assertEqual(second_source, "disk_cache_partial_history:PartialHistoryFetcher")
+        self.assertEqual(
+            second_df["date"].dt.strftime("%Y-%m-%d").tolist(),
+            ["2026-03-06", "2026-03-07", "2026-03-08"],
         )
 
     def test_manager_history_cache_ttl_refreshes_current_range(self):

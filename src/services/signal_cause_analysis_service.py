@@ -127,6 +127,7 @@ BUSINESS_LABEL_RULES: List[Dict[str, Any]] = [
     {"label": "AI服务器", "keywords": ["ai服务器", "服务器", "交换机", "算力"]},
     {"label": "数据中心", "keywords": ["数据中心", "idc", "aidc", "idc业务", "aidc业务"]},
     {"label": "半导体", "keywords": ["半导体", "芯片", "封测", "ic"]},
+    {"label": "存储芯片", "keywords": ["存储", "存储器", "存储芯片", "dram", "nand", "nor flash", "flash"]},
     {"label": "电子材料", "keywords": ["电子材料", "覆铜板", "基板", "载板", "封装载板", "高频高速", "高速材料", "光模块材料", "封装材料", "abf", "ccl", "电子级玻璃纤维布", "电子级玻纤布", "电子布", "超细纱"]},
     {"label": "通信设备", "keywords": ["通信设备", "通信系统设备", "数据网络", "光网络设备"]},
     {"label": "海缆", "keywords": ["海缆", "海洋通信", "海底电缆", "海底光缆"]},
@@ -192,6 +193,18 @@ BUSINESS_ALIAS_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "industry_hint": "电力设备",
         "business_labels": ["海缆", "电力设备", "光通信"],
         "business_summary": "海缆/电力设备/光通信",
+    },
+    "603986": {
+        "main_business": "存储器芯片、MCU 与传感器芯片",
+        "industry_hint": "半导体",
+        "business_labels": ["存储芯片", "半导体"],
+        "business_summary": "存储芯片/MCU，偏半导体存储涨价链",
+    },
+    "001309": {
+        "main_business": "存储控制芯片、存储模组及嵌入式存储产品",
+        "industry_hint": "半导体",
+        "business_labels": ["存储芯片", "半导体"],
+        "business_summary": "存储控制芯片/存储模组，偏半导体存储涨价链",
     },
 }
 

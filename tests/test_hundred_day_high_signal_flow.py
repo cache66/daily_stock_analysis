@@ -873,6 +873,8 @@ class HundredDayHighSignalFlowTestCase(unittest.TestCase):
         self.assertEqual(captured["prepare_kwargs"]["shard_index"], 1)
         self.assertEqual(captured["prepare_kwargs"]["quote_hydration_workers"], 3)
         self.assertTrue(captured["prepare_kwargs"]["exclude_st"])
+        self.assertTrue(captured["prepare_kwargs"]["exclude_kcb"])
+        self.assertFalse(captured["prepare_kwargs"]["exclude_cyb"])
         self.assertEqual(captured["scan_kwargs"]["as_of_date"], date(2026, 4, 22))
         self.assertIsNone(captured["scan_kwargs"]["prefilter"])
         self.assertEqual(captured["scan_kwargs"]["shard_count"], 1)

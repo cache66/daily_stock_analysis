@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
 import sys
@@ -12,7 +13,7 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 
 import pandas as pd
 
@@ -31,6 +32,7 @@ from src.services.kline_selector_service import (
     KlineSelectorRunResult,
     KlineSelectorService,
     MaxMarketCapRule,
+    resolve_local_strategy_universe_filters,
 )
 from src.services.capital_profile_service import CapitalProfileService
 from src.services.shared_signal_factors_service import SharedSignalFactorsService
@@ -328,6 +330,24 @@ def _safe_float(value: Any) -> Optional[float]:
         return None
 
 
+def _build_quote_payload_from_universe_row(row_payload: Optional[Dict[str, Any]]) -> Optional[Dict[str, float]]:
+    if not isinstance(row_payload, dict) or not row_payload:
+        return None
+    payload = {
+        "price": _safe_float(row_payload.get("latest_price")),
+        "change_pct": _safe_float(row_payload.get("pct_change")),
+        "turnover_rate": _safe_float(row_payload.get("turnover_rate")),
+        "amount": _safe_float(row_payload.get("amount")),
+        "total_mv": _safe_float(row_payload.get("total_mv")),
+    }
+    normalized = {
+        key: value
+        for key, value in payload.items()
+        if value is not None
+    }
+    return normalized or None
+
+
 def _aggregate_history_by_week(history: pd.DataFrame) -> pd.DataFrame:
     if history is None or history.empty:
         return pd.DataFrame()
@@ -562,6 +582,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-every", type=int, default=50)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--history-lookback-days", type=int, default=365)
+    parser.add_argument(
+        "--history-cache-dir",
+        default=str(PROJECT_ROOT / "data" / "cache" / "history"),
+        help="本地日线缓存目录，cache-only 模式下优先按这里过滤无缓存样本。",
+    )
     parser.add_argument("--skip-db-persist", action="store_true")
     parser.add_argument("--max-workers", type=int, default=4)
     parser.add_argument("--min-60d-change-pct-prefilter", type=float, default=None)
@@ -576,8 +601,86 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable service-level shared scan shell for diagnostics.",
     )
+    parser.add_argument(
+        "--cache-only",
+        action="store_true",
+        help="仅扫描本地已有 history cache 的股票；无缓存样本直接跳过，不触发补抓。",
+    )
+    parser.add_argument(
+        "--universe-codes-file",
+        default=None,
+        help="可选 TXT/CSV 股票白名单，先收窄 monthly universe 再扫描。",
+    )
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return parser.parse_args()
+
+
+def _load_universe_code_whitelist(path: Optional[Path]) -> Optional[Set[str]]:
+    if path is None:
+        return None
+    if not path.exists():
+        raise FileNotFoundError(f"universe codes file not found: {path}")
+
+    suffix = path.suffix.lower()
+    codes: Set[str] = set()
+    if suffix == ".csv":
+        with path.open("r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if not isinstance(row, dict):
+                    continue
+                code = str(row.get("code") or row.get("stock_code") or "").strip()
+                if code:
+                    codes.add(code)
+    else:
+        for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
+            code = str(raw_line.split(",")[0] or "").strip()
+            if code and code.lower() != "code":
+                codes.add(code)
+    return codes or set()
+
+
+def _history_cache_path_exists(manager: Any, stock_code: str, history_cache_dir: Optional[Path]) -> bool:
+    if manager is not None and hasattr(manager, "_get_history_cache_paths"):
+        try:
+            cache_path, _ = manager._get_history_cache_paths(stock_code)
+            return Path(cache_path).exists()
+        except Exception:
+            logger.debug("monthly_slow_rise failed to resolve manager cache path for %s", stock_code, exc_info=True)
+
+    if history_cache_dir is None:
+        return False
+    normalized_code = str(stock_code or "").strip()
+    candidates = [
+        Path(history_cache_dir) / "cn" / f"{normalized_code}.csv",
+        Path(history_cache_dir) / f"{normalized_code}.csv",
+    ]
+    return any(path.exists() for path in candidates)
+
+
+def _filter_universe_to_cached_history(
+    universe: pd.DataFrame,
+    *,
+    manager: Any,
+    history_cache_dir: Optional[Path],
+) -> tuple[pd.DataFrame, Dict[str, int]]:
+    if universe is None or universe.empty:
+        return universe, {"before": 0, "after": 0, "removed_missing_history_cache": 0}
+
+    keep_mask = []
+    removed_missing = 0
+    for row in universe.itertuples(index=False):
+        code = str(getattr(row, "code", "") or "").strip()
+        keep = bool(code) and _history_cache_path_exists(manager, code, history_cache_dir)
+        keep_mask.append(keep)
+        if not keep:
+            removed_missing += 1
+    filtered = universe.loc[keep_mask].reset_index(drop=True)
+    return filtered, {
+        "before": int(len(universe)),
+        "after": int(len(filtered)),
+        "removed_missing_history_cache": int(removed_missing),
+    }
 
 
 def configure_logging(level: str) -> None:
@@ -1142,19 +1245,43 @@ def scan_monthly_slow_rise_candidates(
     service: KlineSelectorService | None = None,
     snapshot_date: date | None = None,
     shared_scan_shell_enabled: bool = True,
+    universe_codes_file: Path | None = None,
+    cache_only: bool = False,
+    history_cache_dir: Path | None = None,
 ) -> KlineSelectorRunResult:
     service = service or KlineSelectorService(manager_factory=KlineSelectorService.build_fast_a_share_manager)
     total_started_at = time.perf_counter()
     universe_started_at = time.perf_counter()
     universe = service.get_spot_enriched_a_share_universe(limit=limit, as_of_date=snapshot_date)
+    whitelist_codes = _load_universe_code_whitelist(universe_codes_file)
+    if whitelist_codes is not None and not universe.empty:
+        universe = universe.loc[
+            universe["code"].astype(str).str.strip().isin(whitelist_codes)
+        ].reset_index(drop=True)
+    cache_filter_stats = {
+        "before": int(len(universe)),
+        "after": int(len(universe)),
+        "removed_missing_history_cache": 0,
+    }
+    if cache_only:
+        universe, cache_filter_stats = _filter_universe_to_cached_history(
+            universe,
+            manager=getattr(service, "manager", None),
+            history_cache_dir=history_cache_dir,
+        )
     universe_elapsed_sec = round(time.perf_counter() - universe_started_at, 4)
     selection_started_at = time.perf_counter()
+    selected_universe_for_enrichment = universe
     use_shared_scan_shell = bool(shared_scan_shell_enabled) and hasattr(service, "prepare_scan_universe")
     if use_shared_scan_shell:
+        universe_filter_kwargs = resolve_local_strategy_universe_filters(
+            exclude_st=bool(prefilter.exclude_st) if prefilter is not None else False,
+        )
         prepared_universe = service.prepare_scan_universe(
             universe=universe,
             prefilter=prefilter,
-            exclude_st=bool(prefilter.exclude_st) if prefilter is not None else False,
+            whitelist_codes=whitelist_codes,
+            **universe_filter_kwargs,
             shard_count=shard_count,
             shard_index=shard_index,
             cached_quote_universe=service._read_spot_universe_reference_cache()
@@ -1166,6 +1293,7 @@ def scan_monthly_slow_rise_candidates(
             quote_hydration_workers=max(1, int(max_workers)),
             as_of_date=snapshot_date,
         )
+        selected_universe_for_enrichment = prepared_universe.prepared_universe
         run_result = service.scan_market(
             criteria=criteria,
             rules=build_monthly_slow_rise_rules(criteria),
@@ -1203,6 +1331,11 @@ def scan_monthly_slow_rise_candidates(
             as_of_date=snapshot_date,
         )
     selection_elapsed_sec = round(time.perf_counter() - selection_started_at, 4)
+    selected_universe_rows_by_code = {
+        str(row_payload.get("code") or "").strip(): row_payload
+        for row_payload in selected_universe_for_enrichment.to_dict("records")
+        if isinstance(row_payload, dict) and str(row_payload.get("code") or "").strip()
+    }
     capital_profile_service = CapitalProfileService(manager=service.manager)
     shared_factors_service = SharedSignalFactorsService(
         manager=service.manager,
@@ -1213,11 +1346,13 @@ def scan_monthly_slow_rise_candidates(
     filtered_selected = []
     filtered_failed = list(run_result.failed)
     for evaluation in run_result.selected:
+        selected_row_payload = selected_universe_rows_by_code.get(str(evaluation.stock_code or "").strip(), {})
         capital_profile = shared_factors_service.build_capital_factors(
             evaluation.stock_code,
             stock_name=evaluation.stock_name,
             latest_price=evaluation.metrics.get("monthly_latest_close"),
             total_market_cap=evaluation.total_market_cap,
+            quote_data=_build_quote_payload_from_universe_row(selected_row_payload),
         )
         evaluation.metrics.update(capital_profile)
         bundle_payload = fundamental_adapter.get_fundamental_bundle(
@@ -1248,6 +1383,11 @@ def scan_monthly_slow_rise_candidates(
             "total_scan_elapsed_sec": total_scan_elapsed_sec,
             "selected_count": len(run_result.selected),
             "failed_count": len(run_result.failed),
+            "cache_only": bool(cache_only),
+            "history_cache_dir": str(history_cache_dir) if history_cache_dir is not None else "",
+            "cache_filter_stats": cache_filter_stats,
+            "whitelist_enabled": whitelist_codes is not None,
+            "whitelist_code_count": len(whitelist_codes or []),
         }
     )
     run_result.phase_metrics = phase_metrics
@@ -1274,6 +1414,9 @@ def main() -> int:
         resume=args.resume,
         snapshot_date=snapshot_date,
         shared_scan_shell_enabled=not bool(args.disable_shared_scan_shell),
+        universe_codes_file=Path(args.universe_codes_file) if args.universe_codes_file else None,
+        cache_only=bool(args.cache_only),
+        history_cache_dir=Path(args.history_cache_dir) if args.history_cache_dir else None,
     )
     export_results(run_result, output_dir, checkpoint_path=checkpoint_path, profile_name=profile_name, snapshot_date=snapshot_date)
     if not args.skip_db_persist:

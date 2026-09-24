@@ -9,6 +9,7 @@ import time
 import unittest
 import tempfile
 import json
+from datetime import datetime, timedelta
 from pathlib import Path
 from threading import BoundedSemaphore, Event
 from types import SimpleNamespace
@@ -1231,6 +1232,292 @@ class TestFundamentalContext(unittest.TestCase):
         self.assertEqual(second["status"], "failed")
         self.assertTrue(bool(second.get("cache_hit")))
         self.assertEqual(second.get("cache_source"), "disk")
+
+    def test_earnings_fundamental_stale_disk_cache_reused_when_report_period_matches(self) -> None:
+        cache_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(cache_dir.cleanup)
+        cfg = SimpleNamespace(
+            enable_fundamental_pipeline=True,
+            fundamental_cache_ttl_seconds=120,
+            fundamental_stage_timeout_seconds=1.5,
+            fundamental_fetch_timeout_seconds=0.8,
+            fundamental_retry_max=1,
+            fundamental_cache_max_entries=256,
+        )
+        first_manager = DataFetcherManager(fetchers=[])
+        first_manager._earnings_fundamental_disk_cache_dir = Path(cache_dir.name)
+        second_manager = DataFetcherManager(fetchers=[])
+        second_manager._earnings_fundamental_disk_cache_dir = Path(cache_dir.name)
+        calls = {"count": 0}
+
+        def _fake_get_fundamental_bundle(stock_code: str, *, enabled_blocks=None):
+            calls["count"] += 1
+            return {
+                "status": "ok",
+                "growth": {
+                    "quarterly_series": [
+                        {
+                            "report_date": "2026-03-31",
+                            "revenue_yoy": 18.0,
+                            "net_profit_yoy": 35.0,
+                        }
+                    ]
+                },
+                "earnings": {
+                    "financial_report": {"report_date": "2026-03-31"},
+                    "forecast_summary": f"{stock_code}-预增",
+                    "quick_report_summary": f"{stock_code}-快报",
+                },
+                "source_chain": [],
+                "errors": [],
+            }
+
+        with patch("src.config.get_config", return_value=cfg), patch.object(
+            first_manager._fundamental_adapter,
+            "get_fundamental_bundle",
+            side_effect=_fake_get_fundamental_bundle,
+        ):
+            first = first_manager.get_earnings_fundamental_context(
+                "600519",
+                budget_seconds=1.5,
+                report_period_hint="20260331",
+            )
+
+        cache_key = first_manager._get_fundamental_cache_key(
+            "600519",
+            1.5,
+            scope="earnings:financial,forecast,quick_report",
+        )
+        cache_file = first_manager._earnings_fundamental_disk_cache_file(cache_key)
+        payload = json.loads(cache_file.read_text(encoding="utf-8"))
+        payload["fetched_at"] = (datetime.now() - timedelta(days=2)).replace(microsecond=0).isoformat()
+        cache_file.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+
+        with patch("src.config.get_config", return_value=cfg), patch.object(
+            second_manager._fundamental_adapter,
+            "get_fundamental_bundle",
+            side_effect=AssertionError("matching stale disk cache should be reused"),
+        ):
+            second = second_manager.get_earnings_fundamental_context(
+                "600519",
+                budget_seconds=1.5,
+                report_period_hint="2026Q1",
+            )
+
+        self.assertEqual(calls["count"], 1)
+        self.assertFalse(bool(first.get("cache_hit")))
+        self.assertTrue(bool(second.get("cache_hit")))
+        self.assertEqual(second.get("cache_source"), "disk_stale_report_period_match")
+        self.assertEqual(
+            second["earnings"]["data"]["financial_report"]["report_date"],
+            "2026-03-31",
+        )
+
+    def test_earnings_fundamental_stale_disk_cache_not_reused_when_report_period_mismatches(self) -> None:
+        cache_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(cache_dir.cleanup)
+        cfg = SimpleNamespace(
+            enable_fundamental_pipeline=True,
+            fundamental_cache_ttl_seconds=120,
+            fundamental_stage_timeout_seconds=1.5,
+            fundamental_fetch_timeout_seconds=0.8,
+            fundamental_retry_max=1,
+            fundamental_cache_max_entries=256,
+        )
+        first_manager = DataFetcherManager(fetchers=[])
+        first_manager._earnings_fundamental_disk_cache_dir = Path(cache_dir.name)
+        second_manager = DataFetcherManager(fetchers=[])
+        second_manager._earnings_fundamental_disk_cache_dir = Path(cache_dir.name)
+        calls = {"count": 0}
+
+        def _fake_first_bundle(stock_code: str, *, enabled_blocks=None):
+            calls["count"] += 1
+            return {
+                "status": "ok",
+                "growth": {
+                    "quarterly_series": [
+                        {
+                            "report_date": "2026-03-31",
+                            "revenue_yoy": 18.0,
+                            "net_profit_yoy": 35.0,
+                        }
+                    ]
+                },
+                "earnings": {
+                    "financial_report": {"report_date": "2026-03-31"},
+                    "forecast_summary": f"{stock_code}-旧报告期",
+                },
+                "source_chain": [],
+                "errors": [],
+            }
+
+        def _fake_second_bundle(stock_code: str, *, enabled_blocks=None):
+            calls["count"] += 1
+            return {
+                "status": "ok",
+                "growth": {
+                    "quarterly_series": [
+                        {
+                            "report_date": "2025-12-31",
+                            "revenue_yoy": 8.0,
+                            "net_profit_yoy": 10.0,
+                        }
+                    ]
+                },
+                "earnings": {
+                    "financial_report": {"report_date": "2025-12-31"},
+                    "forecast_summary": f"{stock_code}-重新抓取",
+                },
+                "source_chain": [],
+                "errors": [],
+            }
+
+        with patch("src.config.get_config", return_value=cfg), patch.object(
+            first_manager._fundamental_adapter,
+            "get_fundamental_bundle",
+            side_effect=_fake_first_bundle,
+        ):
+            first_manager.get_earnings_fundamental_context(
+                "600519",
+                budget_seconds=1.5,
+                report_period_hint="20260331",
+            )
+
+        cache_key = first_manager._get_fundamental_cache_key(
+            "600519",
+            1.5,
+            scope="earnings:financial,forecast,quick_report",
+        )
+        cache_file = first_manager._earnings_fundamental_disk_cache_file(cache_key)
+        payload = json.loads(cache_file.read_text(encoding="utf-8"))
+        payload["fetched_at"] = (datetime.now() - timedelta(days=2)).replace(microsecond=0).isoformat()
+        cache_file.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+
+        with patch("src.config.get_config", return_value=cfg), patch.object(
+            second_manager._fundamental_adapter,
+            "get_fundamental_bundle",
+            side_effect=_fake_second_bundle,
+        ):
+            second = second_manager.get_earnings_fundamental_context(
+                "600519",
+                budget_seconds=1.5,
+                report_period_hint="20251231",
+            )
+
+        self.assertEqual(calls["count"], 2)
+        self.assertFalse(bool(second.get("cache_hit")))
+        self.assertIsNone(second.get("cache_source"))
+        self.assertEqual(
+            second["earnings"]["data"]["financial_report"]["report_date"],
+            "2025-12-31",
+        )
+        self.assertEqual(
+            second["earnings"]["data"]["forecast_summary"],
+            "600519-重新抓取",
+        )
+
+    def test_earnings_fundamental_stale_disk_cache_not_reused_when_newer_announcement_exists(self) -> None:
+        cache_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(cache_dir.cleanup)
+        cfg = SimpleNamespace(
+            enable_fundamental_pipeline=True,
+            fundamental_cache_ttl_seconds=120,
+            fundamental_stage_timeout_seconds=1.5,
+            fundamental_fetch_timeout_seconds=0.8,
+            fundamental_retry_max=1,
+            fundamental_cache_max_entries=256,
+        )
+        first_manager = DataFetcherManager(fetchers=[])
+        first_manager._earnings_fundamental_disk_cache_dir = Path(cache_dir.name)
+        second_manager = DataFetcherManager(fetchers=[])
+        second_manager._earnings_fundamental_disk_cache_dir = Path(cache_dir.name)
+        calls = {"count": 0}
+
+        def _fake_first_bundle(stock_code: str, *, enabled_blocks=None):
+            calls["count"] += 1
+            return {
+                "status": "ok",
+                "growth": {
+                    "quarterly_series": [
+                        {
+                            "report_date": "2026-03-31",
+                            "revenue_yoy": 18.0,
+                            "net_profit_yoy": 35.0,
+                        }
+                    ]
+                },
+                "earnings": {
+                    "financial_report": {"report_date": "2026-03-31"},
+                    "quick_report_summary": f"{stock_code}-旧快报",
+                    "quick_report_announcement_date": "2026-04-18",
+                },
+                "source_chain": [],
+                "errors": [],
+            }
+
+        def _fake_second_bundle(stock_code: str, *, enabled_blocks=None):
+            calls["count"] += 1
+            return {
+                "status": "ok",
+                "growth": {
+                    "quarterly_series": [
+                        {
+                            "report_date": "2026-03-31",
+                            "revenue_yoy": 18.0,
+                            "net_profit_yoy": 35.0,
+                        }
+                    ]
+                },
+                "earnings": {
+                    "financial_report": {"report_date": "2026-03-31"},
+                    "quick_report_summary": f"{stock_code}-新快报",
+                    "quick_report_announcement_date": "2026-04-28",
+                },
+                "source_chain": [],
+                "errors": [],
+            }
+
+        with patch("src.config.get_config", return_value=cfg), patch.object(
+            first_manager._fundamental_adapter,
+            "get_fundamental_bundle",
+            side_effect=_fake_first_bundle,
+        ):
+            first_manager.get_earnings_fundamental_context(
+                "600519",
+                budget_seconds=1.5,
+                report_period_hint="20260331",
+                announcement_date_hint="2026-04-18",
+            )
+
+        cache_key = first_manager._get_fundamental_cache_key(
+            "600519",
+            1.5,
+            scope="earnings:financial,forecast,quick_report",
+        )
+        cache_file = first_manager._earnings_fundamental_disk_cache_file(cache_key)
+        payload = json.loads(cache_file.read_text(encoding="utf-8"))
+        payload["fetched_at"] = (datetime.now() - timedelta(days=2)).replace(microsecond=0).isoformat()
+        cache_file.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+
+        with patch("src.config.get_config", return_value=cfg), patch.object(
+            second_manager._fundamental_adapter,
+            "get_fundamental_bundle",
+            side_effect=_fake_second_bundle,
+        ):
+            second = second_manager.get_earnings_fundamental_context(
+                "600519",
+                budget_seconds=1.5,
+                report_period_hint="20260331",
+                announcement_date_hint="2026-04-28",
+            )
+
+        self.assertEqual(calls["count"], 2)
+        self.assertFalse(bool(second.get("cache_hit")))
+        self.assertIsNone(second.get("cache_source"))
+        self.assertEqual(
+            second["earnings"]["data"]["quick_report_summary"],
+            "600519-新快报",
+        )
 
     def test_board_context_empty_rankings_mark_failed(self) -> None:
         manager = DataFetcherManager(fetchers=[])

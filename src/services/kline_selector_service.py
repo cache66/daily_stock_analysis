@@ -55,6 +55,24 @@ _NON_EQUITY_NAME_KEYWORDS = (
     "联接",
     "基金",
 )
+_INVALID_TEXT_TOKENS = {"", "nan", "none", "null", "nat", "<na>"}
+LOCAL_STRATEGY_DEFAULT_EXCLUDE_ST = True
+LOCAL_STRATEGY_DEFAULT_EXCLUDE_KCB = True
+LOCAL_STRATEGY_DEFAULT_EXCLUDE_CYB = False
+
+
+def resolve_local_strategy_universe_filters(
+    *,
+    exclude_st: Optional[bool] = None,
+    exclude_kcb: Optional[bool] = None,
+    exclude_cyb: Optional[bool] = None,
+) -> Dict[str, bool]:
+    """Return the canonical stock-pool filters for local strategy scans."""
+    return {
+        "exclude_st": LOCAL_STRATEGY_DEFAULT_EXCLUDE_ST if exclude_st is None else bool(exclude_st),
+        "exclude_kcb": LOCAL_STRATEGY_DEFAULT_EXCLUDE_KCB if exclude_kcb is None else bool(exclude_kcb),
+        "exclude_cyb": LOCAL_STRATEGY_DEFAULT_EXCLUDE_CYB if exclude_cyb is None else bool(exclude_cyb),
+    }
 
 
 def _normalize_market_cap(value: Any) -> Optional[float]:
@@ -120,6 +138,15 @@ def _looks_like_non_equity_name(name: Any) -> bool:
     return any(keyword in normalized for keyword in _NON_EQUITY_NAME_KEYWORDS)
 
 
+def _looks_like_delisted_name(name: Any) -> bool:
+    """Return True for obviously delisted or delisting A-share names."""
+    normalized = _safe_text(name)
+    if not normalized:
+        return False
+    upper_name = normalized.upper()
+    return normalized.endswith("退") or "退市" in normalized or upper_name.startswith("PT")
+
+
 def _coerce_list_date(value: Any) -> Optional[pd.Timestamp]:
     """Normalize heterogeneous listing-date values into pandas timestamps."""
     if value is None or (isinstance(value, float) and math.isnan(value)):
@@ -153,7 +180,17 @@ def _compute_listed_days(list_date_value: Any, *, as_of_date: Optional[date]) ->
 
 
 def _safe_text(value: Any) -> str:
-    return str(value or "").strip()
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    text = str(value).strip()
+    if text.lower() in _INVALID_TEXT_TOKENS:
+        return ""
+    return text
 
 
 def _safe_float(value: Any) -> Optional[float]:
@@ -171,6 +208,7 @@ def _safe_float(value: Any) -> Optional[float]:
 def _apply_scan_universe_filters(
     universe: pd.DataFrame,
     *,
+    active_codes: Optional[Set[str]] = None,
     whitelist_codes: Optional[Set[str]] = None,
     exclude_st: bool = False,
     exclude_kcb: bool = False,
@@ -181,8 +219,10 @@ def _apply_scan_universe_filters(
             "before": 0,
             "after": 0,
             "removed_invalid_code": 0,
+            "removed_inactive_code": 0,
             "removed_whitelist": 0,
             "removed_st": 0,
+            "removed_delisted_name": 0,
             "removed_kcb": 0,
             "removed_cyb": 0,
         }
@@ -196,7 +236,12 @@ def _apply_scan_universe_filters(
     filtered = filtered[filtered["_normalized_code"].astype(str).str.fullmatch(r"\d{6}", na=False)]
     after_valid = len(filtered)
 
-    after_whitelist = after_valid
+    after_active_codes = after_valid
+    if active_codes is not None:
+        filtered = filtered[filtered["_normalized_code"].isin(active_codes)]
+        after_active_codes = len(filtered)
+
+    after_whitelist = after_active_codes
     if whitelist_codes is not None:
         filtered = filtered[filtered["_normalized_code"].isin(whitelist_codes)]
         after_whitelist = len(filtered)
@@ -209,7 +254,12 @@ def _apply_scan_universe_filters(
         else:
             logger.warning("scan universe has no name column; exclude_st is ignored")
 
-    after_kcb = after_st
+    after_delisted_name = after_st
+    if "name" in filtered.columns and not filtered.empty:
+        filtered = filtered[~filtered["name"].apply(_looks_like_delisted_name)]
+        after_delisted_name = len(filtered)
+
+    after_kcb = after_delisted_name
     if exclude_kcb:
         filtered = filtered[~filtered["_normalized_code"].astype(str).str.startswith(("688", "689"), na=False)]
         after_kcb = len(filtered)
@@ -225,9 +275,11 @@ def _apply_scan_universe_filters(
         "before": before,
         "after": len(filtered),
         "removed_invalid_code": before - after_valid,
-        "removed_whitelist": after_valid - after_whitelist,
+        "removed_inactive_code": after_valid - after_active_codes,
+        "removed_whitelist": after_active_codes - after_whitelist,
         "removed_st": after_whitelist - after_st,
-        "removed_kcb": after_st - after_kcb,
+        "removed_delisted_name": after_st - after_delisted_name,
+        "removed_kcb": after_delisted_name - after_kcb,
         "removed_cyb": after_kcb - after_cyb,
     }
     return filtered.reset_index(drop=True), stats
@@ -1050,6 +1102,7 @@ class KlineSelectorService:
 
     _spot_universe_cache: Optional[pd.DataFrame] = None
     _listing_metadata_cache: Optional[pd.DataFrame] = None
+    _stock_basic_metadata_cache: Optional[pd.DataFrame] = None
     _spot_universe_reference_cache_memory: Optional[Dict[str, Any]] = None
     _spot_universe_reference_cache_ttl_seconds: int = 6 * 60 * 60
     _spot_universe_reference_cache_min_rows: int = 1000
@@ -1080,48 +1133,46 @@ class KlineSelectorService:
 
     @staticmethod
     def build_fast_a_share_manager() -> DataFetcherManager:
-        """Build a resilient yet fast A-share fetcher chain for full-market scans."""
+        """Build a resilient yet still practical A-share fetcher chain for full-market scans."""
         from data_provider.akshare_fetcher import AkshareFetcher
         from data_provider.tushare_fetcher import TushareFetcher
 
-        # Keep this path intentionally minimal: for a full-market K-line scan,
-        # per-symbol multi-provider fallback can turn a few missing symbols into
-        # minutes of extra wall time. We therefore prefer a single fast source
-        # and fail a symbol quickly when the source has no usable data.
-        #
-        # In the current Windows environment, Sina history can crash through
-        # py_mini_racer during threaded full-market scans. Keep Tencent/EM as
-        # the Akshare history path here and let manager-level Tushare fallback
-        # absorb symbols that those two endpoints still miss.
-        #
-        # For daily runnable jobs we still attach a Tushare fallback (when token
-        # is available) so transient Akshare endpoint failures do not directly
-        # turn into empty-day scans.
         akshare_fetcher = AkshareFetcher(
             sleep_min=0.0,
             sleep_max=0.0,
             stock_history_source_priority=("tencent", "em"),
             stock_history_retry_attempts=1,
         )
-        # Keep Akshare as the first fast path inside this specialized manager.
-        akshare_fetcher.priority = -2
+        # Daily full-market review should prefer the more stable history source
+        # when a token is available, while still keeping a lightweight fallback.
+        akshare_fetcher.priority = -1
 
-        fetchers = [akshare_fetcher]
+        fetchers = []
         try:
-            tushare_fetcher = TushareFetcher()
+            # Keep a little headroom below the account-side 50/min limit because
+            # the same process may also use Tushare for trade calendar, realtime,
+            # or board helpers during the same replay.
+            tushare_fetcher = TushareFetcher(rate_limit_per_minute=35)
             if tushare_fetcher.is_available():
+                tushare_fetcher.priority = -2
                 fetchers.append(tushare_fetcher)
         except Exception as exc:
             logger.debug("failed to attach Tushare fallback for fast selector manager: %s", exc)
+        fetchers.append(akshare_fetcher)
 
         manager = DataFetcherManager(fetchers=fetchers)
-        manager._daily_data_fetch_timeout_seconds = 20.0
+        # Safe single-machine scans may intentionally wait through provider-side
+        # minute windows, so keep the manager timeout above that guard.
+        manager._daily_data_fetch_timeout_seconds = 75.0
         # Monthly scans need a full trading window, but not a 2x calendar overfetch.
         manager._daily_data_request_calendar_span_multiplier = 1.6
         manager._daily_data_include_derived_indicators = False
         manager._prefer_cached_history_when_covered = True
         # Keep Tushare as a real fallback for transient Akshare history misses.
         manager._skip_tushare_history_fallback_for_fast_scan = False
+        # Do not suppress Tushare -> Akshare no-data fallback: recent listings
+        # and partial provider coverage can still recover on the free source.
+        manager._skip_redundant_history_fallback_for_fast_scan = False
         return manager
 
     @staticmethod
@@ -1290,10 +1341,23 @@ class KlineSelectorService:
     ) -> KlinePreparedUniverseResult:
         """Apply shared scan-shell preparation before deep per-stock evaluation."""
         normalized_universe = self._normalize_universe_dataframe(universe, as_of_date=as_of_date)
+        stock_basic_df = self._fetch_stock_basic_metadata_dataframe()
+        active_codes: Optional[Set[str]] = None
+        if self._universe_provider is None and stock_basic_df is not None and not stock_basic_df.empty:
+            stock_basic_universe = self._normalize_universe_dataframe(stock_basic_df, as_of_date=as_of_date)
+            if not stock_basic_universe.empty:
+                normalized_universe = self._merge_universe_stock_basic_metadata(
+                    normalized_universe,
+                    stock_basic_universe=stock_basic_universe,
+                )
+                active_code_set = self._build_active_stock_code_set(stock_basic_universe)
+                if active_code_set:
+                    active_codes = active_code_set
         base_universe_size = len(normalized_universe)
 
         filtered_universe, filter_stats = _apply_scan_universe_filters(
             normalized_universe,
+            active_codes=active_codes,
             whitelist_codes=whitelist_codes,
             exclude_st=exclude_st,
             exclude_kcb=exclude_kcb,
@@ -2136,7 +2200,7 @@ class KlineSelectorService:
         normalized = pd.DataFrame(
             {
                 "code": df[code_col].map(lambda v: normalize_stock_code(str(v)) if pd.notna(v) else None),
-                "name": df[name_col].map(lambda v: str(v).strip() if pd.notna(v) else ""),
+                "name": df[name_col].map(_safe_text),
             }
         )
         if total_mv_col is not None:
@@ -2220,6 +2284,61 @@ class KlineSelectorService:
             universe,
             listing_universe=listing_universe,
         )
+
+    @staticmethod
+    def _merge_universe_stock_basic_metadata(
+        universe: pd.DataFrame,
+        *,
+        stock_basic_universe: pd.DataFrame,
+    ) -> pd.DataFrame:
+        if universe.empty or stock_basic_universe.empty:
+            return universe.reset_index(drop=True)
+
+        metadata = stock_basic_universe[[col for col in ("code", "name") if col in stock_basic_universe.columns]].copy()
+        if metadata.empty or "code" not in metadata.columns or "name" not in metadata.columns:
+            return universe.reset_index(drop=True)
+        metadata = metadata.drop_duplicates(subset=["code"], keep="first")
+        merged = universe.merge(metadata, on="code", how="left", suffixes=("", "_stock_basic"))
+        latest_name_column = "name_stock_basic"
+        if latest_name_column in merged.columns:
+            latest_names = merged[latest_name_column].map(_safe_text)
+            if "name" not in merged.columns:
+                merged["name"] = ""
+            merged["name"] = latest_names.where(latest_names != "", merged["name"])
+            merged = merged.drop(columns=[latest_name_column])
+        return merged.sort_values("code").reset_index(drop=True)
+
+    def _merge_stock_basic_metadata_if_available(
+        self,
+        universe: pd.DataFrame,
+        *,
+        as_of_date: Optional[date] = None,
+    ) -> pd.DataFrame:
+        if universe is None or universe.empty:
+            return pd.DataFrame() if universe is None else universe.reset_index(drop=True)
+
+        stock_basic_df = self._fetch_stock_basic_metadata_dataframe()
+        if stock_basic_df is None or stock_basic_df.empty:
+            return universe.reset_index(drop=True)
+
+        stock_basic_universe = self._normalize_universe_dataframe(stock_basic_df, as_of_date=as_of_date)
+        if stock_basic_universe.empty:
+            return universe.reset_index(drop=True)
+
+        return self._merge_universe_stock_basic_metadata(
+            universe,
+            stock_basic_universe=stock_basic_universe,
+        )
+
+    @staticmethod
+    def _build_active_stock_code_set(stock_basic_universe: pd.DataFrame) -> Set[str]:
+        if stock_basic_universe is None or stock_basic_universe.empty or "code" not in stock_basic_universe.columns:
+            return set()
+        return {
+            code
+            for code in stock_basic_universe["code"].map(_safe_text)
+            if code and code.isdigit() and len(code) == 6
+        }
 
     @staticmethod
     def _prepare_history(df: Optional[pd.DataFrame]) -> pd.DataFrame:
@@ -2403,3 +2522,22 @@ class KlineSelectorService:
             except Exception as exc:
                 logger.debug("K-line selector listing metadata provider %s failed: %s", provider_name, exc)
         return pd.DataFrame(columns=["code", "name", "list_date"])
+
+    def _fetch_stock_basic_metadata_dataframe(self) -> pd.DataFrame:
+        cached_stock_basic_df = self.__class__._stock_basic_metadata_cache
+        if cached_stock_basic_df is not None and not cached_stock_basic_df.empty:
+            return cached_stock_basic_df.copy()
+
+        providers: List[tuple[str, Callable[[], pd.DataFrame]]] = [
+            ("tushare_stock_basic", self._fetch_universe_from_tushare),
+        ]
+        for provider_name, provider in providers:
+            try:
+                df = provider()
+                if df is not None and not df.empty:
+                    logger.info("K-line selector loaded stock basic metadata via %s: %s rows", provider_name, len(df))
+                    self.__class__._stock_basic_metadata_cache = df.copy()
+                    return df
+            except Exception as exc:
+                logger.debug("K-line selector stock basic provider %s failed: %s", provider_name, exc)
+        return pd.DataFrame(columns=["code", "name"])

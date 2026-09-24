@@ -21,6 +21,7 @@ except ValueError:
 if not json_repair_available and "json_repair" not in sys.modules:
     sys.modules["json_repair"] = MagicMock()
 
+from data_provider.base import RateLimitError
 from data_provider.tushare_fetcher import TushareFetcher
 
 
@@ -34,6 +35,12 @@ class TestTushareFetcherFollowUps(unittest.TestCase):
         fetcher._api = MagicMock()
         fetcher.priority = 2
         return fetcher
+
+    def setUp(self) -> None:
+        TushareFetcher.reset_global_rate_limit_state()
+
+    def tearDown(self) -> None:
+        TushareFetcher.reset_global_rate_limit_state()
 
     def test_get_trade_time_refreshes_trade_calendar_when_day_changes(self) -> None:
         fetcher = self._make_fetcher()
@@ -153,6 +160,35 @@ class TestTushareFetcherFollowUps(unittest.TestCase):
         self.assertAlmostEqual(chip.concentration_90, 0.1)
         self.assertAlmostEqual(chip.concentration_70, 0.1)
         self.assertEqual(rate_limit_mock.call_count, 3)
+
+    def test_rate_limit_budget_is_shared_across_fetcher_instances(self) -> None:
+        first = self._make_fetcher()
+        second = self._make_fetcher()
+        first.rate_limit_per_minute = 1
+        second.rate_limit_per_minute = 1
+
+        with patch(
+            "data_provider.tushare_fetcher.time.time",
+            side_effect=[100.0, 100.0, 161.0, 161.0],
+        ), patch(
+            "data_provider.tushare_fetcher.time.sleep",
+            return_value=None,
+        ) as sleep_mock:
+            first._check_rate_limit()
+            second._check_rate_limit()
+
+        sleep_mock.assert_called_once()
+        self.assertGreaterEqual(sleep_mock.call_args[0][0], 60.0)
+
+    def test_fetch_raw_data_rate_limit_error_arms_process_wide_cooldown(self) -> None:
+        fetcher = self._make_fetcher()
+        fetcher._api.daily.side_effect = Exception("抱歉，您访问接口(daily)频率超限(50次/分钟)")
+
+        with patch.object(fetcher, "_check_rate_limit"):
+            with self.assertRaises(RateLimitError):
+                fetcher._fetch_raw_data("600519", "20260101", "20260105")
+
+        self.assertGreater(TushareFetcher._GLOBAL_RATE_LIMIT_COOLDOWN_UNTIL, 0.0)
 
     def test_convert_stock_code_accepts_exchange_prefixed_a_share(self) -> None:
         fetcher = self._make_fetcher()

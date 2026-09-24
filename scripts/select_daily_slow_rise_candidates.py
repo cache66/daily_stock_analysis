@@ -29,6 +29,7 @@ from src.services.kline_selector_service import (
     KlineSelectorRunResult,
     KlineSelectorService,
     MaxMarketCapRule,
+    resolve_local_strategy_universe_filters,
 )
 from src.storage import DatabaseManager
 
@@ -40,6 +41,7 @@ PROFILE_LABELS = {
     "strict": "严格",
     "balanced": "均衡",
     "loose": "宽松",
+    "review_balanced": "每日复盘均衡",
 }
 PROFILE_PRESETS: Dict[str, Dict[str, Dict[str, Any]]] = {
     "strict": {
@@ -61,6 +63,9 @@ PROFILE_PRESETS: Dict[str, Dict[str, Dict[str, Any]]] = {
             "min_breakout_above_base_pct": 1.8,
             "min_avg_daily_amount_20d": 20_000_000.0,
             "max_total_market_cap": 350.0 * 1e8,
+            "max_upper_shadow_day_ratio_20d": 0.22,
+            "max_upper_shadow_avg_pct_20d": 2.0,
+            "require_monthly_uptrend": True,
         },
         "prefilter": {
             "min_change_pct_60d": 8.0,
@@ -88,6 +93,9 @@ PROFILE_PRESETS: Dict[str, Dict[str, Dict[str, Any]]] = {
             "min_breakout_above_base_pct": 1.5,
             "min_avg_daily_amount_20d": 15_000_000.0,
             "max_total_market_cap": 450.0 * 1e8,
+            "max_upper_shadow_day_ratio_20d": 0.25,
+            "max_upper_shadow_avg_pct_20d": 2.2,
+            "require_monthly_uptrend": True,
         },
         "prefilter": {
             "min_change_pct_60d": 6.0,
@@ -115,6 +123,9 @@ PROFILE_PRESETS: Dict[str, Dict[str, Dict[str, Any]]] = {
             "min_breakout_above_base_pct": 1.0,
             "min_avg_daily_amount_20d": 12_000_000.0,
             "max_total_market_cap": 600.0 * 1e8,
+            "max_upper_shadow_day_ratio_20d": 0.30,
+            "max_upper_shadow_avg_pct_20d": 2.5,
+            "require_monthly_uptrend": True,
         },
         "prefilter": {
             "min_change_pct_60d": 4.0,
@@ -145,9 +156,44 @@ PROFILE_PRESETS["accelerating"] = {
         "min_breakout_above_base_pct": 1.0,
         "min_avg_daily_amount_20d": 15_000_000.0,
         "max_total_market_cap": 600.0 * 1e8,
+        "max_upper_shadow_day_ratio_20d": 0.28,
+        "max_upper_shadow_avg_pct_20d": 2.5,
+        "require_monthly_uptrend": True,
     },
     "prefilter": {
         "min_change_pct_60d": 8.0,
+        "min_turnover_rate": 0.5,
+        "require_positive_change": False,
+        "exclude_st": True,
+    },
+}
+
+PROFILE_PRESETS["review_balanced"] = {
+    "criteria": {
+        "base_lookback_days": 25,
+        "advance_lookback_days": 30,
+        "ma_short_days": 20,
+        "ma_long_days": 60,
+        "max_base_range_pct": 24.0,
+        "max_base_return_abs_pct": 10.0,
+        "min_advance_return_pct": 10.0,
+        "max_advance_return_pct": 85.0,
+        "min_advance_positive_ratio": 0.50,
+        "min_steady_positive_ratio": 0.52,
+        "max_advance_drawdown_pct": 14.0,
+        "max_full_window_drawdown_pct": 28.0,
+        "max_single_day_gain_pct": 12.5,
+        "max_consecutive_down_days": 3,
+        "min_breakout_above_base_pct": 0.0,
+        "min_avg_daily_amount_20d": 15_000_000.0,
+        "max_total_market_cap": 600.0 * 1e8,
+        "max_recent_drawdown_10d_pct": 10.0,
+        "max_upper_shadow_day_ratio_20d": 0.25,
+        "max_upper_shadow_avg_pct_20d": 2.2,
+        "require_monthly_uptrend": True,
+    },
+    "prefilter": {
+        "min_change_pct_60d": 5.0,
         "min_turnover_rate": 0.5,
         "require_positive_change": False,
         "exclude_st": True,
@@ -177,6 +223,10 @@ class DailySlowRiseCriteria(KlineSelectorCriteria):
     min_breakout_above_base_pct: float = 1.5
     min_avg_daily_amount_20d: float = 15_000_000.0
     max_total_market_cap: float = 450.0 * 1e8
+    max_recent_drawdown_10d_pct: float = 99.0
+    max_upper_shadow_day_ratio_20d: float = 0.25
+    max_upper_shadow_avg_pct_20d: float = 2.2
+    require_monthly_uptrend: bool = True
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -206,6 +256,12 @@ class DailySlowRiseCriteria(KlineSelectorCriteria):
             raise ValueError("min_breakout_above_base_pct must be >= 0")
         if self.min_avg_daily_amount_20d < 0:
             raise ValueError("min_avg_daily_amount_20d must be >= 0")
+        if self.max_recent_drawdown_10d_pct <= 0:
+            raise ValueError("max_recent_drawdown_10d_pct must be > 0")
+        if not 0 <= self.max_upper_shadow_day_ratio_20d <= 1:
+            raise ValueError("max_upper_shadow_day_ratio_20d must be in [0, 1]")
+        if self.max_upper_shadow_avg_pct_20d < 0:
+            raise ValueError("max_upper_shadow_avg_pct_20d must be >= 0")
 
     @property
     def history_days_required(self) -> int:
@@ -249,6 +305,77 @@ def _max_consecutive_down_days(history: pd.DataFrame) -> int:
     return max_streak
 
 
+def _upper_shadow_metrics(history: pd.DataFrame) -> dict[str, float]:
+    recent = history.tail(20).copy()
+    if recent.empty:
+        return {
+            "upper_shadow_day_ratio_20d": 0.0,
+            "upper_shadow_avg_pct_20d": 0.0,
+            "upper_shadow_max_pct_20d": 0.0,
+        }
+    high = pd.to_numeric(recent["high"], errors="coerce")
+    close = pd.to_numeric(recent["close"], errors="coerce")
+    open_ = pd.to_numeric(recent["open"], errors="coerce")
+    upper_shadow_pct = ((high - pd.concat([open_, close], axis=1).max(axis=1)) / close.clip(lower=1e-6)) * 100.0
+    upper_shadow_pct = upper_shadow_pct.clip(lower=0).dropna()
+    if upper_shadow_pct.empty:
+        return {
+            "upper_shadow_day_ratio_20d": 0.0,
+            "upper_shadow_avg_pct_20d": 0.0,
+            "upper_shadow_max_pct_20d": 0.0,
+        }
+    pressure_days = upper_shadow_pct >= 3.0
+    return {
+        "upper_shadow_day_ratio_20d": round(float(pressure_days.mean()), 4),
+        "upper_shadow_avg_pct_20d": round(float(upper_shadow_pct.mean()), 4),
+        "upper_shadow_max_pct_20d": round(float(upper_shadow_pct.max()), 4),
+    }
+
+
+def _monthly_uptrend_metrics(history: pd.DataFrame) -> dict[str, Any]:
+    required_false = {
+        "monthly_uptrend_passed": False,
+        "monthly_recent_return_pct": None,
+        "monthly_latest_close": None,
+        "monthly_prev_close": None,
+        "monthly_ma3": None,
+        "monthly_observation_months": 0,
+    }
+    if "date" not in history.columns:
+        return required_false
+    monthly = history.dropna(subset=["date", "close"]).copy()
+    if monthly.empty:
+        return required_false
+    monthly["date"] = pd.to_datetime(monthly["date"], errors="coerce")
+    monthly = monthly.dropna(subset=["date"])
+    if monthly.empty:
+        return required_false
+    monthly["period_bucket"] = monthly["date"].dt.to_period("M")
+    closes = (
+        monthly.sort_values("date")
+        .groupby("period_bucket", sort=True)["close"]
+        .last()
+        .astype(float)
+        .tail(4)
+    )
+    if len(closes) < 3:
+        return required_false | {"monthly_observation_months": int(len(closes))}
+    latest_close = float(closes.iloc[-1])
+    prev_close = float(closes.iloc[-2])
+    start_close = float(closes.iloc[0])
+    ma3 = float(closes.tail(3).mean())
+    recent_return_pct = round((latest_close / max(start_close, 1e-6) - 1.0) * 100.0, 4)
+    passed = latest_close >= prev_close and latest_close >= ma3 and recent_return_pct >= 0.0
+    return {
+        "monthly_uptrend_passed": bool(passed),
+        "monthly_recent_return_pct": recent_return_pct,
+        "monthly_latest_close": round(latest_close, 4),
+        "monthly_prev_close": round(prev_close, 4),
+        "monthly_ma3": round(ma3, 4),
+        "monthly_observation_months": int(len(closes)),
+    }
+
+
 class DailySlowRiseRule(KlineSelectionRule):
     name = "daily_slow_rise"
     description = "Detect healthy 30-45 degree style daily slow-rise structures."
@@ -286,6 +413,9 @@ class DailySlowRiseRule(KlineSelectionRule):
         )
         advance_max_drawdown_pct = _max_drawdown_pct(advance["close"])
         full_window_drawdown_pct = _max_drawdown_pct(history["close"])
+        recent_drawdown_10d_pct = _max_drawdown_pct(history.tail(10)["close"])
+        upper_shadow_metrics = _upper_shadow_metrics(history)
+        monthly_metrics = _monthly_uptrend_metrics(history)
         gain_series = (
             (pd.to_numeric(advance_valid["close"], errors="coerce") / pd.to_numeric(advance_valid["prev_close"], errors="coerce") - 1.0)
             * 100.0
@@ -310,6 +440,11 @@ class DailySlowRiseRule(KlineSelectionRule):
         )
         amount_passed = avg_daily_amount_20d >= self.criteria.min_avg_daily_amount_20d
         breakout_passed = breakout_above_base_pct >= self.criteria.min_breakout_above_base_pct
+        upper_shadow_passed = (
+            upper_shadow_metrics["upper_shadow_day_ratio_20d"] <= self.criteria.max_upper_shadow_day_ratio_20d
+            and upper_shadow_metrics["upper_shadow_avg_pct_20d"] <= self.criteria.max_upper_shadow_avg_pct_20d
+        )
+        monthly_uptrend_passed = bool(monthly_metrics["monthly_uptrend_passed"]) or not self.criteria.require_monthly_uptrend
         steady_passed = (
             full_window_return_pct >= self.criteria.min_advance_return_pct
             and full_window_return_pct <= self.criteria.max_advance_return_pct
@@ -339,19 +474,28 @@ class DailySlowRiseRule(KlineSelectionRule):
             "steady_positive_ratio": steady_positive_ratio,
             "advance_max_drawdown_pct": advance_max_drawdown_pct,
             "full_window_drawdown_pct": full_window_drawdown_pct,
+            "recent_drawdown_10d_pct": recent_drawdown_10d_pct,
             "max_single_day_gain_pct": max_single_day_gain_pct,
             "max_consecutive_down_days": int(max_consecutive_down_days),
             "breakout_above_base_pct": breakout_above_base_pct,
             "avg_daily_amount_20d": avg_daily_amount_20d,
             "trend_pattern_label": pattern_label or "not_pretty",
+            **upper_shadow_metrics,
+            **monthly_metrics,
         }
 
         if not amount_passed:
             return KlineRuleResult(name=self.name, passed=False, message="average daily amount too low", metrics=metrics)
+        if not monthly_uptrend_passed:
+            return KlineRuleResult(name=self.name, passed=False, message="monthly trend not aligned", metrics=metrics)
+        if not upper_shadow_passed:
+            return KlineRuleResult(name=self.name, passed=False, message="upper shadow pressure too high", metrics=metrics)
         if max_single_day_gain_pct > self.criteria.max_single_day_gain_pct:
             return KlineRuleResult(name=self.name, passed=False, message="single-day gain too large", metrics=metrics)
         if advance_max_drawdown_pct > self.criteria.max_advance_drawdown_pct or full_window_drawdown_pct > self.criteria.max_full_window_drawdown_pct:
             return KlineRuleResult(name=self.name, passed=False, message="drawdown too deep", metrics=metrics)
+        if recent_drawdown_10d_pct > self.criteria.max_recent_drawdown_10d_pct:
+            return KlineRuleResult(name=self.name, passed=False, message="recent pullback not recovered", metrics=metrics)
         if not ma_structure_passed:
             return KlineRuleResult(name=self.name, passed=False, message="ma structure not aligned", metrics=metrics)
         if max_consecutive_down_days > self.criteria.max_consecutive_down_days:
@@ -440,6 +584,10 @@ def resolve_profile_settings(args: argparse.Namespace) -> tuple[str, DailySlowRi
         min_breakout_above_base_pct=float(criteria_defaults["min_breakout_above_base_pct"]),
         min_avg_daily_amount_20d=float(criteria_defaults["min_avg_daily_amount_20d"]),
         max_total_market_cap=float(criteria_defaults["max_total_market_cap"]),
+        max_recent_drawdown_10d_pct=float(criteria_defaults.get("max_recent_drawdown_10d_pct", 99.0)),
+        max_upper_shadow_day_ratio_20d=float(criteria_defaults.get("max_upper_shadow_day_ratio_20d", 0.25)),
+        max_upper_shadow_avg_pct_20d=float(criteria_defaults.get("max_upper_shadow_avg_pct_20d", 2.2)),
+        require_monthly_uptrend=bool(criteria_defaults.get("require_monthly_uptrend", True)),
     )
     prefilter = None
     if not args.disable_spot_prefilter:
@@ -481,10 +629,16 @@ def build_selected_dataframe(run_result: KlineSelectorRunResult) -> pd.DataFrame
                 "advance_return_pct": metrics.get("advance_return_pct"),
                 "advance_positive_ratio": metrics.get("advance_positive_ratio"),
                 "advance_max_drawdown_pct": metrics.get("advance_max_drawdown_pct"),
+                "recent_drawdown_10d_pct": metrics.get("recent_drawdown_10d_pct"),
                 "max_single_day_gain_pct": metrics.get("max_single_day_gain_pct"),
                 "max_consecutive_down_days": metrics.get("max_consecutive_down_days"),
                 "breakout_above_base_pct": metrics.get("breakout_above_base_pct"),
                 "avg_daily_amount_20d": metrics.get("avg_daily_amount_20d"),
+                "upper_shadow_day_ratio_20d": metrics.get("upper_shadow_day_ratio_20d"),
+                "upper_shadow_avg_pct_20d": metrics.get("upper_shadow_avg_pct_20d"),
+                "upper_shadow_max_pct_20d": metrics.get("upper_shadow_max_pct_20d"),
+                "monthly_uptrend_passed": metrics.get("monthly_uptrend_passed"),
+                "monthly_recent_return_pct": metrics.get("monthly_recent_return_pct"),
                 "trend_pattern_label": metrics.get("trend_pattern_label"),
                 "history_source": evaluation.history_source,
             }
@@ -839,10 +993,13 @@ def scan_daily_slow_rise_candidates(
     use_shared_scan_shell = bool(shared_scan_shell_enabled) and hasattr(service, "prepare_scan_universe")
     if use_shared_scan_shell and hasattr(service, "get_spot_enriched_a_share_universe"):
         universe = service.get_spot_enriched_a_share_universe(limit=limit, as_of_date=snapshot_date)
+        universe_filter_kwargs = resolve_local_strategy_universe_filters(
+            exclude_st=bool(prefilter.exclude_st) if prefilter is not None else None,
+        )
         prepared_universe = service.prepare_scan_universe(
             universe=universe,
             prefilter=prefilter,
-            exclude_st=bool(prefilter.exclude_st) if prefilter is not None else False,
+            **universe_filter_kwargs,
             shard_count=shard_count,
             shard_index=shard_index,
             cached_quote_universe=service._read_spot_universe_reference_cache()

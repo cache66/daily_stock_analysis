@@ -251,3 +251,105 @@ export interface FastReviewFocusResponse {
   driverSummary: Record<string, number>;
   items: FastReviewFocusItem[];
 }
+
+export interface FastReviewStockOverviewItem {
+  code: string;
+  name?: string | null;
+  stockReviewLane?: string | null;
+  stockReviewLaneLabel?: string | null;
+  tier?: string | null;
+  abBucket?: string | null;
+  reviewStageLabel?: string | null;
+  driverLabel?: string | null;
+  priorityScore?: number | null;
+  strategyCount: number;
+  signalKeys: string[];
+  signalTypes: string[];
+  triggeredStrategies: string[];
+  chartEvidenceSummary?: string | null;
+  earningsEvidenceSummary?: string | null;
+  stockContextSummary?: string | null;
+  todayChangePct?: number | null;
+  peRatio?: number | null;
+  reportPeriodLabel?: string | null;
+  revenueYoy?: number | null;
+  netProfitYoy?: number | null;
+  roe?: number | null;
+  earningsStrategyScore?: number | null;
+  earningsStrategyGateStatus?: string | null;
+  earningsQualityScore?: number | null;
+  earningsQualityCyclePhase?: string | null;
+  capitalProfileScore?: number | null;
+  relativeStrengthScore?: number | null;
+  breakoutQualityScore?: number | null;
+  marketExpectationInstitutionCount?: number | null;
+  netProfitAmount?: number | null;
+  primaryBoardName?: string | null;
+  preferredIndustryLabel?: string | null;
+  themeLabel?: string | null;
+  mainlineJudgement?: string | null;
+  reasonSummary?: string | null;
+  displayReasonSummary?: string | null;
+  causeTagsZh?: string | null;
+  latestTradeDate?: string | null;
+  pureChartQualityPassed?: boolean | null;
+}
+
+export interface FastReviewStockOverviewResponse {
+  snapshotDate: string;
+  total: number;
+  sourceRunDir: string;
+  sourceCsvPath: string;
+  laneSummary: Record<string, number>;
+  signalSummary: Record<string, number>;
+  items: FastReviewStockOverviewItem[];
+}
+
+export interface PersonalStrategyDefinition {
+  id: string;
+  name: string;
+  shortName: string;
+  group: string;
+  groupLabel: string;
+  mode: string;
+  aliases: string[];
+  role: string;
+  logic: string;
+}
+
+export interface PersonalStrategyMatch {
+  id: string;
+  name: string;
+  shortName: string;
+  group: string;
+  groupLabel: string;
+  mode: string;
+  role: string;
+  logic: string;
+}
+
+export interface PersonalStrategyMatrixItem extends FastReviewStockOverviewItem {
+  matchedStrategies: PersonalStrategyMatch[];
+  matchedStrategyIds: string[];
+  matchedStrategyCount: number;
+  qualityScore: number;
+  qualityBand: 'recommended' | 'watch' | 'weak';
+  qualityLabel: string;
+  qualitySummary: string;
+  qualityFlags: string[];
+  viewLane: 'short_term' | 'long_term' | 'watch';
+  viewLaneLabel: string;
+  viewLaneSummary: string;
+}
+
+export interface PersonalStrategyMatrixResponse {
+  snapshotDate: string;
+  total: number;
+  sourceRunDir: string;
+  sourceCsvPath: string;
+  laneSummary: Record<string, number>;
+  signalSummary: Record<string, number>;
+  strategySummary: Record<string, number>;
+  strategies: PersonalStrategyDefinition[];
+  items: PersonalStrategyMatrixItem[];
+}

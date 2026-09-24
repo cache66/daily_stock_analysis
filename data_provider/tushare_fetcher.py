@@ -10,7 +10,7 @@ TushareFetcher - 备用数据源 1 (Priority 2)
 
 流控策略：
 1. 实现"每分钟调用计数器"
-2. 超过免费配额（80次/分）时，强制休眠到下一分钟
+2. 超过配置配额时，强制休眠到下一分钟
 3. 使用 tenacity 实现指数退避重试
 """
 
@@ -20,6 +20,7 @@ import re
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from threading import Lock
 from typing import Optional, Tuple, List, Dict, Any
 
 import pandas as pd
@@ -120,25 +121,36 @@ class TushareFetcher(BaseFetcher):
     
     关键策略：
     - 每分钟调用计数器，防止超出配额
-    - 超过 80 次/分钟时强制等待
+    - 超过配置的每分钟配额时强制等待
     - 失败后指数退避重试
     
-    配额说明（Tushare 免费用户）：
-    - 每分钟最多 80 次请求
-    - 每天最多 500 次请求
+    配额说明：
+    - 每分钟请求数受账号档位和运行配置共同约束
+    - 项目默认使用保守限速，优先保证单机日常任务稳定运行
     """
+
+    _GLOBAL_RATE_LIMIT_LOCK = Lock()
+    _GLOBAL_RATE_LIMIT_WINDOW_START: Optional[float] = None
+    _GLOBAL_RATE_LIMIT_CALL_COUNT: int = 0
+    _GLOBAL_RATE_LIMIT_COOLDOWN_UNTIL: float = 0.0
     
     name = "TushareFetcher"
     priority = int(os.getenv("TUSHARE_PRIORITY", "2"))  # 默认优先级，会在 __init__ 中根据配置动态调整
 
-    def __init__(self, rate_limit_per_minute: int = 80):
+    def __init__(self, rate_limit_per_minute: Optional[int] = None):
         """
         初始化 TushareFetcher
 
         Args:
-            rate_limit_per_minute: 每分钟最大请求数（默认80，Tushare免费配额）
+            rate_limit_per_minute: 每分钟最大请求数；未显式传入时读取配置。
         """
-        self.rate_limit_per_minute = rate_limit_per_minute
+        config = get_config()
+        resolved_rate_limit = (
+            config.tushare_rate_limit_per_minute
+            if rate_limit_per_minute is None
+            else rate_limit_per_minute
+        )
+        self.rate_limit_per_minute = max(1, int(resolved_rate_limit))
         self._call_count = 0  # 当前分钟内的调用次数
         self._minute_start: Optional[float] = None  # 当前计数周期开始时间
         self._api: Optional[object] = None  # Tushare API 实例
@@ -150,6 +162,45 @@ class TushareFetcher(BaseFetcher):
 
         # 根据 API 初始化结果动态调整优先级
         self.priority = self._determine_priority()
+
+    @classmethod
+    def reset_global_rate_limit_state(cls) -> None:
+        """Reset process-wide Tushare rate-limit bookkeeping for tests."""
+        with cls._GLOBAL_RATE_LIMIT_LOCK:
+            cls._GLOBAL_RATE_LIMIT_WINDOW_START = None
+            cls._GLOBAL_RATE_LIMIT_CALL_COUNT = 0
+            cls._GLOBAL_RATE_LIMIT_COOLDOWN_UNTIL = 0.0
+
+    @staticmethod
+    def _looks_like_server_rate_limit_message(error_text: str) -> bool:
+        normalized = str(error_text or "").strip().lower()
+        if not normalized:
+            return False
+        rate_limit_markers = (
+            "频率超限",
+            "rate limit",
+            "too many requests",
+            "次数/分钟",
+            "次/分钟",
+            "requests per minute",
+        )
+        return any(marker in normalized for marker in rate_limit_markers)
+
+    @classmethod
+    def _arm_global_rate_limit_cooldown(
+        cls,
+        *,
+        cooldown_seconds: float = 65.0,
+    ) -> None:
+        """Pause future Tushare calls across fetcher instances after a provider-side limit hit."""
+        now = time.time()
+        with cls._GLOBAL_RATE_LIMIT_LOCK:
+            cls._GLOBAL_RATE_LIMIT_COOLDOWN_UNTIL = max(
+                cls._GLOBAL_RATE_LIMIT_COOLDOWN_UNTIL,
+                now + max(1.0, float(cooldown_seconds)),
+            )
+            cls._GLOBAL_RATE_LIMIT_WINDOW_START = now
+            cls._GLOBAL_RATE_LIMIT_CALL_COUNT = 0
     
     def _init_api(self) -> None:
         """
@@ -381,38 +432,55 @@ class TushareFetcher(BaseFetcher):
         2. 如果是，重置计数器
         3. 如果当前分钟调用次数超过限制，强制休眠
         """
-        current_time = time.time()
-        
-        # 检查是否需要重置计数器（新的一分钟）
-        if self._minute_start is None:
-            self._minute_start = current_time
-            self._call_count = 0
-        elif current_time - self._minute_start >= 60:
-            # 已经过了一分钟，重置计数器
-            self._minute_start = current_time
-            self._call_count = 0
-            logger.debug("速率限制计数器已重置")
-        
-        # 检查是否超过配额
-        if self._call_count >= self.rate_limit_per_minute:
-            # 计算需要等待的时间（到下一分钟）
-            elapsed = current_time - self._minute_start
-            sleep_time = max(0, 60 - elapsed) + 1  # +1 秒缓冲
-            
-            logger.warning(
-                f"Tushare 达到速率限制 ({self._call_count}/{self.rate_limit_per_minute} 次/分钟)，"
-                f"等待 {sleep_time:.1f} 秒..."
+        cls = type(self)
+        effective_limit = max(1, int(self.rate_limit_per_minute))
+
+        with cls._GLOBAL_RATE_LIMIT_LOCK:
+            current_time = time.time()
+
+            if cls._GLOBAL_RATE_LIMIT_COOLDOWN_UNTIL > current_time:
+                sleep_time = cls._GLOBAL_RATE_LIMIT_COOLDOWN_UNTIL - current_time
+                logger.warning(
+                    "Tushare 触发进程级冷却窗口，等待 %.1f 秒后继续...",
+                    sleep_time,
+                )
+                time.sleep(sleep_time)
+                current_time = time.time()
+                cls._GLOBAL_RATE_LIMIT_COOLDOWN_UNTIL = 0.0
+                cls._GLOBAL_RATE_LIMIT_WINDOW_START = current_time
+                cls._GLOBAL_RATE_LIMIT_CALL_COUNT = 0
+
+            if cls._GLOBAL_RATE_LIMIT_WINDOW_START is None:
+                cls._GLOBAL_RATE_LIMIT_WINDOW_START = current_time
+                cls._GLOBAL_RATE_LIMIT_CALL_COUNT = 0
+            elif current_time - cls._GLOBAL_RATE_LIMIT_WINDOW_START >= 60:
+                cls._GLOBAL_RATE_LIMIT_WINDOW_START = current_time
+                cls._GLOBAL_RATE_LIMIT_CALL_COUNT = 0
+                logger.debug("Tushare 进程级速率限制计数器已重置")
+
+            if cls._GLOBAL_RATE_LIMIT_CALL_COUNT >= effective_limit:
+                elapsed = current_time - cls._GLOBAL_RATE_LIMIT_WINDOW_START
+                sleep_time = max(0, 60 - elapsed) + 1
+                logger.warning(
+                    "Tushare 达到进程级速率限制 (%s/%s 次/分钟)，等待 %.1f 秒...",
+                    cls._GLOBAL_RATE_LIMIT_CALL_COUNT,
+                    effective_limit,
+                    sleep_time,
+                )
+                time.sleep(sleep_time)
+                current_time = time.time()
+                cls._GLOBAL_RATE_LIMIT_WINDOW_START = current_time
+                cls._GLOBAL_RATE_LIMIT_CALL_COUNT = 0
+                cls._GLOBAL_RATE_LIMIT_COOLDOWN_UNTIL = 0.0
+
+            cls._GLOBAL_RATE_LIMIT_CALL_COUNT += 1
+            self._minute_start = cls._GLOBAL_RATE_LIMIT_WINDOW_START
+            self._call_count = cls._GLOBAL_RATE_LIMIT_CALL_COUNT
+            logger.debug(
+                "Tushare 当前进程级调用次数: %s/%s",
+                self._call_count,
+                effective_limit,
             )
-            
-            time.sleep(sleep_time)
-            
-            # 重置计数器
-            self._minute_start = time.time()
-            self._call_count = 0
-        
-        # 增加调用计数
-        self._call_count += 1
-        logger.debug(f"Tushare 当前分钟调用次数: {self._call_count}/{self.rate_limit_per_minute}")
 
     def _call_api_with_rate_limit(self, method_name: str, **kwargs) -> pd.DataFrame:
         """统一通过速率限制包装 Tushare API 调用。"""
@@ -719,7 +787,9 @@ class TushareFetcher(BaseFetcher):
             error_msg = str(e).lower()
             
             # 检测配额超限
-            if any(keyword in error_msg for keyword in ['quota', '配额', 'limit', '权限']):
+            if any(keyword in error_msg for keyword in ['quota', '配额', 'limit', '权限', '频率超限', '次/分钟']):
+                if self._looks_like_server_rate_limit_message(str(e)):
+                    self._arm_global_rate_limit_cooldown()
                 logger.warning(f"Tushare 配额可能超限: {e}")
                 raise RateLimitError(f"Tushare 配额超限: {e}") from e
             

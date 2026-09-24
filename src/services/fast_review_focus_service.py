@@ -65,6 +65,35 @@ class FastReviewFocusService:
             "items": items,
         }
 
+    def get_stock_overview(self, *, snapshot_date: Any, code: Optional[str] = None) -> Dict[str, Any]:
+        normalized_date, overview_csv = self._resolve_stock_overview_csv(snapshot_date=snapshot_date)
+        if normalized_date is None or overview_csv is None:
+            raise ValueError("snapshot_date is required and must be YYYY-MM-DD")
+
+        items = self._load_stock_overview_items(overview_csv)
+        if self._clean_text(code):
+            items = [
+                item
+                for item in items
+                if self._stock_code_matches(item.get("code"), code)
+            ]
+
+        return {
+            "snapshot_date": normalized_date.isoformat(),
+            "total": len(items),
+            "source_run_dir": str(overview_csv.parent.parent.parent),
+            "source_csv_path": str(overview_csv),
+            "lane_summary": self._build_lane_summary(items),
+            "signal_summary": self._build_signal_summary(items),
+            "items": items,
+        }
+
+    def get_latest_stock_overview_date(self) -> Optional[date]:
+        latest_csv = self._find_latest_stock_overview_csv()
+        if latest_csv is None:
+            return None
+        return self._coerce_date(latest_csv.parent.parent.name)
+
     def enrich_items(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Fill missing market/earnings snapshot fields in-place."""
         for item in items:
@@ -98,6 +127,67 @@ class FastReviewFocusService:
         matched.sort(key=lambda item: item.stat().st_mtime, reverse=True)
         return matched[0]
 
+    def _find_stock_overview_csv(self, *, snapshot_date: date) -> Optional[Path]:
+        if not self.manual_runs_root.exists():
+            return None
+
+        matched: List[Path] = []
+        snapshot_key = snapshot_date.isoformat()
+        for path in self.manual_runs_root.rglob("fast_review_stock_overview.csv"):
+            try:
+                if path.parent.name != "review" or path.parent.parent.name != snapshot_key:
+                    continue
+            except Exception:
+                continue
+            matched.append(path)
+
+        if not matched:
+            return None
+        matched.sort(key=lambda item: item.stat().st_mtime, reverse=True)
+        return matched[0]
+
+    def _find_latest_stock_overview_csv(self) -> Optional[Path]:
+        if not self.manual_runs_root.exists():
+            return None
+
+        matched: List[Path] = []
+        for path in self.manual_runs_root.rglob("fast_review_stock_overview.csv"):
+            try:
+                if path.parent.name != "review":
+                    continue
+                if self._coerce_date(path.parent.parent.name) is None:
+                    continue
+            except Exception:
+                continue
+            matched.append(path)
+
+        if not matched:
+            return None
+        matched.sort(
+            key=lambda item: (
+                self._coerce_date(item.parent.parent.name) or date.min,
+                item.stat().st_mtime,
+            ),
+            reverse=True,
+        )
+        return matched[0]
+
+    def _resolve_stock_overview_csv(self, *, snapshot_date: Any) -> Tuple[Optional[date], Optional[Path]]:
+        text = str(snapshot_date or "").strip().lower()
+        if text in {"latest", "auto"}:
+            latest_csv = self._find_latest_stock_overview_csv()
+            if latest_csv is None:
+                return None, None
+            return self._coerce_date(latest_csv.parent.parent.name), latest_csv
+
+        normalized_date = self._coerce_date(snapshot_date)
+        if normalized_date is None:
+            return None, None
+        overview_csv = self._find_stock_overview_csv(snapshot_date=normalized_date)
+        if overview_csv is None:
+            raise ValueError(f"fast review stock overview artifact not found for {normalized_date.isoformat()}")
+        return normalized_date, overview_csv
+
     def _load_focus_items(self, focus_csv: Path) -> List[Dict[str, Any]]:
         with focus_csv.open("r", encoding="utf-8-sig", newline="") as handle:
             reader = csv.DictReader(handle)
@@ -111,6 +201,68 @@ class FastReviewFocusService:
         self._enrich_items(items)
         self._annotate_peer_context(items)
         return items
+
+    def _load_stock_overview_items(self, overview_csv: Path) -> List[Dict[str, Any]]:
+        with overview_csv.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            items = [self._stock_overview_row_to_item(row) for row in reader]
+        items.sort(
+            key=lambda item: (
+                -(item.get("priority_score") or float("-inf")),
+                item.get("code") or "",
+            )
+        )
+        return items
+
+    def _stock_overview_row_to_item(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        signal_keys = self._split_csv_like(row.get("signal_keys"))
+        signal_types = self._split_csv_like(row.get("signal_types"))
+        strategy_count = self._to_int(row.get("strategy_count"))
+        if strategy_count is None:
+            strategy_count = len(signal_keys)
+
+        return {
+            "code": str(row.get("code") or "").strip(),
+            "name": self._clean_text(row.get("name")),
+            "stock_review_lane": self._clean_text(row.get("stock_review_lane")),
+            "stock_review_lane_label": self._clean_text(row.get("stock_review_lane_label")),
+            "tier": self._clean_text(row.get("tier")),
+            "ab_bucket": self._clean_text(row.get("ab_bucket")),
+            "review_stage_label": self._clean_text(row.get("review_stage_label")),
+            "driver_label": self._clean_text(row.get("driver_label")),
+            "priority_score": self._to_float(row.get("priority_score")),
+            "strategy_count": strategy_count,
+            "signal_keys": signal_keys,
+            "signal_types": signal_types,
+            "triggered_strategies": signal_keys,
+            "chart_evidence_summary": self._clean_text(row.get("chart_evidence_summary")),
+            "earnings_evidence_summary": self._clean_text(row.get("earnings_evidence_summary")),
+            "stock_context_summary": self._clean_text(row.get("stock_context_summary")),
+            "today_change_pct": self._to_float(row.get("today_change_pct")),
+            "pe_ratio": self._to_float(row.get("pe_ratio")),
+            "report_period_label": self._clean_text(row.get("report_period_label")),
+            "revenue_yoy": self._to_float(row.get("revenue_yoy")),
+            "net_profit_yoy": self._to_float(row.get("net_profit_yoy")),
+            "roe": self._to_float(row.get("roe")),
+            "earnings_strategy_score": self._to_float(row.get("earnings_strategy_score")),
+            "earnings_strategy_gate_status": self._clean_text(row.get("earnings_strategy_gate_status")),
+            "earnings_quality_score": self._to_float(row.get("earnings_quality_score")),
+            "earnings_quality_cycle_phase": self._clean_text(row.get("earnings_quality_cycle_phase")),
+            "capital_profile_score": self._to_float(row.get("capital_profile_score")),
+            "relative_strength_score": self._to_float(row.get("relative_strength_score")),
+            "breakout_quality_score": self._to_float(row.get("breakout_quality_score")),
+            "market_expectation_institution_count": self._to_int(row.get("market_expectation_institution_count")),
+            "net_profit_amount": self._to_float(row.get("net_profit_amount")),
+            "primary_board_name": self._clean_text(row.get("primary_board_name")),
+            "preferred_industry_label": self._clean_text(row.get("preferred_industry_label")),
+            "theme_label": self._clean_text(row.get("theme_label")),
+            "mainline_judgement": self._clean_text(row.get("mainline_judgement")),
+            "reason_summary": self._clean_text(row.get("reason_summary")),
+            "display_reason_summary": self._clean_text(row.get("display_reason_summary")),
+            "cause_tags_zh": self._clean_text(row.get("cause_tags_zh")),
+            "latest_trade_date": self._clean_text(row.get("latest_trade_date")),
+            "pure_chart_quality_passed": self._to_bool(row.get("pure_chart_quality_passed")),
+        }
 
     def _row_to_item(self, row: Dict[str, Any]) -> Dict[str, Any]:
         cause_tags_text = self._clean_text(row.get("cause_tags")) or ""
@@ -266,6 +418,7 @@ class FastReviewFocusService:
                         code,
                         budget_seconds=DEFAULT_EXPORT_EARNINGS_BUDGET_SECONDS,
                         enabled_blocks=("financial", "quick_report"),
+                        announcement_date_hint=item.get("event_date"),
                     )
                 except Exception:
                     earnings_context = {}
@@ -675,6 +828,42 @@ class FastReviewFocusService:
                 summary[driver] = summary.get(driver, 0) + 1
         return dict(sorted(summary.items(), key=lambda pair: (-pair[1], pair[0])))
 
+    def _build_lane_summary(self, items: List[Dict[str, Any]]) -> Dict[str, int]:
+        summary: Dict[str, int] = {}
+        for item in items:
+            lane = str(item.get("stock_review_lane_label") or item.get("stock_review_lane") or "").strip()
+            if lane:
+                summary[lane] = summary.get(lane, 0) + 1
+        return dict(sorted(summary.items(), key=lambda pair: (-pair[1], pair[0])))
+
+    def _build_signal_summary(self, items: List[Dict[str, Any]]) -> Dict[str, int]:
+        summary: Dict[str, int] = {}
+        for item in items:
+            for signal_key in item.get("signal_keys") or []:
+                key = str(signal_key or "").strip()
+                if key:
+                    summary[key] = summary.get(key, 0) + 1
+        return dict(sorted(summary.items(), key=lambda pair: (-pair[1], pair[0])))
+
+    @classmethod
+    def _stock_code_matches(cls, item_code: Any, query_code: Any) -> bool:
+        item_raw = str(item_code or "").strip()
+        query_raw = str(query_code or "").strip()
+        if not item_raw or not query_raw:
+            return False
+        return cls._normalize_code_for_compare(item_raw) == cls._normalize_code_for_compare(query_raw)
+
+    @staticmethod
+    def _normalize_code_for_compare(value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        try:
+            normalized = normalize_stock_code(text)
+        except Exception:
+            normalized = text
+        return str(normalized or "").strip().upper()
+
     @staticmethod
     def _is_em_quote_cache_warm() -> bool:
         try:
@@ -838,6 +1027,21 @@ class FastReviewFocusService:
             return int(float(value))
         except Exception:
             return None
+
+    @staticmethod
+    def _to_bool(value: Any) -> Optional[bool]:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return None
+        text = str(value).strip().lower()
+        if not text:
+            return None
+        if text in {"1", "true", "yes", "y", "是", "通过"}:
+            return True
+        if text in {"0", "false", "no", "n", "否", "不通过"}:
+            return False
+        return None
 
     @classmethod
     def _prefill_snapshot_fields_from_authority_summaries(cls, item: Dict[str, Any]) -> None:

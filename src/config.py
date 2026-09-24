@@ -1093,8 +1093,8 @@ class Config:
     akshare_sleep_min: float = 2.0
     akshare_sleep_max: float = 5.0
     
-    # Tushare 每分钟最大请求数（免费配额）
-    tushare_rate_limit_per_minute: int = 80
+    # Tushare 每分钟最大请求数（默认保守值，避免日线批量扫描频繁撞限速）
+    tushare_rate_limit_per_minute: int = 45
     
     # 重试配置
     max_retries: int = 3
@@ -1623,12 +1623,14 @@ class Config:
         if report_show_llm_model_raw is not None and not report_show_llm_model_raw.strip():
             report_show_llm_model = False
 
+        tushare_token = cls._resolve_tushare_token_env_value()
+
         return cls(
             stock_list=stock_list,
             feishu_app_id=os.getenv('FEISHU_APP_ID'),
             feishu_app_secret=os.getenv('FEISHU_APP_SECRET'),
             feishu_folder_token=os.getenv('FEISHU_FOLDER_TOKEN'),
-            tushare_token=os.getenv('TUSHARE_TOKEN'),
+            tushare_token=tushare_token or None,
             tickflow_api_key=os.getenv('TICKFLOW_API_KEY'),
             tickflow_kline_adjust=normalize_tickflow_kline_adjust(os.getenv('TICKFLOW_KLINE_ADJUST')),
             tickflow_priority=parse_env_int(os.getenv('TICKFLOW_PRIORITY'), 2, field_name='TICKFLOW_PRIORITY', minimum=0),
@@ -2077,6 +2079,24 @@ class Config:
             # - efinance/akshare_em: 东财全量接口，数据最全但容易被封
             # - tushare: Tushare Pro，需要2000积分，数据全面
             realtime_source_priority=cls._resolve_realtime_source_priority(),
+            akshare_sleep_min=parse_env_float(
+                os.getenv('AKSHARE_SLEEP_MIN'),
+                2.0,
+                field_name='AKSHARE_SLEEP_MIN',
+                minimum=0.0,
+            ),
+            akshare_sleep_max=parse_env_float(
+                os.getenv('AKSHARE_SLEEP_MAX'),
+                5.0,
+                field_name='AKSHARE_SLEEP_MAX',
+                minimum=0.0,
+            ),
+            tushare_rate_limit_per_minute=parse_env_int(
+                os.getenv('TUSHARE_RATE_LIMIT_PER_MINUTE'),
+                45,
+                field_name='TUSHARE_RATE_LIMIT_PER_MINUTE',
+                minimum=1,
+            ),
             history_disk_cache_enabled=parse_env_bool(os.getenv('HISTORY_DISK_CACHE_ENABLED'), True),
             history_disk_cache_dir=os.getenv('HISTORY_DISK_CACHE_DIR', './data/cache/history'),
             history_disk_cache_ttl_seconds=parse_env_int(
@@ -2723,7 +2743,7 @@ class Config:
             # User explicitly set priority, respect it
             return explicit
 
-        tushare_token = os.getenv('TUSHARE_TOKEN', '').strip()
+        tushare_token = cls._resolve_tushare_token_env_value()
         if tushare_token:
             # Token configured but no explicit priority override
             # Prepend tushare so the paid source is tried first
@@ -2736,6 +2756,14 @@ class Config:
             return resolved
 
         return default_priority
+
+    @classmethod
+    def _resolve_tushare_token_env_value(cls) -> str:
+        for key in ('TUSHARE_TOKEN', 'TUSHARE_PRO_TOKEN', 'TUSHARE_API_TOKEN'):
+            value = os.getenv(key, '').strip()
+            if value:
+                return value
+        return ''
 
     @classmethod
     def reset_instance(cls) -> None:

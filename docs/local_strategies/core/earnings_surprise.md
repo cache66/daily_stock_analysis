@@ -1,6 +1,6 @@
 # `earnings_surprise`
 
-最后更新：2026-05-01
+最后更新：2026-07-10
 
 ## 1. 定位
 
@@ -54,6 +54,15 @@ fast review 默认口径已经收敛到：
 2. `earnings_strategy_score >= strategy_watch_pass_score` 且满足确认条件
 
 默认 `balanced/strict` 的 watch 放行需要质量确认。
+
+2026-07-10 补充：
+
+- `balanced/strict` 现在连 `direct pass` 也不再允许“弱质量但总分够”的样本直通。
+- 这两档默认还需要满足一个最小质量底板：
+  - `earnings_quality_signal=True`，或
+  - `earnings_quality_score >= 50` 且 `cycle_phase in {recovering, reaccelerating, expanding, neutral}`
+- 否则即使总分超过 `direct pass` 分数线，也会记为 `blocked_direct_quality_floor`。
+- `relaxed` 不受这条 direct-quality-floor 约束，仍保留更宽的观察池语义。
 
 ## 6. 当前重点增强
 

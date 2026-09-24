@@ -36,6 +36,16 @@ cp .env.example .env
 # Edit .env and fill in the required API keys
 ```
 
+If you are developing on Linux or WSL, you can also use the repo-local helper script:
+
+```bash
+./scripts/run-local-linux.sh install
+./scripts/run-local-linux.sh check
+./scripts/run-local-linux.sh api
+```
+
+See [Local Linux Development Setup](local-linux-dev_EN.md) for details.
+
 ### Contribution Workflow
 
 1. Fork this repository.

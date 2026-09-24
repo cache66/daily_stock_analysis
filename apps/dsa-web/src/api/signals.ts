@@ -2,6 +2,8 @@ import apiClient from './index';
 import { toCamelCase } from './utils';
 import type {
   FastReviewFocusResponse,
+  FastReviewStockOverviewResponse,
+  PersonalStrategyMatrixResponse,
   SignalSnapshotCountsResponse,
   SignalSnapshotHistoryResponse,
   SignalSnapshotListResponse,
@@ -38,6 +40,17 @@ export interface GetSignalSnapshotCountsParams {
 
 export interface GetFastReviewFocusParams {
   snapshotDate: string;
+}
+
+export interface GetFastReviewStockOverviewParams {
+  snapshotDate: string;
+  code?: string;
+}
+
+export interface GetPersonalStrategyMatrixParams {
+  snapshotDate: string;
+  code?: string;
+  strategyIds?: string[];
 }
 
 export interface SendSignalSelectionParams {
@@ -120,6 +133,35 @@ export const signalsApi = {
       },
     });
     return toCamelCase<FastReviewFocusResponse>(response.data);
+  },
+
+  getFastReviewStockOverview: async (
+    params: GetFastReviewStockOverviewParams,
+    options?: SignalsRequestOptions,
+  ): Promise<FastReviewStockOverviewResponse> => {
+    const response = await apiClient.get<Record<string, unknown>>('/api/v1/signals/fast-review-stock-overview', {
+      signal: options?.signal,
+      params: {
+        snapshot_date: params.snapshotDate,
+        code: params.code || undefined,
+      },
+    });
+    return toCamelCase<FastReviewStockOverviewResponse>(response.data);
+  },
+
+  getPersonalStrategyMatrix: async (
+    params: GetPersonalStrategyMatrixParams,
+    options?: SignalsRequestOptions,
+  ): Promise<PersonalStrategyMatrixResponse> => {
+    const response = await apiClient.get<Record<string, unknown>>('/api/v1/signals/personal-strategy-matrix', {
+      signal: options?.signal,
+      params: {
+        snapshot_date: params.snapshotDate,
+        code: params.code || undefined,
+        strategy_ids: params.strategyIds && params.strategyIds.length > 0 ? params.strategyIds.join(',') : undefined,
+      },
+    });
+    return toCamelCase<PersonalStrategyMatrixResponse>(response.data);
   },
 
   sendSelection: async (

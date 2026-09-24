@@ -151,6 +151,18 @@ describe('SidebarNav', () => {
     expect(signalsLink).toHaveClass('font-medium');
   });
 
+  it('renders the personal strategies navigation item and marks it active', () => {
+    render(
+      <MemoryRouter initialEntries={['/personal-strategies']}>
+        <SidebarNav />
+      </MemoryRouter>,
+    );
+
+    const strategiesLink = screen.getByRole('link', { name: '个人策略' });
+    expect(strategiesLink).toHaveAttribute('href', '/personal-strategies');
+    expect(strategiesLink).toHaveClass('font-medium');
+  });
+
   it('opens the logout confirmation and confirms logout', async () => {
     render(
       <MemoryRouter initialEntries={['/chat']}>

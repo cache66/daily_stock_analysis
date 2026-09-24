@@ -725,7 +725,10 @@ class MonthlySlowRiseSelectorTestCase(unittest.TestCase):
         self.assertEqual(captured["prepare_kwargs"]["shard_count"], 2)
         self.assertEqual(captured["prepare_kwargs"]["shard_index"], 1)
         self.assertEqual(captured["prepare_kwargs"]["quote_hydration_workers"], 3)
+        self.assertIsNone(captured["prepare_kwargs"]["whitelist_codes"])
         self.assertTrue(captured["prepare_kwargs"]["exclude_st"])
+        self.assertTrue(captured["prepare_kwargs"]["exclude_kcb"])
+        self.assertFalse(captured["prepare_kwargs"]["exclude_cyb"])
         self.assertEqual(captured["scan_kwargs"]["as_of_date"], pd.Timestamp("2026-04-22").date())
         self.assertIsNone(captured["scan_kwargs"]["prefilter"])
         self.assertEqual(captured["scan_kwargs"]["shard_count"], 1)
@@ -734,6 +737,111 @@ class MonthlySlowRiseSelectorTestCase(unittest.TestCase):
         self.assertEqual(run_result.skipped_prefilter_count, 1)
         self.assertTrue(run_result.phase_metrics["shared_scan_shell_enabled"])
         self.assertEqual(run_result.phase_metrics["scan_shell_filter_stats"]["removed_st"], 1)
+
+    def test_scan_monthly_slow_rise_passes_whitelist_codes_to_shared_scan_shell(self):
+        captured: dict[str, object] = {}
+        expected_run_result = KlineSelectorRunResult(
+            criteria=MonthlySlowRiseCriteria(),
+            universe_size=1,
+            evaluated_count=0,
+            skipped_market_cap_count=0,
+            skipped_prefilter_count=0,
+            skipped_listed_days_count=0,
+            universe_codes=["600888"],
+            selected=[],
+            failed=[],
+        )
+
+        class _FakeService:
+            manager = None
+
+            def get_spot_enriched_a_share_universe(self, *, limit=None, as_of_date=None):
+                return pd.DataFrame(
+                    [
+                        {"code": "600888", "name": "monthly_case", "listed_days": 900},
+                        {"code": "600999", "name": "other_case", "listed_days": 900},
+                    ]
+                )
+
+            def prepare_scan_universe(self, **kwargs):
+                captured["prepare_kwargs"] = kwargs
+                return type(
+                    "Prepared",
+                    (),
+                    {
+                        "prepared_universe": pd.DataFrame([{"code": "600888", "name": "monthly_case", "listed_days": 900}]),
+                        "base_universe_size": 1,
+                        "sharded_universe_size": 1,
+                        "prepared_universe_size": 1,
+                        "filter_stats": {},
+                        "prefilter_stats": {},
+                    },
+                )()
+
+            def scan_market(self, **kwargs):
+                return expected_run_result
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            whitelist_path = Path(tmp_dir) / "universe.txt"
+            whitelist_path.write_text("600888\n", encoding="utf-8")
+            scan_monthly_slow_rise_candidates(
+                criteria=MonthlySlowRiseCriteria(),
+                service=_FakeService(),
+                universe_codes_file=whitelist_path,
+            )
+
+        self.assertEqual(captured["prepare_kwargs"]["whitelist_codes"], {"600888"})
+
+    def test_scan_monthly_slow_rise_cache_only_filters_missing_history_cache(self):
+        captured: dict[str, object] = {}
+        expected_run_result = KlineSelectorRunResult(
+            criteria=MonthlySlowRiseCriteria(),
+            universe_size=1,
+            evaluated_count=0,
+            skipped_market_cap_count=0,
+            skipped_prefilter_count=0,
+            skipped_listed_days_count=0,
+            universe_codes=["600888"],
+            selected=[],
+            failed=[],
+        )
+
+        class _FakeManager:
+            def __init__(self, cache_root: Path) -> None:
+                self.cache_root = cache_root
+
+            def _get_history_cache_paths(self, stock_code: str):
+                return self.cache_root / f"{stock_code}.csv", self.cache_root / f"{stock_code}.meta.json"
+
+        class _FakeService:
+            def __init__(self, cache_root: Path) -> None:
+                self.manager = _FakeManager(cache_root)
+
+            def get_spot_enriched_a_share_universe(self, *, limit=None, as_of_date=None):
+                return pd.DataFrame(
+                    [
+                        {"code": "600888", "name": "cached_case", "listed_days": 900},
+                        {"code": "600999", "name": "missing_case", "listed_days": 900},
+                    ]
+                )
+
+            def scan_market(self, **kwargs):
+                captured["scan_kwargs"] = kwargs
+                return expected_run_result
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cache_root = Path(tmp_dir)
+            (cache_root / "600888.csv").write_text("date,open,high,low,close\n", encoding="utf-8")
+            run_result = scan_monthly_slow_rise_candidates(
+                criteria=MonthlySlowRiseCriteria(),
+                service=_FakeService(cache_root),
+                cache_only=True,
+                history_cache_dir=cache_root,
+            )
+
+        self.assertEqual(captured["scan_kwargs"]["universe"]["code"].tolist(), ["600888"])
+        self.assertTrue(run_result.phase_metrics["cache_only"])
+        self.assertEqual(run_result.phase_metrics["cache_filter_stats"]["removed_missing_history_cache"], 1)
 
     def test_scan_monthly_slow_rise_collects_phase_metrics(self):
         evaluation = MagicMock()
@@ -757,7 +865,17 @@ class MonthlySlowRiseSelectorTestCase(unittest.TestCase):
             manager = None
 
             def get_spot_enriched_a_share_universe(self, *, limit=None, as_of_date=None):
-                return pd.DataFrame({"code": ["600999"], "name": ["phase_case"], "listed_days": [900]})
+                return pd.DataFrame(
+                    {
+                        "code": ["600999"],
+                        "name": ["phase_case"],
+                        "listed_days": [900],
+                        "latest_price": [12.8],
+                        "pct_change": [1.6],
+                        "turnover_rate": [2.3],
+                        "total_mv": [55e9],
+                    }
+                )
 
             def scan_market(self, **kwargs):
                 return expected_run_result
@@ -783,6 +901,16 @@ class MonthlySlowRiseSelectorTestCase(unittest.TestCase):
         self.assertEqual(run_result.phase_metrics["total_scan_elapsed_sec"], 14.0)
         self.assertEqual(run_result.phase_metrics["selected_count"], 1)
         self.assertEqual(run_result.phase_metrics["failed_count"], 0)
+        build_profile_kwargs = capital_cls.return_value.build_stock_profile.call_args.kwargs
+        self.assertEqual(
+            build_profile_kwargs["quote_data"],
+            {
+                "price": 12.8,
+                "change_pct": 1.6,
+                "turnover_rate": 2.3,
+                "total_mv": 55e9,
+            },
+        )
 
     def test_export_results_writes_run_summary_with_phase_metrics(self):
         run_result = KlineSelectorRunResult(

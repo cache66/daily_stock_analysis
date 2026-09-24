@@ -13,6 +13,11 @@ from api.v1.schemas.common import ErrorResponse
 from api.v1.schemas.signals import (
     FastReviewFocusItem,
     FastReviewFocusResponse,
+    FastReviewStockOverviewItem,
+    FastReviewStockOverviewResponse,
+    PersonalStrategyDefinition,
+    PersonalStrategyMatrixItem,
+    PersonalStrategyMatrixResponse,
     SignalContinuitySummary,
     SignalDrawdownSummary,
     SignalSnapshotCompareItem,
@@ -25,6 +30,7 @@ from api.v1.schemas.signals import (
     SignalSnapshotStreakItem,
 )
 from src.services.fast_review_focus_service import FastReviewFocusService
+from src.services.personal_strategy_matrix_service import PersonalStrategyMatrixService
 from src.services.signal_snapshot_service import SignalSnapshotService
 from src.storage import DatabaseManager
 
@@ -72,6 +78,108 @@ def get_fast_review_focus(
         raise HTTPException(
             status_code=500,
             detail={"error": "internal_error", "message": f"Query fast-review focus failed: {str(exc)}"},
+        )
+
+
+@router.get(
+    "/fast-review-stock-overview",
+    response_model=FastReviewStockOverviewResponse,
+    responses={
+        200: {"description": "Fast-review stock-centered overview rows"},
+        400: {"description": "Invalid request", "model": ErrorResponse},
+        500: {"description": "Internal server error", "model": ErrorResponse},
+    },
+    summary="Get fast-review stock overview rows",
+    description=(
+        "Return the latest stock-centered fast-review artifact for the given snapshot date. "
+        "Optionally filter to one stock code to inspect which strategies it triggered."
+    ),
+)
+def get_fast_review_stock_overview(
+    snapshot_date: str = Query(..., description="Snapshot date (YYYY-MM-DD)"),
+    code: Optional[str] = Query(None, description="Optional stock code filter"),
+) -> FastReviewStockOverviewResponse:
+    try:
+        service = FastReviewFocusService()
+        data = service.get_stock_overview(snapshot_date=snapshot_date, code=code)
+        return FastReviewStockOverviewResponse(
+            snapshot_date=data["snapshot_date"],
+            total=data["total"],
+            source_run_dir=data["source_run_dir"],
+            source_csv_path=data["source_csv_path"],
+            lane_summary=data.get("lane_summary", {}),
+            signal_summary=data.get("signal_summary", {}),
+            items=[FastReviewStockOverviewItem(**item) for item in data.get("items", [])],
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_request", "message": str(exc)},
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Query fast-review stock overview failed: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "internal_error", "message": f"Query fast-review stock overview failed: {str(exc)}"},
+        )
+
+
+@router.get(
+    "/personal-strategy-matrix",
+    response_model=PersonalStrategyMatrixResponse,
+    responses={
+        200: {"description": "Personal strategy matrix rows"},
+        400: {"description": "Invalid request", "model": ErrorResponse},
+        500: {"description": "Internal server error", "model": ErrorResponse},
+    },
+    summary="Get stock-centered personal strategy matrix",
+    description=(
+        "Return the personal strategy registry and stock-centered strategy hits for a snapshot date. "
+        "This endpoint reads generated fast-review artifacts and does not run strategy scans."
+    ),
+)
+def get_personal_strategy_matrix(
+    snapshot_date: str = Query(..., description="Snapshot date (YYYY-MM-DD)"),
+    code: Optional[str] = Query(None, description="Optional stock code filter"),
+    strategy_ids: Optional[str] = Query(None, description="Optional comma-separated personal strategy ids"),
+) -> PersonalStrategyMatrixResponse:
+    try:
+        selected_strategy_ids = [
+            item.strip()
+            for item in str(strategy_ids or "").split(",")
+            if item.strip()
+        ]
+        service = PersonalStrategyMatrixService()
+        data = service.get_matrix(
+            snapshot_date=snapshot_date,
+            code=code,
+            strategy_ids=selected_strategy_ids,
+        )
+        return PersonalStrategyMatrixResponse(
+            snapshot_date=data["snapshot_date"],
+            total=data["total"],
+            source_run_dir=data["source_run_dir"],
+            source_csv_path=data["source_csv_path"],
+            lane_summary=data.get("lane_summary", {}),
+            signal_summary=data.get("signal_summary", {}),
+            strategy_summary=data.get("strategy_summary", {}),
+            strategies=[PersonalStrategyDefinition(**item) for item in data.get("strategies", [])],
+            items=[PersonalStrategyMatrixItem(**item) for item in data.get("items", [])],
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_request", "message": str(exc)},
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Query personal strategy matrix failed: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "internal_error", "message": f"Query personal strategy matrix failed: {str(exc)}"},
         )
 
 

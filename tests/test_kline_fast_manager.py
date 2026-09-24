@@ -5,7 +5,7 @@ Tests for the low-latency K-line selector Akshare path.
 
 import sys
 import time
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import requests
@@ -52,10 +52,24 @@ def test_akshare_history_source_priority_respected(monkeypatch):
 
 
 def test_kline_fast_manager_uses_low_latency_akshare_profile():
-    manager = KlineSelectorService.build_fast_a_share_manager()
+    class FakeTushareFetcher:
+        name = "TushareFetcher"
+        priority = -1
 
-    assert len(manager._fetchers) >= 1
-    fetcher = manager._fetchers[0]
+        def __init__(self, *args, **kwargs):
+            self.priority = -1
+            self.rate_limit_per_minute = kwargs.get("rate_limit_per_minute")
+
+        def is_available(self):
+            return True
+
+    # keep the real AkshareFetcher instance while making Tushare presence deterministic
+    with patch("data_provider.tushare_fetcher.TushareFetcher", FakeTushareFetcher):
+        manager = KlineSelectorService.build_fast_a_share_manager()
+
+    assert len(manager._fetchers) >= 2
+    assert manager._fetchers[0].name == "TushareFetcher"
+    fetcher = manager._fetchers[1]
     assert isinstance(fetcher, AkshareFetcher)
     assert fetcher.sleep_min == 0.0
     assert fetcher.sleep_max == 0.0
@@ -80,7 +94,8 @@ def test_kline_fast_manager_can_attach_tushare_fallback(monkeypatch):
     manager = KlineSelectorService.build_fast_a_share_manager()
     names = [getattr(item, "name", type(item).__name__) for item in manager._fetchers]
 
-    assert names[0] == "AkshareFetcher"
+    assert names[0] == "TushareFetcher"
+    assert names[1] == "AkshareFetcher"
     assert "TushareFetcher" in names
 
 

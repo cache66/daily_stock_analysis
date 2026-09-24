@@ -35,6 +35,16 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
+如果你是在 Linux / WSL 上做本地开发，也可以直接使用仓库内脚本准备环境并启动：
+
+```bash
+./scripts/run-local-linux.sh install
+./scripts/run-local-linux.sh check
+./scripts/run-local-linux.sh api
+```
+
+对应说明见 [Linux 本地运行说明](local-linux-dev.md)。
+
 ### 提交流程
 
 1. Fork 本仓库

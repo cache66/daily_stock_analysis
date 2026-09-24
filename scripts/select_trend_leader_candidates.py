@@ -29,7 +29,11 @@ from data_provider.base import is_st_stock, normalize_stock_code
 from src.core.trading_calendar import get_effective_trading_date
 from src.services.capital_profile_service import CapitalProfileService
 from src.services.dragon_head_analysis_service import DragonHeadAnalysisService
-from src.services.kline_selector_service import KlineSelectorPrefilter, KlineSelectorService
+from src.services.kline_selector_service import (
+    KlineSelectorPrefilter,
+    KlineSelectorService,
+    resolve_local_strategy_universe_filters,
+)
 from src.services.shared_signal_factors_service import SharedSignalFactorsService
 from src.services.trend_leader_strategy_service import TrendLeaderStrategyService
 from src.storage import DatabaseManager
@@ -142,13 +146,27 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--exclude-st",
+        dest="exclude_st",
         action="store_true",
-        help="Exclude ST/*ST stocks before scanning.",
+        help="Exclude ST/*ST/PT stocks before scanning (default enabled).",
+    )
+    parser.add_argument(
+        "--include-st",
+        dest="exclude_st",
+        action="store_false",
+        help="Allow ST/*ST/PT stocks to enter the scan universe.",
     )
     parser.add_argument(
         "--exclude-kcb",
+        dest="exclude_kcb",
         action="store_true",
-        help="Exclude STAR market codes (688/689) before scanning.",
+        help="Exclude STAR market codes (688/689) before scanning (default enabled).",
+    )
+    parser.add_argument(
+        "--include-kcb",
+        dest="exclude_kcb",
+        action="store_false",
+        help="Allow STAR market codes (688/689) to enter the scan universe.",
     )
     parser.add_argument(
         "--exclude-cyb",
@@ -224,6 +242,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    parser.set_defaults(exclude_st=True, exclude_kcb=True)
     return parser.parse_args()
 
 
@@ -300,8 +319,8 @@ def _apply_universe_filters(
     universe: pd.DataFrame,
     *,
     whitelist_codes: Optional[Set[str]] = None,
-    exclude_st: bool = False,
-    exclude_kcb: bool = False,
+    exclude_st: bool = True,
+    exclude_kcb: bool = True,
     exclude_cyb: bool = False,
 ) -> Tuple[pd.DataFrame, Dict[str, int]]:
     if universe.empty:
@@ -2066,8 +2085,8 @@ def build_criteria_payload(
     second_stage_news_search_enabled: bool = True,
     second_stage_business_profile_enabled: bool = True,
     enrich_top_n: int = DEFAULT_ENRICH_TOP_N,
-    exclude_st: bool = False,
-    exclude_kcb: bool = False,
+    exclude_st: bool = True,
+    exclude_kcb: bool = True,
     exclude_cyb: bool = False,
     universe_codes_file: Optional[str] = None,
     scan_prefilter_enabled: bool = True,
@@ -2571,8 +2590,8 @@ def scan_trend_leader_candidates_with_stats(
     second_stage_business_profile_enabled: bool = True,
     enrich_top_n: int = DEFAULT_ENRICH_TOP_N,
     progress_every: int = DEFAULT_PROGRESS_EVERY,
-    exclude_st: bool = False,
-    exclude_kcb: bool = False,
+    exclude_st: bool = True,
+    exclude_kcb: bool = True,
     exclude_cyb: bool = False,
     universe_codes_file: Optional[Path] = None,
     scan_prefilter_enabled: bool = True,
@@ -2622,13 +2641,16 @@ def scan_trend_leader_candidates_with_stats(
     )
     use_shared_scan_shell = bool(shared_scan_shell_enabled) and hasattr(selector, "prepare_scan_universe")
     if use_shared_scan_shell:
+        universe_filter_kwargs = resolve_local_strategy_universe_filters(
+            exclude_st=bool(exclude_st),
+            exclude_kcb=bool(exclude_kcb),
+            exclude_cyb=bool(exclude_cyb),
+        )
         prepared_universe = selector.prepare_scan_universe(
             universe=universe,
             prefilter=scan_prefilter,
             whitelist_codes=whitelist_codes,
-            exclude_st=bool(exclude_st),
-            exclude_kcb=bool(exclude_kcb),
-            exclude_cyb=bool(exclude_cyb),
+            **universe_filter_kwargs,
             shard_count=shard_count,
             shard_index=shard_index,
             cached_quote_universe=selector._read_spot_universe_reference_cache() if hasattr(selector, "_read_spot_universe_reference_cache") else None,
@@ -3231,8 +3253,8 @@ def scan_trend_leader_candidates(
     second_stage_business_profile_enabled: bool = True,
     enrich_top_n: int = DEFAULT_ENRICH_TOP_N,
     progress_every: int = DEFAULT_PROGRESS_EVERY,
-    exclude_st: bool = False,
-    exclude_kcb: bool = False,
+    exclude_st: bool = True,
+    exclude_kcb: bool = True,
     exclude_cyb: bool = False,
     universe_codes_file: Optional[Path] = None,
     scan_prefilter_enabled: bool = True,

@@ -46,6 +46,7 @@ from src.services.kline_selector_service import (
     KlineSelectorPrefilter,
     KlineSelectorRunResult,
     KlineSelectorService,
+    resolve_local_strategy_universe_filters,
 )
 from src.services.shared_signal_factors_service import SharedSignalFactorsService
 from src.services.signal_cause_analysis_service import SignalCauseAnalysisService
@@ -2023,10 +2024,13 @@ def scan_hundred_day_high_candidates(
     universe = service.get_spot_enriched_a_share_universe(limit=limit, as_of_date=snapshot_date)
     use_shared_scan_shell = bool(shared_scan_shell_enabled) and hasattr(service, "prepare_scan_universe")
     if use_shared_scan_shell:
+        universe_filter_kwargs = resolve_local_strategy_universe_filters(
+            exclude_st=bool(prefilter.exclude_st) if prefilter is not None else None,
+        )
         prepared_universe = service.prepare_scan_universe(
             universe=universe,
             prefilter=prefilter,
-            exclude_st=bool(prefilter.exclude_st) if prefilter is not None else False,
+            **universe_filter_kwargs,
             shard_count=shard_count,
             shard_index=shard_index,
             cached_quote_universe=service._read_spot_universe_reference_cache()

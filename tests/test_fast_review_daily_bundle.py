@@ -4,7 +4,7 @@
 import csv
 import io
 import json
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -28,6 +28,35 @@ def _install_stub_cause_service(monkeypatch: pytest.MonkeyPatch) -> None:
             }
 
     monkeypatch.setattr(fast_bundle, "SignalCauseAnalysisService", _StubCauseService, raising=False)
+
+
+def _write_cached_history(cache_dir: Path, code: str, closes: list[float]) -> None:
+    history_dir = cache_dir / "cn"
+    history_dir.mkdir(parents=True, exist_ok=True)
+    start = date(2026, 4, 1)
+    with (history_dir / f"{code}.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["date", "open", "high", "low", "close", "volume", "amount", "pct_chg"],
+        )
+        writer.writeheader()
+        previous_close = closes[0]
+        for index, close in enumerate(closes):
+            current_date = start + timedelta(days=index)
+            pct_chg = ((close / previous_close) - 1.0) * 100.0 if index else 0.0
+            writer.writerow(
+                {
+                    "date": current_date.isoformat(),
+                    "open": close,
+                    "high": close * 1.01,
+                    "low": close * 0.99,
+                    "close": close,
+                    "volume": 1000000,
+                    "amount": close * 1000000,
+                    "pct_chg": pct_chg,
+                }
+            )
+            previous_close = close
 
 
 def test_normalize_include_signals_expands_alias_and_deduplicates() -> None:
@@ -68,8 +97,9 @@ def test_build_commands_forward_skip_db_persist() -> None:
         monthly_signal_type="monthly_slow_rise",
         monthly_profile="balanced",
         monthly_max_workers=2,
+        monthly_cache_only=True,
         long_base_release_signal_type="long_base_release",
-        long_base_release_profile="default",
+        long_base_release_profile="loose",
         long_base_release_max_workers=3,
         trend_signal_type="trend_leader_unified",
         trend_max_workers=2,
@@ -88,10 +118,11 @@ def test_build_commands_forward_skip_db_persist() -> None:
         max_workers=1,
         limit=100,
         progress_every=25,
+        history_cache_dir="data/cache/history",
         exclude_st=True,
         exclude_kcb=True,
         exclude_cyb=True,
-        universe_codes_file=None,
+        universe_codes_file="tmp/universe.txt",
         log_level="INFO",
     )
     snapshot_date = date(2026, 4, 20)
@@ -137,6 +168,11 @@ def test_build_commands_forward_skip_db_persist() -> None:
     assert earnings_cmd[earnings_cmd.index("--limit") + 1] == "100"
     assert "--skip-db-persist" in hundred_cmd
     assert "--skip-db-persist" in monthly_cmd
+    assert "--cache-only" in monthly_cmd
+    assert "--history-cache-dir" in monthly_cmd
+    assert monthly_cmd[monthly_cmd.index("--history-cache-dir") + 1] == "data/cache/history"
+    assert "--universe-codes-file" in monthly_cmd
+    assert monthly_cmd[monthly_cmd.index("--universe-codes-file") + 1] == "tmp/universe.txt"
     assert "--skip-db-persist" in long_base_cmd
     assert "--skip-db-persist" in trend_cmd
     assert "--skip-cause-analysis" in hundred_cmd
@@ -154,11 +190,12 @@ def test_build_commands_forward_skip_db_persist() -> None:
     assert "--exclude-st-prefilter" in hundred_cmd
     assert "--max-workers" in hundred_cmd
     assert hundred_cmd[hundred_cmd.index("--max-workers") + 1] == "2"
-    assert "--limit" not in hundred_cmd
+    assert "--limit" in hundred_cmd
+    assert hundred_cmd[hundred_cmd.index("--limit") + 1] == "100"
     assert "--profile" in monthly_cmd
     assert monthly_cmd[monthly_cmd.index("--profile") + 1] == "balanced"
     assert "--profile" in long_base_cmd
-    assert long_base_cmd[long_base_cmd.index("--profile") + 1] == "default"
+    assert long_base_cmd[long_base_cmd.index("--profile") + 1] == "loose"
     assert "--signal-type" in long_base_cmd
     assert long_base_cmd[long_base_cmd.index("--signal-type") + 1] == "long_base_release"
     assert "--max-workers" in long_base_cmd
@@ -431,13 +468,13 @@ def test_main_warns_when_earnings_runs_without_persist(
         ],
     )
 
-    with caplog.at_level("WARNING"):
+    with caplog.at_level("INFO"):
         rc = fast_bundle.main()
 
     assert rc == 0
     assert "earnings" in caplog.text
     assert "--skip-persist-snapshots" in caplog.text
-    assert "same-day/cross-day cache" in caplog.text
+    assert "existing signal_fundamental_snapshot cache will still be read" in caplog.text
 
 
 def test_run_external_signal_jobs_keeps_job_order(monkeypatch, tmp_path: Path) -> None:
@@ -540,6 +577,46 @@ def test_run_external_signal_retries_once_when_sqlite_locked(monkeypatch, tmp_pa
     assert len(result.rows) == 1
 
 
+def test_load_signal_rows_keeps_long_base_recent_confirmation_fields(tmp_path: Path) -> None:
+    csv_path = tmp_path / "long_base.csv"
+    csv_path.write_text(
+        "\n".join(
+            [
+                "code,name,release_pattern_label,release_return_pct,release_max_drawdown_pct,latest_trade_date,recent_return_5d,recent_return_10d,recent_drawdown_10d,recent_max_consecutive_down_days_10d,above_ma5,above_ma10,pure_chart_quality_passed",
+                "002025,航天电器,long_base_breakout,40.6,8.9,2026-07-08,3.9,17.8,6.3,2,False,True,False",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    rows = fast_bundle._load_signal_rows_from_csv(
+        csv_path=csv_path,
+        signal_type="long_base_release",
+        signal_label="long_base",
+    )
+
+    assert rows == [
+        {
+            "signal_type": "long_base_release",
+            "signal_label": "long_base",
+            "code": "002025",
+            "name": "航天电器",
+            "release_pattern_label": "long_base_breakout",
+            "release_return_pct": "40.6",
+            "release_max_drawdown_pct": "8.9",
+            "latest_trade_date": "2026-07-08",
+            "recent_return_5d": "3.9",
+            "recent_return_10d": "17.8",
+            "recent_drawdown_10d": "6.3",
+            "recent_max_consecutive_down_days_10d": "2",
+            "above_ma5": "False",
+            "above_ma10": "True",
+            "pure_chart_quality_passed": "False",
+        }
+    ]
+
+
 def test_build_summary_markdown_contains_skipped_section(tmp_path: Path) -> None:
     summary = fast_bundle._build_summary_markdown(
         snapshot_date=date(2026, 4, 20),
@@ -568,7 +645,7 @@ def test_build_summary_markdown_contains_skipped_section(tmp_path: Path) -> None
         suggested_windows="1,3,5,10",
     )
 
-    assert "Skipped / No-result Signals" in summary
+    assert "当天空结果/跳过信号" in summary
     assert "earnings" in summary
     assert "no_rows" in summary
 
@@ -642,8 +719,7 @@ def test_build_strategy_focus_rows_prioritizes_overlap_earnings_capital_and_boar
     assert rows[0]["market_expectation_reference_label"] == "beat_ref"
     assert rows[0]["market_expectation_summary"] == "2026年EPS一致预期 1.23 元"
     assert rows[0]["primary_board_name"] == "AI"
-    assert rows[-1]["code"] == "600003"
-    assert rows[-1]["tier"] == "low_priority"
+    assert [row["code"] for row in rows] == ["600001", "600002"]
 
 
 def test_build_strategy_focus_rows_marks_trend_hundred_intersection_and_difference(monkeypatch) -> None:
@@ -723,6 +799,303 @@ def test_build_strategy_focus_rows_assigns_review_display_groups(monkeypatch) ->
     assert rows["600002"]["review_display_group_label"] == "纯趋势延续"
     assert rows["600003"]["review_display_group"] == "hundred_strong_chart"
     assert rows["600003"]["review_display_group_label"] == "纯百日新高"
+
+
+def test_build_strategy_focus_rows_includes_pure_daily_and_long_base_names(monkeypatch) -> None:
+    _install_stub_cause_service(monkeypatch)
+    signal_results = [
+        fast_bundle.SignalResult(
+            key=fast_bundle.SIGNAL_DAILY_SLOW_RISE,
+            signal_type="daily_slow_rise",
+            label="daily",
+            rows=[
+                {
+                    "code": "300001",
+                    "name": "DailyOnly",
+                    "trend_pattern_label": "steady_rise",
+                    "advance_return_pct": "18.0",
+                    "advance_max_drawdown_pct": "5.2",
+                }
+            ],
+            csv_path=Path("daily.csv"),
+        ),
+        fast_bundle.SignalResult(
+            key=fast_bundle.SIGNAL_LONG_BASE_RELEASE,
+            signal_type="long_base_release",
+            label="long_base",
+            rows=[
+                {
+                    "code": "300002",
+                    "name": "LongBaseOnly",
+                    "release_pattern_label": "long_base_slow_push",
+                    "release_return_pct": "14.0",
+                    "release_max_drawdown_pct": "6.5",
+                    "pure_chart_quality_passed": True,
+                    "above_ma10": True,
+                    "latest_trade_date": "2026-07-09",
+                }
+            ],
+            csv_path=Path("long_base.csv"),
+        ),
+        fast_bundle.SignalResult(
+            key=fast_bundle.SIGNAL_EARNINGS,
+            signal_type="earnings_surprise",
+            label="earnings",
+            rows=[
+                {
+                    "code": "300003",
+                    "name": "EarningsOnly",
+                    "earnings_strategy_score": "68",
+                    "earnings_strategy_gate_status": "pass",
+                    "event_date": "2026-07-08",
+                }
+            ],
+            csv_path=Path("earnings.csv"),
+        ),
+    ]
+
+    rows = {row["code"]: row for row in fast_bundle._build_strategy_focus_rows(signal_results)}
+
+    assert rows["300001"]["signal_keys"] == "daily_slow_rise"
+    assert rows["300001"]["tier"] == "watch"
+    assert rows["300001"]["trend_pattern_label"] == "steady_rise"
+    assert rows["300002"]["signal_keys"] == "long_base_release"
+    assert rows["300002"]["tier"] == "watch"
+    assert rows["300002"]["pure_chart_quality_passed"] is True
+    assert rows["300003"]["signal_keys"] == "earnings"
+
+
+def test_build_strategy_focus_rows_promotes_confirmed_long_base_release_without_strict_flag(
+    monkeypatch,
+) -> None:
+    _install_stub_cause_service(monkeypatch)
+    signal_results = [
+        fast_bundle.SignalResult(
+            key=fast_bundle.SIGNAL_LONG_BASE_RELEASE,
+            signal_type="long_base_release",
+            label="long_base",
+            rows=[
+                {
+                    "code": "002025",
+                    "name": "ChartConfirmed",
+                    "release_pattern_label": "long_base_breakout",
+                    "release_return_pct": "40.6",
+                    "release_max_drawdown_pct": "8.9",
+                    "recent_return_10d": "17.8",
+                    "recent_drawdown_10d": "6.3",
+                    "recent_max_consecutive_down_days_10d": "2",
+                    "above_ma10": True,
+                    "pure_chart_quality_passed": False,
+                    "latest_trade_date": "2026-07-08",
+                },
+                {
+                    "code": "002821",
+                    "name": "ChartRecoveryWatch",
+                    "release_pattern_label": "long_base_breakout",
+                    "release_return_pct": "35.8",
+                    "release_max_drawdown_pct": "10.9",
+                    "recent_return_5d": "-2.4",
+                    "recent_return_10d": "-0.4",
+                    "recent_drawdown_10d": "10.9",
+                    "recent_max_consecutive_down_days_10d": "3",
+                    "above_ma10": False,
+                    "pure_chart_quality_passed": False,
+                    "latest_trade_date": "2026-07-08",
+                },
+                {
+                    "code": "300005",
+                    "name": "ChartBroken",
+                    "release_pattern_label": "long_base_breakout",
+                    "release_return_pct": "37.6",
+                    "release_max_drawdown_pct": "15.4",
+                    "recent_return_5d": "-11.2",
+                    "recent_return_10d": "-9.2",
+                    "recent_drawdown_10d": "15.4",
+                    "recent_max_consecutive_down_days_10d": "1",
+                    "above_ma10": False,
+                    "pure_chart_quality_passed": False,
+                    "latest_trade_date": "2026-07-08",
+                },
+            ],
+            csv_path=Path("long_base.csv"),
+        )
+    ]
+
+    rows = {
+        row["code"]: row
+        for row in fast_bundle._build_strategy_focus_rows(
+            signal_results,
+            snapshot_date=date(2026, 7, 10),
+        )
+    }
+
+    assert rows["002025"]["tier"] == "watch"
+    assert rows["002025"]["review_certainty_type"] == "accumulation_watch"
+    assert "accumulation_watch" in rows["002025"]["focus_reason"]
+    assert rows["002025"]["long_base_chart_read_passed"] is True
+    assert rows["002025"]["long_base_read_status"] == "confirmed"
+    assert "long_base=long_base_breakout/release=40.6%/10d=17.8%/confirmed" in rows["002025"]["focus_reason"]
+    assert rows["002821"]["tier"] == "watch"
+    assert rows["002821"]["review_certainty_type"] == "accumulation_watch"
+    assert rows["002821"]["long_base_chart_read_passed"] is True
+    assert rows["002821"]["long_base_read_status"] == "recovery_watch"
+    assert "long_base=long_base_breakout/release=35.8%/10d=-0.4%/recovery_watch" in rows["002821"]["focus_reason"]
+    assert rows["300005"]["tier"] == "low_priority"
+    assert rows["300005"]["long_base_chart_read_passed"] is False
+
+    overview_rows = {
+        row["code"]: row
+        for row in fast_bundle._build_stock_overview_rows(
+            strategy_focus_rows=list(rows.values()),
+            snapshot_date=date(2026, 7, 10),
+        )
+    }
+    assert overview_rows["002025"]["stock_review_lane"] == "accumulation_watch"
+    assert overview_rows["002025"]["stock_review_lane_label"] == "吸筹观察"
+
+
+def test_build_strategy_focus_rows_filters_trend_fallback_rows_from_homepage(
+    monkeypatch,
+) -> None:
+    _install_stub_cause_service(monkeypatch)
+    signal_results = [
+        fast_bundle.SignalResult(
+            key=fast_bundle.SIGNAL_TREND_LEADER,
+            signal_type="trend_leader_unified",
+            label="trend",
+            rows=[
+                {
+                    "code": "000062",
+                    "name": "深圳华强",
+                    "selection_mode": "fallback",
+                    "trend_score": "0",
+                    "risk_flags": "weak_trend_structure|relaxed_fallback_pool",
+                    "overall_score": "0",
+                },
+                {
+                    "code": "300308",
+                    "name": "中际旭创",
+                    "selection_mode": "strict",
+                    "trend_score": "18.5",
+                    "risk_flags": "",
+                    "overall_score": "42.0",
+                    "today_change_pct": "6.1",
+                    "trend_stage2_passed": True,
+                    "near_new_high": True,
+                },
+            ],
+            csv_path=Path("trend.csv"),
+        )
+    ]
+
+    rows = fast_bundle._build_strategy_focus_rows(signal_results)
+
+    assert [item["code"] for item in rows] == ["300308"]
+
+
+def test_build_strategy_focus_rows_marks_storage_cycle_catalyst_without_enrichment() -> None:
+    signal_results = [
+        fast_bundle.SignalResult(
+            key=fast_bundle.SIGNAL_EARNINGS,
+            signal_type="earnings_surprise",
+            label="earnings",
+            rows=[
+                {
+                    "code": "603986",
+                    "name": "兆易创新",
+                    "earnings_strategy_score": "87.9",
+                    "earnings_strategy_gate_status": "passed_strategy_score",
+                    "earnings_quality_score": "59",
+                    "earnings_quality_cycle_phase": "reaccelerating",
+                    "event_date": "2026-07-10",
+                    "report_date": "2026-03-31",
+                    "report_period_label": "2026Q1",
+                    "revenue_yoy": "177.0",
+                    "net_profit_yoy": "1099.0",
+                    "market_expectation_summary": "2026年EPS一致预期 7.01 元（24家机构）",
+                    "market_expectation_reference_label": "unknown",
+                    "market_expectation_institution_count": "24",
+                    "reason_summary": "增长指标命中：营收同比 177.0%、净利润同比 1099.0%；cycle reaccelerating",
+                }
+            ],
+            csv_path=Path("earnings.csv"),
+        )
+    ]
+
+    rows = fast_bundle._build_strategy_focus_rows(signal_results, allow_reason_enrichment=False)
+
+    assert rows[0]["code"] == "603986"
+    assert rows[0]["tier"] == "watch"
+    assert rows[0]["business_labels"] == "存储芯片,半导体"
+    assert rows[0]["business_summary"] == "存储芯片/MCU，偏半导体存储涨价链"
+    assert rows[0]["cycle_catalyst_type"] == "storage_price_recovery"
+    assert rows[0]["cycle_catalyst_label"] == "存储涨价/复苏 + 业绩兑现"
+    assert rows[0]["review_certainty_type"] == "confirmed_driver"
+    assert rows[0]["review_certainty_label"] == "确定性主线"
+    assert "cycle_catalyst=存储涨价/复苏 + 业绩兑现" in rows[0]["focus_reason"]
+    assert "涨价" in rows[0]["cause_tags_zh"]
+    assert "存储涨价/复苏 + 业绩兑现" in fast_bundle._build_review_earnings_summary(rows[0])
+
+    overview_rows = fast_bundle._build_stock_overview_rows(strategy_focus_rows=rows)
+    assert overview_rows[0]["stock_review_lane"] == "earnings_first"
+
+
+def test_build_strategy_focus_rows_uses_explicit_catalyst_registry_for_known_themes() -> None:
+    signal_results = [
+        fast_bundle.SignalResult(
+            key=fast_bundle.SIGNAL_EARNINGS,
+            signal_type="earnings_surprise",
+            label="earnings",
+            rows=[
+                {
+                    "code": "002709",
+                    "name": "天赐材料",
+                    "earnings_strategy_score": "83.1",
+                    "earnings_strategy_gate_status": "passed_strategy_score",
+                    "earnings_quality_score": "58",
+                    "earnings_quality_cycle_phase": "reaccelerating",
+                    "event_date": "2026-07-10",
+                    "report_period_label": "2026Q1",
+                    "revenue_yoy": "91.3",
+                    "net_profit_yoy": "1093.5",
+                    "market_expectation_reference_label": "skipped_fast_review",
+                    "reason_summary": "增长指标命中：营收同比 91.3%、净利润同比 1093.5%；cycle reaccelerating",
+                },
+                {
+                    "code": "601138",
+                    "name": "工业富联",
+                    "earnings_strategy_score": "77.3",
+                    "earnings_strategy_gate_status": "passed_strategy_score",
+                    "earnings_quality_score": "51",
+                    "earnings_quality_cycle_phase": "reaccelerating",
+                    "event_date": "2026-07-10",
+                    "report_period_label": "2026Q1",
+                    "revenue_yoy": "56.5",
+                    "net_profit_yoy": "97.0",
+                    "market_expectation_reference_label": "skipped_fast_review",
+                    "reason_summary": "增长指标命中：营收同比 56.5%、净利润同比 97.0%；cycle reaccelerating",
+                },
+            ],
+            csv_path=Path("earnings.csv"),
+        )
+    ]
+
+    rows = {
+        row["code"]: row
+        for row in fast_bundle._build_strategy_focus_rows(signal_results, allow_reason_enrichment=False)
+    }
+
+    assert rows["002709"]["tier"] == "watch"
+    assert rows["002709"]["review_gate_status"] == "passed"
+    assert rows["002709"]["cycle_catalyst_type"] == "lithium_battery_materials_recovery"
+    assert rows["002709"]["cycle_catalyst_label"] == "锂电材料复苏/涨价 + 业绩兑现"
+    assert rows["002709"]["business_labels"] == "电解液,锂电材料"
+
+    assert rows["601138"]["tier"] == "watch"
+    assert rows["601138"]["review_gate_status"] == "passed"
+    assert rows["601138"]["cycle_catalyst_type"] == "ai_compute_chain"
+    assert rows["601138"]["cycle_catalyst_label"] == "AI算力链景气 + 业绩兑现"
+    assert rows["601138"]["business_labels"] == "AI服务器"
 
 
 def test_build_strategy_focus_rows_does_not_treat_trend_residual_earnings_as_turning_point_when_earnings_signal_empty(
@@ -927,6 +1300,70 @@ def test_build_strategy_focus_rows_blank_earnings_window_can_promote_chart_drive
     assert rows[0]["trend_hundred_relation"] == "hundred_only"
 
 
+def test_build_strategy_focus_rows_penalizes_recently_weak_trend_only_pullbacks(monkeypatch) -> None:
+    _install_stub_cause_service(monkeypatch)
+    signal_results = [
+        fast_bundle.SignalResult(
+            key="earnings",
+            signal_type="earnings_surprise",
+            label="earnings",
+            rows=[
+                {
+                    "code": "688888",
+                    "name": "OtherEarningsName",
+                    "earnings_strategy_score": "72",
+                }
+            ],
+            csv_path=Path("earnings.csv"),
+        ),
+        fast_bundle.SignalResult(
+            key="trend_leader",
+            signal_type="trend_leader_unified",
+            label="trend",
+            rows=[
+                {
+                    "code": "600001",
+                    "name": "WeakPullback",
+                    "overall_score": "41",
+                    "capital_consensus_score": "2",
+                    "sector_leadership_score": "2",
+                    "recognizability_score": "2",
+                    "today_change_pct": "2.3",
+                    "primary_profile": "pullback",
+                    "trend_label": "pullback_above_ma",
+                    "trend_stage2_passed": "false",
+                    "bias_ma5": "0.7",
+                    "near_new_high": "false",
+                },
+                {
+                    "code": "600002",
+                    "name": "FreshMomentum",
+                    "overall_score": "36",
+                    "capital_consensus_score": "1",
+                    "sector_leadership_score": "1",
+                    "recognizability_score": "1",
+                    "today_change_pct": "10.0",
+                    "primary_profile": "pullback",
+                    "trend_label": "pullback_above_ma",
+                    "trend_stage2_passed": "true",
+                    "bias_ma5": "7.8",
+                    "near_new_high": "false",
+                },
+            ],
+            csv_path=Path("trend.csv"),
+        ),
+    ]
+
+    rows = fast_bundle._build_strategy_focus_rows(signal_results)
+    row_by_code = {row["code"]: row for row in rows}
+    ordered_codes = [row["code"] for row in rows]
+
+    assert row_by_code["600002"]["tier"] == "watch"
+    assert row_by_code["600001"]["tier"] == "watch"
+    assert row_by_code["600002"]["priority_score"] > row_by_code["600001"]["priority_score"]
+    assert ordered_codes.index("600002") < ordered_codes.index("600001")
+
+
 def test_build_strategy_focus_rows_reuses_existing_reason_fields_for_non_alias_names() -> None:
     signal_results = [
         fast_bundle.SignalResult(
@@ -1103,6 +1540,155 @@ def test_build_strategy_focus_rows_augments_existing_earnings_reason_with_busine
     assert "alloy contacts / relays" in rows[0]["reason_summary"]
     assert "业绩驱动" in rows[0]["reason_summary"]
     assert rows[0]["cause_tags"] == "earnings"
+
+
+def test_build_strategy_focus_rows_can_skip_reason_enrichment_for_lightweight_runs(monkeypatch) -> None:
+    class _BoomCauseService:
+        def __init__(self, *args, **kwargs) -> None:
+            raise AssertionError("reason enrichment should be skipped")
+
+    monkeypatch.setattr(fast_bundle, "SignalCauseAnalysisService", _BoomCauseService, raising=False)
+    signal_results = [
+        fast_bundle.SignalResult(
+            key="earnings",
+            signal_type="earnings_surprise",
+            label="earnings",
+            rows=[
+                {
+                    "code": "600045",
+                    "name": "EarningsA",
+                    "earnings_strategy_score": "67.5",
+                    "reason_summary": "growth-hit",
+                    "cause_tags": "earnings",
+                    "event_date": "2026-04-30",
+                }
+            ],
+            csv_path=Path("earnings.csv"),
+        )
+    ]
+
+    rows = fast_bundle._build_strategy_focus_rows(signal_results, allow_reason_enrichment=False)
+
+    assert rows[0]["reason_summary"] == "growth-hit"
+    assert rows[0]["cause_tags"] == "earnings"
+
+
+def test_build_strategy_focus_rows_demotes_unconfirmed_earnings_only_rows() -> None:
+    signal_results = [
+        fast_bundle.SignalResult(
+            key="earnings",
+            signal_type="earnings_surprise",
+            label="earnings",
+            rows=[
+                {
+                    "code": "600301",
+                    "name": "UnconfirmedEarnings",
+                    "earnings_strategy_score": "82.0",
+                    "revenue_yoy": "35.0",
+                    "net_profit_yoy": "120.0",
+                    "earnings_quality_score": "58.0",
+                    "earnings_quality_cycle_phase": "reaccelerating",
+                    "market_expectation_reference_label": "unknown",
+                    "fast_review_focus_gate_passed": True,
+                    "reason_summary": "增长指标命中",
+                    "cause_tags": "earnings",
+                    "event_date": "2026-04-30",
+                },
+                {
+                    "code": "600302",
+                    "name": "ConfirmedEarnings",
+                    "earnings_strategy_score": "82.0",
+                    "revenue_yoy": "35.0",
+                    "net_profit_yoy": "120.0",
+                    "earnings_quality_score": "58.0",
+                    "earnings_quality_cycle_phase": "reaccelerating",
+                    "market_expectation_reference_label": "unknown",
+                    "relative_strength_score": "1.2",
+                    "fast_review_focus_gate_passed": True,
+                    "reason_summary": "增长指标命中",
+                    "cause_tags": "earnings",
+                    "event_date": "2026-04-30",
+                },
+            ],
+            csv_path=Path("earnings.csv"),
+        )
+    ]
+
+    rows = {
+        row["code"]: row
+        for row in fast_bundle._build_strategy_focus_rows(signal_results, allow_reason_enrichment=False)
+    }
+
+    assert rows["600301"]["tier"] == "low_priority"
+    assert rows["600301"]["review_gate_status"] == "earnings_only_unconfirmed"
+    assert rows["600302"]["tier"] == "watch"
+    assert rows["600302"]["review_gate_status"] == "passed"
+
+
+def test_build_strategy_focus_rows_demotes_earnings_only_when_cached_price_health_is_weak(
+    tmp_path: Path,
+) -> None:
+    cache_dir = tmp_path / "history"
+    healthy_closes = [10.0 + index * 0.08 for index in range(80)]
+    weak_closes = [10.0 + min(index, 55) * 0.06 for index in range(70)] + [12.8, 12.0, 11.3, 10.5, 9.9]
+    _write_cached_history(cache_dir, "600401", weak_closes)
+    _write_cached_history(cache_dir, "600402", healthy_closes)
+    _write_cached_history(cache_dir, "600403", weak_closes)
+    base_row = {
+        "earnings_strategy_score": "82.0",
+        "revenue_yoy": "35.0",
+        "net_profit_yoy": "120.0",
+        "earnings_quality_score": "58.0",
+        "earnings_quality_cycle_phase": "reaccelerating",
+        "market_expectation_reference_label": "unknown",
+        "relative_strength_score": "1.2",
+        "fast_review_focus_gate_passed": True,
+        "reason_summary": "增长指标命中",
+        "cause_tags": "earnings",
+        "event_date": "2026-06-15",
+    }
+    signal_results = [
+        fast_bundle.SignalResult(
+            key="earnings",
+            signal_type="earnings_surprise",
+            label="earnings",
+            rows=[
+                {**base_row, "code": "600401", "name": "WeakPriceEarnings"},
+                {**base_row, "code": "600402", "name": "HealthyPriceEarnings"},
+                {
+                    **base_row,
+                    "code": "600403",
+                    "name": "CatalystPullbackEarnings",
+                    "reason_summary": "存储涨价带动业绩兑现",
+                },
+            ],
+            csv_path=Path("earnings.csv"),
+        )
+    ]
+
+    rows = {
+        row["code"]: row
+        for row in fast_bundle._build_strategy_focus_rows(
+            signal_results,
+            allow_reason_enrichment=False,
+            snapshot_date=date(2026, 7, 9),
+            history_cache_dir=cache_dir,
+        )
+    }
+
+    assert rows["600401"]["tier"] == "low_priority"
+    assert rows["600401"]["review_gate_status"] == "earnings_price_health_weak"
+    assert rows["600401"]["review_certainty_type"] == "unconfirmed"
+    assert rows["600401"]["earnings_price_health_status"] == "weak"
+    assert "20日回撤" in rows["600401"]["earnings_price_health_reason"]
+    assert rows["600402"]["tier"] == "watch"
+    assert rows["600402"]["review_gate_status"] == "passed"
+    assert rows["600402"]["earnings_price_health_status"] == "healthy"
+    assert rows["600403"]["tier"] == "watch"
+    assert rows["600403"]["review_gate_status"] == "earnings_price_pullback_watch"
+    assert rows["600403"]["review_certainty_label"] == "回撤观察"
+    assert rows["600403"]["cycle_catalyst_type"] == "storage_price_recovery"
+    assert rows["600403"]["earnings_price_health_status"] == "weak"
 
 
 def test_build_strategy_focus_rows_uses_earnings_reason_source_even_with_hundred_overlay(monkeypatch) -> None:
@@ -1796,27 +2382,119 @@ def test_write_strategy_focus_outputs_limits_export_enrichment_scope(monkeypatch
     assert captured["codes"][20:] == [f"L{idx:03d}" for idx in range(5)]
 
 
-def test_build_summary_markdown_includes_concise_strategy_focus(tmp_path: Path) -> None:
+def test_write_stock_overview_outputs_writes_stock_centered_artifact(tmp_path: Path) -> None:
+    rows = [
+        {
+            "code": "300001",
+            "name": "DailyOnly",
+            "stock_review_lane": "chart_first",
+            "stock_review_lane_label": "图形优先",
+            "tier": "watch",
+            "ab_bucket": "B",
+            "review_stage_label": "拐点",
+            "driver_label": "拐点观察型",
+            "priority_score": 66.0,
+            "strategy_count": 1,
+            "signal_keys": "daily_slow_rise",
+            "signal_types": "daily_slow_rise",
+            "chart_evidence_summary": "平滑慢涨",
+            "earnings_evidence_summary": "-",
+            "stock_context_summary": "消费电子",
+            "display_reason_summary": "走势保持顺滑，先按图形观察。",
+        }
+    ]
+
+    csv_path = tmp_path / "fast_review_stock_overview.csv"
+    md_path = tmp_path / "fast_review_stock_overview.md"
+
+    fast_bundle._write_stock_overview_outputs(rows=rows, csv_path=csv_path, md_path=md_path)
+
+    assert csv_path.exists()
+    assert md_path.exists()
+    content = md_path.read_text(encoding="utf-8")
+    assert "单票证据总览" in content
+    assert "DailyOnly" in content
+    assert "daily_slow_rise" in content
+
+
+def test_build_stock_overview_rows_filters_weak_earnings_only_names() -> None:
+    rows = fast_bundle._build_stock_overview_rows(
+        strategy_focus_rows=[
+            {
+                "code": "600201",
+                "name": "EarningsStrong",
+                "signal_keys": "earnings",
+                "tier": "watch",
+                "priority_score": 88.0,
+                "earnings_strategy_score": 78.0,
+                "revenue_yoy": 35.0,
+                "net_profit_yoy": 120.0,
+                "earnings_quality_score": 55.0,
+                "earnings_quality_cycle_phase": "reaccelerating",
+                "relative_strength_score": 1.0,
+            },
+            {
+                "code": "600202",
+                "name": "EarningsWeak",
+                "signal_keys": "earnings",
+                "tier": "watch",
+                "priority_score": 92.0,
+                "earnings_strategy_score": 75.0,
+                "revenue_yoy": 28.0,
+                "net_profit_yoy": 90.0,
+                "earnings_quality_score": 49.0,
+                "earnings_quality_cycle_phase": "mixed",
+                "relative_strength_score": 0.0,
+            },
+        ],
+        snapshot_date=date(2026, 7, 9),
+    )
+
+    assert [item["code"] for item in rows] == ["600201"]
+
+
+def test_build_summary_markdown_includes_curated_daily_review_sections(tmp_path: Path) -> None:
     focus_rows = [
         {
             "code": "600001",
             "name": "CoreA",
             "tier": "core",
             "priority_score": 121.5,
-            "signal_keys": "trend_leader,hundred_day_high,earnings",
+            "signal_keys": "earnings,hundred_day_high",
             "trend_hundred_relation": "intersection",
             "focus_reason": "trend+hundred+earnings",
             "ab_bucket": "A",
             "today_change_pct": 7.12,
             "pe_ratio": 28.4,
             "report_period_label": "2026Q1",
+            "earnings_strategy_score": 86.0,
+            "revenue_yoy": 42.0,
+            "net_profit_yoy": 88.0,
             "revenue_amount": 4560000000.0,
             "net_profit_amount": 780000000.0,
             "driver_label": "业绩兑现型",
+            "chart_pattern_summary": "横盘突破型",
+            "display_reason_summary": "当前更像是 PCB 方向走强；主线判断更偏 AI主线扩散；CoreA 命中 hundred_day_high 信号。",
         },
         {
             "code": "600002",
-            "name": "WatchB",
+            "name": "WatchChart",
+            "tier": "watch",
+            "priority_score": 92.0,
+            "signal_keys": "daily_slow_rise",
+            "trend_hundred_relation": "neither",
+            "focus_reason": "daily",
+            "ab_bucket": "B",
+            "driver_label": "拐点观察型",
+            "trend_pattern_label": "base_to_trend",
+            "today_change_pct": 5.42,
+            "report_period_label": "2026Q1",
+            "net_profit_amount": 180000000.0,
+            "display_reason_summary": "当前更像是 平台转顺趋势 方向走强。",
+        },
+        {
+            "code": "600003",
+            "name": "WatchTrend",
             "tier": "watch",
             "priority_score": 70.0,
             "signal_keys": "trend_leader",
@@ -1824,6 +2502,8 @@ def test_build_summary_markdown_includes_concise_strategy_focus(tmp_path: Path) 
             "focus_reason": "trend",
             "ab_bucket": "B",
             "driver_label": "题材情绪型",
+            "trend_label": "强趋势延续",
+            "display_reason_summary": "当前更像是 光模块 方向走强。",
         },
     ]
 
@@ -1841,16 +2521,22 @@ def test_build_summary_markdown_includes_concise_strategy_focus(tmp_path: Path) 
         strategy_focus_rows=focus_rows,
     )
 
-    assert "策略精简焦点" in summary
-    assert "trend_leader_unified ∩ hundred_day_high：`1`" in summary
-    assert "trend_leader_unified only：`1`" in summary
+    assert "每日精选复盘" in summary
+    assert "今日最值得看（top 2 / 2）" in summary
+    assert "双确认候选（top 1 / 1）" in summary
+    assert "吸筹观察候选（top 1 / 1）" in summary
+    assert "趋势补充观察（top 1 / 1）" in summary
     assert "CoreA" in summary
-    assert "WatchB" in summary
+    assert "WatchChart" in summary
+    assert "WatchTrend" in summary
     assert "涨幅 7.12%" in summary
     assert "PE 28.4" in summary
     assert "2026Q1" in summary
     assert "营收 45.60亿" in summary
     assert "净利 7.80亿" in summary
+    assert "横盘突破型" in summary
+    assert "平台转顺趋势" in summary
+    assert "强趋势延续" in summary
 
 
 def test_build_summary_markdown_marks_review_context_for_strategy_focus(tmp_path: Path) -> None:
@@ -1874,8 +2560,8 @@ def test_build_summary_markdown_marks_review_context_for_strategy_focus(tmp_path
                 "signal_keys": "hundred_day_high",
                 "trend_hundred_relation": "hundred_only",
                 "ab_bucket": "B",
-                "driver_label": "棰樻潗鎯呯华鍨?",
-                "review_stage_label": "绾疆鍔?",
+                "driver_label": "拐点观察型",
+                "review_stage_label": "拐点",
                 "review_context_label": "业绩空窗期",
                 "review_context_reason": "当日 earnings 候选为 0，前排优先看交叉强样本与强图形百日新高。",
             }
@@ -1884,6 +2570,108 @@ def test_build_summary_markdown_marks_review_context_for_strategy_focus(tmp_path
 
     assert "业绩空窗期" in summary
     assert "当日 earnings 候选为 0" in summary
+
+
+def test_build_summary_markdown_filters_weak_pure_long_base_rows_from_chart_first(tmp_path: Path) -> None:
+    summary = fast_bundle._build_summary_markdown(
+        snapshot_date=date(2026, 7, 9),
+        signal_results=[],
+        skipped_signals=[],
+        unified_csv=tmp_path / "fast_review_candidates.csv",
+        resonance_csv=tmp_path / "fast_review_resonance.csv",
+        resonance_md=tmp_path / "fast_review_resonance.md",
+        resonance_rows=[],
+        suggested_windows="1,3,5,10",
+        strategy_focus_csv=tmp_path / "fast_review_strategy_focus.csv",
+        strategy_focus_md=tmp_path / "fast_review_strategy_focus.md",
+        strategy_focus_rows=[
+            {
+                "code": "600101",
+                "name": "ChartReady",
+                "tier": "watch",
+                "priority_score": 90.0,
+                "signal_keys": "long_base_release",
+                "release_pattern_label": "long_base_slow_push",
+                "pure_chart_quality_passed": True,
+                "above_ma10": True,
+                "latest_trade_date": "2026-07-09",
+                "recent_positive_ratio_20d": 0.65,
+                "recent_positive_ratio_30d": 0.60,
+                "recent_return_10d": 12.5,
+                "display_reason_summary": "当前更像是 长横盘慢推方向走强。",
+            },
+            {
+                "code": "600102",
+                "name": "ChartWeak",
+                "tier": "watch",
+                "priority_score": 95.0,
+                "signal_keys": "long_base_release",
+                "release_pattern_label": "long_base_slow_push",
+                "pure_chart_quality_passed": False,
+                "above_ma10": False,
+                "latest_trade_date": "2026-06-26",
+                "recent_positive_ratio_20d": 0.50,
+                "recent_positive_ratio_30d": 0.43,
+                "recent_return_10d": -8.0,
+                "display_reason_summary": "当前更像是 长横盘慢推方向走强。",
+            },
+        ],
+    )
+
+    assert "ChartReady" in summary
+    assert "ChartWeak" not in summary
+    assert "吸筹观察候选（top 1 / 1）" in summary
+
+
+def test_build_summary_markdown_filters_weak_earnings_only_rows_from_earnings_first(tmp_path: Path) -> None:
+    summary = fast_bundle._build_summary_markdown(
+        snapshot_date=date(2026, 7, 9),
+        signal_results=[],
+        skipped_signals=[],
+        unified_csv=tmp_path / "fast_review_candidates.csv",
+        resonance_csv=tmp_path / "fast_review_resonance.csv",
+        resonance_md=tmp_path / "fast_review_resonance.md",
+        resonance_rows=[],
+        suggested_windows="1,3,5,10",
+        strategy_focus_csv=tmp_path / "fast_review_strategy_focus.csv",
+        strategy_focus_md=tmp_path / "fast_review_strategy_focus.md",
+        strategy_focus_rows=[
+            {
+                "code": "600201",
+                "name": "EarningsStrong",
+                "tier": "watch",
+                "priority_score": 88.0,
+                "signal_keys": "earnings",
+                "earnings_strategy_score": 78.0,
+                "revenue_yoy": 35.0,
+                "net_profit_yoy": 120.0,
+                "earnings_quality_score": 55.0,
+                "earnings_quality_cycle_phase": "reaccelerating",
+                "relative_strength_score": 1.0,
+                "display_reason_summary": "业绩与价格都有一点确认。",
+                "event_date": "2026-07-09",
+            },
+            {
+                "code": "600202",
+                "name": "EarningsWeak",
+                "tier": "watch",
+                "priority_score": 92.0,
+                "signal_keys": "earnings",
+                "earnings_strategy_score": 75.0,
+                "revenue_yoy": 28.0,
+                "net_profit_yoy": 90.0,
+                "earnings_quality_score": 49.0,
+                "earnings_quality_cycle_phase": "mixed",
+                "relative_strength_score": 0.0,
+                "display_reason_summary": "只有财报分数，没有额外确认。",
+                "event_date": "2026-07-09",
+            },
+        ],
+    )
+
+    assert "EarningsStrong" in summary
+    assert "EarningsWeak" not in summary
+    assert "业绩优先候选（top 1 / 1）" in summary
 
 
 def test_build_summary_markdown_shows_source_and_export_count_when_clipped(tmp_path: Path) -> None:
@@ -1914,24 +2702,10 @@ def test_build_summary_markdown_shows_source_and_export_count_when_clipped(tmp_p
     assert "| hundred_day_high | hundred_day_high | 226 (export 30) | 12.30 |" in summary
 
 
-def test_build_summary_markdown_includes_hundred_day_high_spotlight_section(tmp_path: Path) -> None:
+def test_build_summary_markdown_prefers_non_trend_rows_in_top_picks(tmp_path: Path) -> None:
     summary = fast_bundle._build_summary_markdown(
         snapshot_date=date(2026, 4, 20),
-        signal_results=[
-            fast_bundle.SignalResult(
-                key=fast_bundle.SIGNAL_HUNDRED_DAY_HIGH,
-                signal_type="hundred_day_high",
-                label="hundred",
-                rows=[
-                    {"code": "600001", "name": "OverlapA", "pct_change": 6.1, "turnover_rate": 3.2},
-                    {"code": "600002", "name": "HundredB", "pct_change": 9.9, "turnover_rate": 6.8},
-                    {"code": "600003", "name": "HundredC", "pct_change": 4.2, "turnover_rate": 2.1},
-                ],
-                csv_path=tmp_path / "hundred.csv",
-                duration_sec=12.3,
-                source_row_count=3,
-            )
-        ],
+        signal_results=[],
         skipped_signals=[],
         unified_csv=tmp_path / "fast_review_candidates.csv",
         resonance_csv=tmp_path / "fast_review_resonance.csv",
@@ -1943,41 +2717,42 @@ def test_build_summary_markdown_includes_hundred_day_high_spotlight_section(tmp_
         strategy_focus_rows=[
             {
                 "code": "600001",
-                "name": "OverlapA",
+                "name": "ChartA",
+                "tier": "watch",
+                "priority_score": 110.0,
+                "signal_keys": "hundred_day_high",
+                "chart_pattern_summary": "横盘突破型",
                 "today_change_pct": 6.1,
                 "pe_ratio": 25.6,
                 "report_period_label": "2026Q1",
                 "net_profit_amount": 320000000.0,
-            }
+                "display_reason_summary": "当前更像是 横盘突破方向走强。",
+            },
+            {
+                "code": "600002",
+                "name": "TrendB",
+                "tier": "core",
+                "priority_score": 180.0,
+                "signal_keys": "trend_leader",
+                "trend_hundred_relation": "trend_only",
+                "trend_label": "强趋势延续",
+                "today_change_pct": 9.9,
+                "display_reason_summary": "当前更像是 趋势延续方向走强。",
+            },
         ],
     )
 
-    assert "百日新高 Top 3" in summary
-    assert "OverlapA" in summary
-    assert "HundredB" in summary
-    assert "HundredC" in summary
-    assert "涨幅 6.10% / 换手 3.20% / PE 25.6 / 2026Q1 / 净利 3.20亿" in summary
-    assert "涨幅 9.90% / 换手 6.80%" in summary
+    top_start = summary.index("### 今日最值得看")
+    top_section = summary[top_start:summary.index("### 双确认候选", top_start)]
+    assert "| 吸筹观察 | 600001 | ChartA |" in top_section
+    assert "TrendB" not in top_section
+    assert "| 600002 | TrendB |" in summary
 
 
-def test_build_summary_markdown_includes_hundred_day_high_spotlight_section(tmp_path: Path) -> None:
+def test_build_summary_markdown_includes_earnings_first_lane(tmp_path: Path) -> None:
     summary = fast_bundle._build_summary_markdown(
-        snapshot_date=date(2026, 4, 20),
-        signal_results=[
-            fast_bundle.SignalResult(
-                key=fast_bundle.SIGNAL_HUNDRED_DAY_HIGH,
-                signal_type="hundred_day_high",
-                label="hundred",
-                rows=[
-                    {"code": "600001", "name": "OverlapA", "pct_change": 6.1, "turnover_rate": 3.2},
-                    {"code": "600002", "name": "HundredB", "pct_change": 9.9, "turnover_rate": 6.8},
-                    {"code": "600003", "name": "HundredC", "pct_change": 4.2, "turnover_rate": 2.1},
-                ],
-                csv_path=tmp_path / "hundred.csv",
-                duration_sec=12.3,
-                source_row_count=3,
-            )
-        ],
+        snapshot_date=date(2026, 4, 28),
+        signal_results=[],
         skipped_signals=[],
         unified_csv=tmp_path / "fast_review_candidates.csv",
         resonance_csv=tmp_path / "fast_review_resonance.csv",
@@ -1988,22 +2763,31 @@ def test_build_summary_markdown_includes_hundred_day_high_spotlight_section(tmp_
         strategy_focus_md=tmp_path / "fast_review_strategy_focus.md",
         strategy_focus_rows=[
             {
-                "code": "600001",
-                "name": "OverlapA",
-                "today_change_pct": 6.1,
-                "pe_ratio": 25.6,
+                "code": "300502",
+                "name": "新易盛",
+                "tier": "watch",
+                "priority_score": 88.0,
+                "signal_keys": "earnings",
+                "today_change_pct": 6.8,
+                "pe_ratio": 18.4,
                 "report_period_label": "2026Q1",
-                "net_profit_amount": 320000000.0,
+                "net_profit_amount": 260000000.0,
+                "earnings_strategy_score": 91.8,
+                "revenue_yoy": 35.0,
+                "net_profit_yoy": 120.0,
+                "earnings_quality_score": 55.0,
+                "earnings_quality_cycle_phase": "reaccelerating",
+                "event_date": "2026-04-24",
+                "display_reason_summary": "当前更像是 光模块/光通信 方向走强；新易盛 命中 earnings 信号。",
             }
         ],
     )
 
-    assert "百日新高 Top 3" in summary
-    assert "OverlapA" in summary
-    assert "HundredB" in summary
-    assert "HundredC" in summary
-    assert "涨幅 6.10% / 换手 3.20% / PE 25.6 / 2026Q1" in summary
-    assert "涨幅 9.90% / 换手 6.80%" in summary
+    assert "业绩优先候选（top 1 / 1）" in summary
+    assert "新易盛" in summary
+    assert "业绩分 91.8" in summary
+    assert "事件 2026-04-24" in summary
+    assert "当前更像是 光模块/光通信 方向走强" in summary
 
 
 def test_build_hundred_day_snapshot_summary_falls_back_to_breakout_fields() -> None:
@@ -2045,365 +2829,6 @@ def test_build_hundred_day_snapshot_summary_prefers_business_hint_before_pe() ->
     )
 
     assert snapshot == "涨幅 3.80% / PCB/光模块/电子材料 / 健康慢涨型 / PE 88.6"
-
-
-def test_hundred_day_spotlight_prioritizes_focus_intersections_and_a_bucket(tmp_path: Path) -> None:
-    summary = fast_bundle._build_summary_markdown(
-        snapshot_date=date(2026, 4, 20),
-        signal_results=[
-            fast_bundle.SignalResult(
-                key=fast_bundle.SIGNAL_HUNDRED_DAY_HIGH,
-                signal_type="hundred_day_high",
-                label="hundred",
-                rows=[
-                    {"code": "600003", "name": "HundredOnly", "pct_change": 9.5},
-                    {"code": "600001", "name": "IntersectA", "pct_change": 1.2},
-                    {"code": "600002", "name": "IntersectB", "pct_change": 7.8},
-                ],
-                csv_path=tmp_path / "hundred.csv",
-                duration_sec=12.3,
-                source_row_count=3,
-            )
-        ],
-        skipped_signals=[],
-        unified_csv=tmp_path / "fast_review_candidates.csv",
-        resonance_csv=tmp_path / "fast_review_resonance.csv",
-        resonance_md=tmp_path / "fast_review_resonance.md",
-        resonance_rows=[],
-        suggested_windows="1,3,5,10",
-        strategy_focus_csv=tmp_path / "fast_review_strategy_focus.csv",
-        strategy_focus_md=tmp_path / "fast_review_strategy_focus.md",
-        strategy_focus_rows=[
-            {
-                "code": "600001",
-                "name": "IntersectA",
-                "bucket": "A类",
-                "score": 295.0,
-                "signals": "trend_leader,hundred_day_high",
-                "today_change_pct": 1.2,
-                "pe_ratio": 55.0,
-                "report_period_label": "2026Q1",
-                "net_profit_amount": 250000000.0,
-            },
-            {
-                "code": "600002",
-                "name": "IntersectB",
-                "bucket": "B类",
-                "score": 220.0,
-                "signals": "trend_leader,hundred_day_high",
-                "today_change_pct": 7.8,
-                "pe_ratio": 42.0,
-                "report_period_label": "2026Q1",
-                "net_profit_amount": 180000000.0,
-            },
-        ],
-    )
-
-    spotlight_start = summary.index("## 百日新高 Top 3")
-    strong_section_pos = summary.index("### 交叉强样本", spotlight_start)
-    pure_section_pos = summary.index("### 纯百日新高", spotlight_start)
-    intersect_a_pos = summary.index("| 600001 | IntersectA |", spotlight_start)
-    intersect_b_pos = summary.index("| 600002 | IntersectB |", spotlight_start)
-    hundred_only_pos = summary.index("| 600003 | HundredOnly |", spotlight_start)
-
-    assert strong_section_pos < pure_section_pos
-    assert strong_section_pos < intersect_a_pos < intersect_b_pos < pure_section_pos < hundred_only_pos
-
-
-def test_hundred_day_spotlight_prioritizes_better_chart_patterns_within_pure_section(tmp_path: Path) -> None:
-    summary = fast_bundle._build_summary_markdown(
-        snapshot_date=date(2026, 4, 20),
-        signal_results=[
-            fast_bundle.SignalResult(
-                key=fast_bundle.SIGNAL_HUNDRED_DAY_HIGH,
-                signal_type="hundred_day_high",
-                label="hundred",
-                rows=[
-                    {
-                        "code": "600003",
-                        "name": "PlainC",
-                        "pct_change": 9.9,
-                        "chart_pattern_label": "plain_breakout",
-                        "chart_pattern_summary": "图形一般",
-                    },
-                    {
-                        "code": "600002",
-                        "name": "HealthyB",
-                        "pct_change": 6.6,
-                        "chart_pattern_label": "healthy_trend",
-                        "chart_pattern_summary": "健康慢涨型",
-                    },
-                    {
-                        "code": "600001",
-                        "name": "BaseA",
-                        "pct_change": 4.4,
-                        "chart_pattern_label": "base_breakout",
-                        "chart_pattern_summary": "横盘突破型",
-                    },
-                ],
-                csv_path=tmp_path / "hundred.csv",
-                duration_sec=12.3,
-                source_row_count=3,
-            )
-        ],
-        skipped_signals=[],
-        unified_csv=tmp_path / "fast_review_candidates.csv",
-        resonance_csv=tmp_path / "fast_review_resonance.csv",
-        resonance_md=tmp_path / "fast_review_resonance.md",
-        resonance_rows=[],
-        suggested_windows="1,3,5,10",
-        strategy_focus_csv=tmp_path / "fast_review_strategy_focus.csv",
-        strategy_focus_md=tmp_path / "fast_review_strategy_focus.md",
-        strategy_focus_rows=[],
-    )
-
-    spotlight_start = summary.index("## 百日新高 Top 3")
-    pure_section_pos = summary.index("### 纯百日新高", spotlight_start)
-    base_pos = summary.index("| 600001 | BaseA |", pure_section_pos)
-    healthy_pos = summary.index("| 600002 | HealthyB |", pure_section_pos)
-    plain_pos = summary.index("| 600003 | PlainC |", pure_section_pos)
-
-    assert pure_section_pos < base_pos < healthy_pos < plain_pos
-    assert "横盘突破型" in summary
-    assert "健康慢涨型" in summary
-    assert "图形一般" in summary
-
-
-def test_hundred_day_spotlight_uses_combined_limit_across_two_sections(tmp_path: Path) -> None:
-    original_limit = fast_bundle.DEFAULT_HUNDRED_DAY_SUMMARY_SPOTLIGHT_LIMIT
-    fast_bundle.DEFAULT_HUNDRED_DAY_SUMMARY_SPOTLIGHT_LIMIT = 4
-    try:
-        summary = fast_bundle._build_summary_markdown(
-            snapshot_date=date(2026, 4, 20),
-            signal_results=[
-                fast_bundle.SignalResult(
-                    key=fast_bundle.SIGNAL_HUNDRED_DAY_HIGH,
-                    signal_type="hundred_day_high",
-                    label="hundred",
-                    rows=[
-                        {"code": "600001", "name": "IntersectA", "pct_change": 8.8},
-                        {"code": "600002", "name": "IntersectB", "pct_change": 7.7},
-                        {"code": "600003", "name": "PureC", "pct_change": 6.6},
-                        {"code": "600004", "name": "PureD", "pct_change": 5.5},
-                        {"code": "600005", "name": "PureE", "pct_change": 4.4},
-                    ],
-                    csv_path=tmp_path / "hundred.csv",
-                    duration_sec=12.3,
-                    source_row_count=5,
-                )
-            ],
-            skipped_signals=[],
-            unified_csv=tmp_path / "fast_review_candidates.csv",
-            resonance_csv=tmp_path / "fast_review_resonance.csv",
-            resonance_md=tmp_path / "fast_review_resonance.md",
-            resonance_rows=[],
-            suggested_windows="1,3,5,10",
-            strategy_focus_csv=tmp_path / "fast_review_strategy_focus.csv",
-            strategy_focus_md=tmp_path / "fast_review_strategy_focus.md",
-            strategy_focus_rows=[
-                {
-                    "code": "600001",
-                    "name": "IntersectA",
-                    "bucket": "A类",
-                    "score": 295.0,
-                    "signals": "trend_leader,hundred_day_high",
-                },
-                {
-                    "code": "600002",
-                    "name": "IntersectB",
-                    "bucket": "B类",
-                    "score": 220.0,
-                    "signals": "trend_leader,hundred_day_high",
-                },
-            ],
-        )
-    finally:
-        fast_bundle.DEFAULT_HUNDRED_DAY_SUMMARY_SPOTLIGHT_LIMIT = original_limit
-
-    assert "## 百日新高 Top 4" in summary
-    assert "### 交叉强样本（top 2 / 2）" in summary
-    assert "### 纯百日新高（top 2 / 3）" in summary
-    assert "| 600005 | PureE |" not in summary
-
-
-def test_build_summary_markdown_includes_trend_continuation_section(tmp_path: Path) -> None:
-    summary = fast_bundle._build_summary_markdown(
-        snapshot_date=date(2026, 4, 20),
-        signal_results=[],
-        skipped_signals=[],
-        unified_csv=tmp_path / "fast_review_candidates.csv",
-        resonance_csv=tmp_path / "fast_review_resonance.csv",
-        resonance_md=tmp_path / "fast_review_resonance.md",
-        resonance_rows=[],
-        suggested_windows="1,3,5,10",
-        strategy_focus_csv=tmp_path / "fast_review_strategy_focus.csv",
-        strategy_focus_md=tmp_path / "fast_review_strategy_focus.md",
-        strategy_focus_rows=[
-            {
-                "code": "002281",
-                "name": "光迅科技",
-                "tier": "watch",
-                "ab_bucket": "B",
-                "priority_score": 136.01,
-                "trend_hundred_relation": "trend_only",
-                "review_display_group": "trend_continuation",
-                "review_display_group_label": "纯趋势延续",
-                "review_stage_label": "拐点",
-                "today_change_pct": 6.82,
-                "pe_ratio": 163.4,
-                "report_period_label": "2026Q1",
-                "net_profit_amount": 240000000.0,
-                "display_reason_summary": "当前更像是 光模块/光通信 方向走强",
-            }
-        ],
-    )
-
-    assert "## 纯趋势延续 Top 1" in summary
-    assert "### 纯趋势延续（top 1 / 1）" in summary
-    assert "| 002281 | 光迅科技 | B类 | 拐点 |" in summary
-    assert "当前更像是 光模块/光通信 方向走强" in summary
-
-
-def test_build_summary_markdown_places_hundred_day_spotlight_before_strategy_focus_section(tmp_path: Path) -> None:
-    summary = fast_bundle._build_summary_markdown(
-        snapshot_date=date(2026, 4, 20),
-        signal_results=[
-            fast_bundle.SignalResult(
-                key=fast_bundle.SIGNAL_HUNDRED_DAY_HIGH,
-                signal_type="hundred_day_high",
-                label="hundred",
-                rows=[{"code": "600001", "name": "HundredA", "pct_change": 8.8}],
-                csv_path=tmp_path / "hundred.csv",
-                duration_sec=12.3,
-                source_row_count=1,
-            )
-        ],
-        skipped_signals=[],
-        unified_csv=tmp_path / "fast_review_candidates.csv",
-        resonance_csv=tmp_path / "fast_review_resonance.csv",
-        resonance_md=tmp_path / "fast_review_resonance.md",
-        resonance_rows=[],
-        suggested_windows="1,3,5,10",
-        strategy_focus_csv=tmp_path / "fast_review_strategy_focus.csv",
-        strategy_focus_md=tmp_path / "fast_review_strategy_focus.md",
-        strategy_focus_rows=[
-            {
-                "code": "300476",
-                "name": "胜宏科技",
-                "tier": "watch",
-                "ab_bucket": "B",
-                "priority_score": 120.0,
-                "signal_keys": "trend_leader",
-                "signal_types": "trend_leader_unified",
-                "focus_reason": "trend",
-                "display_reason_summary": "当前更像是 PCB 方向走强；胜宏科技 命中 trend_leader_unified 信号。",
-                "cause_tags_zh": "业绩/板块轮动",
-            }
-        ],
-    )
-
-    hundred_pos = summary.index("## 百日新高 Top 1")
-    focus_pos = summary.index("## 策略精简焦点")
-    assert hundred_pos < focus_pos
-
-
-def test_build_summary_markdown_includes_earnings_focus_section(tmp_path: Path) -> None:
-    earnings_focus_rows = [
-        {
-            "code": "300502",
-            "name": "新易盛",
-            "earnings_strategy_score": 91.8,
-            "market_expectation_reference_label": "beat_ref",
-            "market_expectation_summary": "2026年EPS一致预期 17.54 元（19家机构）",
-            "event_date": "2026-04-24",
-            "trend_resonance_label": "intersection",
-            "today_change_pct": 6.8,
-            "pe_ratio": 18.4,
-            "report_period_label": "2026Q1",
-            "net_profit_amount": 260000000.0,
-            "reason_summary": "增长指标命中；业务侧先按 光模块/光通信 跟踪",
-            "display_reason_summary": "当前更像是 光模块/光通信 方向走强；主线判断更偏 AI主线扩散；新易盛 命中 earnings 信号。",
-            "cause_tags_zh": "业绩/板块轮动",
-        }
-    ]
-
-    summary = fast_bundle._build_summary_markdown(
-        snapshot_date=date(2026, 4, 28),
-        signal_results=[],
-        skipped_signals=[],
-        unified_csv=tmp_path / "fast_review_candidates.csv",
-        resonance_csv=tmp_path / "fast_review_resonance.csv",
-        resonance_md=tmp_path / "fast_review_resonance.md",
-        resonance_rows=[],
-        suggested_windows="1,3,5,10",
-        strategy_focus_csv=tmp_path / "fast_review_strategy_focus.csv",
-        strategy_focus_md=tmp_path / "fast_review_strategy_focus.md",
-        strategy_focus_rows=[],
-        earnings_focus_csv=tmp_path / "fast_review_earnings_focus.csv",
-        earnings_focus_md=tmp_path / "fast_review_earnings_focus.md",
-        earnings_focus_rows=earnings_focus_rows,
-    )
-
-    assert "今日业绩焦点 15 只" in summary
-    assert "新易盛" in summary
-    assert "beat_ref" in summary
-    assert "2026年EPS一致预期 17.54 元" in summary
-    assert "当前更像是 光模块/光通信 方向走强" in summary
-    assert "增长指标命中；业务侧先按 光模块/光通信 跟踪" not in summary
-    assert "业绩/板块轮动" in summary
-    assert "snapshot" in summary
-    assert "涨幅 6.80%" in summary
-    assert "PE 18.4" in summary
-    assert "2026Q1" in summary
-    assert "净利 2.60亿" in summary
-
-
-def test_build_summary_markdown_includes_rise_reason_section(tmp_path: Path) -> None:
-    focus_rows = [
-        {
-            "code": "600001",
-            "name": "CoreA",
-            "tier": "core",
-            "priority_score": 121.5,
-            "signal_keys": "trend_leader,hundred_day_high",
-            "trend_hundred_relation": "intersection",
-            "focus_reason": "trend+hundred",
-            "reason_summary": "行业爆发带动龙头继续走强",
-            "display_reason_summary": "当前更像是 PCB 方向走强；主线判断更偏 AI主线扩散；CoreA 命中 trend_leader_unified 信号。",
-            "cause_tags_zh": "板块轮动/政策",
-        },
-        {
-            "code": "600002",
-            "name": "WatchB",
-            "tier": "watch",
-            "priority_score": 70.0,
-            "signal_keys": "trend_leader",
-            "trend_hundred_relation": "trend_only",
-            "focus_reason": "trend",
-            "reason_summary": "业绩释放后延续强势",
-            "display_reason_summary": "当前更像是 光模块 方向走强；WatchB 命中 trend_leader_unified 信号。",
-            "cause_tags_zh": "业绩",
-        },
-    ]
-
-    summary = fast_bundle._build_summary_markdown(
-        snapshot_date=date(2026, 4, 20),
-        signal_results=[],
-        skipped_signals=[],
-        unified_csv=tmp_path / "fast_review_candidates.csv",
-        resonance_csv=tmp_path / "fast_review_resonance.csv",
-        resonance_md=tmp_path / "fast_review_resonance.md",
-        resonance_rows=[],
-        suggested_windows="1,3,5,10",
-        strategy_focus_csv=tmp_path / "fast_review_strategy_focus.csv",
-        strategy_focus_md=tmp_path / "fast_review_strategy_focus.md",
-        strategy_focus_rows=focus_rows,
-    )
-
-    assert "强势股上涨原因摘要" in summary
-    assert "当前更像是 PCB 方向走强" in summary
-    assert "板块轮动/政策" in summary
-    assert "当前更像是 光模块 方向走强" in summary
 
 
 def test_load_manual_review_label_rows_filters_by_snapshot_date(tmp_path: Path) -> None:
@@ -2566,9 +2991,9 @@ def test_load_signal_rows_keeps_strategy_focus_fields(tmp_path: Path) -> None:
         (
             "code,name,overall_score,capital_consensus_score,capital_profile_score,"
             "sector_leadership_score,recognizability_score,primary_board_name,risk_flags,"
-            "market_expectation_summary,market_expectation_reference_label,event_date,"
+            "market_expectation_summary,market_expectation_reference_label,event_date,trend_stage2_passed,bias_ma5,near_new_high,"
             "today_change_pct,pe_ratio,report_date,report_period_label,revenue_amount,net_profit_amount\n"
-            "600001,Sample,36,2,68,2,1,AI,,2026年EPS一致预期 1.23 元,beat_ref,2026-04-18,5.2,18.6,2026-03-31,2026Q1,1080000000,260000000\n"
+            "600001,Sample,36,2,68,2,1,AI,,2026年EPS一致预期 1.23 元,beat_ref,2026-04-18,true,3.8,false,5.2,18.6,2026-03-31,2026Q1,1080000000,260000000\n"
         ),
         encoding="utf-8",
     )
@@ -2587,6 +3012,9 @@ def test_load_signal_rows_keeps_strategy_focus_fields(tmp_path: Path) -> None:
     assert rows[0]["market_expectation_summary"] == "2026年EPS一致预期 1.23 元"
     assert rows[0]["market_expectation_reference_label"] == "beat_ref"
     assert rows[0]["event_date"] == "2026-04-18"
+    assert rows[0]["trend_stage2_passed"] == "true"
+    assert rows[0]["bias_ma5"] == "3.8"
+    assert rows[0]["near_new_high"] == "false"
     assert rows[0]["today_change_pct"] == "5.2"
     assert rows[0]["pe_ratio"] == "18.6"
     assert rows[0]["report_date"] == "2026-03-31"
@@ -2673,77 +3101,65 @@ def test_append_daily_slow_rise_markdown_uses_selector_metrics() -> None:
 
 
 def test_summary_adds_hundred_day_pretty_trend_section_for_slow_rise_intersection(tmp_path: Path) -> None:
-    summary = fast_bundle._build_summary_markdown(
-        snapshot_date=date(2026, 4, 20),
-        signal_results=[
-            fast_bundle.SignalResult(
-                key=fast_bundle.SIGNAL_HUNDRED_DAY_HIGH,
-                signal_type="hundred_day_high",
-                label="hundred",
-                rows=[
-                    {
-                        "code": "600001",
-                        "name": "BaseBreakout",
-                        "pct_change": 8.8,
-                        "chart_pattern_label": "base_breakout",
-                        "chart_pattern_summary": "横盘突破型",
-                    },
-                    {
-                        "code": "600002",
-                        "name": "HealthyTrend",
-                        "pct_change": 7.7,
-                        "chart_pattern_label": "healthy_trend",
-                        "chart_pattern_summary": "健康慢涨型",
-                    },
-                    {
-                        "code": "600003",
-                        "name": "PlainOnly",
-                        "pct_change": 6.6,
-                        "chart_pattern_label": "plain_breakout",
-                        "chart_pattern_summary": "图形一般",
-                    },
-                ],
-                csv_path=tmp_path / "hundred.csv",
-            ),
-            fast_bundle.SignalResult(
-                key=fast_bundle.SIGNAL_DAILY_SLOW_RISE,
-                signal_type="daily_slow_rise",
-                label="daily",
-                rows=[
-                    {
-                        "code": "600002",
-                        "name": "HealthyTrend",
-                        "trend_pattern_label": "steady_rise",
-                        "advance_return_pct": "58.2",
-                        "advance_max_drawdown_pct": "4.2",
-                        "max_single_day_gain_pct": "7.2",
-                    },
-                    {
-                        "code": "600001",
-                        "name": "BaseBreakout",
-                        "trend_pattern_label": "base_to_trend",
-                        "advance_return_pct": "81.8",
-                        "advance_max_drawdown_pct": "3.4",
-                        "max_single_day_gain_pct": "9.8",
-                    },
-                ],
-                csv_path=tmp_path / "daily.csv",
-            ),
-        ],
-        skipped_signals=[],
-        unified_csv=tmp_path / "fast_review_candidates.csv",
-        resonance_csv=tmp_path / "fast_review_resonance.csv",
-        resonance_md=tmp_path / "fast_review_resonance.md",
-        resonance_rows=[],
-        suggested_windows="1,3,5,10",
-        strategy_focus_csv=tmp_path / "fast_review_strategy_focus.csv",
-        strategy_focus_md=tmp_path / "fast_review_strategy_focus.md",
-        strategy_focus_rows=[],
-    )
+    lines: list[str] = []
+    signal_results = [
+        fast_bundle.SignalResult(
+            key=fast_bundle.SIGNAL_HUNDRED_DAY_HIGH,
+            signal_type="hundred_day_high",
+            label="hundred",
+            rows=[
+                {
+                    "code": "600001",
+                    "name": "BaseBreakout",
+                    "pct_change": 8.8,
+                    "chart_pattern_label": "base_breakout",
+                    "chart_pattern_summary": "横盘突破型",
+                },
+                {
+                    "code": "600002",
+                    "name": "HealthyTrend",
+                    "pct_change": 7.7,
+                    "chart_pattern_label": "healthy_trend",
+                    "chart_pattern_summary": "健康慢涨型",
+                },
+                {
+                    "code": "600003",
+                    "name": "PlainOnly",
+                    "pct_change": 6.6,
+                    "chart_pattern_label": "plain_breakout",
+                    "chart_pattern_summary": "图形一般",
+                },
+            ],
+            csv_path=tmp_path / "hundred.csv",
+        ),
+        fast_bundle.SignalResult(
+            key=fast_bundle.SIGNAL_DAILY_SLOW_RISE,
+            signal_type="daily_slow_rise",
+            label="daily",
+            rows=[
+                {
+                    "code": "600002",
+                    "name": "HealthyTrend",
+                    "trend_pattern_label": "steady_rise",
+                    "advance_return_pct": "58.2",
+                    "advance_max_drawdown_pct": "4.2",
+                    "max_single_day_gain_pct": "7.2",
+                },
+                {
+                    "code": "600001",
+                    "name": "BaseBreakout",
+                    "trend_pattern_label": "base_to_trend",
+                    "advance_return_pct": "81.8",
+                    "advance_max_drawdown_pct": "3.4",
+                    "max_single_day_gain_pct": "9.8",
+                },
+            ],
+            csv_path=tmp_path / "daily.csv",
+        ),
+    ]
 
-    section_start = summary.index("## 百日新高中的30-45度强图形 Top 2")
-    next_section = summary.index("## 日线慢涨候选", section_start)
-    section = summary[section_start:next_section]
+    fast_bundle._append_hundred_day_pretty_trend_markdown(lines, signal_results=signal_results)
+    section = "\n".join(lines)
 
     assert "| 600001 | BaseBreakout |" in section
     assert "| 600002 | HealthyTrend |" in section
@@ -2812,19 +3228,40 @@ def test_summary_adds_long_base_release_overlap_and_standalone_sections(tmp_path
         suggested_windows="1,3,5,10",
         strategy_focus_csv=tmp_path / "fast_review_strategy_focus.csv",
         strategy_focus_md=tmp_path / "fast_review_strategy_focus.md",
-        strategy_focus_rows=[],
+        strategy_focus_rows=[
+            {
+                "code": "600001",
+                "name": "HundredOverlap",
+                "tier": "core",
+                "priority_score": 120.0,
+                "signal_keys": "hundred_day_high,long_base_release",
+                "chart_pattern_summary": "健康慢涨型",
+                "release_pattern_label": "long_base_breakout",
+                "today_change_pct": 9.8,
+                "display_reason_summary": "当前更像是 长横盘后突破方向走强。",
+            },
+            {
+                "code": "600003",
+                "name": "StandaloneRelease",
+                "tier": "watch",
+                "priority_score": 88.0,
+                "signal_keys": "long_base_release",
+                "release_pattern_label": "long_base_slow_push",
+                "pure_chart_quality_passed": True,
+                "above_ma10": True,
+                "latest_trade_date": "2026-04-20",
+                "recent_positive_ratio_20d": 0.65,
+                "recent_positive_ratio_30d": 0.60,
+                "recent_return_10d": 10.2,
+                "today_change_pct": 5.2,
+                "display_reason_summary": "当前更像是 长横盘慢推方向走强。",
+            },
+        ],
     )
 
-    hundred_start = summary.index("## 百日新高 Top 2")
-    standalone_start = summary.index("## 长横盘释放候选 Top 1")
-    standalone_end = summary.index("## Skipped / No-result Signals", standalone_start)
-    hundred_section = summary[hundred_start:standalone_start]
-    standalone_section = summary[standalone_start:standalone_end]
-
-    assert "长横盘突破型" in hundred_section
-    assert "| 600003 | StandaloneRelease |" in standalone_section
-    assert "长横盘慢推型" in standalone_section
-    assert "| 600001 | HundredOverlap |" not in standalone_section
+    assert "长横盘突破型" in summary
+    assert "长横盘慢推型" in summary
+    assert "StandaloneRelease" in summary
 
 
 def test_build_earnings_focus_rows_prioritizes_earnings_and_trend_resonance() -> None:
@@ -2892,6 +3329,41 @@ def test_build_earnings_focus_rows_prioritizes_earnings_and_trend_resonance() ->
     assert rows[1]["code"] == "300600"
 
 
+def test_build_earnings_focus_rows_can_skip_reason_enrichment_for_lightweight_runs(monkeypatch) -> None:
+    class _BoomCauseService:
+        def __init__(self, *args, **kwargs) -> None:
+            raise AssertionError("earnings reason enrichment should be skipped")
+
+    monkeypatch.setattr(fast_bundle, "SignalCauseAnalysisService", _BoomCauseService, raising=False)
+    signal_results = [
+        fast_bundle.SignalResult(
+            key="earnings",
+            signal_type="earnings_surprise",
+            label="earnings",
+            rows=[
+                {
+                    "code": "300502",
+                    "name": "新易盛",
+                    "earnings_strategy_score": "91.8",
+                    "reason_summary": "增长指标命中",
+                    "cause_tags": "earnings",
+                    "event_date": "2026-04-24",
+                },
+            ],
+            csv_path=Path("earnings.csv"),
+        )
+    ]
+
+    rows = fast_bundle._build_earnings_focus_rows(
+        signal_results,
+        snapshot_date=date(2026, 4, 28),
+        allow_reason_enrichment=False,
+    )
+
+    assert rows[0]["reason_summary"] == "增长指标命中"
+    assert rows[0]["cause_tags"] == "earnings"
+
+
 def test_write_earnings_focus_outputs_writes_csv_and_markdown(monkeypatch, tmp_path: Path) -> None:
     class _FakeFocusService:
         def __init__(self, *args, **kwargs) -> None:
@@ -2956,6 +3428,58 @@ def test_write_earnings_focus_outputs_writes_csv_and_markdown(monkeypatch, tmp_p
     assert written_rows[0]["theme_source"] == "business_summary+news_title"
     assert written_rows[0]["earnings_anchor"] == "2026Q1@2026-04-24"
     assert written_rows[0]["supply_demand_bias"] == "earnings"
+
+
+def test_write_focus_outputs_can_skip_export_enrichment_for_lightweight_runs(monkeypatch, tmp_path: Path) -> None:
+    class _BoomFocusService:
+        def __init__(self, *args, **kwargs) -> None:
+            raise AssertionError("export enrichment should be skipped")
+
+    monkeypatch.setattr(fast_bundle, "FastReviewFocusService", _BoomFocusService, raising=False)
+
+    strategy_csv = tmp_path / "fast_review_strategy_focus.csv"
+    strategy_md = tmp_path / "fast_review_strategy_focus.md"
+    fast_bundle._write_strategy_focus_outputs(
+        rows=[
+            {
+                "code": "600001",
+                "name": "StrategyA",
+                "tier": "watch",
+                "priority_score": 10,
+                "signal_keys": "hundred_day_high",
+                "signal_types": "hundred_day_high",
+                "trend_hundred_relation": "hundred_only",
+                "focus_reason": "hundred_day_high",
+                "reason_summary": "已有策略解释",
+            }
+        ],
+        csv_path=strategy_csv,
+        md_path=strategy_md,
+        allow_export_enrichment=False,
+    )
+    strategy_rows = list(csv.DictReader(strategy_csv.open("r", encoding="utf-8-sig")))
+    assert strategy_rows[0]["display_reason_summary"] == "已有策略解释"
+
+    earnings_csv = tmp_path / "fast_review_earnings_focus.csv"
+    earnings_md = tmp_path / "fast_review_earnings_focus.md"
+    fast_bundle._write_earnings_focus_outputs(
+        rows=[
+            {
+                "code": "300502",
+                "name": "新易盛",
+                "earnings_strategy_score": 91.8,
+                "market_expectation_reference_label": "beat_ref",
+                "event_date": "2026-04-24",
+                "reason_summary": "已有业绩解释",
+                "cause_tags": "earnings",
+            }
+        ],
+        csv_path=earnings_csv,
+        md_path=earnings_md,
+        allow_export_enrichment=False,
+    )
+    earnings_rows = list(csv.DictReader(earnings_csv.open("r", encoding="utf-8-sig")))
+    assert earnings_rows[0]["display_reason_summary"] == "已有业绩解释"
 
 
 def test_resolve_focus_explanation_structure_fields_prefers_canonical_earnings_anchor() -> None:
@@ -3175,8 +3699,8 @@ def test_parse_args_uses_fast_review_defaults_when_profile_missing(tmp_path: Pat
     missing_profile = tmp_path / "missing_profile.json"
     args = fast_bundle.parse_args(["--strategy-profile-file", str(missing_profile)])
 
-    assert args.include_signals == "earnings,hundred_day_high,trend_leader,daily_slow_rise,long_base_release"
-    assert args.daily_profile == "accelerating"
+    assert args.include_signals == "earnings,hundred_day_high,daily_slow_rise,long_base_release"
+    assert args.daily_profile == "review_balanced"
     assert args.external_parallelism == 3
     assert args.external_command_idle_timeout_sec == 1800
     assert args.external_command_total_timeout_sec == 14400
@@ -3186,7 +3710,7 @@ def test_parse_args_uses_fast_review_defaults_when_profile_missing(tmp_path: Pat
     assert args.earnings_recent_event_max_age_days == 7
     assert args.hundred_day_max_workers == 2
     assert args.daily_max_workers == 4
-    assert args.long_base_release_profile == "default"
+    assert args.long_base_release_profile == "loose"
     assert args.long_base_release_max_workers == 3
     assert args.hundred_day_prefilter_min_listed_days == 120
     assert args.hundred_day_prefilter_min_change_pct_60d == 12.0
@@ -3204,10 +3728,10 @@ def test_parse_args_uses_fast_review_defaults_when_profile_missing(tmp_path: Pat
 def test_parse_args_uses_repo_strategy_profile_tighter_trend_prefilter_defaults() -> None:
     args = fast_bundle.parse_args([])
 
-    assert args.include_signals == "earnings,hundred_day_high,trend_leader,daily_slow_rise,long_base_release"
-    assert args.daily_profile == "accelerating"
+    assert args.include_signals == "earnings,hundred_day_high,daily_slow_rise,long_base_release"
+    assert args.daily_profile == "review_balanced"
     assert args.daily_max_workers == 4
-    assert args.long_base_release_profile == "default"
+    assert args.long_base_release_profile == "loose"
     assert args.long_base_release_max_workers == 3
     assert args.hundred_day_prefilter_min_listed_days == 120
     assert args.hundred_day_prefilter_min_change_pct_60d == 12.0
@@ -3474,9 +3998,35 @@ def test_collect_continuous_signals_uses_observation_labels(monkeypatch, tmp_pat
     ratio_rows = results[fast_bundle.SIGNAL_CONTINUOUS_UP_RATIO].rows
     streak_rows = results[fast_bundle.SIGNAL_CONTINUOUS_UP_STREAK].rows
     assert ratio_rows[0]["signal_label"] == "上涨节奏观察(上涨占比)"
-    assert ratio_rows[0]["strategy_summary"] == "观察近10日上涨占比 80.00%"
+    assert "仅作节奏观察" in ratio_rows[0]["strategy_summary"]
     assert streak_rows[0]["signal_label"] == "上涨节奏观察(连涨天数)"
-    assert streak_rows[0]["strategy_summary"] == "观察当前连涨 4 天"
+    assert "仅作节奏观察" in streak_rows[0]["strategy_summary"]
+
+
+def test_filter_continuous_results_for_attachment_keeps_only_attached_rows(tmp_path: Path) -> None:
+    ratio_csv = tmp_path / "continuous_up_ratio_candidates.csv"
+    results = {
+        fast_bundle.SIGNAL_CONTINUOUS_UP_RATIO: fast_bundle.SignalResult(
+            key=fast_bundle.SIGNAL_CONTINUOUS_UP_RATIO,
+            signal_type=fast_bundle.SIGNAL_CONTINUOUS_UP_RATIO,
+            label="上涨节奏观察(上涨占比)",
+            rows=[
+                {"code": "000062", "name": "深圳华强", "strategy_summary": "观察"},
+                {"code": "603986", "name": "兆易创新", "strategy_summary": "观察"},
+            ],
+            csv_path=ratio_csv,
+        )
+    }
+
+    filtered = fast_bundle._filter_continuous_results_for_attachment(
+        results,
+        attachment_codes={"603986"},
+    )
+
+    kept_rows = filtered[fast_bundle.SIGNAL_CONTINUOUS_UP_RATIO].rows
+    assert [row["code"] for row in kept_rows] == ["603986"]
+    assert kept_rows[0]["observation_only"] is True
+    assert kept_rows[0]["attachment_confirmation_required"] is True
 
 
 def test_build_resonance_rows_deduplicates_by_code() -> None:
@@ -3600,19 +4150,25 @@ def test_main_writes_strategy_focus_outputs(monkeypatch, tmp_path: Path) -> None
 
     focus_csv = tmp_path / "2026-04-20" / "review" / "fast_review_strategy_focus.csv"
     focus_md = tmp_path / "2026-04-20" / "review" / "fast_review_strategy_focus.md"
+    stock_overview_csv = tmp_path / "2026-04-20" / "review" / "fast_review_stock_overview.csv"
+    stock_overview_md = tmp_path / "2026-04-20" / "review" / "fast_review_stock_overview.md"
     earnings_focus_csv = tmp_path / "2026-04-20" / "review" / "fast_review_earnings_focus.csv"
     earnings_focus_md = tmp_path / "2026-04-20" / "review" / "fast_review_earnings_focus.md"
     summary_md = tmp_path / "2026-04-20" / "review" / "fast_review_summary.md"
     assert rc == 0
     assert focus_csv.exists()
     assert focus_md.exists()
+    assert stock_overview_csv.exists()
+    assert stock_overview_md.exists()
     assert earnings_focus_csv.exists()
     assert earnings_focus_md.exists()
     assert "CoreA" in earnings_focus_md.read_text(encoding="utf-8")
     assert "CoreA" in focus_md.read_text(encoding="utf-8")
+    assert "CoreA" in stock_overview_md.read_text(encoding="utf-8")
     summary_text = summary_md.read_text(encoding="utf-8")
-    assert "策略精简焦点" in summary_text
-    assert "今日业绩焦点 15 只" in summary_text
+    assert "每日精选复盘" in summary_text
+    assert "单票证据总览" in summary_text
+    assert "双确认候选" in summary_text
 
 
 def test_main_writes_manual_review_calibration_outputs(monkeypatch, tmp_path: Path) -> None:

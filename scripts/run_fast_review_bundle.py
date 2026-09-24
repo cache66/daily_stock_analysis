@@ -29,6 +29,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from data_provider.base import is_st_stock
 from src.services.fast_review_focus_service import FastReviewFocusService
+from src.services.industry_catalyst_registry import resolve_industry_catalyst
 from src.services.signal_cause_analysis_service import (
     BUSINESS_ALIAS_OVERRIDES,
     SignalCauseAnalysisService,
@@ -62,14 +63,17 @@ SHORTLINE_SIGNAL_TYPES = [
 DEFAULT_INCLUDE_SIGNALS = [
     SIGNAL_EARNINGS,
     SIGNAL_HUNDRED_DAY_HIGH,
-    SIGNAL_TREND_LEADER,
     SIGNAL_DAILY_SLOW_RISE,
     SIGNAL_LONG_BASE_RELEASE,
 ]
 SIGNAL_ALIASES = {
     "continuous_up": [SIGNAL_CONTINUOUS_UP_RATIO, SIGNAL_CONTINUOUS_UP_STREAK],
 }
-KNOWN_SIGNALS = set(DEFAULT_INCLUDE_SIGNALS) | {SIGNAL_MONTHLY_SLOW_RISE, SIGNAL_DAILY_SLOW_RISE} | set(SIGNAL_ALIASES)
+KNOWN_SIGNALS = (
+    set(DEFAULT_INCLUDE_SIGNALS)
+    | {SIGNAL_TREND_LEADER, SIGNAL_MONTHLY_SLOW_RISE, SIGNAL_DAILY_SLOW_RISE}
+    | set(SIGNAL_ALIASES)
+)
 CAUSE_TAG_LABELS = {
     "earnings": "业绩",
     "policy": "政策",
@@ -113,6 +117,30 @@ TURNING_POINT_KEYWORDS = (
     "扭亏",
     "减亏",
 )
+STORAGE_CYCLE_KEYWORDS = (
+    "存储",
+    "存储器",
+    "存储芯片",
+    "存储模组",
+    "dram",
+    "nand",
+    "nor flash",
+    "flash",
+)
+CYCLE_CATALYST_KEYWORDS = (
+    "涨价",
+    "提价",
+    "调价",
+    "价格上涨",
+    "价格上调",
+    "复苏",
+    "回暖",
+    "景气",
+    "供需",
+    "reaccelerating",
+    "recovering",
+    "expanding",
+)
 HUNDRED_DAY_CHART_PATTERN_PRIORITY = {
     "base_breakout": 0,
     "healthy_trend": 1,
@@ -131,6 +159,7 @@ REVIEW_DISPLAY_GROUP_LABELS = {
 
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "fast_review_daily"
 DEFAULT_STRATEGY_PROFILE_FILE = PROJECT_ROOT / "config" / "local_strategy_profile.json"
+DEFAULT_HISTORY_CACHE_DIR = PROJECT_ROOT / "data" / "cache" / "history"
 
 DEFAULT_CONTINUOUS_LOOKBACK_DAYS = 10
 DEFAULT_CONTINUOUS_MIN_RATIO = 0.7
@@ -154,9 +183,9 @@ DEFAULT_HUNDRED_DAY_PREFILTER_REQUIRE_POSITIVE_CHANGE = True
 DEFAULT_HUNDRED_DAY_PREFILTER_EXCLUDE_ST = True
 DEFAULT_MONTHLY_PROFILE = "balanced"
 DEFAULT_MONTHLY_MAX_WORKERS = 2
-DEFAULT_DAILY_SLOW_RISE_PROFILE = "accelerating"
+DEFAULT_DAILY_SLOW_RISE_PROFILE = "review_balanced"
 DEFAULT_DAILY_SLOW_RISE_MAX_WORKERS = 4
-DEFAULT_LONG_BASE_RELEASE_PROFILE = "default"
+DEFAULT_LONG_BASE_RELEASE_PROFILE = "loose"
 DEFAULT_LONG_BASE_RELEASE_MAX_WORKERS = 3
 DEFAULT_EXTERNAL_LOCK_RETRY = 2
 DEFAULT_PROGRESS_EVERY = 25
@@ -170,10 +199,34 @@ DEFAULT_TREND_SCAN_PREFILTER_MIN_TURNOVER_RATE = 0.8
 DEFAULT_EXTERNAL_COMMAND_IDLE_TIMEOUT_SEC = int(os.getenv("FAST_REVIEW_EXTERNAL_IDLE_TIMEOUT_SEC", "1800"))
 DEFAULT_EXTERNAL_COMMAND_TOTAL_TIMEOUT_SEC = int(os.getenv("FAST_REVIEW_EXTERNAL_TOTAL_TIMEOUT_SEC", "14400"))
 DEFAULT_EXTERNAL_COMMAND_HEARTBEAT_SEC = int(os.getenv("FAST_REVIEW_EXTERNAL_HEARTBEAT_SEC", "300"))
+SAFE_MODE_WORKER_COUNT = 1
 STRATEGY_FOCUS_MARKDOWN_SECTIONS = [
     ("core", "核心候选", 10),
     ("watch", "观察候选", 10),
     ("low_priority", "低优先级候选", 5),
+]
+DAILY_REVIEW_LANE_PRIORITY = {
+    "double_confirmation": 0,
+    "earnings_first": 1,
+    "chart_first": 2,
+    "accumulation_watch": 3,
+    "trend_watch": 4,
+    "other": 5,
+}
+DAILY_REVIEW_LANE_LABELS = {
+    "double_confirmation": "双确认",
+    "chart_first": "图形优先",
+    "accumulation_watch": "吸筹观察",
+    "earnings_first": "业绩优先",
+    "trend_watch": "趋势补充",
+    "other": "其他",
+}
+DAILY_REVIEW_MARKDOWN_SECTIONS = [
+    ("double_confirmation", "双确认候选", 6),
+    ("earnings_first", "业绩优先候选", 6),
+    ("chart_first", "图形优先候选", 8),
+    ("accumulation_watch", "吸筹观察候选", 8),
+    ("trend_watch", "趋势补充观察", 6),
 ]
 
 LITON_STYLE_MARKDOWN_SECTIONS = [
@@ -332,8 +385,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Fast-review daily bundle: aggregate earnings / 100D high / trend leader / "
-            "continuous-up (ratio + streak). This entry only exports + snapshot persistence."
+            "Fast-review daily bundle: aggregate earnings / 100D high / daily slow rise / "
+            "long-base release, with trend leader kept as optional supplementary watch."
         )
     )
     parser.add_argument(
@@ -347,13 +400,22 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--snapshot-date", default=None, help="Snapshot date, format YYYY-MM-DD, default today.")
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help=f"Output root directory, default {DEFAULT_OUTPUT_DIR}.")
     parser.add_argument(
+        "--safe-mode",
+        action="store_true",
+        help=(
+            "Force low-concurrency execution for single-machine stability. "
+            "This clamps bundle and per-signal worker counts to 1."
+        ),
+    )
+    parser.add_argument(
         "--include-signals",
         default=",".join(DEFAULT_INCLUDE_SIGNALS),
         help=(
             "Comma-separated signal keys. Supported keys: "
             "earnings,hundred_day_high,trend_leader,monthly_slow_rise,daily_slow_rise,long_base_release,"
             "continuous_up_ratio,continuous_up_streak,"
-            "continuous_up(alias for both continuous signals)."
+            "continuous_up(alias for both continuous signals). "
+            "Default daily focus is earnings + chart signals; trend_leader is optional supplementary input."
         ),
     )
     parser.add_argument(
@@ -418,6 +480,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--progress-every", type=int, default=DEFAULT_PROGRESS_EVERY, help=f"Progress log interval, default {DEFAULT_PROGRESS_EVERY}.")
     parser.add_argument("--history-lookback-days", type=int, default=365, help="History lookback days for snapshot payload.")
+    parser.add_argument(
+        "--history-cache-dir",
+        default=str(DEFAULT_HISTORY_CACHE_DIR),
+        help=(
+            "Local daily history cache used by read-layer price-health gates. "
+            f"Default {DEFAULT_HISTORY_CACHE_DIR}."
+        ),
+    )
     parser.add_argument("--windows", default=DEFAULT_WINDOWS, help=f"Suggested eval windows for follow-up command hints, default {DEFAULT_WINDOWS}.")
     parser.add_argument(
         "--manual-review-labels-file",
@@ -585,6 +655,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             f"default {DEFAULT_MONTHLY_MAX_WORKERS}."
         ),
     )
+    parser.set_defaults(monthly_cache_only=True)
+    parser.add_argument(
+        "--monthly-cache-only",
+        dest="monthly_cache_only",
+        action="store_true",
+        help="Monthly slow-rise 仅扫描本地已有 history cache 的样本（默认开启）。",
+    )
+    parser.add_argument(
+        "--monthly-allow-history-fetch",
+        dest="monthly_cache_only",
+        action="store_false",
+        help="允许 monthly slow-rise 对缺缓存样本补抓历史。",
+    )
     parser.add_argument("--daily-signal-type", default="daily_slow_rise", help="Signal type for daily slow-rise scan.")
     parser.add_argument(
         "--daily-profile",
@@ -635,7 +718,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.set_defaults(trend_disable_second_stage_enrichment=True)
     parser.add_argument("--trend-disable-second-stage-enrichment", dest="trend_disable_second_stage_enrichment", action="store_true", help="Disable post-select enrichment in trend scan (default enabled).")
     parser.add_argument("--trend-enable-second-stage-enrichment", dest="trend_disable_second_stage_enrichment", action="store_false", help="Enable post-select enrichment in trend scan.")
-    parser.add_argument("--trend-fallback-top-n", type=int, default=20, help="Fallback top-N for trend scan.")
+    parser.add_argument("--trend-fallback-top-n", type=int, default=0, help="Fallback top-N for trend scan.")
     parser.add_argument(
         "--trend-watch-top-n",
         type=int,
@@ -707,7 +790,18 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         logger.warning("ignore unknown strategy profile defaults: %s", ",".join(ignored_keys))
     if applicable_defaults:
         parser.set_defaults(**applicable_defaults)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if bool(getattr(args, "safe_mode", False)):
+        args.max_workers = SAFE_MODE_WORKER_COUNT
+        args.external_parallelism = SAFE_MODE_WORKER_COUNT
+        args.continuous_max_workers = SAFE_MODE_WORKER_COUNT
+        args.earnings_max_workers = SAFE_MODE_WORKER_COUNT
+        args.hundred_day_max_workers = SAFE_MODE_WORKER_COUNT
+        args.monthly_max_workers = SAFE_MODE_WORKER_COUNT
+        args.daily_max_workers = SAFE_MODE_WORKER_COUNT
+        args.long_base_release_max_workers = SAFE_MODE_WORKER_COUNT
+        args.trend_max_workers = SAFE_MODE_WORKER_COUNT
+    return args
 
 
 def configure_logging(level: str) -> None:
@@ -936,6 +1030,19 @@ def _to_optional_float(value: Any) -> Optional[float]:
         return None
 
 
+def _to_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
 def _to_int(value: Any, default: int = 0) -> int:
     try:
         return int(float(value))
@@ -972,9 +1079,9 @@ def resolve_earnings_signal_type(profile: str) -> str:
 def _warn_earnings_skip_persist_cache_bypass(include_signals: Sequence[str], *, persist_snapshots: bool) -> None:
     if SIGNAL_EARNINGS not in include_signals or persist_snapshots:
         return
-    logger.warning(
-        "earnings selected with --skip-persist-snapshots: this bypasses same-day/cross-day cache reuse "
-        "in signal_fundamental_snapshot and can turn an ~80s cached run into a much slower cold scan."
+    logger.info(
+        "earnings selected with --skip-persist-snapshots: existing signal_fundamental_snapshot cache "
+        "will still be read, while new snapshots and selected results will not be persisted."
     )
 
 
@@ -1033,6 +1140,8 @@ def build_hundred_day_high_command(args: argparse.Namespace, *, snapshot_date: d
         "--log-level",
         str(args.log_level),
     ]
+    if args.limit is not None and int(args.limit) > 0:
+        command.extend(["--limit", str(int(args.limit))])
     if bool(getattr(args, "hundred_day_disable_spot_prefilter", False)):
         command.append("--disable-spot-prefilter")
     else:
@@ -1101,11 +1210,17 @@ def build_monthly_slow_rise_command(args: argparse.Namespace, *, snapshot_date: 
         str(output_dir),
         "--max-workers",
         str(max(1, int(getattr(args, "monthly_max_workers", args.max_workers)))),
+        "--history-cache-dir",
+        str(args.history_cache_dir),
         "--log-level",
         str(args.log_level),
     ]
     if args.limit is not None and int(args.limit) > 0:
         command.extend(["--limit", str(int(args.limit))])
+    if bool(getattr(args, "monthly_cache_only", False)):
+        command.append("--cache-only")
+    if args.universe_codes_file:
+        command.extend(["--universe-codes-file", str(args.universe_codes_file)])
     if not bool(args.persist_snapshots):
         command.append("--skip-db-persist")
     return command
@@ -1259,6 +1374,9 @@ def _load_signal_rows_from_csv(
                 "relative_strength_score",
                 "primary_profile",
                 "selection_mode",
+                "trend_stage2_passed",
+                "bias_ma5",
+                "near_new_high",
                 "up_ratio",
                 "up_days",
                 "lookback_days",
@@ -1272,6 +1390,7 @@ def _load_signal_rows_from_csv(
                 "base_return_pct",
                 "advance_return_pct",
                 "advance_max_drawdown_pct",
+                "recent_drawdown_10d_pct",
                 "full_window_return_pct",
                 "release_pattern_label",
                 "base_high",
@@ -1281,6 +1400,16 @@ def _load_signal_rows_from_csv(
                 "release_return_pct",
                 "release_max_drawdown_pct",
                 "full_window_return_pct",
+                "latest_trade_date",
+                "recent_positive_ratio_20d",
+                "recent_positive_ratio_30d",
+                "recent_return_5d",
+                "recent_return_10d",
+                "recent_drawdown_10d",
+                "recent_max_consecutive_down_days_10d",
+                "above_ma5",
+                "above_ma10",
+                "pure_chart_quality_passed",
                 "breakout_above_base_pct",
                 "max_single_day_gain_pct",
                 "breakout_quality_score",
@@ -1291,8 +1420,11 @@ def _load_signal_rows_from_csv(
                 "healthy_trend_score",
                 "earnings_strategy_score",
                 "earnings_strategy_gate_status",
+                "fast_review_focus_gate_passed",
+                "fast_review_focus_gate_reason",
                 "earnings_quality_score",
                 "earnings_quality_verdict",
+                "earnings_quality_cycle_phase",
                 "market_expectation_status",
                 "market_expectation_source",
                 "market_expectation_year",
@@ -1315,6 +1447,9 @@ def _load_signal_rows_from_csv(
                 "quick_report_announcement_date",
                 "report_date",
                 "report_period_label",
+                "revenue_yoy",
+                "net_profit_yoy",
+                "roe",
                 "revenue_amount",
                 "revenue",
                 "operating_revenue",
@@ -1765,7 +1900,7 @@ def _collect_continuous_signals(
                     "current_up_streak": current_streak,
                     "close": close,
                     "total_market_cap_yi": total_mv_yi,
-                    "strategy_summary": f"观察近{metric_lookback_days}日上涨占比 {up_ratio:.2%}",
+                    "strategy_summary": f"观察近{metric_lookback_days}日上涨占比 {up_ratio:.2%}；仅作节奏观察，需其他主信号共振",
                 }
             )
         if include_streak and current_streak >= int(args.continuous_up_streak_days):
@@ -1781,7 +1916,7 @@ def _collect_continuous_signals(
                     "current_up_streak": current_streak,
                     "close": close,
                     "total_market_cap_yi": total_mv_yi,
-                    "strategy_summary": f"观察当前连涨 {current_streak} 天",
+                    "strategy_summary": f"观察当前连涨 {current_streak} 天；仅作节奏观察，需其他主信号共振",
                 }
             )
 
@@ -1834,6 +1969,35 @@ def _collect_continuous_signals(
         len(streak_rows),
     )
     return results
+
+
+def _filter_continuous_results_for_attachment(
+    continuous_results: Dict[str, SignalResult],
+    *,
+    attachment_codes: set[str],
+) -> Dict[str, SignalResult]:
+    normalized_attachment_codes = {str(code or "").strip() for code in attachment_codes if str(code or "").strip()}
+    filtered_results: Dict[str, SignalResult] = {}
+    for key, result in continuous_results.items():
+        rows = []
+        for item in result.rows:
+            code = str(item.get("code") or "").strip()
+            if not code or code not in normalized_attachment_codes:
+                continue
+            row = dict(item)
+            row["observation_only"] = True
+            row["attachment_confirmation_required"] = True
+            rows.append(row)
+        _export_signal_rows(rows=rows, csv_path=result.csv_path, txt_path=result.csv_path.with_suffix(".txt"))
+        filtered_results[key] = SignalResult(
+            key=result.key,
+            signal_type=result.signal_type,
+            label=result.label,
+            rows=rows,
+            csv_path=result.csv_path,
+            duration_sec=result.duration_sec,
+        )
+    return filtered_results
 
 
 def _safe_cell(value: Any) -> str:
@@ -2091,7 +2255,334 @@ def _build_long_base_release_snapshot_summary(item: Dict[str, Any]) -> str:
     if breakout_above_base_pct is not None:
         parts.append(f"突破底部 {breakout_above_base_pct:.2f}%")
 
+    recent_positive_ratio_20d = _to_optional_float(item.get("recent_positive_ratio_20d"))
+    if recent_positive_ratio_20d is not None:
+        parts.append(f"20日阳线 {recent_positive_ratio_20d * 100:.0f}%")
+
+    recent_positive_ratio_30d = _to_optional_float(item.get("recent_positive_ratio_30d"))
+    if recent_positive_ratio_30d is not None:
+        parts.append(f"30日阳线 {recent_positive_ratio_30d * 100:.0f}%")
+
+    recent_return_10d = _to_optional_float(item.get("recent_return_10d"))
+    if recent_return_10d is not None:
+        parts.append(f"近10日 {recent_return_10d:.2f}%")
+
     return " / ".join(parts) or "--"
+
+
+def _is_pure_long_base_chart_row(item: Dict[str, Any]) -> bool:
+    signal_keys = set(_split_signal_keys(item.get("signal_keys")))
+    if not signal_keys:
+        signal_type = str(item.get("signal_type") or item.get("signal_key") or "").strip()
+        return signal_type == SIGNAL_LONG_BASE_RELEASE
+    if SIGNAL_LONG_BASE_RELEASE not in signal_keys:
+        return False
+    return SIGNAL_HUNDRED_DAY_HIGH not in signal_keys and SIGNAL_DAILY_SLOW_RISE not in signal_keys
+
+
+def _is_snapshot_fresh_trade_date(latest_trade_date: Any, *, snapshot_date: Optional[date]) -> bool:
+    if snapshot_date is None:
+        return True
+    latest_trade = _parse_iso_date_maybe(latest_trade_date)
+    if latest_trade is None:
+        return False
+    return (snapshot_date - latest_trade).days <= 3
+
+
+def _passes_pure_chart_read_gate(item: Dict[str, Any], *, snapshot_date: Optional[date]) -> bool:
+    if not _is_pure_long_base_chart_row(item):
+        return True
+
+    return bool(_classify_long_base_read_status(item, snapshot_date=snapshot_date))
+
+
+def _classify_long_base_read_status(item: Dict[str, Any], *, snapshot_date: Optional[date]) -> str:
+    signal_keys = set(_split_signal_keys(item.get("signal_keys")))
+    signal_type = str(item.get("signal_type") or item.get("signal_key") or "").strip()
+    if SIGNAL_LONG_BASE_RELEASE not in signal_keys and signal_type != SIGNAL_LONG_BASE_RELEASE:
+        return ""
+    if not _to_bool(item.get("above_ma10"), default=False):
+        ma10_confirmed = False
+    else:
+        ma10_confirmed = True
+    if not _is_snapshot_fresh_trade_date(item.get("latest_trade_date"), snapshot_date=snapshot_date):
+        return ""
+    if _to_bool(item.get("pure_chart_quality_passed"), default=False):
+        return "confirmed"
+
+    # The selector's pure-chart flag is intentionally strict. For daily review,
+    # allow fresh long-base breakouts that are still trending above MA10 with a
+    # controlled 10-day pullback, otherwise valid early releases are hidden.
+    release_return = _to_optional_float(item.get("release_return_pct"))
+    recent_return_10d = _to_optional_float(item.get("recent_return_10d"))
+    recent_drawdown_10d = _to_optional_float(item.get("recent_drawdown_10d"))
+    release_drawdown = _to_optional_float(item.get("release_max_drawdown_pct"))
+    recent_down_days = _to_int(item.get("recent_max_consecutive_down_days_10d"))
+    if (
+        ma10_confirmed
+        and recent_return_10d is not None
+        and recent_return_10d >= 8.0
+        and recent_drawdown_10d is not None
+        and recent_drawdown_10d <= 12.0
+        and release_drawdown is not None
+        and release_drawdown <= 12.0
+        and recent_down_days <= 2
+    ):
+        return "confirmed"
+
+    # Early recovery watch: the board/industry may be turning before the stock
+    # fully reclaims short moving averages. Keep only controlled long-base
+    # releases, not broken pullbacks or overextended spikes.
+    recent_return_5d = _to_optional_float(item.get("recent_return_5d"))
+    if release_return is None or not (18.0 <= release_return <= 60.0):
+        return ""
+    if recent_return_10d is None or recent_return_10d < -2.0:
+        return ""
+    if recent_return_5d is not None and recent_return_5d < -5.0:
+        return ""
+    if recent_drawdown_10d is None or recent_drawdown_10d > 12.0:
+        return ""
+    if release_drawdown is None or release_drawdown > 12.0:
+        return ""
+    if recent_down_days > 3:
+        return ""
+    return "recovery_watch"
+
+
+def _is_earnings_only_row(item: Dict[str, Any]) -> bool:
+    signal_keys = set(_split_signal_keys(item.get("signal_keys")))
+    if not signal_keys:
+        signal_type = str(item.get("signal_type") or item.get("signal_key") or "").strip()
+        return signal_type == SIGNAL_EARNINGS
+    return signal_keys == {SIGNAL_EARNINGS}
+
+
+def _load_cached_price_history(code: str, history_cache_dir: Optional[Path]) -> pd.DataFrame:
+    if history_cache_dir is None:
+        return pd.DataFrame()
+
+    normalized_code = str(code or "").strip()
+    if not normalized_code:
+        return pd.DataFrame()
+
+    candidate_paths = [
+        history_cache_dir / "cn" / f"{normalized_code}.csv",
+        history_cache_dir / f"{normalized_code}.csv",
+    ]
+    for path in candidate_paths:
+        if not path.exists():
+            continue
+        try:
+            df = pd.read_csv(path)
+        except Exception as exc:
+            logger.warning("failed to read cached price history for %s from %s: %s", normalized_code, path, exc)
+            return pd.DataFrame()
+        if df.empty:
+            return pd.DataFrame()
+        return df
+    return pd.DataFrame()
+
+
+def _compute_cached_price_health_payload(
+    *,
+    code: str,
+    history_cache_dir: Optional[Path],
+    snapshot_date: Optional[date],
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "earnings_price_health_status": "cache_missing",
+        "earnings_price_health_reason": "本地日线缓存缺失，未使用价格健康门槛。",
+        "earnings_price_latest_trade_date": "",
+        "earnings_price_recent_return_10d": None,
+        "earnings_price_recent_return_20d": None,
+        "earnings_price_drawdown_20d": None,
+        "earnings_price_above_ma20": None,
+        "earnings_price_above_ma60": None,
+        "earnings_price_monthly_uptrend_passed": None,
+    }
+
+    df = _load_cached_price_history(code, history_cache_dir)
+    if df.empty:
+        return payload
+
+    if "date" not in df.columns or "close" not in df.columns:
+        payload["earnings_price_health_status"] = "cache_invalid"
+        payload["earnings_price_health_reason"] = "本地日线缓存缺少 date/close 字段，未使用价格健康门槛。"
+        return payload
+
+    working = df.copy()
+    working["date"] = pd.to_datetime(working["date"], errors="coerce")
+    working["close"] = pd.to_numeric(working["close"], errors="coerce")
+    working = working.dropna(subset=["date", "close"]).sort_values("date")
+    if snapshot_date is not None:
+        snapshot_ts = pd.Timestamp(snapshot_date)
+        working = working[working["date"] <= snapshot_ts]
+    if len(working) < 30:
+        payload["earnings_price_health_status"] = "insufficient_history"
+        payload["earnings_price_health_reason"] = "本地日线缓存少于 30 条，未使用价格健康门槛。"
+        return payload
+
+    closes = working["close"].astype(float)
+    latest_close = float(closes.iloc[-1])
+    payload["earnings_price_latest_trade_date"] = working["date"].iloc[-1].date().isoformat()
+    ret_10d = ((latest_close / float(closes.iloc[-11])) - 1.0) * 100.0 if len(closes) >= 11 else None
+    ret_20d = ((latest_close / float(closes.iloc[-21])) - 1.0) * 100.0 if len(closes) >= 21 else None
+    recent_20 = closes.tail(20)
+    running_peak_20 = recent_20.cummax()
+    drawdown_20d = float(((recent_20 / running_peak_20) - 1.0).min() * -100.0)
+    ma20 = float(closes.tail(20).mean())
+    ma60 = float(closes.tail(60).mean()) if len(closes) >= 60 else None
+    above_ma20 = latest_close >= ma20
+    above_ma60 = bool(ma60 is not None and latest_close >= ma60) if ma60 is not None else None
+
+    monthly_closes = working.set_index("date")["close"].resample("ME").last().dropna().tail(4)
+    monthly_uptrend_passed: Optional[bool] = None
+    if len(monthly_closes) >= 3:
+        monthly_uptrend_passed = bool(
+            float(monthly_closes.iloc[-1]) >= float(monthly_closes.iloc[-2])
+            and float(monthly_closes.iloc[-1]) >= float(monthly_closes.tail(3).mean())
+        )
+
+    payload.update(
+        {
+            "earnings_price_recent_return_10d": round(ret_10d, 2) if ret_10d is not None else None,
+            "earnings_price_recent_return_20d": round(ret_20d, 2) if ret_20d is not None else None,
+            "earnings_price_drawdown_20d": round(drawdown_20d, 2),
+            "earnings_price_above_ma20": above_ma20,
+            "earnings_price_above_ma60": above_ma60,
+            "earnings_price_monthly_uptrend_passed": monthly_uptrend_passed,
+        }
+    )
+
+    weak_reasons: List[str] = []
+    if ret_10d is not None and ret_10d <= -7.0:
+        weak_reasons.append(f"10日回落{ret_10d:.1f}%")
+    if ret_20d is not None and ret_20d <= -8.0:
+        weak_reasons.append(f"20日回落{ret_20d:.1f}%")
+    if drawdown_20d >= 14.0:
+        weak_reasons.append(f"20日回撤{drawdown_20d:.1f}%")
+    if above_ma20 is False and above_ma60 is False:
+        weak_reasons.append("同时跌破MA20/MA60")
+    if monthly_uptrend_passed is False and drawdown_20d >= 12.0:
+        weak_reasons.append("月线转弱且短线回撤偏大")
+    if above_ma60 is False and ret_20d is not None and ret_20d < 8.0:
+        weak_reasons.append("未站回MA60且20日弹性不足")
+
+    if weak_reasons:
+        payload["earnings_price_health_status"] = "weak"
+        payload["earnings_price_health_reason"] = "；".join(dict.fromkeys(weak_reasons))
+    else:
+        payload["earnings_price_health_status"] = "healthy"
+        payload["earnings_price_health_reason"] = "近期走势未触发破位/大回撤价格健康门槛。"
+    return payload
+
+
+def _has_earnings_only_market_confirmation(item: Dict[str, Any]) -> bool:
+    if str(item.get("cycle_catalyst_type") or "").strip():
+        return True
+
+    reference_label = str(item.get("market_expectation_reference_label") or "").strip().lower()
+    if reference_label in {"beat_ref", "inline_ref"}:
+        return True
+    if reference_label == "miss_ref":
+        return False
+
+    today_change_pct = _to_optional_float(item.get("today_change_pct"))
+    if today_change_pct is not None and today_change_pct >= 2.0:
+        return True
+    if _to_float(item.get("relative_strength_score")) >= 1.0:
+        return True
+    if _to_float(item.get("capital_profile_score")) >= 25.0:
+        return True
+    if _to_float(item.get("capital_consensus_score")) >= 1.0:
+        return True
+    if (
+        _to_float(item.get("market_expectation_institution_count")) >= 3.0
+        and str(item.get("market_expectation_summary") or "").strip()
+    ):
+        return True
+    return False
+
+
+def _passes_earnings_only_read_gate(item: Dict[str, Any]) -> bool:
+    if not _is_earnings_only_row(item):
+        return True
+
+    price_health_status = str(item.get("earnings_price_health_status") or "").strip().lower()
+    if price_health_status == "weak" and not _is_earnings_price_pullback_watch_candidate(item):
+        return False
+
+    explicit_gate = item.get("fast_review_focus_gate_passed")
+    if explicit_gate is not None and str(explicit_gate).strip() != "" and not _to_bool(explicit_gate, default=False):
+        return False
+
+    earnings_score = _to_float(item.get("earnings_strategy_score"))
+    revenue_yoy = _to_float(item.get("revenue_yoy"))
+    net_profit_yoy = _to_float(item.get("net_profit_yoy"))
+    earnings_quality_score = _to_float(item.get("earnings_quality_score"))
+    cycle_phase = str(item.get("earnings_quality_cycle_phase") or "").strip().lower()
+
+    if earnings_score < 70.0:
+        return False
+    if revenue_yoy < 20.0:
+        return False
+    if net_profit_yoy < 50.0:
+        return False
+    if earnings_quality_score < 50.0:
+        return False
+    if cycle_phase not in {"recovering", "reaccelerating", "expanding"}:
+        return False
+    reference_label = str(item.get("market_expectation_reference_label") or "unknown").strip().lower() or "unknown"
+    if reference_label not in {"beat_ref", "inline_ref"} and not _has_earnings_only_market_confirmation(item):
+        return False
+    return True
+
+
+def _is_earnings_price_pullback_watch_candidate(item: Dict[str, Any]) -> bool:
+    if not _is_earnings_only_row(item):
+        return False
+    if str(item.get("earnings_price_health_status") or "").strip().lower() != "weak":
+        return False
+    return bool(str(item.get("cycle_catalyst_type") or "").strip())
+
+
+def _passes_stock_review_read_gate(item: Dict[str, Any], *, snapshot_date: Optional[date]) -> bool:
+    return _passes_pure_chart_read_gate(item, snapshot_date=snapshot_date) and _passes_earnings_only_read_gate(item)
+
+
+def _build_chart_focus_reason(
+    *,
+    daily_trend_pattern_label: str,
+    daily_advance_return_pct: Optional[float],
+    daily_recent_drawdown_10d_pct: Optional[float],
+    long_base_pattern_label: str,
+    long_base_release_return_pct: Optional[float],
+    long_base_recent_return_10d: Optional[float],
+    long_base_read_status: str,
+) -> str:
+    parts: List[str] = []
+    daily_label = str(daily_trend_pattern_label or "").strip()
+    if daily_label:
+        text = f"daily={daily_label}"
+        if daily_advance_return_pct is not None:
+            text += f"/advance={daily_advance_return_pct:.1f}%"
+        if daily_recent_drawdown_10d_pct is not None:
+            text += f"/10d_dd={daily_recent_drawdown_10d_pct:.1f}%"
+        parts.append(text)
+
+    long_base_label = str(long_base_pattern_label or "").strip()
+    if long_base_label:
+        text = f"long_base={long_base_label}"
+        if long_base_release_return_pct is not None:
+            text += f"/release={long_base_release_return_pct:.1f}%"
+        if long_base_recent_return_10d is not None:
+            text += f"/10d={long_base_recent_return_10d:.1f}%"
+        if long_base_read_status == "confirmed":
+            text += "/confirmed"
+        elif long_base_read_status == "recovery_watch":
+            text += "/recovery_watch"
+        parts.append(text)
+    return "; ".join(parts)
 
 
 def _append_hundred_day_high_spotlight_markdown(
@@ -2372,6 +2863,7 @@ def _append_long_base_release_markdown(
     lines: List[str],
     *,
     signal_results: Sequence[SignalResult],
+    snapshot_date: Optional[date] = None,
     limit: int = 12,
 ) -> None:
     long_base_result = next((item for item in signal_results if item.key == SIGNAL_LONG_BASE_RELEASE), None)
@@ -2389,7 +2881,11 @@ def _append_long_base_release_markdown(
         if str(item.get("code") or "").strip()
     }
     standalone_rows = [
-        item for item in rows if str(item.get("code") or "").strip() and str(item.get("code") or "").strip() not in hundred_codes
+        item
+        for item in rows
+        if str(item.get("code") or "").strip()
+        and str(item.get("code") or "").strip() not in hundred_codes
+        and _passes_pure_chart_read_gate(item, snapshot_date=snapshot_date)
     ]
     if not standalone_rows:
         return
@@ -2492,18 +2988,57 @@ def _collect_codes_for_signal(signal_results: Sequence[SignalResult], signal_key
         if result.key != signal_key:
             continue
         for item in result.rows:
+            if signal_key == SIGNAL_TREND_LEADER and not _passes_trend_leader_homepage_gate(item):
+                continue
             code = str(item.get("code") or "").strip()
             if code:
                 codes.add(code)
     return codes
 
 
+def _normalize_risk_flags_text(value: Any) -> set[str]:
+    if isinstance(value, str):
+        tokens = [token.strip().lower() for token in value.replace("|", ",").split(",")]
+        return {token for token in tokens if token}
+    if isinstance(value, (list, tuple, set)):
+        return {str(token or "").strip().lower() for token in value if str(token or "").strip()}
+    return set()
+
+
+def _passes_trend_leader_homepage_gate(item: Dict[str, Any]) -> bool:
+    if not isinstance(item, dict):
+        return False
+    selection_mode = str(item.get("selection_mode") or "").strip().lower()
+    if selection_mode == "fallback":
+        return False
+    trend_score_raw = item.get("trend_score")
+    if str(trend_score_raw or "").strip() and _to_float(trend_score_raw) <= 0.0:
+        return False
+    if "weak_trend_structure" in _normalize_risk_flags_text(item.get("risk_flags")):
+        return False
+    return True
+
+
+def _should_merge_focus_signal_row(signal_key: str, item: Dict[str, Any]) -> bool:
+    if signal_key == SIGNAL_TREND_LEADER:
+        return _passes_trend_leader_homepage_gate(item)
+    return True
+
+
 def _build_focus_grouped_rows(signal_results: Sequence[SignalResult]) -> Dict[str, Dict[str, Any]]:
     grouped: Dict[str, Dict[str, Any]] = {}
     for result in signal_results:
-        if result.key not in {SIGNAL_EARNINGS, SIGNAL_HUNDRED_DAY_HIGH, SIGNAL_TREND_LEADER}:
+        if result.key not in {
+            SIGNAL_EARNINGS,
+            SIGNAL_HUNDRED_DAY_HIGH,
+            SIGNAL_TREND_LEADER,
+            SIGNAL_DAILY_SLOW_RISE,
+            SIGNAL_LONG_BASE_RELEASE,
+        }:
             continue
         for item in result.rows:
+            if not _should_merge_focus_signal_row(result.key, item):
+                continue
             code = str(item.get("code") or "").strip()
             if not code:
                 continue
@@ -2536,6 +3071,8 @@ def _merge_focus_signal_rows(
     rows: Sequence[Dict[str, Any]],
 ) -> None:
     for item in rows:
+        if not _should_merge_focus_signal_row(signal_key, item):
+            continue
         code = str(item.get("code") or "").strip()
         if not code:
             continue
@@ -2568,11 +3105,12 @@ def _load_trend_watch_rows_for_focus(signal_results: Sequence[SignalResult]) -> 
         watch_csv = result.csv_path.parent / "trend_leader_unified_watchlist.csv"
         if not watch_csv.exists():
             return []
-        return _load_signal_rows_from_csv(
+        rows = _load_signal_rows_from_csv(
             csv_path=watch_csv,
             signal_type=result.signal_type,
             signal_label=result.label,
         )
+        return [row for row in rows if _passes_trend_leader_homepage_gate(row)]
     return []
 
 
@@ -2665,6 +3203,50 @@ def _normalize_listish_text(value: Any) -> str:
         items = [str(item or "").strip() for item in value if str(item or "").strip()]
         return ",".join(items)
     return str(value or "").strip()
+
+
+def _resolve_business_alias_fields(code: str) -> Dict[str, str]:
+    normalized_code = str(code or "").strip().zfill(6)
+    alias = BUSINESS_ALIAS_OVERRIDES.get(normalized_code)
+    if not isinstance(alias, dict) or not alias:
+        return {}
+
+    labels = _normalize_listish_text(alias.get("business_labels"))
+    summary = str(alias.get("business_summary") or "").strip()
+    industry_hint = str(alias.get("industry_hint") or "").strip()
+    main_business = str(alias.get("main_business") or "").strip()
+    return {
+        "business_labels": labels,
+        "business_summary": summary,
+        "preferred_industry_label": industry_hint or (labels.split(",", 1)[0] if labels else ""),
+        "industry_logic": f"业务辨识度更偏 {summary or main_business}".strip() if (summary or main_business) else "",
+    }
+
+
+def _merge_business_alias_fields(reason_fields: Dict[str, Any], *, code: str) -> Dict[str, Any]:
+    merged = dict(reason_fields or {})
+    alias_fields = _resolve_business_alias_fields(code)
+    if not alias_fields:
+        return merged
+    for field, value in alias_fields.items():
+        if str(merged.get(field) or "").strip():
+            continue
+        if str(value or "").strip():
+            merged[field] = value
+    return merged
+
+
+def _append_cause_tags(existing: Any, *tags: str) -> str:
+    ordered: List[str] = []
+    for item in _normalize_cause_tags_text(existing).split(","):
+        key = str(item or "").strip()
+        if key and key not in ordered:
+            ordered.append(key)
+    for tag in tags:
+        key = str(tag or "").strip()
+        if key and key not in ordered:
+            ordered.append(key)
+    return ",".join(ordered)
 
 
 def _extract_chain_role_label_from_summary(business_summary: str) -> str:
@@ -2994,6 +3576,7 @@ def _resolve_focus_rise_reason_fields(
     report_period_label: str = "",
     report_date: str = "",
     cause_service: Optional[Any] = None,
+    allow_reason_enrichment: bool = True,
 ) -> Dict[str, str]:
     signal_order = [SIGNAL_TREND_LEADER, SIGNAL_HUNDRED_DAY_HIGH, SIGNAL_EARNINGS]
     reason_summary = str(_first_non_empty_field(rows_by_signal, "reason_summary", signal_order) or "").strip()
@@ -3021,6 +3604,30 @@ def _resolve_focus_rise_reason_fields(
         if isinstance(earnings_row, dict) and earnings_row:
             analysis_signal_key = SIGNAL_EARNINGS
             analysis_row = earnings_row
+
+    if not allow_reason_enrichment:
+        existing_row = analysis_row if isinstance(analysis_row, dict) and analysis_row else source_row or {}
+        fallback_reason = reason_summary or focus_reason
+        explanation_fields = _resolve_focus_explanation_structure_fields(
+            payload={},
+            reason_summary=fallback_reason,
+            industry_logic=industry_logic,
+            technical_logic=technical_logic,
+            cause_tags=cause_tags,
+            event_date=event_date,
+            report_period_label=report_period_label,
+            report_date=report_date,
+            existing_row=existing_row,
+        )
+        return {
+            "reason_summary": fallback_reason,
+            "cause_tags": cause_tags,
+            "cause_tags_zh": _cause_tags_to_zh_text(cause_tags),
+            "industry_logic": industry_logic,
+            "news_logic": news_logic,
+            "technical_logic": technical_logic,
+            **explanation_fields,
+        }
 
     if reason_summary and not should_refresh_existing and analysis_signal_key != SIGNAL_EARNINGS:
         explanation_fields = _resolve_focus_explanation_structure_fields(
@@ -3318,6 +3925,58 @@ def _classify_driver_label(
     }
 
 
+def _classify_cycle_catalyst(
+    *,
+    code: str,
+    name: str,
+    signal_keys: Sequence[str],
+    earnings_score: float,
+    earnings_gate_status: str,
+    earnings_quality_cycle_phase: str,
+    revenue_yoy: Optional[float],
+    net_profit_yoy: Optional[float],
+    reason_summary: str,
+    market_expectation_summary: str,
+    business_labels: str,
+    business_summary: str,
+    preferred_industry_label: str,
+    industry_logic: str,
+    cause_tags: str,
+) -> Dict[str, str]:
+    has_earnings = SIGNAL_EARNINGS in signal_keys
+    earnings_status = str(earnings_gate_status or "").strip().lower()
+    earnings_strength = has_earnings and (
+        earnings_score >= 70.0
+        or earnings_status in {"core", "pass", "passed", "watch", "positive"}
+    )
+    if not earnings_strength:
+        return {
+            "cycle_catalyst_type": "",
+            "cycle_catalyst_label": "",
+            "cycle_catalyst_reason": "",
+            "business_labels": "",
+            "business_summary": "",
+            "preferred_industry_label": "",
+        }
+
+    return resolve_industry_catalyst(
+        {
+            "code": code,
+            "name": name,
+            "reason_summary": reason_summary,
+            "market_expectation_summary": market_expectation_summary,
+            "business_labels": business_labels,
+            "business_summary": business_summary,
+            "preferred_industry_label": preferred_industry_label,
+            "industry_logic": industry_logic,
+            "cause_tags": cause_tags,
+            "earnings_quality_cycle_phase": earnings_quality_cycle_phase,
+            "revenue_yoy": revenue_yoy,
+            "net_profit_yoy": net_profit_yoy,
+        }
+    )
+
+
 def _classify_review_stage(
     *,
     signal_keys: Sequence[str],
@@ -3380,6 +4039,17 @@ def _classify_strategy_focus_tier(
     board_count: int,
     selection_mode: str,
     risk_flags: str,
+    today_change_pct: Optional[float],
+    primary_profile: str,
+    trend_label: str,
+    trend_stage2_passed: bool,
+    bias_ma5: Optional[float],
+    near_new_high: bool,
+    daily_trend_pattern_label: str,
+    long_base_pattern_label: str,
+    long_base_pure_chart_quality_passed: bool,
+    long_base_above_ma10: bool,
+    long_base_chart_read_passed: bool,
 ) -> str:
     if _has_hard_risk(risk_flags):
         return "low_priority"
@@ -3387,9 +4057,12 @@ def _classify_strategy_focus_tier(
     has_trend = SIGNAL_TREND_LEADER in signal_keys
     has_hundred = SIGNAL_HUNDRED_DAY_HIGH in signal_keys
     has_earnings = SIGNAL_EARNINGS in signal_keys
+    has_daily = SIGNAL_DAILY_SLOW_RISE in signal_keys
+    has_long_base = SIGNAL_LONG_BASE_RELEASE in signal_keys
+    has_chart_extension = has_daily or has_long_base
     earnings_status = str(earnings_gate_status or "").strip().lower()
     earnings_strength = (
-        (has_earnings or bool(earnings_signal_active))
+        has_earnings
         and (
             earnings_score >= 50
             or earnings_status in {
@@ -3408,14 +4081,107 @@ def _classify_strategy_focus_tier(
         "core",
         "balanced",
     }
+    chart_extension_strength = bool(
+        str(daily_trend_pattern_label or "").strip()
+        or (
+            str(long_base_pattern_label or "").strip()
+            and long_base_chart_read_passed
+        )
+    )
+    trend_only_recent_adjustment = _compute_trend_only_recent_strength_adjustment(
+        relation=relation,
+        signal_keys=signal_keys,
+        today_change_pct=today_change_pct,
+        primary_profile=primary_profile,
+        trend_label=trend_label,
+        trend_stage2_passed=trend_stage2_passed,
+        bias_ma5=bias_ma5,
+        near_new_high=near_new_high,
+    )
+    trend_only_recent_confirmation = trend_only_recent_adjustment >= 8.0
+
+    if has_trend and relation == "trend_only" and not has_hundred and not earnings_strength:
+        if trend_strength and (capital_strength or board_strength) and trend_only_recent_confirmation:
+            return "core"
+        return "watch"
+
+    if has_chart_extension and not has_trend and not has_hundred:
+        if earnings_strength and chart_extension_strength:
+            return "core"
+        if chart_extension_strength:
+            return "watch"
 
     if has_trend and trend_strength and (relation == "intersection" or earnings_strength or capital_strength or board_strength):
         return "core"
     if has_hundred and has_earnings and (earnings_strength or capital_strength):
         return "core"
-    if has_trend or has_hundred or earnings_strength:
+    if has_trend or has_hundred or earnings_strength or (has_chart_extension and chart_extension_strength):
         return "watch"
     return "low_priority"
+
+
+def _compute_trend_only_recent_strength_adjustment(
+    *,
+    relation: str,
+    signal_keys: Sequence[str],
+    today_change_pct: Optional[float],
+    primary_profile: str,
+    trend_label: str,
+    trend_stage2_passed: bool,
+    bias_ma5: Optional[float],
+    near_new_high: bool,
+) -> float:
+    if relation != "trend_only" or SIGNAL_TREND_LEADER not in signal_keys:
+        return 0.0
+
+    adjustment = 0.0
+    today = today_change_pct
+    primary_profile = str(primary_profile or "").strip().lower()
+    trend_label = str(trend_label or "").strip().lower()
+
+    if today is None:
+        adjustment -= 4.0
+    elif today >= 9.5:
+        adjustment += 15.0
+    elif today >= 7.0:
+        adjustment += 10.0
+    elif today >= 5.0:
+        adjustment += 5.0
+    elif today >= 3.0:
+        adjustment += 1.0
+    elif today >= 1.0:
+        adjustment -= 6.0
+    elif today >= 0.0:
+        adjustment -= 10.0
+    else:
+        adjustment -= 18.0
+
+    if trend_stage2_passed:
+        adjustment += 4.0
+    else:
+        adjustment -= 10.0
+
+    if near_new_high:
+        adjustment += 4.0
+    else:
+        adjustment -= 4.0
+
+    if bias_ma5 is not None:
+        if bias_ma5 <= -4.0:
+            adjustment -= 12.0
+        elif bias_ma5 <= -1.5:
+            adjustment -= 7.0
+        elif bias_ma5 <= 0.0:
+            adjustment -= 3.0
+        elif bias_ma5 >= 4.0:
+            adjustment += 5.0
+        elif bias_ma5 >= 1.0:
+            adjustment += 2.0
+
+    if (primary_profile == "pullback" or "pullback" in trend_label) and today is not None and today < 3.0:
+        adjustment -= 5.0
+
+    return adjustment
 
 
 def _score_strategy_focus_row(
@@ -3437,10 +4203,26 @@ def _score_strategy_focus_row(
     chart_pattern_label: str,
     chart_pattern_score: float,
     risk_flags: str,
+    today_change_pct: Optional[float],
+    primary_profile: str,
+    trend_label: str,
+    trend_stage2_passed: bool,
+    bias_ma5: Optional[float],
+    near_new_high: bool,
+    daily_trend_pattern_label: str,
+    daily_advance_return_pct: Optional[float],
+    daily_advance_max_drawdown_pct: Optional[float],
+    long_base_pattern_label: str,
+    long_base_release_return_pct: Optional[float],
+    long_base_release_max_drawdown_pct: Optional[float],
+    long_base_pure_chart_quality_passed: bool,
+    long_base_above_ma10: bool,
+    long_base_chart_read_passed: bool,
+    long_base_read_status: str,
 ) -> float:
     score = 0.0
     chart_label = str(chart_pattern_label or "").strip()
-    has_live_earnings_context = SIGNAL_EARNINGS in signal_keys or bool(earnings_signal_active)
+    has_live_earnings_context = SIGNAL_EARNINGS in signal_keys
     if tier == "core":
         score += 80.0
     elif tier == "watch":
@@ -3449,6 +4231,10 @@ def _score_strategy_focus_row(
         score += 35.0
     if SIGNAL_EARNINGS in signal_keys:
         score += 12.0
+    if SIGNAL_DAILY_SLOW_RISE in signal_keys:
+        score += 8.0
+    if SIGNAL_LONG_BASE_RELEASE in signal_keys:
+        score += 6.0
     score += min(40.0, max(0.0, overall_score)) * 0.5
     score += min(100.0, max(0.0, earnings_score)) * (0.25 if has_live_earnings_context else 0.05)
     score += capital_consensus_score * 6.0
@@ -3476,7 +4262,55 @@ def _score_strategy_focus_row(
                 chart_bonus += 6.0
             elif chart_label == "healthy_trend":
                 chart_bonus += 4.0
+        if SIGNAL_DAILY_SLOW_RISE in signal_keys:
+            pattern_label = str(daily_trend_pattern_label or "").strip()
+            if pattern_label == "base_to_trend":
+                chart_bonus += 10.0
+            elif pattern_label == "steady_rise":
+                chart_bonus += 8.0
+            if daily_advance_return_pct is not None:
+                chart_bonus += min(18.0, max(0.0, daily_advance_return_pct)) * 0.6
+            if daily_advance_max_drawdown_pct is not None:
+                if daily_advance_max_drawdown_pct <= 6.0:
+                    chart_bonus += 5.0
+                elif daily_advance_max_drawdown_pct <= 10.0:
+                    chart_bonus += 2.0
+                elif daily_advance_max_drawdown_pct >= 15.0:
+                    chart_bonus -= 4.0
+        if SIGNAL_LONG_BASE_RELEASE in signal_keys:
+            pattern_label = str(long_base_pattern_label or "").strip()
+            if pattern_label == "long_base_breakout":
+                chart_bonus += 8.0
+            elif pattern_label == "long_base_slow_push":
+                chart_bonus += 6.0
+            if long_base_pure_chart_quality_passed:
+                chart_bonus += 10.0
+            if long_base_read_status == "confirmed":
+                chart_bonus += 8.0
+            elif long_base_read_status == "recovery_watch":
+                chart_bonus += 3.0
+            if long_base_above_ma10:
+                chart_bonus += 3.0
+            if long_base_release_return_pct is not None:
+                chart_bonus += min(16.0, max(0.0, long_base_release_return_pct)) * 0.35
+            if long_base_release_max_drawdown_pct is not None:
+                if long_base_release_max_drawdown_pct <= 8.0:
+                    chart_bonus += 4.0
+                elif long_base_release_max_drawdown_pct <= 12.0:
+                    chart_bonus += 1.0
+                elif long_base_release_max_drawdown_pct >= 15.0:
+                    chart_bonus -= 4.0
         score += chart_bonus
+    score += _compute_trend_only_recent_strength_adjustment(
+        relation=relation,
+        signal_keys=signal_keys,
+        today_change_pct=today_change_pct,
+        primary_profile=primary_profile,
+        trend_label=trend_label,
+        trend_stage2_passed=trend_stage2_passed,
+        bias_ma5=bias_ma5,
+        near_new_high=near_new_high,
+    )
     if _has_hard_risk(risk_flags):
         score -= 80.0
     return round(score, 2)
@@ -3566,6 +4400,9 @@ def _build_strategy_focus_rows(
     signal_results: Sequence[SignalResult],
     *,
     trend_watch_rows: Optional[Sequence[Dict[str, Any]]] = None,
+    allow_reason_enrichment: bool = True,
+    snapshot_date: Optional[date] = None,
+    history_cache_dir: Optional[Path] = None,
 ) -> List[Dict[str, Any]]:
     grouped = _build_focus_grouped_rows(signal_results)
     earnings_signal_active = any(
@@ -3589,7 +4426,7 @@ def _build_strategy_focus_rows(
                 trend_codes.add(code)
 
     focus_rows: List[Dict[str, Any]] = []
-    cause_service = SignalCauseAnalysisService(enable_news_search=False)
+    cause_service = SignalCauseAnalysisService(enable_news_search=False) if allow_reason_enrichment else None
     for code, group in grouped.items():
         rows_by_signal = group.get("rows_by_signal") or {}
         signal_keys = sorted(
@@ -3627,6 +4464,14 @@ def _build_strategy_focus_rows(
             _first_non_empty_field(
                 rows_by_signal,
                 "earnings_quality_verdict",
+                [SIGNAL_EARNINGS, SIGNAL_TREND_LEADER],
+            )
+            or ""
+        ).strip()
+        earnings_quality_cycle_phase = str(
+            _first_non_empty_field(
+                rows_by_signal,
+                "earnings_quality_cycle_phase",
                 [SIGNAL_EARNINGS, SIGNAL_TREND_LEADER],
             )
             or ""
@@ -3702,6 +4547,15 @@ def _build_strategy_focus_rows(
         ).strip()
         if not report_period_label and report_date:
             report_period_label = _build_report_period_label(report_date)
+        revenue_yoy = _to_optional_float(
+            _first_non_empty_field(rows_by_signal, "revenue_yoy", [SIGNAL_EARNINGS, SIGNAL_TREND_LEADER])
+        )
+        net_profit_yoy = _to_optional_float(
+            _first_non_empty_field(rows_by_signal, "net_profit_yoy", [SIGNAL_EARNINGS, SIGNAL_TREND_LEADER])
+        )
+        roe = _to_optional_float(
+            _first_non_empty_field(rows_by_signal, "roe", [SIGNAL_EARNINGS, SIGNAL_TREND_LEADER])
+        )
         revenue_amount = _to_optional_float(
             _first_non_empty_field_any(
                 rows_by_signal,
@@ -3761,7 +4615,92 @@ def _build_strategy_focus_rows(
             _first_non_empty_field(rows_by_signal, "recognizability_score", [SIGNAL_TREND_LEADER, SIGNAL_HUNDRED_DAY_HIGH])
         )
         trend_label = str(_first_non_empty_field(rows_by_signal, "trend_label", [SIGNAL_TREND_LEADER]) or "").strip()
+        primary_profile = str(
+            _first_non_empty_field(rows_by_signal, "primary_profile", [SIGNAL_TREND_LEADER]) or ""
+        ).strip()
         selection_mode = str(_first_non_empty_field(rows_by_signal, "selection_mode", [SIGNAL_TREND_LEADER]) or "").strip()
+        daily_trend_pattern_label = str(
+            _first_non_empty_field(rows_by_signal, "trend_pattern_label", [SIGNAL_DAILY_SLOW_RISE]) or ""
+        ).strip()
+        daily_advance_return_pct = _to_optional_float(
+            _first_non_empty_field(rows_by_signal, "advance_return_pct", [SIGNAL_DAILY_SLOW_RISE])
+        )
+        daily_advance_max_drawdown_pct = _to_optional_float(
+            _first_non_empty_field(rows_by_signal, "advance_max_drawdown_pct", [SIGNAL_DAILY_SLOW_RISE])
+        )
+        daily_recent_drawdown_10d_pct = _to_optional_float(
+            _first_non_empty_field(rows_by_signal, "recent_drawdown_10d_pct", [SIGNAL_DAILY_SLOW_RISE])
+        )
+        long_base_pattern_label = str(
+            _first_non_empty_field(rows_by_signal, "release_pattern_label", [SIGNAL_LONG_BASE_RELEASE]) or ""
+        ).strip()
+        long_base_release_return_pct = _to_optional_float(
+            _first_non_empty_field(rows_by_signal, "release_return_pct", [SIGNAL_LONG_BASE_RELEASE])
+        )
+        long_base_release_max_drawdown_pct = _to_optional_float(
+            _first_non_empty_field(rows_by_signal, "release_max_drawdown_pct", [SIGNAL_LONG_BASE_RELEASE])
+        )
+        long_base_latest_trade_date = str(
+            _first_non_empty_field(rows_by_signal, "latest_trade_date", [SIGNAL_LONG_BASE_RELEASE]) or ""
+        ).strip()
+        long_base_recent_positive_ratio_20d = _to_optional_float(
+            _first_non_empty_field(rows_by_signal, "recent_positive_ratio_20d", [SIGNAL_LONG_BASE_RELEASE])
+        )
+        long_base_recent_positive_ratio_30d = _to_optional_float(
+            _first_non_empty_field(rows_by_signal, "recent_positive_ratio_30d", [SIGNAL_LONG_BASE_RELEASE])
+        )
+        long_base_recent_return_5d = _to_optional_float(
+            _first_non_empty_field(rows_by_signal, "recent_return_5d", [SIGNAL_LONG_BASE_RELEASE])
+        )
+        long_base_recent_return_10d = _to_optional_float(
+            _first_non_empty_field(rows_by_signal, "recent_return_10d", [SIGNAL_LONG_BASE_RELEASE])
+        )
+        long_base_recent_drawdown_10d = _to_optional_float(
+            _first_non_empty_field(rows_by_signal, "recent_drawdown_10d", [SIGNAL_LONG_BASE_RELEASE])
+        )
+        long_base_recent_max_consecutive_down_days_10d = _to_int(
+            _first_non_empty_field(rows_by_signal, "recent_max_consecutive_down_days_10d", [SIGNAL_LONG_BASE_RELEASE])
+        )
+        long_base_above_ma5 = _to_bool(
+            _first_non_empty_field(rows_by_signal, "above_ma5", [SIGNAL_LONG_BASE_RELEASE]),
+            default=False,
+        )
+        long_base_above_ma10 = _to_bool(
+            _first_non_empty_field(rows_by_signal, "above_ma10", [SIGNAL_LONG_BASE_RELEASE]),
+            default=False,
+        )
+        long_base_pure_chart_quality_passed = _to_bool(
+            _first_non_empty_field(rows_by_signal, "pure_chart_quality_passed", [SIGNAL_LONG_BASE_RELEASE]),
+            default=False,
+        )
+        long_base_read_status = _classify_long_base_read_status(
+            {
+                "signal_keys": ",".join(signal_keys),
+                "release_pattern_label": long_base_pattern_label,
+                "release_return_pct": long_base_release_return_pct,
+                "release_max_drawdown_pct": long_base_release_max_drawdown_pct,
+                "latest_trade_date": long_base_latest_trade_date,
+                "recent_return_5d": long_base_recent_return_5d,
+                "recent_return_10d": long_base_recent_return_10d,
+                "recent_drawdown_10d": long_base_recent_drawdown_10d,
+                "recent_max_consecutive_down_days_10d": long_base_recent_max_consecutive_down_days_10d,
+                "above_ma10": long_base_above_ma10,
+                "pure_chart_quality_passed": long_base_pure_chart_quality_passed,
+            },
+            snapshot_date=snapshot_date,
+        )
+        long_base_chart_read_passed = bool(long_base_read_status)
+        trend_stage2_passed = _to_bool(
+            _first_non_empty_field(rows_by_signal, "trend_stage2_passed", [SIGNAL_TREND_LEADER]),
+            default=False,
+        )
+        bias_ma5 = _to_optional_float(
+            _first_non_empty_field(rows_by_signal, "bias_ma5", [SIGNAL_TREND_LEADER])
+        )
+        near_new_high = _to_bool(
+            _first_non_empty_field(rows_by_signal, "near_new_high", [SIGNAL_TREND_LEADER]),
+            default=False,
+        )
         risk_flags = str(_first_non_empty_field(rows_by_signal, "risk_flags", [SIGNAL_TREND_LEADER, SIGNAL_HUNDRED_DAY_HIGH]) or "").strip()
 
         tier = _classify_strategy_focus_tier(
@@ -3779,6 +4718,17 @@ def _build_strategy_focus_rows(
             board_count=board_count,
             selection_mode=selection_mode,
             risk_flags=risk_flags,
+            today_change_pct=today_change_pct,
+            primary_profile=primary_profile,
+            trend_label=trend_label,
+            trend_stage2_passed=trend_stage2_passed,
+            bias_ma5=bias_ma5,
+            near_new_high=near_new_high,
+            daily_trend_pattern_label=daily_trend_pattern_label,
+            long_base_pattern_label=long_base_pattern_label,
+            long_base_pure_chart_quality_passed=long_base_pure_chart_quality_passed,
+            long_base_above_ma10=long_base_above_ma10,
+            long_base_chart_read_passed=long_base_chart_read_passed,
         )
         priority_score = _score_strategy_focus_row(
             tier=tier,
@@ -3798,6 +4748,22 @@ def _build_strategy_focus_rows(
             chart_pattern_label=chart_pattern_label,
             chart_pattern_score=chart_pattern_score,
             risk_flags=risk_flags,
+            today_change_pct=today_change_pct,
+            primary_profile=primary_profile,
+            trend_label=trend_label,
+            trend_stage2_passed=trend_stage2_passed,
+            bias_ma5=bias_ma5,
+            near_new_high=near_new_high,
+            daily_trend_pattern_label=daily_trend_pattern_label,
+            daily_advance_return_pct=daily_advance_return_pct,
+            daily_advance_max_drawdown_pct=daily_advance_max_drawdown_pct,
+            long_base_pattern_label=long_base_pattern_label,
+            long_base_release_return_pct=long_base_release_return_pct,
+            long_base_release_max_drawdown_pct=long_base_release_max_drawdown_pct,
+            long_base_pure_chart_quality_passed=long_base_pure_chart_quality_passed,
+            long_base_above_ma10=long_base_above_ma10,
+            long_base_chart_read_passed=long_base_chart_read_passed,
+            long_base_read_status=long_base_read_status,
         )
         focus_reason = _build_focus_reason(
             signal_keys=signal_keys,
@@ -3814,6 +4780,17 @@ def _build_strategy_focus_rows(
             focus_reason = "; ".join(
                 item for item in (focus_reason, f"expectation={market_expectation_reference_label}") if item
             )
+        chart_focus_reason = _build_chart_focus_reason(
+            daily_trend_pattern_label=daily_trend_pattern_label,
+            daily_advance_return_pct=daily_advance_return_pct,
+            daily_recent_drawdown_10d_pct=daily_recent_drawdown_10d_pct,
+            long_base_pattern_label=long_base_pattern_label,
+            long_base_release_return_pct=long_base_release_return_pct,
+            long_base_recent_return_10d=long_base_recent_return_10d,
+            long_base_read_status=long_base_read_status,
+        )
+        if chart_focus_reason:
+            focus_reason = "; ".join(item for item in (focus_reason, chart_focus_reason) if item)
         reason_fields = _resolve_focus_rise_reason_fields(
             code=code,
             name=str(group.get("name") or code).strip() or code,
@@ -3823,7 +4800,54 @@ def _build_strategy_focus_rows(
             report_period_label=report_period_label,
             report_date=report_date,
             cause_service=cause_service,
+            allow_reason_enrichment=allow_reason_enrichment,
         )
+        reason_fields = _merge_business_alias_fields(reason_fields, code=code)
+        display_name = str(group.get("name") or code).strip() or code
+        cycle_catalyst_payload = _classify_cycle_catalyst(
+            code=code,
+            name=display_name,
+            signal_keys=signal_keys,
+            earnings_score=earnings_score,
+            earnings_gate_status=earnings_gate_status,
+            earnings_quality_cycle_phase=earnings_quality_cycle_phase,
+            revenue_yoy=revenue_yoy,
+            net_profit_yoy=net_profit_yoy,
+            reason_summary=reason_fields["reason_summary"],
+            market_expectation_summary=market_expectation_summary,
+            business_labels=str(reason_fields.get("business_labels") or "").strip(),
+            business_summary=str(reason_fields.get("business_summary") or "").strip(),
+            preferred_industry_label=str(reason_fields.get("preferred_industry_label") or "").strip(),
+            industry_logic=reason_fields["industry_logic"],
+            cause_tags=reason_fields["cause_tags"],
+        )
+        if cycle_catalyst_payload["cycle_catalyst_type"]:
+            for field in ("business_labels", "business_summary", "preferred_industry_label"):
+                value = str(cycle_catalyst_payload.get(field) or "").strip()
+                if value and not str(reason_fields.get(field) or "").strip():
+                    reason_fields[field] = value
+            reason_fields["cause_tags"] = _append_cause_tags(
+                reason_fields["cause_tags"],
+                "earnings",
+                "price_increase",
+                "supply_demand",
+            )
+            reason_fields["cause_tags_zh"] = _cause_tags_to_zh_text(reason_fields["cause_tags"])
+            focus_reason = "; ".join(
+                item
+                for item in (
+                    focus_reason,
+                    f"cycle_catalyst={cycle_catalyst_payload['cycle_catalyst_label']}",
+                )
+                if item
+            )
+        earnings_price_health_payload = {}
+        if signal_keys == [SIGNAL_EARNINGS]:
+            earnings_price_health_payload = _compute_cached_price_health_payload(
+                code=code,
+                history_cache_dir=history_cache_dir,
+                snapshot_date=snapshot_date,
+            )
         driver_payload = _classify_driver_label(
             signal_keys=signal_keys,
             earnings_score=earnings_score,
@@ -3859,8 +4883,7 @@ def _build_strategy_focus_rows(
             }
         )
 
-        focus_rows.append(
-            {
+        focus_row = {
                 "code": code,
                 "name": group.get("name") or code,
                 "tier": tier,
@@ -3886,6 +4909,7 @@ def _build_strategy_focus_rows(
                 "earnings_strategy_gate_status": earnings_gate_status,
                 "earnings_quality_score": earnings_quality_score,
                 "earnings_quality_verdict": earnings_quality_verdict,
+                "earnings_quality_cycle_phase": earnings_quality_cycle_phase,
                 "market_expectation_summary": market_expectation_summary,
                 "market_expectation_reference_label": market_expectation_reference_label,
                 "market_expectation_reference_delta_pct": market_expectation_reference_delta_pct,
@@ -3896,6 +4920,9 @@ def _build_strategy_focus_rows(
                 "pe_ratio": pe_ratio,
                 "report_date": report_date,
                 "report_period_label": report_period_label,
+                "revenue_yoy": revenue_yoy,
+                "net_profit_yoy": net_profit_yoy,
+                "roe": roe,
                 "revenue_amount": revenue_amount,
                 "net_profit_amount": net_profit_amount,
                 "capital_score": capital_score,
@@ -3907,7 +4934,30 @@ def _build_strategy_focus_rows(
                 "sector_leadership_score": sector_leadership_score,
                 "recognizability_score": recognizability_score,
                 "trend_label": trend_label,
+                "primary_profile": primary_profile,
                 "selection_mode": selection_mode,
+                "trend_pattern_label": daily_trend_pattern_label,
+                "advance_return_pct": daily_advance_return_pct,
+                "advance_max_drawdown_pct": daily_advance_max_drawdown_pct,
+                "recent_drawdown_10d_pct": daily_recent_drawdown_10d_pct,
+                "release_pattern_label": long_base_pattern_label,
+                "release_return_pct": long_base_release_return_pct,
+                "release_max_drawdown_pct": long_base_release_max_drawdown_pct,
+                "latest_trade_date": long_base_latest_trade_date,
+                "recent_positive_ratio_20d": long_base_recent_positive_ratio_20d,
+                "recent_positive_ratio_30d": long_base_recent_positive_ratio_30d,
+                "recent_return_5d": long_base_recent_return_5d,
+                "recent_return_10d": long_base_recent_return_10d,
+                "recent_drawdown_10d": long_base_recent_drawdown_10d,
+                "recent_max_consecutive_down_days_10d": long_base_recent_max_consecutive_down_days_10d,
+                "above_ma5": long_base_above_ma5,
+                "above_ma10": long_base_above_ma10,
+                "pure_chart_quality_passed": long_base_pure_chart_quality_passed,
+                "long_base_chart_read_passed": long_base_chart_read_passed,
+                "long_base_read_status": long_base_read_status,
+                "trend_stage2_passed": trend_stage2_passed,
+                "bias_ma5": bias_ma5,
+                "near_new_high": near_new_high,
                 "risk_flags": risk_flags,
                 "review_stage_type": review_stage_payload["review_stage_type"],
                 "review_stage_label": review_stage_payload["review_stage_label"],
@@ -3938,11 +4988,69 @@ def _build_strategy_focus_rows(
                 "earnings_evidence_summary": str(reason_fields.get("earnings_evidence_summary") or "").strip(),
                 "research_evidence_summary": str(reason_fields.get("research_evidence_summary") or "").strip(),
                 "authority_time_window_days": reason_fields.get("authority_time_window_days"),
+                "cycle_catalyst_type": cycle_catalyst_payload["cycle_catalyst_type"],
+                "cycle_catalyst_label": cycle_catalyst_payload["cycle_catalyst_label"],
+                "cycle_catalyst_reason": cycle_catalyst_payload["cycle_catalyst_reason"],
                 "driver_type": driver_payload["driver_type"],
                 "driver_label": driver_payload["driver_label"],
                 "driver_reason": driver_payload["driver_reason"],
             }
-        )
+        certainty_payload = _classify_review_certainty(focus_row)
+        focus_row.update(certainty_payload)
+        if earnings_price_health_payload:
+            focus_row.update(earnings_price_health_payload)
+        if certainty_payload["review_certainty_type"] == "accumulation_watch":
+            focus_row["priority_score"] = round(_to_float(focus_row.get("priority_score")) - 18.0, 2)
+            focus_row["focus_reason"] = "; ".join(
+                item
+                for item in (
+                    str(focus_row.get("focus_reason") or "").strip(),
+                    "accumulation_watch",
+                )
+                if item
+            )
+        if _is_earnings_only_row(focus_row) and not _passes_earnings_only_read_gate(focus_row):
+            focus_row["tier"] = "low_priority"
+            focus_row["priority_score"] = round(_to_float(focus_row.get("priority_score")) - 45.0, 2)
+            price_health_status = str(focus_row.get("earnings_price_health_status") or "").strip().lower()
+            if price_health_status == "weak":
+                focus_row["review_gate_status"] = "earnings_price_health_weak"
+                focus_row["review_certainty_type"] = "unconfirmed"
+                focus_row["review_certainty_label"] = "走势未确认"
+                focus_row["review_certainty_reason"] = str(
+                    focus_row.get("earnings_price_health_reason") or "业绩票近期价格健康度不满足读层门槛。"
+                )
+            else:
+                focus_row["review_gate_status"] = "earnings_only_unconfirmed"
+            focus_row["focus_reason"] = "; ".join(
+                item
+                for item in (
+                    str(focus_row.get("focus_reason") or "").strip(),
+                    str(focus_row.get("review_gate_status") or "").strip(),
+                )
+                if item
+            )
+        else:
+            if _is_earnings_price_pullback_watch_candidate(focus_row):
+                focus_row["priority_score"] = round(_to_float(focus_row.get("priority_score")) - 24.0, 2)
+                focus_row["review_gate_status"] = "earnings_price_pullback_watch"
+                focus_row["review_certainty_type"] = "pullback_watch"
+                focus_row["review_certainty_label"] = "回撤观察"
+                focus_row["review_certainty_reason"] = str(
+                    focus_row.get("earnings_price_health_reason")
+                    or "已有行业催化或业绩主线，但近期价格健康度偏弱，先按回撤观察。"
+                )
+                focus_row["focus_reason"] = "; ".join(
+                    item
+                    for item in (
+                        str(focus_row.get("focus_reason") or "").strip(),
+                        "earnings_price_pullback_watch",
+                    )
+                    if item
+                )
+            else:
+                focus_row["review_gate_status"] = "passed"
+        focus_rows.append(focus_row)
 
     tier_priority = {"core": 0, "watch": 1, "low_priority": 2}
     focus_rows.sort(
@@ -4036,6 +5144,454 @@ def _append_strategy_focus_markdown(
                 )
             )
         lines.append("")
+
+
+def _split_signal_keys(value: Any) -> List[str]:
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(value, (list, tuple, set)):
+        result: List[str] = []
+        for item in value:
+            text = str(item or "").strip()
+            if text:
+                result.append(text)
+        return result
+    return []
+
+
+def _has_chart_signal(item: Dict[str, Any]) -> bool:
+    signal_keys = set(_split_signal_keys(item.get("signal_keys")))
+    return any(
+        key in signal_keys
+        for key in (
+            SIGNAL_HUNDRED_DAY_HIGH,
+            SIGNAL_DAILY_SLOW_RISE,
+            SIGNAL_LONG_BASE_RELEASE,
+        )
+    )
+
+
+def _has_non_chart_confirmation(item: Dict[str, Any]) -> bool:
+    signal_keys = set(_split_signal_keys(item.get("signal_keys")))
+    if str(item.get("cycle_catalyst_type") or "").strip():
+        return True
+
+    if SIGNAL_EARNINGS in signal_keys:
+        earnings_score = _to_float(item.get("earnings_strategy_score"))
+        revenue_yoy = _to_float(item.get("revenue_yoy"))
+        net_profit_yoy = _to_float(item.get("net_profit_yoy"))
+        cycle_phase = str(item.get("earnings_quality_cycle_phase") or "").strip().lower()
+        if earnings_score >= 70.0 and revenue_yoy >= 20.0 and net_profit_yoy >= 50.0:
+            return True
+        if cycle_phase in {"recovering", "reaccelerating", "expanding"} and earnings_score >= 60.0:
+            return True
+
+    reference_label = str(item.get("market_expectation_reference_label") or "").strip().lower()
+    if reference_label in {"beat_ref", "inline_ref"}:
+        return True
+
+    normalized_tags = {
+        str(tag or "").strip()
+        for tag in _normalize_cause_tags_text(item.get("cause_tags")).split(",")
+        if str(tag or "").strip()
+    }
+    if normalized_tags & {"price_increase", "supply_demand", "policy", "overseas_theme"}:
+        return True
+
+    if _to_float(item.get("capital_profile_score")) >= 25.0:
+        return True
+    if _to_float(item.get("capital_consensus_score")) >= 1.0:
+        return True
+    if _to_float(item.get("capital_flow_score")) >= 1.0:
+        return True
+    if _to_float(item.get("sector_leadership_score")) >= 2.0:
+        return True
+    if _to_float(item.get("recognizability_score")) >= 2.0:
+        return True
+    if _to_int(item.get("board_count")) >= 3:
+        return True
+    return False
+
+
+def _classify_review_certainty(item: Dict[str, Any]) -> Dict[str, str]:
+    has_chart = _has_chart_signal(item)
+    has_confirmation = _has_non_chart_confirmation(item)
+    if has_chart and not has_confirmation:
+        return {
+            "review_certainty_type": "accumulation_watch",
+            "review_certainty_label": "吸筹观察",
+            "review_certainty_reason": "图形走顺但缺少业绩、行业催化、资金或板块确认，先按早期吸筹观察。",
+        }
+    if has_confirmation:
+        return {
+            "review_certainty_type": "confirmed_driver",
+            "review_certainty_label": "确定性主线",
+            "review_certainty_reason": "除图形外已有业绩、产业催化、资金或板块确认。",
+        }
+    return {
+        "review_certainty_type": "unconfirmed",
+        "review_certainty_label": "未确认",
+        "review_certainty_reason": "缺少足够确定性证据。",
+    }
+
+
+def _classify_daily_review_lane(item: Dict[str, Any]) -> str:
+    signal_keys = set(_split_signal_keys(item.get("signal_keys")))
+    has_chart = _has_chart_signal(item)
+    has_earnings = SIGNAL_EARNINGS in signal_keys
+    has_trend = SIGNAL_TREND_LEADER in signal_keys
+    has_confirmation = _has_non_chart_confirmation(item)
+    if has_chart and has_earnings and has_confirmation:
+        return "double_confirmation"
+    if has_earnings:
+        return "earnings_first"
+    if has_chart and has_confirmation:
+        return "chart_first"
+    if has_chart:
+        return "accumulation_watch"
+    if has_trend:
+        return "trend_watch"
+    return "other"
+
+
+def _daily_review_sort_key(item: Dict[str, Any]) -> tuple[Any, ...]:
+    lane = _classify_daily_review_lane(item)
+    tier_priority = {"core": 0, "watch": 1, "low_priority": 2}
+    return (
+        DAILY_REVIEW_LANE_PRIORITY.get(lane, 99),
+        tier_priority.get(str(item.get("tier") or ""), 99),
+        -_to_float(item.get("priority_score")),
+        str(item.get("code") or ""),
+    )
+
+
+def _build_review_shape_summary(item: Dict[str, Any]) -> str:
+    parts: List[str] = []
+    chart_summary = str(item.get("chart_pattern_summary") or "").strip()
+    if chart_summary:
+        parts.append(chart_summary)
+    daily_pattern_label = str(item.get("trend_pattern_label") or "").strip()
+    if daily_pattern_label:
+        parts.append(DAILY_TREND_PATTERN_LABELS.get(daily_pattern_label, daily_pattern_label))
+    long_base_pattern_label = str(item.get("release_pattern_label") or "").strip()
+    if long_base_pattern_label:
+        parts.append(_long_base_release_label_zh(long_base_pattern_label))
+    if not parts and str(item.get("trend_hundred_relation") or "").strip() == "trend_only":
+        trend_label = str(item.get("trend_label") or "").strip()
+        if trend_label:
+            parts.append(trend_label)
+    if not parts:
+        return "-"
+    return " / ".join(dict.fromkeys(parts))
+
+
+def _build_review_earnings_summary(item: Dict[str, Any]) -> str:
+    parts: List[str] = []
+    cycle_catalyst_label = str(item.get("cycle_catalyst_label") or "").strip()
+    if cycle_catalyst_label:
+        parts.append(cycle_catalyst_label)
+    report_period_label = str(item.get("report_period_label") or "").strip()
+    if report_period_label:
+        parts.append(report_period_label)
+    net_profit_amount = _format_amount_yi(item.get("net_profit_amount"))
+    if net_profit_amount:
+        parts.append(f"净利 {net_profit_amount}")
+    earnings_score = _to_optional_float(item.get("earnings_strategy_score"))
+    if earnings_score is not None and earnings_score > 0:
+        parts.append(f"业绩分 {earnings_score:.1f}")
+    event_date = str(item.get("event_date") or "").strip()
+    if event_date:
+        parts.append(f"事件 {event_date}")
+    return " / ".join(parts) if parts else "-"
+
+
+def _build_review_risk_summary(item: Dict[str, Any]) -> str:
+    risk_flags = str(item.get("risk_flags") or "").strip()
+    if risk_flags:
+        return risk_flags.replace("|", "/")
+    pe_ratio = _to_optional_float(item.get("pe_ratio"))
+    if pe_ratio is not None and pe_ratio <= 0:
+        return "PE<=0"
+    return "-"
+
+
+def _append_daily_curated_review_markdown(
+    lines: List[str],
+    *,
+    strategy_focus_rows: Sequence[Dict[str, Any]],
+    snapshot_date: Optional[date] = None,
+) -> None:
+    rows = [
+        dict(item)
+        for item in (strategy_focus_rows or [])
+        if _passes_stock_review_read_gate(dict(item), snapshot_date=snapshot_date)
+    ]
+    rows = sorted(rows, key=_daily_review_sort_key)
+    for item in rows:
+        lane = _classify_daily_review_lane(item)
+        item["daily_review_lane"] = lane
+        item["daily_review_lane_label"] = DAILY_REVIEW_LANE_LABELS.get(lane, lane)
+
+    lane_counts = {
+        lane: sum(1 for item in rows if item.get("daily_review_lane") == lane)
+        for lane in DAILY_REVIEW_LANE_LABELS
+    }
+    preferred_rows = [item for item in rows if item.get("daily_review_lane") != "trend_watch"] or rows
+
+    lines.append("## 每日精选复盘")
+    if not rows:
+        lines.append("- 当天没有可供汇总的候选。")
+        lines.append("")
+        return
+    context_label = str((rows[0].get("review_context_label") or "")).strip()
+    context_reason = str((rows[0].get("review_context_reason") or "")).strip()
+    lines.append("- 这份文档按“今天先看什么票”组织，不再按策略文件逐个阅读。")
+    lines.append(
+        "- 今日候选：`{total}`，双确认 ` {double_count} ` / 图形优先 ` {chart_count} ` / 业绩优先 ` {earnings_count} ` / 趋势补充 ` {trend_count} `。".format(
+            total=len(rows),
+            double_count=lane_counts["double_confirmation"],
+            chart_count=lane_counts["chart_first"],
+            earnings_count=lane_counts["earnings_first"],
+            trend_count=lane_counts["trend_watch"],
+        ).replace("` ", "`").replace(" `", "`")
+    )
+    if context_label:
+        lines.append(f"- 当前模式：`{context_label}`")
+    if context_reason:
+        lines.append(f"- 模式说明：{context_reason}")
+    lines.append("")
+
+    top_rows = preferred_rows[:5]
+    lines.append(f"### 今日最值得看（top {len(top_rows)} / {len(preferred_rows)}）")
+    if not top_rows:
+        lines.append("- none")
+        lines.append("")
+    else:
+        lines.append("| 类别 | code | name | 图形 | 业绩 | snapshot | 一句话 | 风险 |")
+        lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
+        for item in top_rows:
+            lines.append(
+                "| {lane} | {code} | {name} | {shape} | {earnings} | {snapshot} | {reason} | {risk} |".format(
+                    lane=_safe_cell(item.get("daily_review_lane_label")),
+                    code=_safe_cell(item.get("code")),
+                    name=_safe_cell(item.get("name")),
+                    shape=_safe_cell(_build_review_shape_summary(item)),
+                    earnings=_safe_cell(_build_review_earnings_summary(item)),
+                    snapshot=_safe_cell(_build_focus_snapshot_summary(item)),
+                    reason=_safe_cell(_prefer_display_reason_summary(item)),
+                    risk=_safe_cell(_build_review_risk_summary(item)),
+                )
+            )
+        lines.append("")
+
+    for lane, title, limit in DAILY_REVIEW_MARKDOWN_SECTIONS:
+        lane_rows = [item for item in rows if item.get("daily_review_lane") == lane]
+        lines.append(f"### {title}（top {min(limit, len(lane_rows))} / {len(lane_rows)}）")
+        if not lane_rows:
+            lines.append("- none")
+            lines.append("")
+            continue
+        lines.append("| code | name | 图形 | 业绩 | snapshot | 一句话 |")
+        lines.append("| --- | --- | --- | --- | --- | --- |")
+        for item in lane_rows[:limit]:
+            lines.append(
+                "| {code} | {name} | {shape} | {earnings} | {snapshot} | {reason} |".format(
+                    code=_safe_cell(item.get("code")),
+                    name=_safe_cell(item.get("name")),
+                    shape=_safe_cell(_build_review_shape_summary(item)),
+                    earnings=_safe_cell(_build_review_earnings_summary(item)),
+                    snapshot=_safe_cell(_build_focus_snapshot_summary(item)),
+                    reason=_safe_cell(_prefer_display_reason_summary(item)),
+                )
+            )
+        lines.append("")
+
+
+def _build_stock_overview_rows(
+    *,
+    strategy_focus_rows: Sequence[Dict[str, Any]],
+    snapshot_date: Optional[date] = None,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for base_item in strategy_focus_rows or []:
+        if not isinstance(base_item, dict):
+            continue
+        item = dict(base_item)
+        if not _passes_stock_review_read_gate(item, snapshot_date=snapshot_date):
+            continue
+        signal_keys = _split_signal_keys(item.get("signal_keys"))
+        lane = _classify_daily_review_lane(item)
+        item["stock_review_lane"] = lane
+        item["stock_review_lane_label"] = DAILY_REVIEW_LANE_LABELS.get(lane, lane)
+        item["strategy_count"] = len(signal_keys)
+        item["chart_evidence_summary"] = _build_review_shape_summary(item)
+        item["earnings_evidence_summary"] = _build_review_earnings_summary(item)
+        evidence_parts = [
+            str(item.get("primary_board_name") or "").strip(),
+            str(item.get("preferred_industry_label") or "").strip(),
+            str(item.get("cycle_catalyst_label") or "").strip(),
+            str(item.get("theme_label") or "").strip(),
+        ]
+        item["stock_context_summary"] = " / ".join(part for part in evidence_parts if part) or "-"
+        rows.append(item)
+
+    rows.sort(key=_daily_review_sort_key)
+    return rows
+
+
+def _append_stock_overview_markdown(
+    lines: List[str],
+    *,
+    stock_overview_rows: Sequence[Dict[str, Any]],
+    stock_overview_csv: Optional[Path] = None,
+    stock_overview_md: Optional[Path] = None,
+) -> None:
+    rows = list(stock_overview_rows or [])
+    if not rows:
+        return
+
+    lane_counts = {
+        lane: sum(1 for item in rows if item.get("stock_review_lane") == lane)
+        for lane in DAILY_REVIEW_LANE_LABELS
+    }
+    multi_strategy_count = sum(1 for item in rows if _to_int(item.get("strategy_count")) >= 2)
+    lines.append("## 单票证据总览")
+    if stock_overview_csv is not None:
+        lines.append(f"- 总览 CSV：`{stock_overview_csv}`")
+    if stock_overview_md is not None:
+        lines.append(f"- 总览 Markdown：`{stock_overview_md}`")
+    lines.append(f"- 单票总数：`{len(rows)}`")
+    lines.append(f"- 多策略共振（>=2）：`{multi_strategy_count}`")
+    lines.append(f"- 双确认：`{lane_counts['double_confirmation']}`")
+    lines.append(f"- 图形优先：`{lane_counts['chart_first']}`")
+    lines.append(f"- 业绩优先：`{lane_counts['earnings_first']}`")
+    lines.append(f"- 趋势补充：`{lane_counts['trend_watch']}`")
+    lines.append("")
+
+    lines.append("| 类别 | code | name | 命中策略 | 图形证据 | 业绩证据 | snapshot | 一句话 |")
+    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
+    for item in rows[:20]:
+        lines.append(
+            "| {lane} | {code} | {name} | {signals} | {shape} | {earnings} | {snapshot} | {reason} |".format(
+                lane=_safe_cell(item.get("stock_review_lane_label")),
+                code=_safe_cell(item.get("code")),
+                name=_safe_cell(item.get("name")),
+                signals=_safe_cell(item.get("signal_keys")),
+                shape=_safe_cell(item.get("chart_evidence_summary")),
+                earnings=_safe_cell(item.get("earnings_evidence_summary")),
+                snapshot=_safe_cell(_build_focus_snapshot_summary(item)),
+                reason=_safe_cell(_prefer_display_reason_summary(item)),
+            )
+        )
+    lines.append("")
+
+
+def _write_stock_overview_outputs(
+    *,
+    rows: Sequence[Dict[str, Any]],
+    csv_path: Path,
+    md_path: Path,
+) -> None:
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    columns = [
+        "code",
+        "name",
+        "stock_review_lane",
+        "stock_review_lane_label",
+        "review_certainty_type",
+        "review_certainty_label",
+        "review_certainty_reason",
+        "tier",
+        "ab_bucket",
+        "review_stage_label",
+        "driver_label",
+        "priority_score",
+        "strategy_count",
+        "signal_keys",
+        "signal_types",
+        "chart_evidence_summary",
+        "earnings_evidence_summary",
+        "stock_context_summary",
+        "today_change_pct",
+        "pe_ratio",
+        "report_period_label",
+        "revenue_yoy",
+        "net_profit_yoy",
+        "roe",
+        "earnings_strategy_score",
+        "earnings_strategy_gate_status",
+        "earnings_quality_score",
+        "earnings_quality_cycle_phase",
+        "earnings_price_health_status",
+        "earnings_price_health_reason",
+        "earnings_price_latest_trade_date",
+        "earnings_price_recent_return_10d",
+        "earnings_price_recent_return_20d",
+        "earnings_price_drawdown_20d",
+        "earnings_price_above_ma20",
+        "earnings_price_above_ma60",
+        "earnings_price_monthly_uptrend_passed",
+        "capital_profile_score",
+        "relative_strength_score",
+        "breakout_quality_score",
+        "market_expectation_institution_count",
+        "net_profit_amount",
+        "primary_board_name",
+        "preferred_industry_label",
+        "cycle_catalyst_type",
+        "cycle_catalyst_label",
+        "cycle_catalyst_reason",
+        "theme_label",
+        "mainline_judgement",
+        "reason_summary",
+        "display_reason_summary",
+        "cause_tags_zh",
+        "latest_trade_date",
+        "pure_chart_quality_passed",
+    ]
+    export_df = pd.DataFrame(list(rows or []))
+    if export_df.empty:
+        export_df = pd.DataFrame(columns=columns)
+    else:
+        export_df = export_df.reindex(columns=columns)
+    export_df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+
+    lines: List[str] = []
+    _append_stock_overview_markdown(
+        lines,
+        stock_overview_rows=list(rows or []),
+        stock_overview_csv=csv_path,
+        stock_overview_md=md_path,
+    )
+    md_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+
+
+def _append_signal_runtime_summary_markdown(
+    lines: List[str],
+    *,
+    signal_results: Sequence[SignalResult],
+    skipped_signals: Sequence[SkippedSignal],
+    total_signal_duration: float,
+) -> None:
+    lines.append("## 运行摘要")
+    lines.append(f"- 生成时间：`{datetime.now().isoformat(timespec='seconds')}`")
+    lines.append(f"- 信号总耗时：`{total_signal_duration:.1f}s`")
+    if signal_results:
+        lines.append("| signal_key | signal_type | count | elapsed_sec |")
+        lines.append("| --- | --- | ---: | ---: |")
+        for result in signal_results:
+            lines.append(
+                f"| {result.key} | {result.signal_type} | {_format_signal_result_count(result)} | {result.duration_sec:.2f} |"
+            )
+    else:
+        lines.append("- 本轮没有成功产出的信号结果。")
+    if skipped_signals:
+        reason_summary = " / ".join(
+            f"{item.key}:{item.reason}" for item in skipped_signals if str(item.key or "").strip()
+        )
+        if reason_summary:
+            lines.append(f"- 空结果/跳过：`{reason_summary}`")
+    lines.append("")
 
 
 def _build_signal_code_map(
@@ -4435,6 +5991,7 @@ def _build_earnings_focus_rows(
     signal_results: Sequence[SignalResult],
     *,
     snapshot_date: date,
+    allow_reason_enrichment: bool = True,
 ) -> List[Dict[str, Any]]:
     grouped = _build_focus_grouped_rows(signal_results)
     trend_codes = _collect_codes_for_signal(signal_results, SIGNAL_TREND_LEADER)
@@ -4520,6 +6077,7 @@ def _build_earnings_focus_rows(
             event_date=event_date,
             report_period_label=report_period_label,
             report_date=report_date,
+            allow_reason_enrichment=allow_reason_enrichment,
         )
         rows.append(
             {
@@ -4836,6 +6394,9 @@ def _build_summary_markdown(
     strategy_focus_csv: Optional[Path] = None,
     strategy_focus_md: Optional[Path] = None,
     strategy_focus_rows: Optional[Sequence[Dict[str, Any]]] = None,
+    stock_overview_csv: Optional[Path] = None,
+    stock_overview_md: Optional[Path] = None,
+    stock_overview_rows: Optional[Sequence[Dict[str, Any]]] = None,
     liton_style_csv: Optional[Path] = None,
     liton_style_md: Optional[Path] = None,
     liton_style_rows: Optional[Sequence[Dict[str, Any]]] = None,
@@ -4848,66 +6409,24 @@ def _build_summary_markdown(
 ) -> str:
     total_signal_duration = sum(max(0.0, float(item.duration_sec)) for item in signal_results)
     lines: List[str] = []
-    lines.append(f"# 快复盘汇总（{snapshot_date.isoformat()}）")
+    lines.append(f"# 每日精选复盘（{snapshot_date.isoformat()}）")
     lines.append("")
-    lines.append("## 运行摘要")
-    lines.append(f"- 生成时间：`{datetime.now().isoformat(timespec='seconds')}`")
-    lines.append(f"- 汇总 CSV：`{unified_csv}`")
-    lines.append(f"- 共振 CSV：`{resonance_csv}`")
-    lines.append(f"- 共振 Markdown：`{resonance_md}`")
-    lines.append(f"- 共振候选数：`{len(resonance_rows)}`")
-    lines.append(f"- 信号总耗时：`{total_signal_duration:.1f}s`")
-    lines.append("")
-    lines.append("## 分信号结果")
-    lines.append("| signal_key | signal_type | count | elapsed_sec | csv |")
-    lines.append("| --- | --- | ---: | ---: | --- |")
-    for result in signal_results:
-        lines.append(
-            f"| {result.key} | {result.signal_type} | {_format_signal_result_count(result)} | {result.duration_sec:.2f} | `{result.csv_path}` |"
-        )
-    lines.append("")
-    _append_liton_style_markdown(
-        lines,
-        liton_style_rows=list(liton_style_rows or []),
-        liton_style_csv=liton_style_csv,
-        liton_style_md=liton_style_md,
-    )
-    _append_hundred_day_high_spotlight_markdown(
-        lines,
-        signal_results=signal_results,
-        strategy_focus_rows=list(strategy_focus_rows or []),
-    )
-    _append_hundred_day_pretty_trend_markdown(
-        lines,
-        signal_results=signal_results,
-    )
-    _append_long_base_release_markdown(
-        lines,
-        signal_results=signal_results,
-    )
-    _append_trend_continuation_spotlight_markdown(
+    _append_daily_curated_review_markdown(
         lines,
         strategy_focus_rows=list(strategy_focus_rows or []),
+        snapshot_date=snapshot_date,
     )
-    _append_daily_slow_rise_markdown(
+    _append_stock_overview_markdown(
+        lines,
+        stock_overview_rows=list(stock_overview_rows or []),
+        stock_overview_csv=stock_overview_csv,
+        stock_overview_md=stock_overview_md,
+    )
+    _append_signal_runtime_summary_markdown(
         lines,
         signal_results=signal_results,
-    )
-    _append_strategy_focus_markdown(
-        lines,
-        strategy_focus_rows=list(strategy_focus_rows or []),
-        strategy_focus_csv=strategy_focus_csv,
-        strategy_focus_md=strategy_focus_md,
-    )
-    _append_rise_reason_summary_markdown(
-        lines,
-        strategy_focus_rows=list(strategy_focus_rows or []),
-    )
-    _append_earnings_focus_markdown(
-        lines,
-        earnings_focus_rows=list(earnings_focus_rows or []),
-        earnings_focus_csv=earnings_focus_csv,
-        earnings_focus_md=earnings_focus_md,
+        skipped_signals=skipped_signals,
+        total_signal_duration=total_signal_duration,
     )
     _append_manual_review_calibration_markdown(
         lines,
@@ -4915,16 +6434,23 @@ def _build_summary_markdown(
         manual_review_csv=manual_review_csv,
         manual_review_md=manual_review_md,
     )
-    lines.append("## Skipped / No-result Signals")
-    if not skipped_signals:
-        lines.append("- none")
-    else:
+    lines.append("## 产物说明")
+    lines.append("- 日常优先只看本文。")
+    if stock_overview_csv is not None or stock_overview_md is not None:
+        lines.append("- 如果想按“这只票今天同时命中了哪些策略”回查，优先看 `单票证据总览`。")
+    lines.append("- 原始 `csv/md/txt` 明细仍保留在同目录，主要用于回查和调试。")
+    if skipped_signals:
+        lines.append("- 如果想看为什么某条策略当天没出结果，优先看本目录下对应信号的原始导出。")
+        lines.append("")
+        lines.append("### 当天空结果/跳过信号")
         lines.append("| signal_key | signal_type | reason | detail |")
         lines.append("| --- | --- | --- | --- |")
         for item in skipped_signals:
             lines.append(
                 f"| {item.key} | {item.signal_type} | {item.reason} | {str(item.detail or '').replace('|', '/')} |"
             )
+    else:
+        lines.append("- 本轮没有空结果或跳过的默认信号。")
     lines.append("")
     lines.append("## 后续独立命令（按需执行）")
     lines.append("```bash")
@@ -5201,12 +6727,13 @@ def _write_strategy_focus_outputs(
     rows: Sequence[Dict[str, Any]],
     csv_path: Path,
     md_path: Path,
+    allow_export_enrichment: bool = True,
 ) -> None:
     export_rows = list(rows)
     for row in export_rows:
         _normalize_export_reason_fields(row)
     focus_service: Optional[FastReviewFocusService] = None
-    if export_rows:
+    if export_rows and allow_export_enrichment:
         try:
             focus_service = FastReviewFocusService()
             for row in export_rows:
@@ -5228,17 +6755,17 @@ def _write_strategy_focus_outputs(
                 focus_service = FastReviewFocusService()
             except Exception:
                 focus_service = None
-        if focus_service is not None:
-            for row in export_rows:
-                if not isinstance(row, dict):
-                    continue
-                row["display_reason_summary"] = _compute_display_reason_summary(
-                    focus_service=focus_service,
-                    row=row,
-                )
-                row["display_reason_summary"] = _deemphasize_broad_ai_mainline_in_display_summary(
-                    str(row.get("display_reason_summary") or "")
-                )
+    if export_rows:
+        for row in export_rows:
+            if not isinstance(row, dict):
+                continue
+            row["display_reason_summary"] = _compute_display_reason_summary(
+                focus_service=focus_service,
+                row=row,
+            )
+            row["display_reason_summary"] = _deemphasize_broad_ai_mainline_in_display_summary(
+                str(row.get("display_reason_summary") or "")
+            )
 
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     columns = [
@@ -5252,6 +6779,16 @@ def _write_strategy_focus_outputs(
         "trend_hundred_relation",
         "review_display_group",
         "review_display_group_label",
+        "review_gate_status",
+        "earnings_price_health_status",
+        "earnings_price_health_reason",
+        "earnings_price_latest_trade_date",
+        "earnings_price_recent_return_10d",
+        "earnings_price_recent_return_20d",
+        "earnings_price_drawdown_20d",
+        "earnings_price_above_ma20",
+        "earnings_price_above_ma60",
+        "earnings_price_monthly_uptrend_passed",
         "focus_reason",
         "reason_summary",
         "display_reason_summary",
@@ -5318,12 +6855,32 @@ def _write_strategy_focus_outputs(
         "recognizability_score",
         "trend_label",
         "selection_mode",
+        "trend_pattern_label",
+        "advance_return_pct",
+        "advance_max_drawdown_pct",
+        "recent_drawdown_10d_pct",
+        "release_pattern_label",
+        "release_return_pct",
+        "release_max_drawdown_pct",
+        "recent_return_5d",
+        "recent_return_10d",
+        "recent_drawdown_10d",
+        "above_ma10",
+        "pure_chart_quality_passed",
+        "long_base_chart_read_passed",
+        "long_base_read_status",
         "risk_flags",
         "review_stage_type",
         "review_stage_label",
         "review_stage_reason",
         "review_context_label",
         "review_context_reason",
+        "review_certainty_type",
+        "review_certainty_label",
+        "review_certainty_reason",
+        "cycle_catalyst_type",
+        "cycle_catalyst_label",
+        "cycle_catalyst_reason",
         "driver_type",
         "driver_label",
         "driver_reason",
@@ -5350,12 +6907,13 @@ def _write_earnings_focus_outputs(
     rows: Sequence[Dict[str, Any]],
     csv_path: Path,
     md_path: Path,
+    allow_export_enrichment: bool = True,
 ) -> None:
     export_rows = list(rows)
     for row in export_rows:
         _normalize_export_reason_fields(row)
     focus_service: Optional[FastReviewFocusService] = None
-    if export_rows:
+    if export_rows and allow_export_enrichment:
         try:
             logger.info("earnings focus export enrichment scope: rows=%s", len(export_rows))
             focus_service = FastReviewFocusService()
@@ -5367,6 +6925,7 @@ def _write_earnings_focus_outputs(
                 focus_service = FastReviewFocusService()
             except Exception:
                 focus_service = None
+    if export_rows:
         for row in export_rows:
             if not isinstance(row, dict):
                 continue
@@ -5653,6 +7212,23 @@ def main() -> int:
             include_ratio=include_ratio,
             include_streak=include_streak,
         )
+        attachment_signal_keys = {
+            SIGNAL_EARNINGS,
+            SIGNAL_HUNDRED_DAY_HIGH,
+            SIGNAL_TREND_LEADER,
+            SIGNAL_MONTHLY_SLOW_RISE,
+            SIGNAL_DAILY_SLOW_RISE,
+            SIGNAL_LONG_BASE_RELEASE,
+        }
+        attachment_codes: set[str] = set()
+        for result in signal_results:
+            if result.key not in attachment_signal_keys:
+                continue
+            attachment_codes.update(_collect_codes_for_signal([result], result.key))
+        continuous_results = _filter_continuous_results_for_attachment(
+            continuous_results,
+            attachment_codes=attachment_codes,
+        )
         continuous_elapsed = time.perf_counter() - continuous_started
         present_keys = [
             key
@@ -5720,15 +7296,27 @@ def main() -> int:
     unified_rows = _build_unified_rows(signal_results)
     resonance_rows = _build_resonance_rows(signal_results)
     trend_watch_rows = _load_trend_watch_rows_for_focus(signal_results)
+    allow_report_enrichment = bool(args.persist_snapshots) and not bool(args.safe_mode)
+    if not allow_report_enrichment:
+        logger.info(
+            "fast review lightweight report mode: reuse existing reason fields and skip external focus enrichment"
+        )
     strategy_focus_rows = _build_strategy_focus_rows(
         signal_results,
         trend_watch_rows=trend_watch_rows,
+        allow_reason_enrichment=allow_report_enrichment,
+        snapshot_date=snapshot_date,
+        history_cache_dir=Path(args.history_cache_dir),
     )
     liton_style_rows = _build_liton_style_watch_rows(
         strategy_focus_rows=strategy_focus_rows,
         signal_results=signal_results,
     )
-    earnings_focus_rows = _build_earnings_focus_rows(signal_results, snapshot_date=snapshot_date)
+    earnings_focus_rows = _build_earnings_focus_rows(
+        signal_results,
+        snapshot_date=snapshot_date,
+        allow_reason_enrichment=allow_report_enrichment,
+    )
     manual_review_rows: List[Dict[str, Any]] = []
     manual_review_csv: Optional[Path] = None
     manual_review_md: Optional[Path] = None
@@ -5747,6 +7335,8 @@ def main() -> int:
     resonance_md = report_dir / "fast_review_resonance.md"
     strategy_focus_csv = report_dir / "fast_review_strategy_focus.csv"
     strategy_focus_md = report_dir / "fast_review_strategy_focus.md"
+    stock_overview_csv = report_dir / "fast_review_stock_overview.csv"
+    stock_overview_md = report_dir / "fast_review_stock_overview.md"
     liton_style_csv = report_dir / "fast_review_liton_style_pool.csv"
     liton_style_md = report_dir / "fast_review_liton_style_pool.md"
     earnings_focus_csv = report_dir / "fast_review_earnings_focus.csv"
@@ -5759,9 +7349,24 @@ def main() -> int:
 
     _export_signal_rows(rows=unified_rows, csv_path=unified_csv, txt_path=report_dir / "fast_review_candidates.txt")
     _write_resonance_outputs(rows=resonance_rows, csv_path=resonance_csv, md_path=resonance_md)
-    _write_strategy_focus_outputs(rows=strategy_focus_rows, csv_path=strategy_focus_csv, md_path=strategy_focus_md)
+    _write_strategy_focus_outputs(
+        rows=strategy_focus_rows,
+        csv_path=strategy_focus_csv,
+        md_path=strategy_focus_md,
+        allow_export_enrichment=allow_report_enrichment,
+    )
+    stock_overview_rows = _build_stock_overview_rows(
+        strategy_focus_rows=strategy_focus_rows,
+        snapshot_date=snapshot_date,
+    )
+    _write_stock_overview_outputs(rows=stock_overview_rows, csv_path=stock_overview_csv, md_path=stock_overview_md)
     _write_liton_style_outputs(rows=liton_style_rows, csv_path=liton_style_csv, md_path=liton_style_md)
-    _write_earnings_focus_outputs(rows=earnings_focus_rows, csv_path=earnings_focus_csv, md_path=earnings_focus_md)
+    _write_earnings_focus_outputs(
+        rows=earnings_focus_rows,
+        csv_path=earnings_focus_csv,
+        md_path=earnings_focus_md,
+        allow_export_enrichment=allow_report_enrichment,
+    )
     if manual_review_csv is not None and manual_review_md is not None:
         _write_manual_review_calibration_outputs(
             rows=manual_review_rows,
@@ -5780,6 +7385,9 @@ def main() -> int:
         strategy_focus_csv=strategy_focus_csv,
         strategy_focus_md=strategy_focus_md,
         strategy_focus_rows=strategy_focus_rows,
+        stock_overview_csv=stock_overview_csv,
+        stock_overview_md=stock_overview_md,
+        stock_overview_rows=stock_overview_rows,
         liton_style_csv=liton_style_csv,
         liton_style_md=liton_style_md,
         liton_style_rows=liton_style_rows,
@@ -5832,6 +7440,8 @@ def main() -> int:
     print(f"resonance_md={resonance_md}")
     print(f"strategy_focus_csv={strategy_focus_csv}")
     print(f"strategy_focus_md={strategy_focus_md}")
+    print(f"stock_overview_csv={stock_overview_csv}")
+    print(f"stock_overview_md={stock_overview_md}")
     print(f"liton_style_csv={liton_style_csv}")
     print(f"liton_style_md={liton_style_md}")
     print(f"earnings_focus_csv={earnings_focus_csv}")

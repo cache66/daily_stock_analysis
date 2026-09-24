@@ -26,7 +26,7 @@ from data_provider.base import DataFetcherManager
 from data_provider.fundamental_adapter import AkshareFundamentalAdapter
 from src.core.trading_calendar import get_effective_trading_date
 from src.services.capital_profile_service import CapitalProfileService
-from src.services.kline_selector_service import KlineSelectorService
+from src.services.kline_selector_service import KlineSelectorService, resolve_local_strategy_universe_filters
 from src.services.shared_signal_factors_service import SharedSignalFactorsService
 from src.storage import DatabaseManager, StockDaily
 
@@ -51,6 +51,12 @@ DEFAULT_EVENT_CATALOG_CACHE_DIR = PROJECT_ROOT / "data" / "cache" / "earnings_ev
 DEFAULT_SCAN_DEPTH = "high"
 SCAN_DEPTH_CHOICES: Tuple[str, ...] = ("low", "medium", "high")
 CORE_FUNDAMENTAL_BLOCKS: Tuple[str, ...] = ("financial", "forecast", "quick_report")
+DIRECT_QUALITY_FLOOR_READY_PHASES: Tuple[str, ...] = (
+    "recovering",
+    "reaccelerating",
+    "expanding",
+    "neutral",
+)
 FULL_FUNDAMENTAL_BLOCKS: Tuple[str, ...] = (
     "financial",
     "forecast",
@@ -228,6 +234,8 @@ class EarningsSurpriseEvaluation:
             "earnings_strategy_score": metrics.get("earnings_strategy_score"),
             "earnings_strategy_label": metrics.get("earnings_strategy_label"),
             "earnings_strategy_gate_status": metrics.get("earnings_strategy_gate_status"),
+            "fast_review_focus_gate_passed": metrics.get("fast_review_focus_gate_passed"),
+            "fast_review_focus_gate_reason": metrics.get("fast_review_focus_gate_reason"),
             "earnings_quality_verdict": metrics.get("earnings_quality_verdict"),
             "earnings_quality_score": metrics.get("earnings_quality_score"),
             "earnings_quality_cycle_phase": metrics.get("earnings_quality_cycle_phase"),
@@ -302,6 +310,58 @@ class EarningsSurpriseEvaluation:
             failure_reason=str(payload.get("failure_reason") or ""),
             metrics=dict(payload.get("metrics") or {}),
         )
+
+
+def _evaluate_fast_review_focus_gate(metrics: Dict[str, Any]) -> Tuple[bool, str]:
+    earnings_score = _safe_float(metrics.get("earnings_strategy_score")) or 0.0
+    revenue_yoy = _safe_float(metrics.get("revenue_yoy")) or 0.0
+    net_profit_yoy = _safe_float(metrics.get("net_profit_yoy")) or 0.0
+    earnings_quality_score = _safe_float(metrics.get("earnings_quality_score")) or 0.0
+    capital_profile_score = _safe_float(metrics.get("capital_profile_score")) or 0.0
+    relative_strength_score = _safe_float(metrics.get("relative_strength_score")) or 0.0
+    market_expectation_institution_count = _safe_float(metrics.get("market_expectation_institution_count")) or 0.0
+    cycle_phase = _safe_text(metrics.get("earnings_quality_cycle_phase")).lower()
+
+    if earnings_score < 70.0:
+        return False, "earnings_score_below_70"
+    if revenue_yoy < 20.0:
+        return False, "revenue_yoy_below_20"
+    if net_profit_yoy < 50.0:
+        return False, "net_profit_yoy_below_50"
+    if earnings_quality_score < 50.0:
+        return False, "earnings_quality_score_below_50"
+    if cycle_phase not in {"recovering", "reaccelerating", "expanding"}:
+        return False, "cycle_phase_not_ready"
+    if (
+        capital_profile_score < 10.0
+        and relative_strength_score < 1.0
+        and market_expectation_institution_count < 3.0
+    ):
+        return False, "missing_market_confirmation"
+    return True, "passed"
+
+
+def _refresh_fast_review_focus_gate_metrics(metrics: Dict[str, Any]) -> None:
+    passed, reason = _evaluate_fast_review_focus_gate(metrics)
+    metrics["fast_review_focus_gate_passed"] = bool(passed)
+    metrics["fast_review_focus_gate_reason"] = reason
+
+
+def _requires_direct_quality_floor(criteria: EarningsSurpriseCriteria) -> bool:
+    return normalize_strategy_profile(criteria.strategy_profile) in {"strict", "balanced"}
+
+
+def _is_direct_quality_floor_ready(
+    *,
+    earnings_quality_signal: bool,
+    earnings_quality_score: Optional[float],
+    cycle_phase: str,
+) -> bool:
+    if earnings_quality_signal:
+        return True
+    if earnings_quality_score is None or earnings_quality_score < 50.0:
+        return False
+    return _safe_text(cycle_phase).lower() in set(DIRECT_QUALITY_FLOOR_READY_PHASES)
 
 
 @dataclass
@@ -1073,6 +1133,16 @@ def _safe_date_from_iso(value: Any) -> Optional[date]:
         return None
 
 
+def _safe_datetime_from_iso(value: Any) -> Optional[datetime]:
+    text = _safe_text(value)
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
 def _prune_recent_event_catalog(
     catalog: Dict[str, Dict[str, Any]],
     *,
@@ -1348,6 +1418,7 @@ def build_recent_earnings_event_catalog(
     cache_dir: Optional[Path] = None,
     force_refresh: bool = False,
     period_list_override: Optional[Sequence[str]] = None,
+    max_same_day_cache_age_seconds: Optional[int] = None,
 ) -> Dict[str, Dict[str, Any]]:
     lookback_days_value = max(1, int(lookback_days))
     lookback_start = snapshot_date - timedelta(days=lookback_days_value)
@@ -1377,11 +1448,30 @@ def build_recent_earnings_event_catalog(
         cached_period_list = [str(item) for item in (cached_payload.get("period_list") or [])]
         cached_catalog_raw = cached_payload.get("catalog")
         cached_catalog = cached_catalog_raw if isinstance(cached_catalog_raw, dict) else {}
+        same_day_cache_age_ok = True
+        normalized_same_day_cache_age_seconds = (
+            max(0, int(max_same_day_cache_age_seconds))
+            if max_same_day_cache_age_seconds is not None
+            else None
+        )
+        if (
+            cached_snapshot_date == snapshot_date
+            and normalized_same_day_cache_age_seconds is not None
+        ):
+            cached_refreshed_at = _safe_datetime_from_iso(cached_payload.get("refreshed_at"))
+            if cached_refreshed_at is None:
+                same_day_cache_age_ok = False
+            else:
+                same_day_cache_age_ok = (
+                    (datetime.now() - cached_refreshed_at).total_seconds()
+                    <= normalized_same_day_cache_age_seconds
+                )
 
         if (
             cached_snapshot_date == snapshot_date
             and cached_lookback_days == lookback_days_value
             and cached_period_list == period_list
+            and same_day_cache_age_ok
         ):
             return _prune_recent_event_catalog(
                 cached_catalog,
@@ -1425,6 +1515,7 @@ def build_recent_earnings_event_catalog(
                 cache_path,
                 {
                     "snapshot_date": snapshot_date.isoformat(),
+                    "refreshed_at": datetime.now().isoformat(timespec="seconds"),
                     "lookback_days": lookback_days_value,
                     "period_list": period_list,
                     "catalog": pruned_catalog,
@@ -1447,6 +1538,7 @@ def build_recent_earnings_event_catalog(
         cache_path,
         {
             "snapshot_date": snapshot_date.isoformat(),
+            "refreshed_at": datetime.now().isoformat(timespec="seconds"),
             "lookback_days": lookback_days_value,
             "period_list": period_list,
             "catalog": pruned_catalog,
@@ -1722,6 +1814,7 @@ def load_or_fetch_signal_fundamental_snapshot(
     required_blocks: Sequence[str] = FULL_FUNDAMENTAL_BLOCKS,
     now: Optional[datetime] = None,
     db_session: Optional[Any] = None,
+    persist_snapshot_cache: bool = True,
 ) -> Dict[str, Any]:
     now_ts = now or datetime.now()
     latest_overlay_date = _latest_overlay_announcement_date(recent_event_payload)
@@ -1771,7 +1864,7 @@ def load_or_fetch_signal_fundamental_snapshot(
                 list(_ordered_fundamental_blocks(cached_enabled_blocks)),
             )
             cached_quote_payload.setdefault("bundle_refreshed_at", _isoformat_timestamp(now_ts))
-            if db is not None and (
+            if persist_snapshot_cache and db is not None and (
                 merged_bundle_payload != cached_bundle_payload
                 or cached_quote_payload != _quote_payload_cache_meta(cached_row.get("quote_payload"))
             ):
@@ -1856,7 +1949,7 @@ def load_or_fetch_signal_fundamental_snapshot(
             if latest_price is not None and previous_quote_payload.get("latest_price") is None:
                 previous_quote_payload["latest_price"] = latest_price
             previous_quote_payload.setdefault("bundle_refreshed_at", _isoformat_timestamp(now_ts))
-            if db is not None:
+            if persist_snapshot_cache and db is not None:
                 _upsert_signal_fundamental_snapshot_with_retry(
                     db=db,
                     signal_type=cache_signal_type,
@@ -1894,7 +1987,7 @@ def load_or_fetch_signal_fundamental_snapshot(
             "recent_event_fingerprint": current_recent_event_fingerprint,
             "bundle_refreshed_at": _isoformat_timestamp(now_ts),
         }
-        if db is not None:
+        if persist_snapshot_cache and db is not None:
             _upsert_signal_fundamental_snapshot_with_retry(
                 db=db,
                 signal_type=cache_signal_type,
@@ -1932,7 +2025,7 @@ def load_or_fetch_signal_fundamental_snapshot(
         "recent_event_fingerprint": current_recent_event_fingerprint,
         "bundle_refreshed_at": _isoformat_timestamp(now_ts),
     }
-    if db is not None:
+    if persist_snapshot_cache and db is not None:
         _upsert_signal_fundamental_snapshot_with_retry(
             db=db,
             signal_type=cache_signal_type,
@@ -3098,6 +3191,16 @@ def evaluate_earnings_surprise_candidate(
     confirmation_signal = positive_text_signal or growth_signal or earnings_quality_signal
     watch_score_reached = earnings_strategy_score >= float(criteria.strategy_watch_pass_score)
     direct_score_reached = earnings_strategy_score >= float(criteria.strategy_direct_pass_score)
+    direct_quality_floor_required = _requires_direct_quality_floor(criteria)
+    direct_quality_floor_ready = (
+        _is_direct_quality_floor_ready(
+            earnings_quality_signal=earnings_quality_signal,
+            earnings_quality_score=earnings_quality_score,
+            cycle_phase=earnings_quality_cycle_phase,
+        )
+        if direct_quality_floor_required
+        else True
+    )
     watch_confirmation_signal = (
         (earnings_quality_signal or (positive_text_signal and growth_signal))
         if criteria.require_quality_confirmation_for_watch
@@ -3116,8 +3219,14 @@ def evaluate_earnings_surprise_candidate(
     elif hard_risk_block_reasons:
         failure_reason = "hard earnings-quality risk gate blocked candidate"
         earnings_strategy_gate_status = "blocked_quality_risk"
+    elif direct_score_reached and direct_quality_floor_required and not direct_quality_floor_ready:
+        failure_reason = "direct score reached but missing quality floor"
+        earnings_strategy_gate_status = "blocked_direct_quality_floor"
     else:
-        passed = direct_score_reached or (watch_score_reached and watch_confirmation_signal)
+        passed = (
+            (direct_score_reached and direct_quality_floor_ready)
+            or (watch_score_reached and watch_confirmation_signal)
+        )
         if not passed:
             if (
                 criteria.require_quality_confirmation_for_watch
@@ -3279,6 +3388,8 @@ def evaluate_earnings_surprise_candidate(
         "earnings_strategy_score": earnings_strategy_score,
         "earnings_strategy_label": earnings_strategy_label or None,
         "earnings_strategy_gate_status": earnings_strategy_gate_status or None,
+        "earnings_direct_quality_floor_required": direct_quality_floor_required,
+        "earnings_direct_quality_floor_ready": direct_quality_floor_ready,
         "earnings_strategy_factor_breakdown": earnings_factor_breakdown,
         "earnings_growth_continuity_score": _safe_float(earnings_quality_payload.get("growth_continuity_score")),
         "earnings_quarterly_continuity_score": _safe_float(earnings_quality_payload.get("quarterly_continuity_score")),
@@ -3337,8 +3448,12 @@ def build_selected_dataframe(selected: List[EarningsSurpriseEvaluation]) -> pd.D
     selected_df = pd.DataFrame([item.to_record() for item in selected])
     if selected_df.empty:
         return selected_df
+    if "fast_review_focus_gate_passed" not in selected_df.columns:
+        selected_df["fast_review_focus_gate_passed"] = False
+    selected_df["fast_review_focus_gate_passed"] = selected_df["fast_review_focus_gate_passed"].fillna(False).astype(bool)
     return selected_df.sort_values(
         by=[
+            "fast_review_focus_gate_passed",
             "earnings_strategy_score",
             "earnings_financial_series_continuity_score",
             "earnings_surprise_history_score",
@@ -3353,7 +3468,7 @@ def build_selected_dataframe(selected: List[EarningsSurpriseEvaluation]) -> pd.D
             "total_market_cap_yi",
             "code",
         ],
-        ascending=[False, False, False, False, False, False, False, False, False, False, False, True, True],
+        ascending=[False, False, False, False, False, False, False, False, False, False, False, False, True, True],
     ).reset_index(drop=True)
 
 
@@ -3429,6 +3544,7 @@ def enrich_selected_market_expectation_reference(
             metrics["market_expectation_reference_label"] = FAST_REVIEW_SKIPPED_STATUS
             metrics["market_expectation_reference_basis"] = None
             metrics["market_expectation_reference_delta_pct"] = None
+            _refresh_fast_review_focus_gate_metrics(metrics)
             evaluation.metrics = metrics
             continue
         report_date = _safe_text(metrics.get("report_date"))
@@ -3462,6 +3578,7 @@ def enrich_selected_market_expectation_reference(
         metrics["market_expectation_reference_label"] = reference_label
         metrics["market_expectation_reference_basis"] = reference_basis
         metrics["market_expectation_reference_delta_pct"] = reference_delta_pct
+        _refresh_fast_review_focus_gate_metrics(metrics)
         evaluation.metrics = metrics
 
 
@@ -3658,6 +3775,7 @@ def build_markdown_report(
         f"- 因市值过滤跳过: {run_result.skipped_market_cap_count}",
         f"- 因重复事件跳过: {run_result.skipped_duplicate_event_count}",
         f"- 命中数量: {len(run_result.selected)}",
+        f"- 适合快复盘继续看: {sum(1 for item in run_result.selected if bool((item.metrics or {}).get('fast_review_focus_gate_passed')))}",
         "",
         "## 当前规则",
         "",
@@ -3699,8 +3817,8 @@ def build_markdown_report(
         [
             "## 命中结果",
             "",
-            "| 代码 | 名称 | 总市值(亿) | 事件日期 | 报告期 | 营收同比 | 净利润同比 | ROE | Strategy Score | Gate | 业绩质量 | 结果摘要 | 上次命中 | 历史次数 |",
-            "| --- | --- | ---: | --- | --- | ---: | ---: | ---: | ---: | --- | --- | --- | --- | ---: |",
+            "| 代码 | 名称 | 快复盘 | 总市值(亿) | 事件日期 | 报告期 | 营收同比 | 净利润同比 | ROE | Strategy Score | Gate | 业绩质量 | 结果摘要 | 上次命中 | 历史次数 |",
+            "| --- | --- | --- | ---: | --- | --- | ---: | ---: | ---: | ---: | --- | --- | --- | --- | ---: |",
         ]
     )
     for row in selected_df.itertuples(index=False):
@@ -3713,9 +3831,10 @@ def build_markdown_report(
             else:
                 quality_summary = str(verdict or "--")
         lines.append(
-            "| {code} | {name} | {mv} | {event_date} | {report_date} | {revenue_yoy} | {profit_yoy} | {roe} | {strategy_score} | {gate} | {quality} | {summary} | {prev_date} | {prev_count} |".format(
+            "| {code} | {name} | {focus_gate} | {mv} | {event_date} | {report_date} | {revenue_yoy} | {profit_yoy} | {roe} | {strategy_score} | {gate} | {quality} | {summary} | {prev_date} | {prev_count} |".format(
                 code=row.code,
                 name=row.name,
+                focus_gate="yes" if bool(getattr(row, "fast_review_focus_gate_passed", False)) else "no",
                 mv=f"{row.total_market_cap_yi:.2f}" if pd.notna(row.total_market_cap_yi) else "--",
                 event_date=getattr(row, "event_date", None) or "--",
                 report_date=getattr(row, "report_date", None) or "--",
@@ -3924,6 +4043,7 @@ def scan_market(
     bundle_loader: Optional[Any] = None,
     on_evaluation: Optional[Callable[[EarningsSurpriseEvaluation, int, int], None]] = None,
     priority_enrichment_top_n: Optional[int] = None,
+    persist_fundamental_snapshots: bool = True,
 ) -> EarningsSurpriseRunResult:
     started_at = datetime.now()
     normalized_scan_depth, required_blocks = resolve_scan_depth_enabled_blocks(scan_depth)
@@ -3947,7 +4067,9 @@ def scan_market(
     if checkpoint_every <= 0:
         raise ValueError("checkpoint_every must be > 0")
 
-    fast_review_lightweight_enrichment = db is None and normalized_scan_depth in {"low", "medium"}
+    fast_review_lightweight_enrichment = (
+        not persist_fundamental_snapshots and normalized_scan_depth in {"low", "medium"}
+    )
     effective_priority_enrichment_top_n = (
         DEFAULT_FAST_REVIEW_PRIORITY_ENRICHMENT_TOP_N
         if priority_enrichment_top_n is None and fast_review_lightweight_enrichment
@@ -4014,11 +4136,15 @@ def scan_market(
         skipped_recent_event_prefilter_count = 0
     if limit is not None and limit > 0:
         universe = universe.head(limit).reset_index(drop=True)
-    universe = service.apply_universe_shard(
-        universe,
+    prepared_universe = service.prepare_scan_universe(
+        universe=universe,
+        prefilter=None,
+        **resolve_local_strategy_universe_filters(),
         shard_count=shard_count,
         shard_index=shard_index,
+        as_of_date=snapshot_date,
     )
+    universe = prepared_universe.prepared_universe.reset_index(drop=True)
     universe_codes = universe["code"].tolist()
 
     selected: List[EarningsSurpriseEvaluation] = []
@@ -4178,6 +4304,7 @@ def scan_market(
                 scan_depth=normalized_scan_depth,
                 required_blocks=initial_required_blocks,
                 db_session=db_session,
+                persist_snapshot_cache=persist_fundamental_snapshots,
             )
             phase_timing_sec["fundamental_fetch"] += time.perf_counter() - fetch_started_at
             bundle_payload = dict(cached_payload.get("bundle_payload") or {})
@@ -4231,6 +4358,7 @@ def scan_market(
                 scan_depth=normalized_scan_depth,
                 required_blocks=FULL_FUNDAMENTAL_BLOCKS,
                 db_session=db_session,
+                persist_snapshot_cache=persist_fundamental_snapshots,
             )
             phase_timing_sec["fundamental_fetch"] += time.perf_counter() - fetch_started_at
             high_depth_enriched = True
@@ -4297,6 +4425,7 @@ def scan_market(
                 },
             }
         )
+        _refresh_fast_review_focus_gate_metrics(evaluation.metrics)
         return evaluation
 
     total_to_process = len(eligible_rows)
@@ -4428,6 +4557,7 @@ def scan_market(
                 )
                 evaluation.metrics.update(full_profile)
                 evaluation.metrics["capital_profile_mode"] = FAST_REVIEW_FULL_PRIORITY_CAPITAL_PROFILE_MODE
+                _refresh_fast_review_focus_gate_metrics(evaluation.metrics)
             phase_timing_totals["capital_profile"] += time.perf_counter() - refresh_started_at
             logger.info(
                 "fast-review lightweight earnings enrichment upgraded priority capital profiles: count=%s top_n=%s",
@@ -4466,7 +4596,8 @@ def main() -> int:
     if args.max_workers > 1:
         logger.warning("业绩超预期扫描在当前环境下更建议先用 --max-workers 1 做稳定基线。")
 
-    db = None if args.skip_db_persist else DatabaseManager.get_instance()
+    persist_db = not args.skip_db_persist
+    db = DatabaseManager.get_instance()
     criteria_payload = build_criteria_payload(
         criteria,
         signal_type=signal_type,
@@ -4481,7 +4612,7 @@ def main() -> int:
         args.max_workers,
         args.capital_profile_ttl_seconds,
         args.history_lookback_days,
-        not args.skip_db_persist,
+        persist_db,
     )
     run_result = scan_market(
         criteria=criteria,
@@ -4501,10 +4632,11 @@ def main() -> int:
         checkpoint_path=checkpoint_path,
         checkpoint_every=args.checkpoint_every,
         resume=args.resume,
+        persist_fundamental_snapshots=persist_db,
     )
     market_expectation_limit = (
         DEFAULT_FAST_REVIEW_PRIORITY_ENRICHMENT_TOP_N
-        if db is None and normalize_scan_depth(args.scan_depth) in {"low", "medium"}
+        if not persist_db and normalize_scan_depth(args.scan_depth) in {"low", "medium"}
         else None
     )
     enrich_selected_market_expectation_reference(
@@ -4513,7 +4645,7 @@ def main() -> int:
         limit=market_expectation_limit,
     )
 
-    if db is not None:
+    if persist_db:
         selected_df = persist_selected_evaluations(
             run_result.selected,
             signal_type=signal_type,

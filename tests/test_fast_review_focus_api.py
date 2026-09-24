@@ -205,6 +205,144 @@ class FastReviewFocusApiTestCase(unittest.TestCase):
             )
         return focus_csv
 
+    def _write_stock_overview_csv(self, run_name: str, snapshot_date: str) -> Path:
+        review_dir = self.manual_runs_root / run_name / snapshot_date / "review"
+        review_dir.mkdir(parents=True, exist_ok=True)
+        overview_csv = review_dir / "fast_review_stock_overview.csv"
+        with overview_csv.open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=[
+                    "code",
+                    "name",
+                    "stock_review_lane",
+                    "stock_review_lane_label",
+                    "tier",
+                    "ab_bucket",
+                    "review_stage_label",
+                    "driver_label",
+                    "priority_score",
+                    "strategy_count",
+                    "signal_keys",
+                    "signal_types",
+                    "chart_evidence_summary",
+                    "earnings_evidence_summary",
+                    "stock_context_summary",
+                    "today_change_pct",
+                    "pe_ratio",
+                    "report_period_label",
+                    "revenue_yoy",
+                    "net_profit_yoy",
+                    "roe",
+                    "earnings_strategy_score",
+                    "earnings_strategy_gate_status",
+                    "earnings_quality_score",
+                    "earnings_quality_cycle_phase",
+                    "capital_profile_score",
+                    "relative_strength_score",
+                    "breakout_quality_score",
+                    "market_expectation_institution_count",
+                    "net_profit_amount",
+                    "primary_board_name",
+                    "preferred_industry_label",
+                    "theme_label",
+                    "mainline_judgement",
+                    "reason_summary",
+                    "display_reason_summary",
+                    "cause_tags_zh",
+                    "latest_trade_date",
+                    "pure_chart_quality_passed",
+                ],
+            )
+            writer.writeheader()
+            writer.writerow(
+                {
+                    "code": "300475",
+                    "name": "香农芯创",
+                    "stock_review_lane": "double_confirmed",
+                    "stock_review_lane_label": "双确认",
+                    "tier": "core",
+                    "ab_bucket": "A",
+                    "review_stage_label": "半兑现",
+                    "driver_label": "业绩兑现型",
+                    "priority_score": "268.5",
+                    "strategy_count": "3",
+                    "signal_keys": "earnings,hundred_day_high,daily_slow_rise",
+                    "signal_types": "earnings_surprise,hundred_day_high,daily_slow_rise",
+                    "chart_evidence_summary": "近20日阳线占比高，仍在强趋势附近",
+                    "earnings_evidence_summary": "2026Q1净利同比+88.0%",
+                    "stock_context_summary": "半导体 / 存储链 / AI算力",
+                    "today_change_pct": "5.6",
+                    "pe_ratio": "38.2",
+                    "report_period_label": "2026Q1",
+                    "revenue_yoy": "42.5",
+                    "net_profit_yoy": "88.0",
+                    "roe": "10.5",
+                    "earnings_strategy_score": "76.0",
+                    "earnings_strategy_gate_status": "passed_strategy_score",
+                    "earnings_quality_score": "63.0",
+                    "earnings_quality_cycle_phase": "reaccelerating",
+                    "capital_profile_score": "2.5",
+                    "relative_strength_score": "2.0",
+                    "breakout_quality_score": "14.0",
+                    "market_expectation_institution_count": "7",
+                    "net_profit_amount": "420000000",
+                    "primary_board_name": "半导体",
+                    "preferred_industry_label": "存储链",
+                    "theme_label": "AI算力 / 半导体",
+                    "mainline_judgement": "主线判断更偏 AI算力扩散",
+                    "reason_summary": "业绩兑现叠加强图形确认。",
+                    "display_reason_summary": "业绩兑现叠加强图形确认。",
+                    "cause_tags_zh": "业绩,图形",
+                    "latest_trade_date": "2026-07-10",
+                    "pure_chart_quality_passed": "true",
+                }
+            )
+            writer.writerow(
+                {
+                    "code": "002463",
+                    "name": "沪电股份",
+                    "stock_review_lane": "chart_first",
+                    "stock_review_lane_label": "图形优先",
+                    "tier": "watch",
+                    "ab_bucket": "B",
+                    "review_stage_label": "拐点",
+                    "driver_label": "拐点观察型",
+                    "priority_score": "221.0",
+                    "strategy_count": "2",
+                    "signal_keys": "hundred_day_high,long_base_release",
+                    "signal_types": "hundred_day_high,long_base_release",
+                    "chart_evidence_summary": "长横盘后放量突破，近期没有走差",
+                    "earnings_evidence_summary": "",
+                    "stock_context_summary": "PCB / AI算力",
+                    "today_change_pct": "3.2",
+                    "pe_ratio": "44.0",
+                    "report_period_label": "",
+                    "revenue_yoy": "",
+                    "net_profit_yoy": "",
+                    "roe": "",
+                    "earnings_strategy_score": "",
+                    "earnings_strategy_gate_status": "",
+                    "earnings_quality_score": "",
+                    "earnings_quality_cycle_phase": "",
+                    "capital_profile_score": "1.5",
+                    "relative_strength_score": "2.0",
+                    "breakout_quality_score": "11.0",
+                    "market_expectation_institution_count": "",
+                    "net_profit_amount": "",
+                    "primary_board_name": "PCB",
+                    "preferred_industry_label": "PCB",
+                    "theme_label": "AI算力 / 半导体",
+                    "mainline_judgement": "主线判断更偏 AI算力扩散",
+                    "reason_summary": "图形强，先按位置观察。",
+                    "display_reason_summary": "图形强，先按位置观察。",
+                    "cause_tags_zh": "图形",
+                    "latest_trade_date": "2026-07-10",
+                    "pure_chart_quality_passed": "true",
+                }
+            )
+        return overview_csv
+
     def test_fast_review_focus_endpoint_returns_summary_and_items(self) -> None:
         self._write_focus_csv("fast_review_focus_case", "2026-05-06")
 
@@ -256,6 +394,118 @@ class FastReviewFocusApiTestCase(unittest.TestCase):
         self.assertIsNone(payload["items"][1]["authority_level"])
         self.assertIsNone(payload["items"][1]["authority_time_window_days"])
         self.assertEqual(payload["items"][1]["ab_bucket"], "B")
+
+    def test_fast_review_stock_overview_endpoint_returns_stock_centered_strategy_hits(self) -> None:
+        self._write_stock_overview_csv("fast_review_stock_overview_case", "2026-07-10")
+
+        with patch("src.services.fast_review_focus_service.DEFAULT_MANUAL_RUNS_ROOT", self.manual_runs_root):
+            response = self.client.get(
+                "/api/v1/signals/fast-review-stock-overview",
+                params={"snapshot_date": "2026-07-10"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["snapshot_date"], "2026-07-10")
+        self.assertEqual(payload["total"], 2)
+        self.assertTrue(payload["source_run_dir"].endswith("fast_review_stock_overview_case"))
+        self.assertEqual(payload["lane_summary"], {"双确认": 1, "图形优先": 1})
+        self.assertEqual(payload["signal_summary"]["hundred_day_high"], 2)
+        self.assertEqual(payload["signal_summary"]["earnings"], 1)
+        self.assertEqual(payload["items"][0]["code"], "300475")
+        self.assertEqual(
+            payload["items"][0]["triggered_strategies"],
+            ["earnings", "hundred_day_high", "daily_slow_rise"],
+        )
+        self.assertEqual(payload["items"][0]["strategy_count"], 3)
+        self.assertEqual(payload["items"][0]["stock_review_lane_label"], "双确认")
+        self.assertEqual(payload["items"][0]["chart_evidence_summary"], "近20日阳线占比高，仍在强趋势附近")
+        self.assertEqual(payload["items"][0]["earnings_evidence_summary"], "2026Q1净利同比+88.0%")
+        self.assertEqual(payload["items"][0]["revenue_yoy"], 42.5)
+        self.assertEqual(payload["items"][0]["earnings_strategy_score"], 76.0)
+        self.assertEqual(payload["items"][0]["earnings_strategy_gate_status"], "passed_strategy_score")
+        self.assertEqual(payload["items"][0]["breakout_quality_score"], 14.0)
+        self.assertTrue(payload["items"][0]["pure_chart_quality_passed"])
+
+    def test_fast_review_stock_overview_endpoint_filters_by_stock_code(self) -> None:
+        self._write_stock_overview_csv("fast_review_stock_overview_filter_case", "2026-07-10")
+
+        with patch("src.services.fast_review_focus_service.DEFAULT_MANUAL_RUNS_ROOT", self.manual_runs_root):
+            response = self.client.get(
+                "/api/v1/signals/fast-review-stock-overview",
+                params={"snapshot_date": "2026-07-10", "code": "SZ300475"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["total"], 1)
+        self.assertEqual(payload["items"][0]["code"], "300475")
+        self.assertEqual(payload["lane_summary"], {"双确认": 1})
+        self.assertEqual(
+            payload["signal_summary"],
+            {"daily_slow_rise": 1, "earnings": 1, "hundred_day_high": 1},
+        )
+
+    def test_personal_strategy_matrix_endpoint_returns_registry_and_matches(self) -> None:
+        self._write_stock_overview_csv("personal_strategy_matrix_case", "2026-07-10")
+
+        with patch("src.services.fast_review_focus_service.DEFAULT_MANUAL_RUNS_ROOT", self.manual_runs_root):
+            with patch("src.services.personal_strategy_matrix_service.DEFAULT_MANUAL_RUNS_ROOT", self.manual_runs_root):
+                response = self.client.get(
+                    "/api/v1/signals/personal-strategy-matrix",
+                    params={"snapshot_date": "2026-07-10"},
+                )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["total"], 2)
+        self.assertIn("earnings_surprise", payload["strategy_summary"])
+        self.assertGreaterEqual(len(payload["strategies"]), 4)
+        by_code = {item["code"]: item for item in payload["items"]}
+        self.assertEqual(
+            by_code["300475"]["matched_strategy_ids"],
+            ["earnings_surprise", "hundred_day_high", "daily_slow_rise"],
+        )
+        self.assertEqual(by_code["002463"]["matched_strategy_ids"], ["hundred_day_high", "long_base_release"])
+        self.assertEqual(by_code["300475"]["matched_strategy_count"], 3)
+        self.assertEqual(by_code["300475"]["quality_band"], "recommended")
+        self.assertEqual(by_code["002463"]["quality_band"], "watch")
+        self.assertGreater(by_code["300475"]["quality_score"], by_code["002463"]["quality_score"])
+        self.assertEqual(by_code["300475"]["view_lane"], "short_term")
+        self.assertEqual(by_code["002463"]["view_lane"], "short_term")
+        self.assertEqual(by_code["300475"]["view_lane_label"], "短线主升")
+
+    def test_personal_strategy_matrix_endpoint_can_load_latest_available_artifact(self) -> None:
+        self._write_stock_overview_csv("personal_strategy_matrix_old_case", "2026-07-09")
+        self._write_stock_overview_csv("personal_strategy_matrix_latest_case", "2026-07-10")
+
+        with patch("src.services.fast_review_focus_service.DEFAULT_MANUAL_RUNS_ROOT", self.manual_runs_root):
+            with patch("src.services.personal_strategy_matrix_service.DEFAULT_MANUAL_RUNS_ROOT", self.manual_runs_root):
+                response = self.client.get(
+                    "/api/v1/signals/personal-strategy-matrix",
+                    params={"snapshot_date": "latest"},
+                )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["snapshot_date"], "2026-07-10")
+        self.assertTrue(payload["source_run_dir"].endswith("personal_strategy_matrix_latest_case"))
+
+    def test_personal_strategy_matrix_endpoint_filters_by_strategy_ids(self) -> None:
+        self._write_stock_overview_csv("personal_strategy_matrix_filter_case", "2026-07-10")
+
+        with patch("src.services.fast_review_focus_service.DEFAULT_MANUAL_RUNS_ROOT", self.manual_runs_root):
+            with patch("src.services.personal_strategy_matrix_service.DEFAULT_MANUAL_RUNS_ROOT", self.manual_runs_root):
+                response = self.client.get(
+                    "/api/v1/signals/personal-strategy-matrix",
+                    params={"snapshot_date": "2026-07-10", "strategy_ids": "daily_slow_rise"},
+                )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["total"], 1)
+        self.assertEqual(payload["items"][0]["code"], "300475")
+        self.assertEqual(payload["strategy_summary"]["long_base_release"], 1)
 
     def test_focus_service_builds_display_authority_from_strong_earnings_evidence_when_raw_authority_is_missing(self) -> None:
         service = FastReviewFocusService(manual_runs_root=self.manual_runs_root)

@@ -25,6 +25,7 @@ from src.services.kline_selector_service import (  # noqa: E402
     KlineRuleResult,
     KlineSelectionEvaluation,
     KlineSelectorService,
+    resolve_local_strategy_universe_filters,
 )
 
 
@@ -93,6 +94,7 @@ class TestKlineSelectorService(unittest.TestCase):
     def tearDown(self) -> None:
         KlineSelectorService._spot_universe_cache = None
         KlineSelectorService._listing_metadata_cache = None
+        KlineSelectorService._stock_basic_metadata_cache = None
         if hasattr(KlineSelectorService, "_spot_universe_reference_cache_memory"):
             KlineSelectorService._spot_universe_reference_cache_memory = None
 
@@ -115,13 +117,29 @@ class TestKlineSelectorService(unittest.TestCase):
         self.assertEqual(tushare_mock.call_count, 1)
         self.assertEqual(akshare_mock.call_count, 0)
 
+    def test_resolve_local_strategy_universe_filters_uses_canonical_defaults(self):
+        self.assertEqual(
+            resolve_local_strategy_universe_filters(),
+            {"exclude_st": True, "exclude_kcb": True, "exclude_cyb": False},
+        )
+        self.assertEqual(
+            resolve_local_strategy_universe_filters(exclude_st=False, exclude_kcb=False, exclude_cyb=True),
+            {"exclude_st": False, "exclude_kcb": False, "exclude_cyb": True},
+        )
+
     def test_build_fast_a_share_manager_keeps_tushare_history_fallback_enabled(self):
         class _FakeAkshareFetcher:
             def __init__(self, *args, **kwargs) -> None:
+                self.name = "AkshareFetcher"
                 self.priority = 1
 
         class _FakeTushareFetcher:
+            name = "TushareFetcher"
             priority = -1
+
+            def __init__(self, rate_limit_per_minute=None) -> None:
+                self.priority = -1
+                self.rate_limit_per_minute = rate_limit_per_minute
 
             def is_available(self) -> bool:
                 return True
@@ -132,8 +150,14 @@ class TestKlineSelectorService(unittest.TestCase):
         ):
             manager = KlineSelectorService.build_fast_a_share_manager()
 
-        self.assertEqual(len(manager._get_fetchers_snapshot()), 2)
+        fetchers = manager._get_fetchers_snapshot()
+        self.assertEqual(len(fetchers), 2)
+        tushare_fetcher = next(
+            fetcher for fetcher in fetchers if getattr(fetcher, "name", "") == "TushareFetcher"
+        )
         self.assertFalse(getattr(manager, "_skip_tushare_history_fallback_for_fast_scan", True))
+        self.assertFalse(getattr(manager, "_skip_redundant_history_fallback_for_fast_scan", True))
+        self.assertEqual(getattr(tushare_fetcher, "rate_limit_per_minute", None), 35)
 
     def test_get_a_share_universe_filters_bse_and_duplicates(self):
         service = KlineSelectorService(
@@ -224,12 +248,17 @@ class TestKlineSelectorService(unittest.TestCase):
             ]
         )
 
-        result = service.prepare_scan_universe(
-            universe=universe,
-            prefilter=KlineSelectorPrefilter(require_positive_change=True),
-            exclude_st=True,
-            exclude_kcb=True,
-        )
+        with patch.object(
+            service,
+            "_fetch_stock_basic_metadata_dataframe",
+            return_value=pd.DataFrame(),
+        ):
+            result = service.prepare_scan_universe(
+                universe=universe,
+                prefilter=KlineSelectorPrefilter(require_positive_change=True),
+                exclude_st=True,
+                exclude_kcb=True,
+            )
 
         self.assertEqual(result.base_universe_size, 3)
         self.assertEqual(result.sharded_universe_size, 1)
@@ -238,6 +267,134 @@ class TestKlineSelectorService(unittest.TestCase):
         self.assertEqual(result.filter_stats["removed_st"], 1)
         self.assertEqual(result.filter_stats["removed_kcb"], 1)
         self.assertEqual(result.prefilter_stats["after"], 1)
+
+    def test_prepare_scan_universe_uses_latest_stock_basic_name_for_st_filter(self):
+        service = KlineSelectorService()
+        universe = pd.DataFrame(
+            [
+                {"code": "600001", "name": "原始正常名", "pct_change": 1.0, "turnover_rate": 2.0},
+            ]
+        )
+        latest_stock_basic = pd.DataFrame(
+            [
+                {"code": "600001", "name": "*ST最新名"},
+            ]
+        )
+
+        with patch.object(
+            service,
+            "_fetch_stock_basic_metadata_dataframe",
+            return_value=latest_stock_basic,
+        ):
+            result = service.prepare_scan_universe(
+                universe=universe,
+                exclude_st=True,
+            )
+
+        self.assertEqual(result.base_universe_size, 1)
+        self.assertEqual(result.sharded_universe_size, 0)
+        self.assertEqual(result.prepared_universe_size, 0)
+        self.assertEqual(result.filter_stats["removed_st"], 1)
+
+    def test_prepare_scan_universe_uses_latest_stock_basic_name_for_pt_filter(self):
+        service = KlineSelectorService()
+        universe = pd.DataFrame(
+            [
+                {"code": "600002", "name": "原始正常名", "pct_change": 1.0, "turnover_rate": 2.0},
+            ]
+        )
+        latest_stock_basic = pd.DataFrame(
+            [
+                {"code": "600002", "name": "PT旧风险标识"},
+            ]
+        )
+
+        with patch.object(
+            service,
+            "_fetch_stock_basic_metadata_dataframe",
+            return_value=latest_stock_basic,
+        ):
+            result = service.prepare_scan_universe(
+                universe=universe,
+                exclude_st=True,
+            )
+
+        self.assertEqual(result.prepared_universe_size, 0)
+        self.assertEqual(result.filter_stats["removed_st"], 1)
+
+    def test_merge_universe_stock_basic_metadata_keeps_existing_name_when_latest_name_missing(self):
+        universe = pd.DataFrame(
+            [
+                {"code": "000003", "name": "PT金田A"},
+            ]
+        )
+        stock_basic_universe = pd.DataFrame(
+            [
+                {"code": "000003", "name": float("nan")},
+            ]
+        )
+
+        merged = KlineSelectorService._merge_universe_stock_basic_metadata(
+            universe,
+            stock_basic_universe=stock_basic_universe,
+        )
+
+        self.assertEqual(merged.loc[0, "name"], "PT金田A")
+
+    def test_prepare_scan_universe_filters_codes_missing_from_active_stock_basic(self):
+        service = KlineSelectorService()
+        universe = pd.DataFrame(
+            [
+                {"code": "000024", "name": "招商地产", "pct_change": 1.0, "turnover_rate": 2.0},
+                {"code": "600001", "name": "正常股", "pct_change": 1.0, "turnover_rate": 2.0},
+            ]
+        )
+        stock_basic_universe = pd.DataFrame(
+            [
+                {"code": "600001", "name": "正常股"},
+            ]
+        )
+
+        with patch.object(
+            service,
+            "_fetch_stock_basic_metadata_dataframe",
+            return_value=stock_basic_universe,
+        ):
+            result = service.prepare_scan_universe(
+                universe=universe,
+                exclude_st=True,
+            )
+
+        self.assertEqual(result.prepared_universe["code"].tolist(), ["600001"])
+        self.assertEqual(result.filter_stats["removed_inactive_code"], 1)
+
+    def test_prepare_scan_universe_filters_delisted_names_even_when_not_st(self):
+        service = KlineSelectorService()
+        universe = pd.DataFrame(
+            [
+                {"code": "000004", "name": "国华退", "pct_change": 1.0, "turnover_rate": 2.0},
+                {"code": "600001", "name": "正常股", "pct_change": 1.0, "turnover_rate": 2.0},
+            ]
+        )
+        stock_basic_universe = pd.DataFrame(
+            [
+                {"code": "000004", "name": "国华退"},
+                {"code": "600001", "name": "正常股"},
+            ]
+        )
+
+        with patch.object(
+            service,
+            "_fetch_stock_basic_metadata_dataframe",
+            return_value=stock_basic_universe,
+        ):
+            result = service.prepare_scan_universe(
+                universe=universe,
+                exclude_st=True,
+            )
+
+        self.assertEqual(result.prepared_universe["code"].tolist(), ["600001"])
+        self.assertEqual(result.filter_stats["removed_delisted_name"], 1)
 
     def test_prepare_scan_universe_skips_pct_change_hydration_when_partial_values_already_exist(self):
         class PartialQuoteManager:

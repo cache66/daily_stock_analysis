@@ -3,7 +3,6 @@
     "include_signals": [
       "earnings",
       "hundred_day_high",
-      "trend_leader",
       "daily_slow_rise",
       "long_base_release"
     ],
@@ -38,16 +37,16 @@
     "trend_scan_prefilter_min_change_pct_60d": 17.0,
     "trend_scan_prefilter_min_turnover_rate": 1.5,
     "trend_scan_prefilter_require_positive_change": true,
-    "daily_profile": "accelerating",
-    "long_base_release_profile": "default",
+    "daily_profile": "review_balanced",
+    "long_base_release_profile": "loose",
     "long_base_release_max_workers": 3,
     "continuous_up_lookback_days": 10,
     "continuous_up_min_ratio": 0.7,
     "continuous_up_streak_days": 3,
     "continuous_max_total_mv_yi": 500.0,
     "disable_continuous_spot_prefilter": false,
-    "exclude_st": false,
-    "exclude_kcb": false,
+    "exclude_st": true,
+    "exclude_kcb": true,
     "exclude_cyb": false
   }
 }

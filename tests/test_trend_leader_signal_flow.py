@@ -2003,7 +2003,9 @@ def test_scan_trend_leader_candidates_prefers_shared_prepare_scan_universe(monke
         scan_prefilter_enabled=False,
     )
 
-    assert captured["prepare_kwargs"]["exclude_st"] is False
+    assert captured["prepare_kwargs"]["exclude_st"] is True
+    assert captured["prepare_kwargs"]["exclude_kcb"] is True
+    assert captured["prepare_kwargs"]["exclude_cyb"] is False
     assert evaluated_codes == ["600001"]
     assert payload["run_stats"]["pending_total"] == 1
     assert captured["prepare_kwargs"]["prefilter"] is None

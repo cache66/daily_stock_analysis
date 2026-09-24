@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
 import sys
@@ -21,6 +22,8 @@ from scripts.select_earnings_surprise_candidates import (
     DEFAULT_SCAN_DEPTH,
     EarningsSurpriseCriteria,
     get_strategy_profile_preset,
+    normalize_strategy_profile,
+    resolve_signal_type_for_profile,
     scan_market,
 )
 from src.services.kline_selector_service import KlineSelectorService
@@ -37,6 +40,7 @@ DEFAULT_MAX_OBSERVATION_DAYS = 240
 DEFAULT_TREND_HISTORY_DAYS = 140
 DEFAULT_TREND_HIGH_WINDOW = 100
 DEFAULT_MAX_DISTANCE_TO_HIGH_PCT = 10.0
+DEFAULT_ENTRY_STRATEGY_PROFILE = "balanced"
 
 
 def _safe_float(value: Any) -> Optional[float]:
@@ -105,8 +109,8 @@ def _normalize_previous_registry_row(row: Any) -> Dict[str, Any]:
     }
 
 
-def _build_balanced_criteria() -> EarningsSurpriseCriteria:
-    preset = get_strategy_profile_preset("balanced")
+def _build_entry_criteria(strategy_profile: str = DEFAULT_ENTRY_STRATEGY_PROFILE) -> EarningsSurpriseCriteria:
+    preset = get_strategy_profile_preset(strategy_profile)
     return EarningsSurpriseCriteria(
         strategy_profile=preset["name"],
         min_revenue_yoy=preset["min_revenue_yoy"],
@@ -123,11 +127,17 @@ def _build_balanced_criteria() -> EarningsSurpriseCriteria:
     )
 
 
-def _extract_earnings_evaluations(snapshot_date: date, db: DatabaseManager) -> Dict[str, Dict[str, Any]]:
+def _extract_earnings_evaluations(
+    snapshot_date: date,
+    db: DatabaseManager,
+    *,
+    entry_strategy_profile: str = DEFAULT_ENTRY_STRATEGY_PROFILE,
+) -> Dict[str, Dict[str, Any]]:
+    criteria = _build_entry_criteria(entry_strategy_profile)
     run_result = scan_market(
-        criteria=_build_balanced_criteria(),
+        criteria=criteria,
         snapshot_date=snapshot_date,
-        signal_type="earnings_surprise",
+        signal_type=resolve_signal_type_for_profile(criteria.strategy_profile),
         history_lookback_days=365,
         event_lookback_days=120,
         recent_event_scope="latest_report_period",
@@ -149,6 +159,7 @@ def _extract_earnings_evaluations(snapshot_date: date, db: DatabaseManager) -> D
             "earnings_strategy_score": _safe_float(metrics.get("earnings_strategy_score")),
             "earnings_strategy_label": _safe_text(metrics.get("earnings_strategy_label")) or None,
             "earnings_strategy_gate_status": _safe_text(metrics.get("earnings_strategy_gate_status")) or None,
+            "strategy_profile": criteria.strategy_profile,
         }
     return evaluations
 
@@ -239,7 +250,9 @@ def build_observation_snapshots(
     earnings_evaluations_by_code: Dict[str, Dict[str, Any]],
     trend_states_by_code: Dict[str, Dict[str, Any]],
     max_observation_days: int = DEFAULT_MAX_OBSERVATION_DAYS,
+    entry_strategy_profile: str = DEFAULT_ENTRY_STRATEGY_PROFILE,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    normalized_entry_strategy_profile = normalize_strategy_profile(entry_strategy_profile)
     previous_by_code = {
         row["code"]: row
         for row in (_normalize_previous_registry_row(item) for item in previous_registry)
@@ -335,7 +348,8 @@ def build_observation_snapshots(
         }
         criteria_payload = {
             "snapshot_date": snapshot_date.isoformat(),
-            "entry_rule": "earnings_surprise_balanced",
+            "entry_rule": f"earnings_surprise_{normalized_entry_strategy_profile}",
+            "entry_strategy_profile": normalized_entry_strategy_profile,
             "trend_rule": {
                 "close_above_ma20": True,
                 "ma20_above_ma60": True,
@@ -390,10 +404,16 @@ def refresh_earnings_observation_snapshots(
     snapshot_date: date,
     db: Optional[DatabaseManager] = None,
     max_observation_days: int = DEFAULT_MAX_OBSERVATION_DAYS,
+    entry_strategy_profile: str = DEFAULT_ENTRY_STRATEGY_PROFILE,
 ) -> Dict[str, Any]:
     database = db or DatabaseManager.get_instance()
     previous_registry = _load_latest_previous_registry(database, snapshot_date=snapshot_date)
-    earnings_evaluations = _extract_earnings_evaluations(snapshot_date, database)
+    normalized_entry_strategy_profile = normalize_strategy_profile(entry_strategy_profile)
+    earnings_evaluations = _extract_earnings_evaluations(
+        snapshot_date,
+        database,
+        entry_strategy_profile=normalized_entry_strategy_profile,
+    )
     trend_codes = {
         row["code"]
         for row in previous_registry
@@ -410,6 +430,7 @@ def refresh_earnings_observation_snapshots(
         earnings_evaluations_by_code=earnings_evaluations,
         trend_states_by_code=trend_states,
         max_observation_days=max_observation_days,
+        entry_strategy_profile=normalized_entry_strategy_profile,
     )
     database.replace_signal_snapshots_for_date(
         signal_type=REGISTRY_SIGNAL_TYPE,
@@ -443,8 +464,178 @@ def refresh_earnings_observation_snapshots(
     )
     return {
         "snapshot_date": snapshot_date.isoformat(),
+        "entry_strategy_profile": normalized_entry_strategy_profile,
         "registry_count": len(registry_rows),
         "active_count": len(active_rows),
+        "registry_rows": registry_rows,
+        "active_rows": active_rows,
+    }
+
+
+def _flatten_snapshot_rows(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    flattened: List[Dict[str, Any]] = []
+    for row in rows:
+        metrics_payload = dict(row.get("metrics_payload") or {})
+        history_payload = dict(row.get("history_payload") or {})
+        cause_payload = dict(row.get("cause_payload") or {})
+        criteria_payload = dict(row.get("criteria_payload") or {})
+        flattened.append(
+            {
+                "signal_type": _safe_text(row.get("signal_type")),
+                "code": _safe_text(row.get("code")),
+                "name": _safe_text(row.get("name")),
+                "status": _safe_text(metrics_payload.get("status")),
+                "observation_days": _safe_int(metrics_payload.get("observation_days"), 0),
+                "bad_quarter_streak": _safe_int(metrics_payload.get("bad_quarter_streak"), 0),
+                "latest_earnings_passed": metrics_payload.get("latest_earnings_passed"),
+                "earnings_strategy_score": _safe_float(metrics_payload.get("earnings_strategy_score")),
+                "earnings_strategy_label": _safe_text(metrics_payload.get("earnings_strategy_label")) or None,
+                "earnings_strategy_gate_status": _safe_text(metrics_payload.get("earnings_strategy_gate_status")) or None,
+                "trend_score": _safe_float(metrics_payload.get("trend_score")),
+                "distance_to_high_pct": _safe_float(metrics_payload.get("distance_to_high_pct")),
+                "first_watch_date": _safe_text(history_payload.get("first_watch_date")) or None,
+                "last_qualified_earnings_date": _safe_text(history_payload.get("last_qualified_earnings_date")) or None,
+                "last_active_date": _safe_text(history_payload.get("last_active_date")) or None,
+                "removal_reason": _safe_text(history_payload.get("removal_reason")) or None,
+                "entry_rule": _safe_text(criteria_payload.get("entry_rule")) or None,
+                "reason_summary": _safe_text(cause_payload.get("reason_summary")) or None,
+            }
+        )
+    return flattened
+
+
+def _write_snapshot_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "signal_type",
+        "code",
+        "name",
+        "status",
+        "observation_days",
+        "bad_quarter_streak",
+        "latest_earnings_passed",
+        "earnings_strategy_score",
+        "earnings_strategy_label",
+        "earnings_strategy_gate_status",
+        "trend_score",
+        "distance_to_high_pct",
+        "first_watch_date",
+        "last_qualified_earnings_date",
+        "last_active_date",
+        "removal_reason",
+        "entry_rule",
+        "reason_summary",
+    ]
+    with path.open("w", encoding="utf-8-sig", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key) for key in fieldnames})
+
+
+def _build_snapshot_markdown(
+    *,
+    snapshot_date: date,
+    entry_strategy_profile: str,
+    registry_rows: List[Dict[str, Any]],
+    active_rows: List[Dict[str, Any]],
+) -> str:
+    lines = [
+        "# 业绩观察池",
+        "",
+        f"- Snapshot Date: {snapshot_date.isoformat()}",
+        f"- Entry Strategy Profile: {entry_strategy_profile}",
+        f"- Registry Count: {len(registry_rows)}",
+        f"- Active Count: {len(active_rows)}",
+        "",
+    ]
+    for title, rows in (("活跃池", active_rows), ("总池", registry_rows)):
+        lines.extend([f"## {title}", ""])
+        if not rows:
+            lines.extend(["本次为空。", ""])
+            continue
+        lines.extend(
+            [
+                "| 代码 | 名称 | 状态 | 观察天数 | 坏季度连击 | 业绩分 | Gate | 趋势分 | 距百日高% | 一句话 |",
+                "| --- | --- | --- | ---: | ---: | ---: | --- | ---: | ---: | --- |",
+            ]
+        )
+        for row in rows:
+            lines.append(
+                "| {code} | {name} | {status} | {days} | {bad} | {score} | {gate} | {trend} | {distance} | {reason} |".format(
+                    code=_safe_text(row.get("code")) or "--",
+                    name=_safe_text(row.get("name")) or "--",
+                    status=_safe_text(row.get("status")) or "--",
+                    days=_safe_int(row.get("observation_days"), 0),
+                    bad=_safe_int(row.get("bad_quarter_streak"), 0),
+                    score=(
+                        f"{float(row['earnings_strategy_score']):.1f}"
+                        if _safe_float(row.get("earnings_strategy_score")) is not None
+                        else "--"
+                    ),
+                    gate=_safe_text(row.get("earnings_strategy_gate_status")) or "--",
+                    trend=(
+                        f"{float(row['trend_score']):.1f}"
+                        if _safe_float(row.get("trend_score")) is not None
+                        else "--"
+                    ),
+                    distance=(
+                        f"{float(row['distance_to_high_pct']):.1f}"
+                        if _safe_float(row.get("distance_to_high_pct")) is not None
+                        else "--"
+                    ),
+                    reason=str(row.get("reason_summary") or "--").replace("\n", " "),
+                )
+            )
+        lines.append("")
+    return "\n".join(lines)
+
+
+def write_snapshot_outputs(
+    *,
+    snapshot_date: date,
+    entry_strategy_profile: str,
+    registry_rows: List[Dict[str, Any]],
+    active_rows: List[Dict[str, Any]],
+    output_dir: Path,
+) -> Dict[str, Path]:
+    normalized_profile = normalize_strategy_profile(entry_strategy_profile)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    flattened_registry_rows = _flatten_snapshot_rows(registry_rows)
+    flattened_active_rows = _flatten_snapshot_rows(active_rows)
+    registry_csv = output_dir / "earnings_observation_registry.csv"
+    active_csv = output_dir / "earnings_observation_active.csv"
+    markdown_path = output_dir / "earnings_observation_summary.md"
+    summary_json = output_dir / "earnings_observation_summary.json"
+    _write_snapshot_csv(registry_csv, flattened_registry_rows)
+    _write_snapshot_csv(active_csv, flattened_active_rows)
+    markdown_path.write_text(
+        _build_snapshot_markdown(
+            snapshot_date=snapshot_date,
+            entry_strategy_profile=normalized_profile,
+            registry_rows=flattened_registry_rows,
+            active_rows=flattened_active_rows,
+        ),
+        encoding="utf-8",
+    )
+    summary_json.write_text(
+        json.dumps(
+            {
+                "snapshot_date": snapshot_date.isoformat(),
+                "entry_strategy_profile": normalized_profile,
+                "registry_count": len(flattened_registry_rows),
+                "active_count": len(flattened_active_rows),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return {
+        "registry_csv": registry_csv,
+        "active_csv": active_csv,
+        "summary_md": markdown_path,
+        "summary_json": summary_json,
     }
 
 
@@ -452,10 +643,23 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Collect earnings observation registry/active snapshots.")
     parser.add_argument("--snapshot-date", type=str, default=None, help="Snapshot date in YYYY-MM-DD.")
     parser.add_argument(
+        "--entry-strategy-profile",
+        type=str,
+        default=DEFAULT_ENTRY_STRATEGY_PROFILE,
+        choices=sorted({"strict", "balanced", "relaxed", "high", "medium", "loose"}),
+        help="Entry earnings strategy profile for observation registry.",
+    )
+    parser.add_argument(
         "--max-observation-days",
         type=int,
         default=DEFAULT_MAX_OBSERVATION_DAYS,
         help=f"Maximum observation days, default {DEFAULT_MAX_OBSERVATION_DAYS}.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="",
+        help="Optional output directory for registry/active CSV and markdown artifacts.",
     )
     parser.add_argument("--log-level", type=str, default="INFO", help="Logging level.")
     return parser.parse_args()
@@ -473,10 +677,23 @@ def main() -> int:
     result = refresh_earnings_observation_snapshots(
         snapshot_date=snapshot_date,
         max_observation_days=max(1, int(args.max_observation_days)),
+        entry_strategy_profile=args.entry_strategy_profile,
     )
+    if str(args.output_dir or "").strip():
+        output_paths = write_snapshot_outputs(
+            snapshot_date=snapshot_date,
+            entry_strategy_profile=result["entry_strategy_profile"],
+            registry_rows=result["registry_rows"],
+            active_rows=result["active_rows"],
+            output_dir=Path(str(args.output_dir)),
+        )
+        logger.info("earnings observation registry CSV exported: %s", output_paths["registry_csv"])
+        logger.info("earnings observation active CSV exported: %s", output_paths["active_csv"])
+        logger.info("earnings observation summary markdown exported: %s", output_paths["summary_md"])
     logger.info(
-        "earnings observation snapshots refreshed: date=%s registry=%s active=%s",
+        "earnings observation snapshots refreshed: date=%s profile=%s registry=%s active=%s",
         result["snapshot_date"],
+        result["entry_strategy_profile"],
         result["registry_count"],
         result["active_count"],
     )

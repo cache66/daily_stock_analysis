@@ -22,7 +22,7 @@ import re
 import time
 from threading import BoundedSemaphore, RLock, Thread
 from abc import ABC, abstractmethod
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Callable, Optional, List, Tuple, Dict, Any, Iterable
 
@@ -46,6 +46,7 @@ DEFAULT_BOARD_CONSTITUENTS_CACHE_TTL_SECONDS = 30 * 60
 DEFAULT_EARNINGS_FUNDAMENTAL_DISK_CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "cache" / "earnings_fundamental_context"
 DEFAULT_EARNINGS_FUNDAMENTAL_DISK_CACHE_TTL_SECONDS = 6 * 60 * 60
 DEFAULT_FAILED_EARNINGS_FUNDAMENTAL_DISK_CACHE_TTL_SECONDS = 30 * 60
+DEFAULT_EARNINGS_EVENT_CATALOG_CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "cache" / "earnings_event_catalog"
 DEFAULT_CAPITAL_FLOW_DISK_CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "cache" / "capital_flow_context"
 DEFAULT_CAPITAL_FLOW_DISK_CACHE_TTL_SECONDS = 6 * 60 * 60
 DEFAULT_FAILED_CAPITAL_FLOW_DISK_CACHE_TTL_SECONDS = 30 * 60
@@ -119,6 +120,29 @@ def _finalize_daily_history_data(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=DAILY_HISTORY_CACHE_COLUMNS)
     return _calculate_daily_indicators(_clean_daily_history_data(df))
+
+
+def _repair_legacy_akshare_history_cache(df: pd.DataFrame, metadata: Dict[str, Any]) -> pd.DataFrame:
+    """Repair old Akshare cache rows where volume was stored in amount and volume was zero."""
+    if df is None or df.empty:
+        return df
+    if str(metadata.get("source") or "").strip() != "AkshareFetcher":
+        return df
+    required_columns = {"close", "volume", "amount"}
+    if not required_columns.issubset(df.columns):
+        return df
+
+    volume = pd.to_numeric(df["volume"], errors="coerce")
+    amount = pd.to_numeric(df["amount"], errors="coerce")
+    close = pd.to_numeric(df["close"], errors="coerce")
+    repair_mask = (volume.fillna(0) == 0) & (amount > 0) & (close > 0)
+    if not bool(repair_mask.any()):
+        return df
+
+    repaired = df.copy()
+    repaired.loc[repair_mask, "volume"] = amount.loc[repair_mask] * 100.0
+    repaired.loc[repair_mask, "amount"] = close.loc[repair_mask] * repaired.loc[repair_mask, "volume"]
+    return repaired
 
 
 def unwrap_exception(exc: Exception) -> Exception:
@@ -354,12 +378,14 @@ def is_bse_code(code: str) -> bool:
 
 def is_st_stock(name: str) -> bool:
     """
-    Check if the stock is an ST or *ST stock based on its name.
+    Check if the stock is a risk-warning stock based on its name.
 
-    ST stocks have special trading rules and typically a ±5% limit.
+    Covers common A-share markers such as ST/*ST and historical PT labels.
+    These names typically belong to risk-warning buckets and should be
+    excluded together when the strategy asks to filter ST stocks.
     """
     n = (name or "").upper()
-    return 'ST' in n
+    return ("ST" in n) or ("PT" in n)
 
 def is_kc_cy_stock(code: str) -> bool:
     """
@@ -773,6 +799,7 @@ class DataFetcherManager:
         self._daily_data_include_derived_indicators = True
         self._prefer_cached_history_when_covered = False
         self._skip_tushare_history_fallback_for_fast_scan = False
+        self._skip_redundant_history_fallback_for_fast_scan = False
 
     def _ensure_concurrency_guards(self) -> None:
         """Lazily initialize thread-safety primitives for test scaffolds using __new__."""
@@ -864,11 +891,57 @@ class DataFetcherManager:
             or self._skip_tushare_history_fallback_for_fast_scan is None
         ):
             self._skip_tushare_history_fallback_for_fast_scan = False
+        if (
+            not hasattr(self, "_skip_redundant_history_fallback_for_fast_scan")
+            or self._skip_redundant_history_fallback_for_fast_scan is None
+        ):
+            self._skip_redundant_history_fallback_for_fast_scan = False
 
     def _get_fetchers_snapshot(self) -> List[BaseFetcher]:
         self._ensure_concurrency_guards()
         with self._fetchers_lock:
             return list(getattr(self, "_fetchers", []))
+
+    def _should_skip_fast_scan_tushare_history_fallback(
+        self,
+        *,
+        fetcher_name: str,
+        next_fetcher_name: str,
+        days: int,
+        error_type: str,
+        error_reason: str,
+    ) -> bool:
+        skip_tushare_fallback = bool(
+            getattr(self, "_skip_tushare_history_fallback_for_fast_scan", False)
+        )
+        skip_redundant_fallback = bool(
+            getattr(self, "_skip_redundant_history_fallback_for_fast_scan", False)
+        )
+        if not skip_tushare_fallback and not skip_redundant_fallback:
+            return False
+        if days <= 0 or days > 160:
+            return False
+
+        normalized_reason = str(error_reason or "")
+        if (
+            skip_tushare_fallback
+            and fetcher_name == "AkshareFetcher"
+            and next_fetcher_name == "TushareFetcher"
+            and "Akshare 所有渠道获取失败" in normalized_reason
+        ):
+            return True
+
+        if (
+            skip_redundant_fallback
+            and fetcher_name == "TushareFetcher"
+            and next_fetcher_name == "AkshareFetcher"
+            and self._is_daily_source_no_data_error(error_type, normalized_reason)
+        ):
+            # Do not short-circuit this path anymore: newly listed stocks and
+            # provider-specific coverage gaps can still recover on Akshare.
+            return False
+
+        return False
 
     def _refresh_fetcher_indexes_locked(self) -> None:
         self._fetchers_by_name = {fetcher.name: fetcher for fetcher in self._fetchers}
@@ -925,11 +998,289 @@ class DataFetcherManager:
                 self._fetcher_call_locks[fetcher_id] = lock
             return lock
 
+    def _get_history_cache_lock(self, cache_key: str) -> RLock:
+        self._ensure_concurrency_guards()
+        with self._history_cache_locks_lock:
+            lock = self._history_cache_locks.get(cache_key)
+            if lock is None:
+                lock = RLock()
+                self._history_cache_locks[cache_key] = lock
+            return lock
+
+    @staticmethod
+    def _storage_history_columns(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame(columns=DAILY_HISTORY_CACHE_COLUMNS)
+
+        prepared = df.copy()
+        if 'date' in prepared.columns:
+            prepared['date'] = pd.to_datetime(prepared['date'])
+
+        keep_columns = [col for col in DAILY_HISTORY_CACHE_COLUMNS if col in prepared.columns]
+        prepared = prepared[keep_columns].copy()
+        prepared = prepared.dropna(subset=['close', 'volume'])
+        prepared = prepared.sort_values('date', ascending=True).reset_index(drop=True)
+        return prepared
+
+    def _finalize_history_frame(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame(columns=DAILY_HISTORY_CACHE_COLUMNS)
+
+        if 'date' in df.columns:
+            df = df.copy()
+            df['date'] = pd.to_datetime(df['date'])
+        if not bool(getattr(self, "_daily_data_include_derived_indicators", True)):
+            return _clean_daily_history_data(df)
+        return _finalize_daily_history_data(df)
+
+    @staticmethod
+    def _slice_history_range(df: pd.DataFrame, start_date: str, end_date: str) -> pd.DataFrame:
+        if df is None or df.empty or 'date' not in df.columns:
+            return pd.DataFrame()
+
+        start_ts = pd.Timestamp(start_date)
+        end_ts = pd.Timestamp(end_date)
+        sliced = df.loc[(df['date'] >= start_ts) & (df['date'] <= end_ts)].copy()
+        return sliced.reset_index(drop=True)
+
+    def _merge_history_frames(self, *frames: pd.DataFrame) -> pd.DataFrame:
+        prepared_frames = []
+        for frame in frames:
+            if frame is None or frame.empty:
+                continue
+            prepared = DataFetcherManager._storage_history_columns(frame)
+            if not prepared.empty:
+                prepared_frames.append(prepared)
+
+        if not prepared_frames:
+            return pd.DataFrame(columns=DAILY_HISTORY_CACHE_COLUMNS)
+
+        merged = pd.concat(prepared_frames, ignore_index=True, sort=False)
+        merged['date'] = pd.to_datetime(merged['date'])
+        merged = merged.sort_values('date', ascending=True)
+        merged = merged.drop_duplicates(subset=['date'], keep='last').reset_index(drop=True)
+        return self._finalize_history_frame(merged)
+
+    def _get_history_cache_config(self) -> Dict[str, Any]:
+        from src.config import get_config
+
+        config = get_config()
+        return {
+            "enabled": bool(getattr(config, "history_disk_cache_enabled", True)),
+            "cache_dir": Path(getattr(config, "history_disk_cache_dir", "./data/cache/history")),
+            "ttl_seconds": max(0, int(getattr(config, "history_disk_cache_ttl_seconds", 21600))),
+            "overlap_days": max(0, int(getattr(config, "history_disk_cache_overlap_days", 5))),
+        }
+
+    @staticmethod
+    def _history_cache_key(stock_code: str) -> str:
+        return f"{_market_tag(stock_code)}:{canonical_stock_code(stock_code)}"
+
+    @staticmethod
+    def _history_cache_filename(stock_code: str) -> str:
+        code = canonical_stock_code(stock_code)
+        for src, dest in (
+            ("/", "_"),
+            ("\\", "_"),
+            (":", "_"),
+            ("*", "_"),
+            ("?", "_"),
+            ('"', "_"),
+            ("<", "_"),
+            (">", "_"),
+            ("|", "_"),
+        ):
+            code = code.replace(src, dest)
+        return code
+
+    def _get_history_cache_paths(self, stock_code: str) -> Tuple[Path, Path]:
+        settings = self._get_history_cache_config()
+        cache_root = settings["cache_dir"] / _market_tag(stock_code)
+        filename = self._history_cache_filename(stock_code)
+        return cache_root / f"{filename}.csv", cache_root / f"{filename}.json"
+
+    def _history_failure_cache_key(
+        self,
+        stock_code: str,
+        *,
+        start_date: str,
+        end_date: str,
+        days: int,
+    ) -> str:
+        normalized_code = normalize_stock_code(stock_code)
+        return (
+            f"{_market_tag(normalized_code)}:{canonical_stock_code(normalized_code)}"
+            f"|start={start_date}|end={end_date}|days={max(0, int(days or 0))}"
+        )
+
+    def _history_failure_disk_cache_file(self, cache_key: str, cache_dir: Path) -> Path:
+        safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(cache_key or "").strip()) or "default"
+        return Path(cache_dir) / "_failed" / f"{safe_key}.json"
+
+    def _load_history_failure_disk_cache(
+        self,
+        cache_key: str,
+        *,
+        cache_dir: Path,
+    ) -> Optional[Dict[str, Any]]:
+        self._ensure_concurrency_guards()
+        ttl_seconds = max(0, int(getattr(self, "_history_failed_disk_cache_ttl_seconds", 0) or 0))
+        if ttl_seconds <= 0:
+            return None
+        cache_file = self._history_failure_disk_cache_file(cache_key, cache_dir)
+        try:
+            if not cache_file.exists():
+                return None
+            payload = json.loads(cache_file.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        fetched_at_text = str(payload.get("fetched_at") or "").strip()
+        try:
+            fetched_at = datetime.fromisoformat(fetched_at_text)
+        except ValueError:
+            return None
+        if time.time() - fetched_at.timestamp() > ttl_seconds:
+            return None
+        return payload
+
+    def _write_history_failure_disk_cache(
+        self,
+        cache_key: str,
+        *,
+        cache_dir: Path,
+        error_message: str,
+    ) -> None:
+        self._ensure_concurrency_guards()
+        ttl_seconds = max(0, int(getattr(self, "_history_failed_disk_cache_ttl_seconds", 0) or 0))
+        if ttl_seconds <= 0:
+            return
+        cache_file = self._history_failure_disk_cache_file(cache_key, cache_dir)
+        try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            cache_file.write_text(
+                json.dumps(
+                    {
+                        "fetched_at": datetime.now().replace(microsecond=0).isoformat(),
+                        "ttl_seconds": ttl_seconds,
+                        "error_message": str(error_message or "").strip(),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+        except Exception:
+            return
+
+    def _clear_history_failure_disk_cache(self, cache_key: str, *, cache_dir: Path) -> None:
+        cache_file = self._history_failure_disk_cache_file(cache_key, cache_dir)
+        try:
+            cache_file.unlink(missing_ok=True)
+        except Exception:
+            return
+
+    @staticmethod
+    def _history_cache_is_fresh(metadata: Dict[str, Any], request_end_date: str, ttl_seconds: int) -> bool:
+        try:
+            request_end = datetime.strptime(request_end_date, '%Y-%m-%d').date()
+        except ValueError:
+            return False
+
+        if request_end < datetime.now().date():
+            return True
+        if ttl_seconds <= 0:
+            return False
+
+        updated_at = float(metadata.get("updated_at") or 0)
+        if updated_at <= 0:
+            return False
+        return (time.time() - updated_at) <= ttl_seconds
+
+    def _read_history_cache(self, stock_code: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+        csv_path, metadata_path = self._get_history_cache_paths(stock_code)
+        if not csv_path.exists():
+            return pd.DataFrame(), {}
+
+        try:
+            cached_df = pd.read_csv(csv_path)
+        except Exception as exc:
+            logger.warning("[history cache] failed to read %s: %s", csv_path, exc)
+            return pd.DataFrame(), {}
+
+        metadata: Dict[str, Any] = {}
+        if metadata_path.exists():
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                logger.warning("[history cache] failed to read metadata %s: %s", metadata_path, exc)
+
+        if not metadata:
+            metadata = {"updated_at": csv_path.stat().st_mtime}
+
+        cached_df = _repair_legacy_akshare_history_cache(cached_df, metadata)
+        return self._finalize_history_frame(cached_df), metadata
+
+    def _write_history_cache(self, stock_code: str, df: pd.DataFrame, source: str) -> None:
+        csv_path, metadata_path = self._get_history_cache_paths(stock_code)
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+        storage_df = self._storage_history_columns(df)
+        storage_df.to_csv(csv_path, index=False, encoding="utf-8")
+
+        metadata = {
+            "stock_code": canonical_stock_code(stock_code),
+            "market": _market_tag(stock_code),
+            "source": source,
+            "updated_at": time.time(),
+            "rows": int(len(storage_df)),
+        }
+        metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+
     def _call_fetcher_method(self, fetcher: BaseFetcher, method_name: str, *args, **kwargs):
         """Serialize shared fetcher state access through manager-owned per-instance locks."""
         method = getattr(fetcher, method_name)
         with self._get_fetcher_call_lock(fetcher):
             return method(*args, **kwargs)
+
+    def _call_fetcher_daily_data(
+        self,
+        fetcher: BaseFetcher,
+        stock_code: str,
+        start_date: Optional[str],
+        end_date: Optional[str],
+        days: int,
+    ):
+        timeout_seconds = max(0.0, float(getattr(self, "_daily_data_fetch_timeout_seconds", 0.0) or 0.0))
+        if timeout_seconds <= 0:
+            return self._call_fetcher_method(
+                fetcher,
+                "get_daily_data",
+                stock_code=stock_code,
+                start_date=start_date,
+                end_date=end_date,
+                days=days,
+            )
+
+        task_name = f"{fetcher.name}.get_daily_data({stock_code})"
+        result, err, _ = self._run_with_timeout_with_slots(
+            lambda: self._call_fetcher_method(
+                fetcher,
+                "get_daily_data",
+                stock_code=stock_code,
+                start_date=start_date,
+                end_date=end_date,
+                days=days,
+            ),
+            timeout_seconds=timeout_seconds,
+            task_name=task_name,
+            slots=self._daily_data_timeout_slots,
+            worker_name_prefix="daily-data",
+        )
+        if err is not None:
+            raise DataFetchError(err)
+        return result
 
     @classmethod
     def _filter_daily_fetchers_for_market(
@@ -1004,6 +1355,22 @@ class DataFetcherManager:
     @staticmethod
     def _daily_source_unavailable_error(fetcher: BaseFetcher) -> str:
         return f"[{fetcher.name}] (CircuitOpen) 数据源短期熔断"
+
+    @staticmethod
+    def _is_daily_source_no_data_error(error_type: str, error_reason: str) -> bool:
+        normalized_type = str(error_type or "").strip()
+        normalized_reason = str(error_reason or "").strip()
+        lower_reason = normalized_reason.lower()
+        if normalized_type != "DataFetchError":
+            return False
+        no_data_markers = (
+            "未获取到",
+            "返回空日线结果",
+            "empty daily data",
+            "empty result",
+            "no data",
+        )
+        return any(marker in normalized_reason or marker in lower_reason for marker in no_data_markers)
 
     @classmethod
     def _record_daily_source_success(cls, fetcher: BaseFetcher, market: str) -> None:
@@ -1344,11 +1711,84 @@ class DataFetcherManager:
         safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(cache_key or "").strip()) or "default"
         return Path(self._earnings_fundamental_disk_cache_dir) / f"{safe_key}.json"
 
-    def _load_earnings_fundamental_disk_cache(self, cache_key: str) -> Optional[Dict[str, Any]]:
-        self._ensure_concurrency_guards()
-        default_ttl_seconds = max(0, int(getattr(self, "_earnings_fundamental_disk_cache_ttl_seconds", 0) or 0))
-        if default_ttl_seconds <= 0:
+    @staticmethod
+    def _normalize_report_period_hint(value: Any) -> Optional[str]:
+        text = str(value or "").strip()
+        if not text:
             return None
+        digits_only = re.sub(r"[^0-9]", "", text)
+        if len(digits_only) == 8:
+            return digits_only
+        quarter_match = re.fullmatch(r"(\d{4})\s*[Qq]([1-4])", text)
+        if quarter_match:
+            year = quarter_match.group(1)
+            quarter = quarter_match.group(2)
+            quarter_end_map = {
+                "1": "0331",
+                "2": "0630",
+                "3": "0930",
+                "4": "1231",
+            }
+            return f"{year}{quarter_end_map[quarter]}"
+        fiscal_year_match = re.fullmatch(r"(\d{4})\s*(?:FY|fy)", text)
+        if fiscal_year_match:
+            return f"{fiscal_year_match.group(1)}1231"
+        try:
+            parsed = pd.Timestamp(text)
+        except Exception:
+            return None
+        if pd.isna(parsed):
+            return None
+        return parsed.strftime("%Y%m%d")
+
+    @classmethod
+    def _extract_fundamental_context_report_period_hints(cls, context: Any) -> List[str]:
+        if not isinstance(context, dict):
+            return []
+
+        hints: List[str] = []
+
+        def _append_hint(value: Any) -> None:
+            normalized = cls._normalize_report_period_hint(value)
+            if normalized:
+                hints.append(normalized)
+
+        earnings_block = context.get("earnings")
+        earnings_data = earnings_block.get("data", {}) if isinstance(earnings_block, dict) else {}
+        if isinstance(earnings_data, dict):
+            financial_report = earnings_data.get("financial_report")
+            if isinstance(financial_report, dict):
+                _append_hint(financial_report.get("report_date"))
+            for item in earnings_data.get("financial_report_series") or []:
+                if isinstance(item, dict):
+                    _append_hint(item.get("report_date"))
+
+        growth_block = context.get("growth")
+        growth_data = growth_block.get("data", {}) if isinstance(growth_block, dict) else {}
+        if isinstance(growth_data, dict):
+            for item in growth_data.get("quarterly_series") or []:
+                if isinstance(item, dict):
+                    _append_hint(item.get("report_date"))
+
+        earnings_quality_block = context.get("earnings_quality")
+        earnings_quality_data = (
+            earnings_quality_block.get("data", {})
+            if isinstance(earnings_quality_block, dict)
+            else {}
+        )
+        if isinstance(earnings_quality_data, dict):
+            metrics_payload = earnings_quality_data.get("metrics")
+            if isinstance(metrics_payload, dict):
+                _append_hint(metrics_payload.get("report_date"))
+                _append_hint(metrics_payload.get("report_period_label"))
+            quarterly_evidence = earnings_quality_data.get("quarterly_evidence")
+            if isinstance(quarterly_evidence, dict):
+                for item in quarterly_evidence.get("observed_report_dates") or []:
+                    _append_hint(item)
+
+        return list(dict.fromkeys(hints))
+
+    def _read_earnings_fundamental_disk_cache_payload(self, cache_key: str) -> Optional[Dict[str, Any]]:
         cache_file = self._earnings_fundamental_disk_cache_file(cache_key)
         try:
             if not cache_file.exists():
@@ -1356,6 +1796,154 @@ class DataFetcherManager:
             payload = json.loads(cache_file.read_text(encoding="utf-8"))
         except Exception:
             return None
+        if not isinstance(payload, dict):
+            return None
+        return payload
+
+    @staticmethod
+    def _normalize_announcement_date_hint(value: Any) -> Optional[str]:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = pd.Timestamp(text)
+        except Exception:
+            return None
+        if pd.isna(parsed):
+            return None
+        return parsed.strftime("%Y-%m-%d")
+
+    @classmethod
+    def _extract_fundamental_context_latest_announcement_date(cls, context: Any) -> Optional[str]:
+        if not isinstance(context, dict):
+            return None
+
+        announcement_candidates: List[str] = []
+
+        def _append_date(value: Any) -> None:
+            normalized = cls._normalize_announcement_date_hint(value)
+            if normalized:
+                announcement_candidates.append(normalized)
+
+        earnings_block = context.get("earnings")
+        earnings_data = earnings_block.get("data", {}) if isinstance(earnings_block, dict) else {}
+        if isinstance(earnings_data, dict):
+            for field_name in (
+                "report_announcement_date",
+                "quick_report_announcement_date",
+                "forecast_announcement_date",
+            ):
+                _append_date(earnings_data.get(field_name))
+
+        _append_date(context.get("latest_earnings_announcement_date"))
+        if not announcement_candidates:
+            return None
+        return max(announcement_candidates)
+
+    @classmethod
+    def _context_satisfies_announcement_date_hint(
+        cls,
+        context: Any,
+        *,
+        announcement_date_hint: Optional[str],
+    ) -> bool:
+        normalized_hint = cls._normalize_announcement_date_hint(announcement_date_hint)
+        if not normalized_hint:
+            return True
+        cached_latest_announcement_date = cls._extract_fundamental_context_latest_announcement_date(context)
+        return bool(
+            cached_latest_announcement_date
+            and cached_latest_announcement_date >= normalized_hint
+        )
+
+    @classmethod
+    def _recent_event_payload_covers_report_period(
+        cls,
+        payload: Any,
+        *,
+        report_period_hint: Optional[str],
+    ) -> bool:
+        normalized_period = cls._normalize_report_period_hint(report_period_hint)
+        if not normalized_period:
+            return True
+        if not isinstance(payload, dict):
+            return False
+        candidates: List[str] = []
+        for item in payload.get("report_periods") or []:
+            normalized_item = cls._normalize_report_period_hint(item)
+            if normalized_item:
+                candidates.append(normalized_item)
+        normalized_report_date = cls._normalize_report_period_hint(payload.get("report_date"))
+        if normalized_report_date:
+            candidates.append(normalized_report_date)
+        return normalized_period in set(candidates)
+
+    def _load_local_earnings_event_latest_announcement_date(
+        self,
+        stock_code: str,
+        *,
+        report_period_hint: Optional[str],
+    ) -> Optional[str]:
+        normalized_code = normalize_stock_code(stock_code)
+        catalog_dir = Path(
+            getattr(
+                self,
+                "_earnings_event_catalog_cache_dir",
+                DEFAULT_EARNINGS_EVENT_CATALOG_CACHE_DIR,
+            )
+        )
+        if not catalog_dir.exists():
+            return None
+
+        best_snapshot_date = ""
+        best_announcement_date = ""
+        try:
+            cache_files = sorted(catalog_dir.glob("lookback_*.json"))
+        except Exception:
+            return None
+
+        for cache_file in cache_files:
+            try:
+                payload = json.loads(cache_file.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            catalog = payload.get("catalog")
+            if not isinstance(catalog, dict):
+                continue
+            code_payload = catalog.get(normalized_code)
+            if not isinstance(code_payload, dict):
+                continue
+            if not self._recent_event_payload_covers_report_period(
+                code_payload,
+                report_period_hint=report_period_hint,
+            ):
+                continue
+            latest_announcement_date = self._extract_fundamental_context_latest_announcement_date(
+                {
+                    "earnings": {
+                        "data": code_payload,
+                    }
+                }
+            )
+            if not latest_announcement_date:
+                continue
+            snapshot_date = str(payload.get("snapshot_date") or "").strip()
+            if (
+                snapshot_date > best_snapshot_date
+                or (snapshot_date == best_snapshot_date and latest_announcement_date > best_announcement_date)
+            ):
+                best_snapshot_date = snapshot_date
+                best_announcement_date = latest_announcement_date
+        return best_announcement_date or None
+
+    def _load_earnings_fundamental_disk_cache(self, cache_key: str) -> Optional[Dict[str, Any]]:
+        self._ensure_concurrency_guards()
+        default_ttl_seconds = max(0, int(getattr(self, "_earnings_fundamental_disk_cache_ttl_seconds", 0) or 0))
+        if default_ttl_seconds <= 0:
+            return None
+        payload = self._read_earnings_fundamental_disk_cache_payload(cache_key)
         if not isinstance(payload, dict):
             return None
         ttl_seconds = max(0, int(payload.get("ttl_seconds") or default_ttl_seconds))
@@ -1371,6 +1959,36 @@ class DataFetcherManager:
         context = payload.get("context")
         if not isinstance(context, dict):
             return None
+        return dict(context)
+
+    def _load_earnings_fundamental_disk_cache_for_report_period(
+        self,
+        cache_key: str,
+        *,
+        report_period_hint: Optional[str] = None,
+        announcement_date_hint: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        self._ensure_concurrency_guards()
+        normalized_hint = self._normalize_report_period_hint(report_period_hint)
+        if not normalized_hint:
+            return None
+        normalized_announcement_hint = self._normalize_announcement_date_hint(announcement_date_hint)
+        payload = self._read_earnings_fundamental_disk_cache_payload(cache_key)
+        if not isinstance(payload, dict):
+            return None
+        context = payload.get("context")
+        if not isinstance(context, dict):
+            return None
+        status = str(context.get("status") or "").strip().lower()
+        if status not in {"ok", "partial"}:
+            return None
+        cached_hints = self._extract_fundamental_context_report_period_hints(context)
+        if normalized_hint not in cached_hints:
+            return None
+        if normalized_announcement_hint:
+            cached_latest_announcement_date = self._extract_fundamental_context_latest_announcement_date(context)
+            if not cached_latest_announcement_date or cached_latest_announcement_date < normalized_announcement_hint:
+                return None
         return dict(context)
 
     @staticmethod
@@ -1899,7 +2517,7 @@ class DataFetcherManager:
                             provider=fetcher.name,
                             operation="get_daily_data",
                         )
-                        df = self._call_fetcher_method(
+                        df = self._call_fetcher_daily_data(
                             fetcher,
                             stock_code,
                             start_date,
@@ -1955,7 +2573,8 @@ class DataFetcherManager:
                             f"[数据源失败 {attempt}/{total_fetchers}] [{fetcher.name}] {stock_code}: "
                             f"error_type={error_type}, reason={error_reason}"
                         )
-                        self._record_daily_source_failure(fetcher, market, error_reason)
+                        if not self._is_daily_source_no_data_error(error_type, error_reason):
+                            self._record_daily_source_failure(fetcher, market, error_reason)
                         errors.append(error_msg)
                     break
 
@@ -1977,7 +2596,7 @@ class DataFetcherManager:
                     provider=fetcher.name,
                     operation="get_daily_data",
                 )
-                df = self._call_fetcher_method(
+                df = self._call_fetcher_daily_data(
                     fetcher,
                     stock_code,
                     start_date,
@@ -2035,7 +2654,8 @@ class DataFetcherManager:
                     f"[数据源失败 {attempt}/{total_fetchers}] [{fetcher.name}] {stock_code}: "
                     f"error_type={error_type}, reason={error_reason}"
                 )
-                self._record_daily_source_failure(fetcher, market, error_reason)
+                if not self._is_daily_source_no_data_error(error_type, error_reason):
+                    self._record_daily_source_failure(fetcher, market, error_reason)
                 errors.append(error_msg)
                 if attempt < total_fetchers:
                     next_fetcher = fetchers[attempt]
@@ -2043,6 +2663,7 @@ class DataFetcherManager:
                         fetcher_name=fetcher.name,
                         next_fetcher_name=next_fetcher.name,
                         days=days,
+                        error_type=error_type,
                         error_reason=error_reason,
                     ):
                         logger.info(
@@ -2067,6 +2688,38 @@ class DataFetcherManager:
         raise DataFetchError(error_summary)
     
     _fetch_daily_data_from_sources = get_daily_data
+
+    def _resolve_daily_data_request_range(
+        self,
+        *,
+        start_date: Optional[str],
+        end_date: Optional[str],
+        days: int,
+    ) -> Tuple[Optional[str], str]:
+        """Resolve the effective daily-history request range used by cache-aware flows."""
+        self._ensure_concurrency_guards()
+
+        normalized_end_date = str(end_date).strip() if end_date else ""
+        if not normalized_end_date:
+            normalized_end_date = datetime.now().strftime("%Y-%m-%d")
+
+        if start_date:
+            normalized_start_date = str(start_date).strip()
+            return normalized_start_date or None, normalized_end_date
+
+        safe_days = max(1, int(days or 1))
+        span_multiplier = float(
+            getattr(
+                self,
+                "_daily_data_request_calendar_span_multiplier",
+                DEFAULT_DAILY_DATA_REQUEST_CALENDAR_SPAN_MULTIPLIER,
+            )
+            or DEFAULT_DAILY_DATA_REQUEST_CALENDAR_SPAN_MULTIPLIER
+        )
+        calendar_days = max(safe_days, int(math.ceil(safe_days * max(1.0, span_multiplier))))
+        end_dt = datetime.strptime(normalized_end_date, "%Y-%m-%d")
+        start_dt = end_dt - timedelta(days=calendar_days)
+        return start_dt.strftime("%Y-%m-%d"), normalized_end_date
 
     def get_daily_data(
         self,
@@ -2164,17 +2817,30 @@ class DataFetcherManager:
 
                 merged_df = cached_df
                 active_source = cached_source
+                head_backfill_failed = False
 
                 if resolved_start_date < cached_start_date:
                     head_end = (pd.Timestamp(cached_start_date) - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
-                    head_df, head_source = self._fetch_daily_data_from_sources(
-                        stock_code,
-                        start_date=resolved_start_date,
-                        end_date=head_end,
-                        days=days,
-                    )
-                    merged_df = self._merge_history_frames(head_df, merged_df)
-                    active_source = head_source or active_source
+                    try:
+                        head_df, head_source = self._fetch_daily_data_from_sources(
+                            stock_code,
+                            start_date=resolved_start_date,
+                            end_date=head_end,
+                            days=days,
+                        )
+                    except Exception:
+                        if auto_range_request:
+                            head_backfill_failed = True
+                            logger.info(
+                                "[history cache] head backfill failed for %s, keeping cached partial history",
+                                stock_code,
+                                exc_info=True,
+                            )
+                        else:
+                            raise
+                    else:
+                        merged_df = self._merge_history_frames(head_df, merged_df)
+                        active_source = head_source or active_source
 
                 should_refresh_tail = (resolved_end_date > cached_end_date) or (not cache_fresh)
                 if should_refresh_tail:
@@ -2218,6 +2884,12 @@ class DataFetcherManager:
                     )
                     sliced = self._slice_history_range(merged_df, resolved_start_date, resolved_end_date)
                     if not sliced.empty:
+                        if head_backfill_failed:
+                            cache_mode = "disk_cache_partial_history"
+                            return (
+                                sliced,
+                                f"{cache_mode}:{active_source or cached_source}" if (active_source or cached_source) else cache_mode,
+                            )
                         return sliced, active_source or cached_source or "unknown"
 
             cached_failure = self._load_history_failure_disk_cache(
@@ -5039,6 +5711,8 @@ class DataFetcherManager:
         stock_code: str,
         budget_seconds: Optional[float] = None,
         enabled_blocks: Optional[Iterable[str]] = None,
+        report_period_hint: Optional[str] = None,
+        announcement_date_hint: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Fetch only the earnings-related fundamental blocks needed by fast scans."""
         from src.config import get_config
@@ -5085,6 +5759,13 @@ class DataFetcherManager:
         default_enabled_blocks = ("financial", "forecast", "quick_report")
         cache_ttl = int(config.fundamental_cache_ttl_seconds)
         cache_max_entries = max(0, int(getattr(config, "fundamental_cache_max_entries", 256)))
+        normalized_report_period_hint = self._normalize_report_period_hint(report_period_hint)
+        normalized_announcement_date_hint = self._normalize_announcement_date_hint(announcement_date_hint)
+        if normalized_announcement_date_hint is None and normalized_report_period_hint:
+            normalized_announcement_date_hint = self._load_local_earnings_event_latest_announcement_date(
+                stock_code,
+                report_period_hint=normalized_report_period_hint,
+            )
         cache_key = self._get_fundamental_cache_key(
             stock_code,
             stage_timeout,
@@ -5113,6 +5794,11 @@ class DataFetcherManager:
                     if age > cache_ttl:
                         continue
                     cached_context = cache_item.get("context", {})
+                    if not self._context_satisfies_announcement_date_hint(
+                        cached_context,
+                        announcement_date_hint=normalized_announcement_date_hint,
+                    ):
+                        continue
                     if candidate_key != cache_key:
                         self._fundamental_cache[cache_key] = {
                             "ts": time.time(),
@@ -5126,6 +5812,11 @@ class DataFetcherManager:
             cached_disk_context = self._load_earnings_fundamental_disk_cache(cache_key)
             if not isinstance(cached_disk_context, dict) and superset_cache_key:
                 cached_disk_context = self._load_earnings_fundamental_disk_cache(superset_cache_key)
+            if isinstance(cached_disk_context, dict) and not self._context_satisfies_announcement_date_hint(
+                cached_disk_context,
+                announcement_date_hint=normalized_announcement_date_hint,
+            ):
+                cached_disk_context = None
             if isinstance(cached_disk_context, dict):
                 with self._fundamental_cache_lock:
                     self._fundamental_cache[cache_key] = {
@@ -5137,6 +5828,29 @@ class DataFetcherManager:
                     cache_hit=True,
                     cache_source="disk",
                 )
+            if normalized_report_period_hint:
+                cached_disk_context = self._load_earnings_fundamental_disk_cache_for_report_period(
+                    cache_key,
+                    report_period_hint=normalized_report_period_hint,
+                    announcement_date_hint=normalized_announcement_date_hint,
+                )
+                if not isinstance(cached_disk_context, dict) and superset_cache_key:
+                    cached_disk_context = self._load_earnings_fundamental_disk_cache_for_report_period(
+                        superset_cache_key,
+                        report_period_hint=normalized_report_period_hint,
+                        announcement_date_hint=normalized_announcement_date_hint,
+                    )
+                if isinstance(cached_disk_context, dict):
+                    with self._fundamental_cache_lock:
+                        self._fundamental_cache[cache_key] = {
+                            "ts": time.time(),
+                            "context": cached_disk_context,
+                        }
+                    return self._decorate_fundamental_context_cache_meta(
+                        cached_disk_context,
+                        cache_hit=True,
+                        cache_source="disk_stale_report_period_match",
+                    )
 
         if bundle_timeout <= 0:
             bundle_status = "failed"
@@ -5205,6 +5919,7 @@ class DataFetcherManager:
             "status": overall_status,
             "cache_hit": False,
             "cache_source": None,
+            "latest_earnings_announcement_date": normalized_announcement_date_hint,
             "coverage": {
                 "growth": growth_status,
                 "earnings": earnings_status,

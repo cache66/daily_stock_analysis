@@ -16,6 +16,7 @@ if "json_repair" not in sys.modules:
 
 from scripts.select_long_base_release_candidates import (  # noqa: E402
     LongBaseReleaseCriteria,
+    build_selected_dataframe,
     resolve_profile_settings,
     scan_long_base_release_candidates,
 )
@@ -135,6 +136,21 @@ class LongBaseReleaseSelectorTestCase(unittest.TestCase):
         self.assertEqual([item.stock_code for item in run_result.selected], ["300069"])
         metrics = run_result.selected[0].metrics
         self.assertEqual(metrics["release_pattern_label"], "long_base_slow_push")
+        self.assertTrue(metrics["pure_chart_quality_passed"])
+        self.assertGreaterEqual(metrics["recent_positive_ratio_20d"], 0.60)
+        self.assertGreaterEqual(metrics["recent_positive_ratio_30d"], 0.58)
+        self.assertGreaterEqual(metrics["recent_return_10d"], 5.0)
+        self.assertTrue(metrics["above_ma10"])
+
+        selected_df = build_selected_dataframe(run_result)
+        assert not selected_df.empty
+        row = selected_df.iloc[0]
+        self.assertIn("latest_trade_date", selected_df.columns)
+        self.assertIn("recent_positive_ratio_20d", selected_df.columns)
+        self.assertIn("recent_positive_ratio_30d", selected_df.columns)
+        self.assertIn("recent_return_10d", selected_df.columns)
+        self.assertIn("pure_chart_quality_passed", selected_df.columns)
+        self.assertTrue(bool(row["pure_chart_quality_passed"]))
 
     def test_scan_long_base_release_selects_long_base_breakout(self):
         prefix = [9.95, 9.96]
@@ -173,6 +189,85 @@ class LongBaseReleaseSelectorTestCase(unittest.TestCase):
         metrics = run_result.selected[0].metrics
         self.assertEqual(metrics["release_pattern_label"], "long_base_breakout")
 
+    def test_scan_long_base_release_marks_recently_weak_shape_as_not_pure_chart_ready(self):
+        prefix = [9.95, 9.97]
+        base = [10.00, 10.03, 9.98, 10.02, 10.01] * 12
+        release = [
+            10.10,
+            10.22,
+            10.36,
+            10.49,
+            10.63,
+            10.78,
+            10.94,
+            11.11,
+            11.29,
+            11.48,
+            11.70,
+            11.82,
+            11.94,
+            12.03,
+            12.10,
+            12.06,
+            12.02,
+            12.05,
+            12.04,
+            12.08,
+        ]
+        history = build_daily_history_from_closes(prefix + base + release)
+        service = self._build_service("300070", "LongBaseWeakFinish", history)
+
+        run_result = scan_long_base_release_candidates(
+            criteria=LongBaseReleaseCriteria(),
+            service=service,
+        )
+
+        self.assertEqual([item.stock_code for item in run_result.selected], ["300070"])
+        metrics = run_result.selected[0].metrics
+        self.assertFalse(metrics["pure_chart_quality_passed"])
+        self.assertLess(metrics["recent_return_10d"], 5.0)
+        self.assertGreaterEqual(metrics["release_positive_ratio"], 0.58)
+
+    def test_scan_long_base_release_rejects_many_upper_shadow_days(self):
+        prefix = [9.95, 9.97]
+        base = [10.00, 10.03, 9.98, 10.02, 10.01] * 12
+        release = [
+            10.12,
+            10.20,
+            10.31,
+            10.40,
+            10.52,
+            10.61,
+            10.73,
+            10.82,
+            10.95,
+            11.06,
+            11.18,
+            11.32,
+            11.48,
+            11.63,
+            11.79,
+            11.92,
+            12.08,
+            12.24,
+            12.41,
+            12.58,
+        ]
+        history = build_daily_history_from_closes(prefix + base + release)
+        pressure_index = history.tail(20).head(8).index
+        history.loc[pressure_index, "high"] = history.loc[pressure_index, "close"] * 1.08
+        service = self._build_service("300071", "UpperShadowBaseRelease", history)
+
+        run_result = scan_long_base_release_candidates(
+            criteria=LongBaseReleaseCriteria(),
+            service=service,
+        )
+
+        self.assertEqual(len(run_result.selected), 0)
+        self.assertEqual(len(run_result.failed), 1)
+        self.assertIn("upper shadow", run_result.failed[0].failure_reason.lower())
+        self.assertGreater(run_result.failed[0].metrics["upper_shadow_day_ratio_20d"], 0.25)
+
     def test_scan_long_base_release_rejects_spike_without_clean_base(self):
         trend = [
             10.00, 10.12, 10.24, 10.37, 10.50, 10.63, 10.77, 10.92, 11.07, 11.22,
@@ -202,6 +297,15 @@ class LongBaseReleaseSelectorTestCase(unittest.TestCase):
 
         self.assertEqual(profile_name, "default")
         self.assertIsInstance(criteria, LongBaseReleaseCriteria)
+        self.assertIsNone(prefilter)
+
+    def test_resolve_profile_settings_returns_loose_profile(self):
+        profile_name, criteria, prefilter = resolve_profile_settings(self._build_profile_args("loose"))
+
+        self.assertEqual(profile_name, "loose")
+        self.assertIsInstance(criteria, LongBaseReleaseCriteria)
+        self.assertEqual(criteria.min_avg_daily_amount_20d, 200_000.0)
+        self.assertEqual(criteria.min_release_return_pct, 6.0)
         self.assertIsNone(prefilter)
 
 

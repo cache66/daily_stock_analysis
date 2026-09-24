@@ -66,6 +66,9 @@ TENCENT_REALTIME_ENDPOINT = "qt.gtimg.cn/q"
 _AKSHARE_HISTORY_CALL_TIMEOUT = 30.0
 _AKSHARE_TIMEOUT_PROCESS_JOIN_GRACE = 1.0
 _AKSHARE_TIMEOUT_PROCESS_START_METHOD = "spawn"
+DEFAULT_SECTOR_RANK_EM_BACKOFF_SECONDS = int(os.getenv("AKSHARE_SECTOR_RANK_EM_BACKOFF_SECONDS", "1200"))
+DEFAULT_STOCK_HISTORY_EM_BACKOFF_SECONDS = int(os.getenv("AKSHARE_STOCK_HISTORY_EM_BACKOFF_SECONDS", "120"))
+DEFAULT_STOCK_HISTORY_SOURCE_PRIORITY: Tuple[str, ...] = ("em", "sina", "tencent")
 
 
 # User-Agent 池，用于随机轮换
@@ -418,6 +421,10 @@ class AkshareFetcher(BaseFetcher):
         self._stock_history_retry_attempts = max(1, int(stock_history_retry_attempts))
         self._last_request_time: Optional[float] = None
         self._history_call_timeout = _AKSHARE_HISTORY_CALL_TIMEOUT
+        self._sector_rank_em_backoff_seconds = max(0, int(DEFAULT_SECTOR_RANK_EM_BACKOFF_SECONDS))
+        self._sector_rank_em_backoff_until_ts: float = 0.0
+        self._stock_history_em_backoff_seconds = max(0, int(DEFAULT_STOCK_HISTORY_EM_BACKOFF_SECONDS))
+        self._stock_history_em_backoff_until_ts: float = 0.0
         # 东财补丁开启才执行打补丁操作
         if get_config().enable_eastmoney_patch:
             eastmoney_patch()
@@ -710,6 +717,8 @@ class AkshareFetcher(BaseFetcher):
         ]
 
         last_error = None
+        source_outcomes: List[str] = []
+        saw_hard_error = False
 
         for source_key, fetch_method, source_name in methods:
             if source_key == "em" and self._is_stock_history_em_backoff_active():
@@ -719,6 +728,7 @@ class AkshareFetcher(BaseFetcher):
                     stock_code,
                     remaining,
                 )
+                source_outcomes.append(f"{source_key}=backoff({remaining:.0f}s)")
                 continue
             try:
                 logger.info(f"[数据源] 尝试使用 {source_name} 获取 {stock_code}...")
@@ -729,14 +739,24 @@ class AkshareFetcher(BaseFetcher):
                         self._clear_stock_history_em_backoff()
                     logger.info(f"[数据源] {source_name} 获取成功")
                     return df
+                source_outcomes.append(f"{source_key}=empty")
             except Exception as e:
                 last_error = e
+                saw_hard_error = True
                 if source_key == "em" and self._should_retry_stock_history_exception(e):
                     self._activate_stock_history_em_backoff(str(e))
+                    source_outcomes.append(f"{source_key}=error(backoff_armed:{type(e).__name__})")
+                else:
+                    source_outcomes.append(f"{source_key}=error({type(e).__name__})")
                 logger.warning(f"[数据源] {source_name} 获取失败: {e}")
                 # 继续尝试下一个
 
         # 所有都失败
+        if not saw_hard_error:
+            outcome_summary = ", ".join(source_outcomes) if source_outcomes else "all_sources_unavailable"
+            raise DataFetchError(
+                f"Akshare 未获取到 {stock_code} 的数据: {outcome_summary}"
+            )
         raise DataFetchError(f"Akshare 所有渠道获取失败: {last_error}")
 
     def _fetch_stock_data_em(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:

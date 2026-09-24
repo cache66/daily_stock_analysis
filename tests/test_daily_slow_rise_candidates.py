@@ -107,6 +107,16 @@ class DailySlowRiseSelectorTestCase(unittest.TestCase):
         self.assertEqual(criteria.max_full_window_drawdown_pct, 24.0)
         self.assertIsNone(prefilter)
 
+    def test_resolve_profile_settings_supports_review_balanced_profile(self):
+        profile_name, criteria, prefilter = resolve_profile_settings(self._build_profile_args("review_balanced"))
+
+        self.assertEqual(profile_name, "review_balanced")
+        self.assertEqual(criteria.max_single_day_gain_pct, 12.5)
+        self.assertEqual(criteria.max_advance_drawdown_pct, 14.0)
+        self.assertEqual(criteria.max_full_window_drawdown_pct, 28.0)
+        self.assertEqual(criteria.max_recent_drawdown_10d_pct, 10.0)
+        self.assertIsNone(prefilter)
+
     def _build_service(self, code: str, name: str, history: pd.DataFrame, total_mv: float = 7_500_000_000.0):
         manager = FakeManager(history_by_code={code: history}, quote_caps={code: total_mv})
         return KlineSelectorService(
@@ -263,6 +273,56 @@ class DailySlowRiseSelectorTestCase(unittest.TestCase):
         self.assertEqual(len(run_result.failed), 1)
         self.assertIn("drawdown", run_result.failed[0].failure_reason.lower())
 
+    def test_scan_daily_slow_rise_rejects_many_upper_shadow_days(self):
+        prefix = [9.96, 9.98]
+        base = [10.00, 10.04, 9.98, 10.03, 10.01] * 6
+        rise = [
+            10.12,
+            10.20,
+            10.28,
+            10.35,
+            10.44,
+            10.52,
+            10.60,
+            10.72,
+            10.80,
+            10.88,
+            10.96,
+            11.02,
+            11.10,
+            11.18,
+            11.26,
+            11.34,
+            11.42,
+            11.50,
+            11.58,
+            11.66,
+            11.74,
+            11.82,
+            11.90,
+            11.98,
+            12.04,
+            12.10,
+            12.16,
+            12.22,
+            12.28,
+            12.34,
+        ]
+        history = build_daily_history_from_closes(prefix + base + rise)
+        pressure_index = history.tail(20).head(8).index
+        history.loc[pressure_index, "high"] = history.loc[pressure_index, "close"] * 1.08
+        service = self._build_service("600396", "上影线压力", history)
+
+        run_result = scan_daily_slow_rise_candidates(
+            criteria=DailySlowRiseCriteria(),
+            service=service,
+        )
+
+        self.assertEqual(len(run_result.selected), 0)
+        self.assertEqual(len(run_result.failed), 1)
+        self.assertIn("upper shadow", run_result.failed[0].failure_reason.lower())
+        self.assertGreater(run_result.failed[0].metrics["upper_shadow_day_ratio_20d"], 0.25)
+
     def test_scan_daily_slow_rise_accelerating_profile_allows_single_limit_style_step_up(self):
         prefix = [19.8, 19.9]
         base = [20.0, 20.1, 20.0, 20.2, 20.1] * 6
@@ -321,6 +381,56 @@ class DailySlowRiseSelectorTestCase(unittest.TestCase):
         self.assertEqual(metrics["trend_pattern_label"], "base_to_trend")
         self.assertEqual(metrics["max_single_day_gain_pct"], 10.0)
         self.assertGreater(metrics["advance_return_pct"], 90.0)
+
+    def test_scan_daily_slow_rise_review_balanced_rejects_recent_unrecovered_pullback(self):
+        prefix = [9.7, 9.8, 9.85, 9.9, 9.92, 9.95, 9.98]
+        base = [10.0, 10.1, 10.0, 10.2, 10.1] * 5
+        rise = [
+            10.6,
+            11.1,
+            11.7,
+            12.2,
+            12.8,
+            13.4,
+            14.1,
+            14.8,
+            15.6,
+            16.3,
+            17.0,
+            17.8,
+            18.6,
+            19.5,
+            20.4,
+            21.3,
+            22.2,
+            23.1,
+            24.1,
+            25.1,
+            26.1,
+            27.1,
+            28.1,
+            29.1,
+            30.1,
+            31.1,
+            32.1,
+            31.0,
+            29.0,
+            28.5,
+        ]
+        history = build_daily_history_from_closes(prefix + base + rise)
+        service = self._build_service("603777", "近期破位样本", history, total_mv=10_000_000_000.0)
+        _profile_name, review_criteria, _prefilter = resolve_profile_settings(
+            self._build_profile_args("review_balanced")
+        )
+
+        run_result = scan_daily_slow_rise_candidates(
+            criteria=review_criteria,
+            service=service,
+        )
+
+        self.assertEqual(len(run_result.selected), 0)
+        self.assertEqual(len(run_result.failed), 1)
+        self.assertIn("recent pullback", run_result.failed[0].failure_reason.lower())
 
     def test_scan_daily_slow_rise_prefers_shared_prepare_scan_universe(self):
         captured: dict[str, object] = {}
@@ -413,6 +523,8 @@ class DailySlowRiseSelectorTestCase(unittest.TestCase):
         self.assertEqual(captured["prepare_kwargs"]["shard_index"], 1)
         self.assertEqual(captured["prepare_kwargs"]["quote_hydration_workers"], 3)
         self.assertTrue(captured["prepare_kwargs"]["exclude_st"])
+        self.assertTrue(captured["prepare_kwargs"]["exclude_kcb"])
+        self.assertFalse(captured["prepare_kwargs"]["exclude_cyb"])
         self.assertEqual(captured["scan_kwargs"]["as_of_date"], pd.Timestamp("2026-05-19").date())
         self.assertIsNone(captured["scan_kwargs"]["prefilter"])
         self.assertEqual(captured["scan_kwargs"]["shard_count"], 1)

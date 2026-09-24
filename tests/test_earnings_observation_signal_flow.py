@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 """Tests for earnings observation lifecycle snapshot building."""
 
+import csv
 import sys
+import tempfile
 import unittest
 from datetime import date
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 if "litellm" not in sys.modules:
@@ -16,6 +19,7 @@ from scripts.collect_earnings_observation_snapshots import (
     REGISTRY_SIGNAL_TYPE,
     _evaluate_trend_states,
     build_observation_snapshots,
+    write_snapshot_outputs,
 )
 
 
@@ -79,6 +83,7 @@ class EarningsObservationSignalFlowTestCase(unittest.TestCase):
         self.assertEqual(registry_rows[0]["metrics_payload"]["bad_quarter_streak"], 0)
         self.assertEqual(registry_rows[0]["history_payload"]["first_watch_date"], "2026-04-24")
         self.assertEqual(registry_rows[0]["history_payload"]["last_qualified_earnings_date"], "2026-04-20")
+        self.assertEqual(registry_rows[0]["criteria_payload"]["entry_rule"], "earnings_surprise_balanced")
 
     def test_build_observation_snapshots_keeps_registry_but_drops_active_when_trend_turns_weak(self) -> None:
         registry_rows, active_rows = build_observation_snapshots(
@@ -204,3 +209,108 @@ class EarningsObservationSignalFlowTestCase(unittest.TestCase):
             registry_rows[0]["history_payload"]["removal_reason"],
             "two_consecutive_bad_quarters",
         )
+
+    def test_build_observation_snapshots_can_tag_relaxed_entry_rule(self) -> None:
+        registry_rows, active_rows = build_observation_snapshots(
+            snapshot_date=date(2026, 4, 24),
+            previous_registry=[],
+            earnings_evaluations_by_code={
+                "600519": {
+                    "code": "600519",
+                    "name": "贵州茅台",
+                    "passed": True,
+                    "event_date": "2026-04-20",
+                    "report_date": "2026-03-31",
+                    "reason_summary": "季报通过 relaxed 门槛",
+                    "earnings_strategy_score": 52.0,
+                },
+            },
+            trend_states_by_code={
+                "600519": {
+                    "passed": True,
+                    "close": 1820.0,
+                    "ma20": 1760.0,
+                    "ma60": 1650.0,
+                    "distance_to_high_pct": 2.3,
+                    "trend_score": 92.0,
+                },
+            },
+            max_observation_days=240,
+            entry_strategy_profile="relaxed",
+        )
+
+        self.assertEqual(len(registry_rows), 1)
+        self.assertEqual(len(active_rows), 1)
+        self.assertEqual(registry_rows[0]["criteria_payload"]["entry_rule"], "earnings_surprise_relaxed")
+        self.assertEqual(registry_rows[0]["criteria_payload"]["entry_strategy_profile"], "relaxed")
+
+    def test_write_snapshot_outputs_exports_registry_and_active_views(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            paths = write_snapshot_outputs(
+                snapshot_date=date(2026, 4, 24),
+                entry_strategy_profile="relaxed",
+                registry_rows=[
+                    {
+                        "signal_type": REGISTRY_SIGNAL_TYPE,
+                        "code": "600519",
+                        "name": "贵州茅台",
+                        "criteria_payload": {"entry_rule": "earnings_surprise_relaxed"},
+                        "metrics_payload": {
+                            "status": "active",
+                            "observation_days": 0,
+                            "bad_quarter_streak": 0,
+                            "latest_earnings_passed": True,
+                            "earnings_strategy_score": 52.0,
+                            "earnings_strategy_gate_status": "passed_watch_with_confirmation",
+                            "trend_score": 92.0,
+                            "distance_to_high_pct": 2.3,
+                        },
+                        "cause_payload": {"reason_summary": "观察池样本"},
+                        "history_payload": {
+                            "first_watch_date": "2026-04-24",
+                            "last_qualified_earnings_date": "2026-04-20",
+                            "last_active_date": "2026-04-24",
+                        },
+                    }
+                ],
+                active_rows=[
+                    {
+                        "signal_type": ACTIVE_SIGNAL_TYPE,
+                        "code": "600519",
+                        "name": "贵州茅台",
+                        "criteria_payload": {"entry_rule": "earnings_surprise_relaxed"},
+                        "metrics_payload": {
+                            "status": "active",
+                            "observation_days": 0,
+                            "bad_quarter_streak": 0,
+                            "latest_earnings_passed": True,
+                            "earnings_strategy_score": 52.0,
+                            "earnings_strategy_gate_status": "passed_watch_with_confirmation",
+                            "trend_score": 92.0,
+                            "distance_to_high_pct": 2.3,
+                        },
+                        "cause_payload": {"reason_summary": "观察池样本"},
+                        "history_payload": {
+                            "first_watch_date": "2026-04-24",
+                            "last_qualified_earnings_date": "2026-04-20",
+                            "last_active_date": "2026-04-24",
+                        },
+                    }
+                ],
+                output_dir=output_dir,
+            )
+
+            self.assertTrue(paths["registry_csv"].exists())
+            self.assertTrue(paths["active_csv"].exists())
+            self.assertTrue(paths["summary_md"].exists())
+
+            with paths["registry_csv"].open(encoding="utf-8-sig", newline="") as fh:
+                rows = list(csv.DictReader(fh))
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["code"], "600519")
+            self.assertEqual(rows[0]["entry_rule"], "earnings_surprise_relaxed")
+
+            markdown = paths["summary_md"].read_text(encoding="utf-8")
+            self.assertIn("Entry Strategy Profile: relaxed", markdown)
+            self.assertIn("贵州茅台", markdown)

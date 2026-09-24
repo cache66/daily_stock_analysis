@@ -14,6 +14,7 @@
 4. [`个人策略中英对照.md`](./个人策略中英对照.md)
 5. [`../local_strategies/README.md`](../local_strategies/README.md)
 6. [`个人策略修改记录.md`](./个人策略修改记录.md)
+7. [`个人策略精简方案.md`](./个人策略精简方案.md)（草案，待确认）
 
 补充说明：
 

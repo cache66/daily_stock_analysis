@@ -39,7 +39,7 @@ DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "dividend_income"
 DIVIDEND_HISTORY_YEARS_WINDOW = 12
 DIV_PROC_IMPLEMENTED_MARKER = "实施"
 RATE_LIMIT_MARKERS = ("频率超限", "rate limit", "too many requests", "次/分", "每分钟")
-STOCK_BASIC_FIELDS = "ts_code,symbol,name,industry,market,list_date,exchange"
+STOCK_BASIC_FIELDS = "ts_code,symbol,name,industry,market,list_date,exchange,act_ent_type"
 DAILY_BASIC_FIELDS = "ts_code,close,dv_ratio,dv_ttm,pe_ttm,pb,total_mv"
 DIVIDEND_FIELDS = "ts_code,end_date,ann_date,div_proc,cash_div,cash_div_tax,record_date,ex_date,pay_date,imp_ann_date"
 FINA_FIELDS = "ts_code,end_date,eps,roe,ocfps"
@@ -68,10 +68,13 @@ CYCLICAL_INDUSTRY_HINTS = (
     "建材",
 )
 
-# 综合分权重（满分 90）：股息率 45 + 连续性 30 + 盈利质量 15。
+# 综合分权重（满分 90）：股息率 45 + 连续性 30 + 盈利质量 15；
+# 央国企偏好为可关闭的软加分（+3）：吃股息场景下央企/地方国企的分红持续性通常更稳。
 YIELD_SCORE_CAP = 45.0
 CONTINUITY_SCORE_CAP = 30.0
 QUALITY_SCORE_CAP = 15.0
+SOE_SCORE_BONUS = 3.0
+OWNER_TYPE_SOE = ("央企", "地方国企")
 
 
 @dataclass(frozen=True)
@@ -87,6 +90,7 @@ class DividendIncomeOptions:
     rate_limit_per_minute: int = 45
     cache_only: bool = False
     wait_minutes: float = 0.0
+    prefer_soe: bool = True
     output_dir: Path = DEFAULT_OUTPUT_DIR
     cache_dir: Path = DEFAULT_CACHE_DIR
 
@@ -175,6 +179,24 @@ def _normalize_ts_code(code: Any) -> str:
     return str(code or "").strip().upper()
 
 
+def _normalize_owner_type(raw: Any) -> str:
+    """归一化实控人企业性质：央企 / 地方国企 / 民营 / 外资 / 其他 / 未知。"""
+    text = str(raw or "").strip()
+    if not text or text.lower() in {"nan", "none", "null"}:
+        return "未知"
+    if "中央" in text:
+        return "央企"
+    if "地方" in text:
+        return "地方国企"
+    if "民营" in text:
+        return "民营"
+    if "外资" in text or "境外" in text or "外商" in text:
+        return "外资"
+    if "国有" in text:
+        return "国企"
+    return "其他"
+
+
 def _code_prefix(ts_code: str) -> str:
     return _normalize_ts_code(ts_code).split(".")[0]
 
@@ -260,7 +282,18 @@ class DividendIncomeService:
     def _load_stock_basic(self, *, cache_only: bool) -> pd.DataFrame:
         cache_path = self._cache_dir / "stock_basic.csv"
         if _cache_is_fresh(cache_path, refresh_days=7):
-            return _read_csv_safe(cache_path)
+            cached = _read_csv_safe(cache_path)
+            if cache_only or "act_ent_type" in cached.columns:
+                return cached
+            # 旧缓存缺少实控人类型（央国企偏好需要）：尽力刷新一次，失败则沿用旧缓存。
+            refreshed = self._query("stock_basic", exchange="", list_status="L", fields=STOCK_BASIC_FIELDS)
+            if refreshed is not None and not refreshed.empty:
+                if "act_ent_type" not in refreshed.columns:
+                    refreshed["act_ent_type"] = ""
+                refreshed.to_csv(cache_path, index=False)
+                return refreshed.fillna("")
+            self._warnings.append("stock_basic_refresh_failed")
+            return cached
         if cache_only:
             return _read_csv_safe(cache_path)
         df = self._query("stock_basic", exchange="", list_status="L", fields=STOCK_BASIC_FIELDS)
@@ -622,9 +655,12 @@ class DividendIncomeService:
         *,
         min_yield_pct: float,
         min_dividend_years: int,
+        prefer_soe: bool = True,
     ) -> Dict[str, Any]:
         yield_pct = _to_float(base_row.get("dv_ttm")) or 0.0
         flags: List[str] = list(dividend_metrics.get("flags") or [])
+        owner_type = _normalize_owner_type(base_row.get("act_ent_type"))
+        soe_bonus = SOE_SCORE_BONUS if (prefer_soe and owner_type in OWNER_TYPE_SOE) else 0.0
 
         consecutive = int(dividend_metrics.get("consecutive_dividend_years") or 0)
         stale = bool(dividend_metrics.get("dividend_history_stale", True))
@@ -677,7 +713,7 @@ class DividendIncomeService:
             quality_score = QUALITY_SCORE_CAP / 2.0
         else:
             quality_score = 0.0
-        score = round(yield_score + continuity_score + quality_score, 1)
+        score = round(yield_score + continuity_score + quality_score + soe_bonus, 1)
 
         qualified = consecutive >= min_dividend_years and not stale
 
@@ -692,6 +728,8 @@ class DividendIncomeService:
             "pb": base_row.get("pb"),
             "total_mv_yi": base_row.get("total_mv_yi"),
             "list_date": base_row.get("list_date"),
+            "owner_type": owner_type,
+            "soe_bonus": round(soe_bonus, 1),
             "consecutive_dividend_years": consecutive,
             "dividend_years_recent": int(dividend_metrics.get("dividend_years_recent") or 0),
             "latest_dividend_year": dividend_metrics.get("latest_dividend_year"),
@@ -826,6 +864,7 @@ class DividendIncomeService:
                 quality_metrics,
                 min_yield_pct=options.min_yield_pct,
                 min_dividend_years=options.min_dividend_years,
+                prefer_soe=options.prefer_soe,
             )
             rows.append(row)
             if index % 25 == 0:
@@ -961,11 +1000,11 @@ class DividendIncomeService:
         lines.append("## 合格池（Top 30）")
         lines.append("")
         if qualified_top:
-            lines.append("| 代码 | 名称 | 行业 | 股息率% | 连续年数 | 最新年度 | 每股分红 | 派现率% | 综合分 | 标注 |")
-            lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+            lines.append("| 代码 | 名称 | 类型 | 行业 | 股息率% | 连续年数 | 最新年度 | 每股分红 | 派现率% | 综合分 | 标注 |")
+            lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
             for row in qualified_top:
                 lines.append(
-                    f"| {row['ts_code']} | {row['name']} | {row['industry']} | {row['dv_ttm_pct']} | "
+                    f"| {row['ts_code']} | {row['name']} | {row.get('owner_type') or '—'} | {row['industry']} | {row['dv_ttm_pct']} | "
                     f"{row['consecutive_dividend_years']} | {row['latest_dividend_year']} | {row['latest_year_cash_div']} | "
                     f"{row['payout_ratio_pct'] if row['payout_ratio_pct'] is not None else '—'} | {row['dividend_score']} | "
                     f"{row['flags'] or '—'} |"
@@ -978,6 +1017,7 @@ class DividendIncomeService:
         lines.append("- 数据：Tushare `daily_basic`（股息率快照）+ AKShare `stock_fhps_em`（分红送配按报告期批量，含每股收益）；Tushare `dividend` 仅作兜底。")
         lines.append("- EPS 来源优先级：AKShare 每股收益（`eps_source=akshare_fhps`）> fina_indicator > `close / pe_ttm` 反推（`eps_source=pe_ttm_proxy`）；后两档派现率仅供粗看。")
         lines.append("- 合格口径：连续分红年数 ≥ 门槛，且最新分红年度不早于当前年度前 2 年（避免用历史高息的名义）。")
+        lines.append("- 央国企偏好：`owner_type` 为央企/地方国企的候选加 3 分软偏好（`soe_bonus`），可用 `--no-prefer-soe` 关闭。")
         lines.append("- 标注说明：`payout_over_100` 派现率超 100%；`yield_outlier` 股息率异常高（>15%，注意一次性分红或价格异动）；")
         lines.append("  `dividend_history_stale` 分红历史过期；`cyclical_industry` 周期行业（景气顶部高息需自行复核）。")
         lines.append("- 复权/除权、红利税与再平衡时点需自行把握；本表只做筛选，不做交易建议。")

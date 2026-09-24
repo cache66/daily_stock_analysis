@@ -96,6 +96,11 @@ def parse_args() -> argparse.Namespace:
             "等待期间按退避轮询重试，0 表示快速失败。"
         ),
     )
+    parser.add_argument(
+        "--no-prefer-soe",
+        action="store_true",
+        help="关闭央国企软偏好加分（默认开启：实控人为央企/地方国企加 3 分，仅影响排序权重）。",
+    )
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="产物根目录。")
     parser.add_argument("--cache-dir", default=str(DEFAULT_CACHE_DIR), help="缓存根目录。")
     parser.add_argument(
@@ -137,6 +142,7 @@ def main() -> int:
         rate_limit_per_minute=int(args.rate_limit),
         cache_only=bool(args.cache_only),
         wait_minutes=float(args.wait_minutes),
+        prefer_soe=not bool(args.no_prefer_soe),
         output_dir=Path(args.output_dir),
         cache_dir=Path(args.cache_dir),
     )

@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > Detailed internal change log and run evidence: [docs/AI_MODIFICATION_LOG.md](./AI_MODIFICATION_LOG.md)
 
 ## [Unreleased]
+- [新功能] 股息线新增央国企软偏好：输出 `owner_type`（央企/地方国企/民营/…）与 `soe_bonus` 加分（默认 +3，`--no-prefer-soe` 关闭）；stock_basic 缓存缺 `act_ent_type` 时自动尝试刷新一次，配额受限时降级为未知并继续。
+- [新功能] 新增 `scripts/refresh_local_daily_basic_snapshot.py`：Tushare 配额受限时用腾讯行情 + AKShare 分红缓存构造本地 `daily_basic` 代理快照（带 `snapshot_source=tencent_proxy` 来源标记，默认跳过已有文件），配合 `--cache-only` 可离线运行股息线；最近 5 个交易日实盘验证可用。
 - [新功能] 新增「股息线（防守线）」筛选 MVP：`src/services/dividend_income_service.py` + `scripts/select_dividend_income_candidates.py`，按 Tushare `daily_basic` 快照计算股息率（本地缓存优先且 30 天复用，配额受限时 `--wait-minutes` 自动等待恢复窗口），分红历史与每股收益改走 AKShare `stock_fhps_em` 按报告期批量（免费无配额，逐票 Tushare `dividend` 仅作兜底，无 `fina_indicator` 权限时 EPS 自动降级），输出高股息率 + 连续分红 + 现金流校验的候选池 CSV/Markdown。
 - [文档] 个人策略方案按「打法化」方向重写（v2）：目标结构改为「一守一攻 + 备用线」（吃股息 / 短线=图形×催化 / 业绩条件启用），新增环境开关（regime）、14 条策略去向对照与落地步骤；待确认后实施。
 - [文档] 新增 `docs/个人策略文档/个人策略精简方案.md`（草案，待确认）：盘点 14 条页面策略、约 36 个策略脚本与 1.3 万行文档现状，给出「4+2+1」目标形态、分档处置明细、冻结候选清单与三步执行计划。

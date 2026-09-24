@@ -453,3 +453,46 @@ def test_wait_minutes_recovers_from_quota(tmp_path: Path) -> None:
     assert summary["status"] == "succeeded"
     assert summary["trade_date"] == "2026-09-23"
     assert provider.daily_basic_attempts >= 5  # 经历多轮退避重试后拿到快照
+
+
+def test_soe_soft_preference_bonus() -> None:
+    base = {
+        "ts_code": "601398.SH",
+        "name": "国有大行A",
+        "industry": "银行",
+        "market": "主板",
+        "close": 8.0,
+        "dv_ttm": 5.0,
+        "pe_ttm": 7.0,
+        "pb": 0.7,
+        "total_mv_yi": 20000.0,
+        "list_date": "20061027",
+        "act_ent_type": "中央国有企业",
+    }
+    dividend_metrics = {
+        "consecutive_dividend_years": 6,
+        "dividend_history_stale": False,
+        "dividend_history_lagging": False,
+        "latest_dividend_year": 2025,
+        "latest_year_cash_div": 0.4,
+    }
+    quality = {
+        "eps_annual_latest": 1.0,
+        "eps_positive_last3": 3,
+        "ocfps_annual_latest": None,
+        "eps_source": "akshare_fhps",
+    }
+
+    row_default = DividendIncomeService.build_candidate_row(
+        base, dividend_metrics, quality, min_yield_pct=4.0, min_dividend_years=5
+    )
+    assert row_default["owner_type"] == "央企"
+    assert row_default["soe_bonus"] == 3.0
+    # 5% 股息率: (5-3)*9=18 + 连续 30 + 质量 10 + 央国企 3 = 61
+    assert row_default["dividend_score"] == 61.0
+
+    row_disabled = DividendIncomeService.build_candidate_row(
+        base, dividend_metrics, quality, min_yield_pct=4.0, min_dividend_years=5, prefer_soe=False
+    )
+    assert row_disabled["soe_bonus"] == 0.0
+    assert row_disabled["dividend_score"] == 58.0

@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > Detailed internal change log and run evidence: [docs/AI_MODIFICATION_LOG.md](./AI_MODIFICATION_LOG.md)
 
 ## [Unreleased]
+- [新功能] 新增「股息线（防守线）」筛选 MVP：`src/services/dividend_income_service.py` + `scripts/select_dividend_income_candidates.py`，按 Tushare `daily_basic` 快照计算股息率（本地缓存优先且 30 天复用，配额受限时 `--wait-minutes` 自动等待恢复窗口），分红历史与每股收益改走 AKShare `stock_fhps_em` 按报告期批量（免费无配额，逐票 Tushare `dividend` 仅作兜底，无 `fina_indicator` 权限时 EPS 自动降级），输出高股息率 + 连续分红 + 现金流校验的候选池 CSV/Markdown。
 - [文档] 个人策略方案按「打法化」方向重写（v2）：目标结构改为「一守一攻 + 备用线」（吃股息 / 短线=图形×催化 / 业绩条件启用），新增环境开关（regime）、14 条策略去向对照与落地步骤；待确认后实施。
 - [文档] 新增 `docs/个人策略文档/个人策略精简方案.md`（草案，待确认）：盘点 14 条页面策略、约 36 个策略脚本与 1.3 万行文档现状，给出「4+2+1」目标形态、分档处置明细、冻结候选清单与三步执行计划。
 - [改进] `scripts/run_fast_review_bundle.py` 与 `scripts/select_monthly_slow_rise_candidates.py` 收紧扩展信号读层：`trend_leader` 的 `fallback` / `trend_score<=0` / `weak_trend_structure` 样本不再进入首页聚合；`continuous_up` 改为“仅作节奏观察，需其他主信号共振”并在无附着主信号时直接清空候选；`monthly_slow_rise` 新增 `--cache-only` 与 `--universe-codes-file`，白天可优先按本地 history cache 和白名单收窄 universe，避免缺缓存样本拖慢运行链路。

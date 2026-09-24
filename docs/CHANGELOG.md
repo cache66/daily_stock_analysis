@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > Detailed internal change log and run evidence: [docs/AI_MODIFICATION_LOG.md](./AI_MODIFICATION_LOG.md)
 
 ## [Unreleased]
+- [文档] 个人策略方案按「打法化」方向重写（v2）：目标结构改为「一守一攻 + 备用线」（吃股息 / 短线=图形×催化 / 业绩条件启用），新增环境开关（regime）、14 条策略去向对照与落地步骤；待确认后实施。
 - [文档] 新增 `docs/个人策略文档/个人策略精简方案.md`（草案，待确认）：盘点 14 条页面策略、约 36 个策略脚本与 1.3 万行文档现状，给出「4+2+1」目标形态、分档处置明细、冻结候选清单与三步执行计划。
 - [改进] `scripts/run_fast_review_bundle.py` 与 `scripts/select_monthly_slow_rise_candidates.py` 收紧扩展信号读层：`trend_leader` 的 `fallback` / `trend_score<=0` / `weak_trend_structure` 样本不再进入首页聚合；`continuous_up` 改为“仅作节奏观察，需其他主信号共振”并在无附着主信号时直接清空候选；`monthly_slow_rise` 新增 `--cache-only` 与 `--universe-codes-file`，白天可优先按本地 history cache 和白名单收窄 universe，避免缺缓存样本拖慢运行链路。
 - [改进] `scripts/run_fast_review_bundle.py` 的 `earnings-only` 读层新增本地缓存价格健康门槛，默认只读 `data/cache/history`，对近端明显回落、20 日回撤过大、跌破中期均线或月线转弱的业绩票标记 `earnings_price_health_*`；其中缺少明确催化的样本降为 `earnings_price_health_weak`，有明确行业催化的样本保留为 `earnings_price_pullback_watch` 回撤观察，减少历史业绩好但当前图形走坏的样本进入前排，同时避免把有主线但短线回撤的票直接隐藏。

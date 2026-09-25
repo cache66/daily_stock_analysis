@@ -152,15 +152,22 @@ def _build_provider() -> FakeProvider:
 
 
 class FakeAkshare:
-    """按报告期返回分红送配表（列名对齐 akshare stock_fhps_em）。"""
+    """按报告期返回分红送配表（列名对齐 akshare stock_fhps_em），可选业绩面年度摘要。"""
 
-    def __init__(self, frames: dict) -> None:
+    def __init__(self, frames: dict, abstract_frames: dict | None = None) -> None:
         self.frames = frames
+        self.abstract_frames = abstract_frames or {}
         self.calls = []
+        self.abstract_calls = []
 
     def stock_fhps_em(self, date: str) -> pd.DataFrame:
         self.calls.append(date)
         df = self.frames.get(date)
+        return df.copy() if df is not None else pd.DataFrame()
+
+    def stock_financial_abstract_ths(self, symbol: str, indicator: str = "按年度") -> pd.DataFrame:
+        self.abstract_calls.append((symbol, indicator))
+        df = self.abstract_frames.get(symbol)
         return df.copy() if df is not None else pd.DataFrame()
 
 
@@ -369,8 +376,8 @@ def test_payout_unknown_and_scoring() -> None:
     )
     assert row["qualified"] is True
     assert "payout_unknown" in row["flags"]
-    # 45 分上限内的股息率得分 (5 - 3) * 9 = 18 + 连续性 30 + 质量 0
-    assert row["dividend_score"] == 48.0
+    # 评分 v2：股息率 (5-3)*7=14 + 连续性 20 + 质量 7（EPS 0 + ROE 中性 4 + 现金流中性 3）+ 低波中性 6
+    assert row["dividend_score"] == 47.0
 
 
 def test_akshare_bulk_path(tmp_path: Path) -> None:
@@ -488,11 +495,350 @@ def test_soe_soft_preference_bonus() -> None:
     )
     assert row_default["owner_type"] == "央企"
     assert row_default["soe_bonus"] == 3.0
-    # 5% 股息率: (5-3)*9=18 + 连续 30 + 质量 10 + 央国企 3 = 61
-    assert row_default["dividend_score"] == 61.0
+    # 评分 v2：股息率 14 + 连续性 20 + 质量 17（EPS 10 + ROE 中性 4 + 现金流中性 3）+ 低波中性 6 + 央国企 3 = 60
+    assert row_default["dividend_score"] == 60.0
 
     row_disabled = DividendIncomeService.build_candidate_row(
         base, dividend_metrics, quality, min_yield_pct=4.0, min_dividend_years=5, prefer_soe=False
     )
     assert row_disabled["soe_bonus"] == 0.0
-    assert row_disabled["dividend_score"] == 58.0
+    assert row_disabled["dividend_score"] == 57.0
+
+
+class FakeKlineFetcher:
+    """按 ts_code 返回合成日线，返回形态对齐 DataFetcherManager.get_daily_data（df, source）。"""
+
+    def __init__(self, series_by_code: dict) -> None:
+        self.series_by_code = series_by_code
+        self.calls = []
+
+    def get_daily_data(self, stock_code, start_date=None, end_date=None, days=30):
+        self.calls.append((stock_code, start_date, end_date))
+        closes = self.series_by_code.get(stock_code)
+        if not closes:
+            return pd.DataFrame(columns=["date", "close"]), "disk_cache:test"
+        end = pd.Timestamp(end_date) if end_date else pd.Timestamp("2026-09-24")
+        dates = pd.bdate_range(end=end, periods=len(closes))
+        frame = pd.DataFrame(
+            {
+                "date": dates,
+                "open": closes,
+                "high": closes,
+                "low": closes,
+                "close": closes,
+                "volume": 0.0,
+                "amount": 0.0,
+            }
+        )
+        return frame, "disk_cache:test"
+
+
+def _trend_series(year_return_pct: float, half_return_pct: float | None = None, bars: int = 320) -> list:
+    """构造收盘价序列：倒数第 251 根/第 121 根到最新收盘的收益率精确等于给定值。"""
+    end_value = 100.0
+    half_pct = year_return_pct if half_return_pct is None else half_return_pct
+    year_ref = end_value / (1.0 + year_return_pct / 100.0)
+    half_ref = end_value / (1.0 + half_pct / 100.0)
+    year_idx = bars - 1 - 250
+    half_idx = bars - 1 - 120
+    closes: list = []
+    for idx in range(bars):
+        if idx <= year_idx:
+            closes.append(year_ref)
+        elif idx <= half_idx:
+            ratio = (idx - year_idx) / (half_idx - year_idx)
+            closes.append(year_ref + (half_ref - year_ref) * ratio)
+        else:
+            ratio = (idx - half_idx) / (bars - 1 - half_idx)
+            closes.append(half_ref + (end_value - half_ref) * ratio)
+    return closes
+
+
+def test_price_trend_penalties_and_cache(tmp_path: Path) -> None:
+    fetcher = FakeKlineFetcher(
+        {
+            "600001.SH": _trend_series(2.0),  # 原始 +2%，股息 5.5% → 含息 +7.5%，无扣分
+            "600002.SH": _trend_series(-5.0, half_return_pct=-15.0),  # 股息 6.0% → 含息 +1%，但近半年继续跌
+            "600005.SH": _trend_series(-25.0, half_return_pct=0.0),  # 股息 6.5% → 含息 -18.5%
+        }
+    )
+    service = DividendIncomeService(
+        provider=_build_provider(),
+        price_trend_fetcher=fetcher,
+        cache_dir=tmp_path / "cache",
+        output_dir=tmp_path / "out",
+        price_trend_interval_seconds=0.0,
+    )
+
+    summary = service.run(_options(tmp_path))
+    assert summary["status"] == "succeeded"
+    assert any(str(item).startswith("price_trend_fetch_failed") for item in summary["warnings"])  # 600003 无数据
+
+    df = pd.read_csv(tmp_path / "out" / "2026-09-24" / "dividend_income_candidates.csv")
+    assert {"year_return_pct", "total_return_1y_pct", "half_year_return_pct", "price_trend_adj"} <= set(df.columns)
+    rows = {row["ts_code"]: row for row in df.to_dict("records")}
+
+    assert rows["600001.SH"]["price_trend_adj"] == 0.0
+    assert pytest.approx(rows["600001.SH"]["year_return_pct"], abs=0.05) == 2.0
+    assert pytest.approx(rows["600001.SH"]["total_return_1y_pct"], abs=0.1) == 7.5
+    assert "total_return_1y_negative" not in str(rows["600001.SH"]["flags"])
+
+    assert pytest.approx(rows["600005.SH"]["year_return_pct"], abs=0.05) == -25.0
+    assert pytest.approx(rows["600005.SH"]["total_return_1y_pct"], abs=0.1) == -18.5
+    assert rows["600005.SH"]["price_trend_adj"] == -8.0
+    assert "price_fall_1y" in rows["600005.SH"]["flags"]
+    assert "total_return_1y_negative" in rows["600005.SH"]["flags"]
+    assert "price_fall_6m" not in rows["600005.SH"]["flags"]
+
+    assert rows["600002.SH"]["price_trend_adj"] == -2.0
+    assert "price_fall_6m" in rows["600002.SH"]["flags"]
+    assert "total_return_1y_negative" not in str(rows["600002.SH"]["flags"])  # 股息回来了，净回报为正
+
+    cache_file = tmp_path / "cache" / "price_trends" / "price_trends_20260924.csv"
+    assert cache_file.exists()
+    assert "disk_cache:test" in cache_file.read_text(encoding="utf-8")
+
+    # 二次运行：成功记录命中缓存；仅数据缺失的 600003.SH 会补拉
+    second_fetcher = FakeKlineFetcher({})
+    second_service = DividendIncomeService(
+        provider=_build_provider(),
+        price_trend_fetcher=second_fetcher,
+        cache_dir=tmp_path / "cache",
+        output_dir=tmp_path / "out",
+        price_trend_interval_seconds=0.0,
+    )
+    second_service.run(_options(tmp_path))
+    assert [call[0] for call in second_fetcher.calls] == ["600003.SH"]
+
+
+def test_price_trend_toggle_and_cache_only(tmp_path: Path) -> None:
+    fetcher = FakeKlineFetcher({})
+    service = DividendIncomeService(
+        provider=_build_provider(),
+        price_trend_fetcher=fetcher,
+        cache_dir=tmp_path / "cache",
+        output_dir=tmp_path / "out",
+        price_trend_interval_seconds=0.0,
+    )
+    service.run(_options(tmp_path, price_trend=False))
+    assert fetcher.calls == []  # 关闭时完全不访问数据源
+
+    second_fetcher = FakeKlineFetcher({})
+    second_service = DividendIncomeService(
+        provider=_build_provider(),
+        price_trend_fetcher=second_fetcher,
+        cache_dir=tmp_path / "cache",
+        output_dir=tmp_path / "out",
+        price_trend_interval_seconds=0.0,
+    )
+    second_service.run(_options(tmp_path, cache_only=True))
+    assert second_fetcher.calls == []  # cache-only 模式不发起补拉
+
+
+def _abstract_frame(roe_by_year: dict, ocfps_by_year: dict) -> pd.DataFrame:
+    rows = []
+    for year in sorted(roe_by_year):
+        rows.append(
+            {
+                "报告期": str(year),
+                "净资产收益率": f"{roe_by_year[year]}%",
+                "每股经营现金流": str(ocfps_by_year.get(year, "--")),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _abstract_frame_full(
+    roe_by_year: dict,
+    ocfps_by_year: dict,
+    *,
+    revenue_by_year: dict | None = None,
+    profit_by_year: dict | None = None,
+    deduct_by_year: dict | None = None,
+) -> pd.DataFrame:
+    rows = []
+    for year in sorted(roe_by_year):
+        row = {
+            "报告期": str(year),
+            "净资产收益率": f"{roe_by_year[year]}%",
+            "每股经营现金流": str(ocfps_by_year.get(year, "--")),
+        }
+        if revenue_by_year:
+            row["营业总收入"] = f"{revenue_by_year.get(year, '--')}亿"
+        if profit_by_year:
+            row["净利润"] = f"{profit_by_year.get(year, '--')}亿"
+        if deduct_by_year:
+            row["扣非净利润"] = f"{deduct_by_year.get(year, '--')}亿"
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def test_trend_gate_adjustments(tmp_path: Path) -> None:
+    rising = [100.0 + 20.0 * (i / 319.0) for i in range(320)]  # 稳健上行 → 站上 200 日线
+    crashing = [150.0 - 50.0 * max(0, i - 69) / 250.0 for i in range(320)]  # 近一年单边下跌 → 跌破
+
+    fetcher = FakeKlineFetcher({"600001.SH": rising, "600002.SH": crashing})
+    service = DividendIncomeService(
+        provider=_build_provider(),
+        price_trend_fetcher=fetcher,
+        cache_dir=tmp_path / "cache",
+        output_dir=tmp_path / "out",
+        price_trend_interval_seconds=0.0,
+    )
+    service.run(_options(tmp_path))
+
+    df = pd.read_csv(tmp_path / "out" / "2026-09-24" / "dividend_income_candidates.csv")
+    rows = {row["ts_code"]: row for row in df.to_dict("records")}
+
+    assert rows["600001.SH"]["ma200_ratio_pct"] > 0
+    assert rows["600001.SH"]["trend_adj"] == 4.0
+    assert "trend_above_ma200" in rows["600001.SH"]["flags"]
+
+    assert rows["600002.SH"]["ma200_ratio_pct"] < -5.0
+    assert rows["600002.SH"]["trend_adj"] == -6.0
+    assert "trend_breakdown" in rows["600002.SH"]["flags"]
+
+
+def test_deduct_ratio_and_decline_flags(tmp_path: Path) -> None:
+    abstract = {
+        "600001": _abstract_frame_full(
+            {2021: 12.0, 2022: 12.2, 2023: 12.1, 2024: 12.4, 2025: 12.3},
+            {2025: 0.6},
+            revenue_by_year={2022: 100, 2023: 105, 2024: 110, 2025: 115},
+            profit_by_year={2022: 10, 2023: 10.5, 2024: 11, 2025: 11.5},
+            deduct_by_year={2022: 9.5, 2023: 10.0, 2024: 10.5, 2025: 11.0},
+        ),
+        "600005": _abstract_frame_full(
+            {2021: 10.0, 2022: 9.0, 2023: 8.0, 2024: 8.0, 2025: 3.0},
+            {2025: 0.5},
+            revenue_by_year={2022: 100, 2023: 92, 2024: 82, 2025: 70},
+            profit_by_year={2022: 10, 2023: 9, 2024: 8, 2025: 7},
+            deduct_by_year={2022: 4.2, 2023: 3.8, 2024: 3.2, 2025: 2.8},
+        ),
+    }
+    akshare = FakeAkshare(_build_fhps_frames(), abstract_frames=abstract)
+    service = DividendIncomeService(
+        provider=_build_provider(), akshare_fetcher=akshare, cache_dir=tmp_path / "cache", output_dir=tmp_path / "out"
+    )
+    service.run(_options(tmp_path))
+
+    df = pd.read_csv(tmp_path / "out" / "2026-09-24" / "dividend_income_candidates.csv")
+    rows = {row["ts_code"]: row for row in df.to_dict("records")}
+
+    good = rows["600001.SH"]
+    assert good["np_deduct_ratio"] == 0.957  # 11.0 / 11.5
+    assert good["quality_adj"] == 0.0
+    assert "np_deduct_low" not in str(good["flags"])
+
+    bad = rows["600005.SH"]
+    assert bad["np_deduct_ratio"] == 0.4  # 2.8 / 7.0
+    assert "np_deduct_low" in bad["flags"]
+    assert "roe_declining" in bad["flags"]  # 3.0 < mean(7.6) * 0.7
+    assert "profit_declining" in bad["flags"]  # (7/10)^(1/3)-1 ≈ -11.2%
+    assert "revenue_declining" in bad["flags"]  # (70/100)^(1/3)-1 ≈ -11.2%
+    assert bad["quality_adj"] == -5.0  # 扣非 -3 + ROE 下滑 -2
+
+
+def test_fundamentals_quality_and_cache(tmp_path: Path) -> None:
+    abstract = {
+        "600001": _abstract_frame(
+            {2021: 12.0, 2022: 12.5, 2023: 12.2, 2024: 12.8, 2025: 12.4},
+            {2021: 0.6, 2022: 0.65, 2023: 0.62, 2024: 0.68, 2025: 0.66},
+        ),
+        "600005": _abstract_frame(
+            {2021: 6.0, 2022: -3.0, 2023: 5.0, 2024: 4.0, 2025: 5.0},
+            {2021: 0.6, 2022: 0.5, 2023: 0.5, 2024: 0.5, 2025: 0.5},
+        ),
+    }
+    akshare = FakeAkshare(_build_fhps_frames(), abstract_frames=abstract)
+    service = DividendIncomeService(
+        provider=_build_provider(), akshare_fetcher=akshare, cache_dir=tmp_path / "cache", output_dir=tmp_path / "out"
+    )
+
+    summary = service.run(_options(tmp_path))
+    assert summary["status"] == "succeeded"
+
+    df = pd.read_csv(tmp_path / "out" / "2026-09-24" / "dividend_income_candidates.csv")
+    rows = {row["ts_code"]: row for row in df.to_dict("records")}
+
+    assert pytest.approx(rows["600001.SH"]["roe_5y_mean"], abs=0.01) == 12.38
+    # 600001：每股经营现金流 0.66 / 每股分红 0.55 = 1.2 → 现金流覆盖良好
+    assert pytest.approx(rows["600001.SH"]["cf_coverage"], abs=0.01) == 1.2
+    assert "cf_below_dividend" not in str(rows["600001.SH"]["flags"])
+
+    # 600005：ROE 出现负年 + 现金流覆盖 0.5/1.0 = 0.5
+    assert "roe_negative_year" in rows["600005.SH"]["flags"]
+    assert "roe_weak" in rows["600005.SH"]["flags"]
+    assert rows["600005.SH"]["cf_coverage"] == 0.5
+    assert "cf_below_dividend" in rows["600005.SH"]["flags"]
+
+    assert (tmp_path / "cache" / "fundamentals" / "600001.csv").exists()
+    assert {call[0] for call in akshare.abstract_calls} == {"600001", "600002", "600003", "600005"}
+
+    # 二次运行：已缓存代码不再拉取，仅无缓存的失败样本重试
+    second_akshare = FakeAkshare(_build_fhps_frames(), abstract_frames=abstract)
+    second_service = DividendIncomeService(
+        provider=_build_provider(),
+        akshare_fetcher=second_akshare,
+        cache_dir=tmp_path / "cache",
+        output_dir=tmp_path / "out",
+    )
+    second_service.run(_options(tmp_path))
+    assert {call[0] for call in second_akshare.abstract_calls} == {"600002", "600003"}
+
+
+def test_dividend_growth_and_shrinking_flags(tmp_path: Path) -> None:
+    def frame(rows):
+        return pd.DataFrame([_fhps_row(*row) for row in rows])
+
+    growth_plan = {"600001": [0.5, 0.55, 0.6, 0.65, 0.7, 0.75], "600005": [1.0, 1.0, 0.9, 0.8, 0.7, 0.6]}
+    frames: dict = {}
+    for year in range(2020, 2026):
+        rows = []
+        for code, name, eps in (("600001", "稳定红利A", 1.0), ("600005", "高派现E", 0.2)):
+            cash = growth_plan[code][year - 2020]
+            rows.append((code, name, cash * 10, eps))
+        frames[f"{year}1231"] = frame(rows)
+
+    akshare = FakeAkshare(frames)
+    service = DividendIncomeService(
+        provider=_build_provider(), akshare_fetcher=akshare, cache_dir=tmp_path / "cache", output_dir=tmp_path / "out"
+    )
+    service.run(_options(tmp_path))
+
+    df = pd.read_csv(tmp_path / "out" / "2026-09-24" / "dividend_income_candidates.csv")
+    rows = {row["ts_code"]: row for row in df.to_dict("records")}
+
+    grow = rows["600001.SH"]
+    assert pytest.approx(grow["dividend_growth_5y_pct"], abs=0.1) == 8.06  # (0.75/0.55)^(1/4)-1
+    assert grow["dividend_growth_adj"] == 2.0
+    assert "dividend_growing" in grow["flags"]
+
+    shrink = rows["600005.SH"]
+    assert shrink["dividend_growth_adj"] == -3.0
+    assert "dividend_shrinking" in shrink["flags"]
+
+
+def test_low_vol_and_drawdown_metrics(tmp_path: Path) -> None:
+    low_vol = [100.0 + (i % 2) * 0.40 for i in range(320)]  # 微幅震荡 → 低波动、浅回撤
+    high_vol = [100.0 + (i % 2) * 10.0 for i in range(320)]  # 大幅震荡 → 高波动
+    crashing = [150.0 - 50.0 * max(0, i - 69) / 250.0 for i in range(320)]  # 近一年单边下跌 → 深度回撤
+
+    fetcher = FakeKlineFetcher({"600001.SH": low_vol, "600002.SH": crashing, "600005.SH": high_vol})
+    service = DividendIncomeService(
+        provider=_build_provider(),
+        price_trend_fetcher=fetcher,
+        cache_dir=tmp_path / "cache",
+        output_dir=tmp_path / "out",
+        price_trend_interval_seconds=0.0,
+    )
+    service.run(_options(tmp_path))
+
+    df = pd.read_csv(tmp_path / "out" / "2026-09-24" / "dividend_income_candidates.csv")
+    rows = {row["ts_code"]: row for row in df.to_dict("records")}
+
+    assert rows["600001.SH"]["volatility_1y_pct"] < 8.0
+    assert rows["600001.SH"]["max_drawdown_1y_pct"] > -5.0
+    assert rows["600005.SH"]["volatility_1y_pct"] > 50.0
+    assert rows["600002.SH"]["max_drawdown_1y_pct"] <= -30.0
+    assert "deep_drawdown_1y" in rows["600002.SH"]["flags"]

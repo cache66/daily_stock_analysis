@@ -7,6 +7,7 @@
     python scripts/select_dividend_income_candidates.py --snapshot-date 2026-09-24
     python scripts/select_dividend_income_candidates.py --min-yield 5 --prefilter-limit 100
     python scripts/select_dividend_income_candidates.py --cache-only   # 只用本地缓存，不联网
+    python scripts/select_dividend_income_candidates.py --no-price-trend  # 关闭近一年涨跌校验
 
 产物：``data/dividend_income/<snapshot>/`` 下的 CSV / Markdown / summary.json。
 """
@@ -51,6 +52,20 @@ def _build_akshare_fetcher() -> object:
         return ak
     except Exception as exc:  # noqa: BLE001
         print(f"【提示】AKShare 不可用（{type(exc).__name__}），分红明细将走 Tushare 兑底。", file=sys.stderr)
+        return None
+
+
+def _build_price_trend_fetcher() -> object:
+    """近一年/近半年涨跌校验复用个人策略同一行情链路（DataFetcherManager，本地 data/cache/history 磁盘缓存优先、缺口自动补齐）。"""
+    try:
+        from src.services.kline_selector_service import KlineSelectorService
+
+        return KlineSelectorService.build_fast_a_share_manager()
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"【提示】行情链路不可用（{type(exc).__name__}），本轮跳过价格走势校验。",
+            file=sys.stderr,
+        )
         return None
 
 
@@ -101,6 +116,22 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="关闭央国企软偏好加分（默认开启：实控人为央企/地方国企加 3 分，仅影响排序权重）。",
     )
+    parser.add_argument(
+        "--no-price-trend",
+        action="store_true",
+        help=(
+            "关闭近一年/近半年涨跌校验（默认开启：复用个人策略行情链路与本地 "
+            "data/cache/history 缓存，下跌按档扣分并标注，降低“高息陷阱”误选）。"
+        ),
+    )
+    parser.add_argument(
+        "--no-fundamentals",
+        action="store_true",
+        help=(
+            "关闭业绩面数据（默认开启：AKShare 同花顺年度摘要，ROE/每股经营现金流，"
+            "缓存 90 天；用于盈利质量与分红现金流覆盖校验）。"
+        ),
+    )
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="产物根目录。")
     parser.add_argument("--cache-dir", default=str(DEFAULT_CACHE_DIR), help="缓存根目录。")
     parser.add_argument(
@@ -143,6 +174,8 @@ def main() -> int:
         cache_only=bool(args.cache_only),
         wait_minutes=float(args.wait_minutes),
         prefer_soe=not bool(args.no_prefer_soe),
+        price_trend=not bool(args.no_price_trend),
+        fundamentals=not bool(args.no_fundamentals),
         output_dir=Path(args.output_dir),
         cache_dir=Path(args.cache_dir),
     )
@@ -152,6 +185,7 @@ def main() -> int:
         cache_dir=Path(args.cache_dir),
         output_dir=Path(args.output_dir),
         rate_limit_per_minute=int(args.rate_limit),
+        price_trend_fetcher=_build_price_trend_fetcher() if not args.no_price_trend else None,
     )
     summary = service.run(options)
     print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))

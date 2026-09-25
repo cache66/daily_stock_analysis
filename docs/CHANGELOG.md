@@ -13,6 +13,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > Detailed internal change log and run evidence: [docs/AI_MODIFICATION_LOG.md](./AI_MODIFICATION_LOG.md)
 
 ## [Unreleased]
+- [文档] 新增 `docs/个人策略文档/吃股息策略-实施与验证总结.md`：汇总股息线 MVP→v3 因子、平台对照、点时回测（合格池等权年化 +9.7% 含息；评分排序/趋势/低波因子未验证出增量）与行业结构分析，含运行手册、未决问题与恢复工作入口。
+- [测试] 股息线门槛敏感性对比（2026-09-24 快照）：股息率门槛 4%→3.5% 后合格池 236→320 只、覆盖行业 66→74 个，新增宁沪高速/上港集团/长江电力/海康威视等 84 只（原 Top10 全部保留），说明放宽门槛为「加宽」而非「替换」。
+- [新功能] 新增 `scripts/backtest_dividend_income.py`：吃股息策略点时回测（本地行情缓存 + 分红缓存重建历史股息率与基本面截点，月度调仓含除权现金流，基准中证红利 000922；Baostock 回测专用深历史缓存 `data/cache/backtest_history/cn/`，`--no-deep-fetch` 可关）。
+- [测试] 股息线回测（2024-06~2026-06，24 期月度调仓）：合格池等权年化 +9.7%（含息）vs 中证红利价格口径 -1.0%/年；Top20 评分排序 RankIC -0.010、距 200 日线 IC -0.016、波动率 IC -0.006，评分排序与趋势/低波闸门均未在点时口径下验证出增量（此前「站上 200 日线更优」为后视偏差）。
+- [新功能] 股息线 v3 条件：趋势闸门（`ma200_ratio_pct` 收盘距 200 日线，站上 +4 记 `trend_above_ma200` / 跌破超 5% -6 记 `trend_breakdown`）、扣非质量（`np_deduct_ratio`<0.7 记 `np_deduct_low` -3）、ROE 趋势（最新年低于 5 年均值 70% 记 `roe_declining` -2）、PE 极端（≤0 或 >30 记 `pe_extreme` -2），以及营收/净利 3 年 CAGR 标注（`revenue_declining`/`profit_declining`）。
+- [新功能] 股息线新增低波动因子（近一年年化波动率 + 最大回撤，复用本地行情缓存零新增数据源）与分红成长性指标（近 5 年每股分红年化增速、下降年数，`dividend_growing`/`dividend_shrinking` 与 ±分调整）。
+- [新功能] 股息线新增业绩面质量块：AKShare 同花顺年度摘要（ROE 5 年均值/最低、每股经营现金流）缓存 90 天，计算现金流覆盖 `cf_coverage` 并标注 `roe_weak`/`roe_negative_year`/`ocfps_negative`/`cf_below_dividend`；`--no-fundamentals` 可关闭。
+- [改进] 股息线评分体系升级为 v2：权重改为股息率 ≤35 + 连续性 ≤20 + 盈利质量 ≤25 + 低波动 ≤12，配合央国企 +3、分红成长 ±、价格走势扣分等调整项（红利低波 × 红利质量混合配方）。
+- [新功能] 股息线新增近一年/近半年涨跌校验：复用个人策略同一行情链路（`DataFetcherManager`，本地 `data/cache/history` 磁盘缓存优先、缺口自动增量补齐并落盘），计算 `year_return_pct` / `half_year_return_pct` 原始涨跌，并以 `total_return_1y_pct ≈ 原始涨跌 + 股息率(TTM)` 近似含息净回报；净回报为负 / ≤-15% / ≤-30% 及近半年原始跌幅 ≥10% 时按档扣分并输出 `total_return_1y_negative` / `price_fall_1y` / `price_fall_severe_1y` / `price_fall_6m` 标签（指标按快照日缓存于 `data/cache/dividend_income/price_trends/`，失败样本下轮自动补拉，`--no-price-trend` 可关闭），用于规避「高息陷阱」：避免股价持续下跌把股息吃掉。
 - [新功能] 股息线新增央国企软偏好：输出 `owner_type`（央企/地方国企/民营/…）与 `soe_bonus` 加分（默认 +3，`--no-prefer-soe` 关闭）；stock_basic 缓存缺 `act_ent_type` 时自动尝试刷新一次，配额受限时降级为未知并继续。
 - [新功能] 新增 `scripts/refresh_local_daily_basic_snapshot.py`：Tushare 配额受限时用腾讯行情 + AKShare 分红缓存构造本地 `daily_basic` 代理快照（带 `snapshot_source=tencent_proxy` 来源标记，默认跳过已有文件），配合 `--cache-only` 可离线运行股息线；最近 5 个交易日实盘验证可用。
 - [新功能] 新增「股息线（防守线）」筛选 MVP：`src/services/dividend_income_service.py` + `scripts/select_dividend_income_candidates.py`，按 Tushare `daily_basic` 快照计算股息率（本地缓存优先且 30 天复用，配额受限时 `--wait-minutes` 自动等待恢复窗口），分红历史与每股收益改走 AKShare `stock_fhps_em` 按报告期批量（免费无配额，逐票 Tushare `dividend` 仅作兜底，无 `fina_indicator` 权限时 EPS 自动降级），输出高股息率 + 连续分红 + 现金流校验的候选池 CSV/Markdown。

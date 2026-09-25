@@ -33,6 +33,25 @@ describe('systemConfigApi', () => {
     });
   });
 
+  it('maps backend LiteLLM provider metadata into the Web config contract', async () => {
+    get.mockResolvedValueOnce({
+      data: {
+        config_version: 'v1',
+        mask_token: '******',
+        items: [],
+        llm_model_providers: ['openai', 'xai'],
+        updated_at: null,
+      },
+    });
+
+    const config = await systemConfigApi.getConfig(false);
+
+    expect(get).toHaveBeenCalledWith('/api/v1/system/config', {
+      params: { include_schema: false },
+    });
+    expect(config.llmModelProviders).toEqual(['openai', 'xai']);
+  });
+
   it('omits capability_checks from basic LLM channel test payloads', async () => {
     await systemConfigApi.testLLMChannel({
       name: 'openai',
@@ -61,6 +80,22 @@ describe('systemConfigApi', () => {
     expect(post).toHaveBeenCalledWith(
       '/api/v1/system/config/llm/test-channel',
       expect.objectContaining({ capability_checks: ['json', 'stream'] }),
+    );
+  });
+
+  it('sends the selected LLM API surface', async () => {
+    await systemConfigApi.testLLMChannel({
+      name: 'anspire',
+      protocol: 'openai',
+      apiSurface: 'responses',
+      baseUrl: 'https://open-gateway.anspire.cn/v6',
+      apiKey: 'sk-test',
+      models: ['gpt-5.6-sol'],
+    });
+
+    expect(post).toHaveBeenCalledWith(
+      '/api/v1/system/config/llm/test-channel',
+      expect.objectContaining({ api_surface: 'responses' }),
     );
   });
 
@@ -272,5 +307,61 @@ describe('systemConfigApi', () => {
     );
     expect(result.success).toBe(true);
     expect(result.status.healthStatus).toBe('passed');
+  });
+
+  it('loads the flat Agent backend compatibility status', async () => {
+    get.mockResolvedValueOnce({
+      data: {
+        backend: 'codex_app_server',
+        available: true,
+        experimental: true,
+        version: 'codex-cli test',
+        error_code: null,
+        message: null,
+      },
+    });
+
+    const result = await systemConfigApi.getAgentBackendStatus();
+
+    expect(get).toHaveBeenCalledWith('/api/v1/system/config/agent-backends/status');
+    expect(result).toEqual({
+      backend: 'codex_app_server',
+      available: true,
+      experimental: true,
+      version: 'codex-cli test',
+      errorCode: null,
+      message: null,
+    });
+  });
+
+  it('previews Agent backend status with unsaved draft items', async () => {
+    post.mockResolvedValueOnce({
+      data: {
+        backend: 'codex_app_server',
+        available: false,
+        experimental: true,
+        version: null,
+        error_code: 'unsupported_agent_arch',
+        message: 'single only',
+      },
+    });
+
+    const result = await systemConfigApi.previewAgentBackendStatus({
+      items: [
+        { key: 'AGENT_BACKEND', value: 'codex_app_server' },
+        { key: 'AGENT_ARCH', value: 'multi' },
+      ],
+      maskToken: '***',
+    });
+
+    expect(post).toHaveBeenCalledWith('/api/v1/system/config/agent-backends/status/preview', {
+      items: [
+        { key: 'AGENT_BACKEND', value: 'codex_app_server' },
+        { key: 'AGENT_ARCH', value: 'multi' },
+      ],
+      mask_token: '***',
+    });
+    expect(result.errorCode).toBe('unsupported_agent_arch');
+    expect(result.message).toBe('single only');
   });
 });

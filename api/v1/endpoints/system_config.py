@@ -10,6 +10,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from api.deps import get_runtime_scheduler_service, get_system_config_service
 from api.v1.schemas.common import ErrorResponse
 from api.v1.schemas.system_config import (
+    AgentBackendStatusPreviewRequest,
+    AgentBackendStatusResponse,
     DiscoverLLMChannelModelsRequest,
     DiscoverLLMChannelModelsResponse,
     ExportSystemConfigResponse,
@@ -61,7 +63,7 @@ def get_scheduler_status(
 @router.post(
     "/scheduler/run-now",
     summary="Run scheduled analysis now",
-    description="Trigger one scheduled analysis run in the current process.",
+    description="Trigger one isolated analysis run through the current runtime scheduler service.",
 )
 def run_scheduler_now(
     scheduler: RuntimeSchedulerService = Depends(get_runtime_scheduler_service),
@@ -315,6 +317,50 @@ def test_generation_backend(
         )
 
 
+@router.get(
+    "/config/agent-backends/status",
+    response_model=AgentBackendStatusResponse,
+    summary="Get Agent Chat backend status",
+    description="Read selected Agent Chat backend configuration and command capability without a model request.",
+)
+def get_agent_backend_status(
+    service: SystemConfigService = Depends(get_system_config_service),
+) -> AgentBackendStatusResponse:
+    try:
+        return AgentBackendStatusResponse.model_validate(service.get_agent_backend_status())
+    except Exception as exc:
+        logger.error("Failed to load Agent backend status: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "internal_error", "message": "Failed to load Agent backend status"},
+        )
+
+
+@router.post(
+    "/config/agent-backends/status/preview",
+    response_model=AgentBackendStatusResponse,
+    summary="Preview Agent Chat backend status",
+    description="Run a side-effect-free cheap check against unsaved Agent settings.",
+)
+def preview_agent_backend_status(
+    request: AgentBackendStatusPreviewRequest,
+    service: SystemConfigService = Depends(get_system_config_service),
+) -> AgentBackendStatusResponse:
+    try:
+        return AgentBackendStatusResponse.model_validate(
+            service.preview_agent_backend_status(
+                items=[item.model_dump() for item in request.items],
+                mask_token=request.mask_token,
+            )
+        )
+    except Exception as exc:
+        logger.error("Failed to preview Agent backend status: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "internal_error", "message": "Failed to preview Agent backend status"},
+        )
+
+
 @router.put(
     "/config",
     response_model=UpdateSystemConfigResponse,
@@ -536,6 +582,7 @@ def test_llm_channel(
         payload = service.test_llm_channel(
             name=request.name,
             protocol=request.protocol,
+            api_surface=request.api_surface,
             base_url=request.base_url,
             api_key=request.api_key,
             models=request.models,

@@ -147,6 +147,7 @@ def test_build_payload_maps_report_context_and_price_plan() -> None:
     assert payload["source_type"] == "analysis"
     assert payload["source_report_id"] == 88
     assert payload["trace_id"] == "trace-88"
+    assert payload["decision_profile"] == "balanced"
     assert payload["trigger_source"] == "api"
     assert payload["action"] == "buy"
     assert payload["confidence"] == 0.8
@@ -174,6 +175,52 @@ def test_build_payload_maps_report_context_and_price_plan() -> None:
         "minutes_to_close": 120,
     }
     assert payload["metadata"]["holding_state"] == "holding"
+
+
+def test_build_payload_adds_market_structure_metadata() -> None:
+    context_snapshot = {
+        "market_structure_context": {
+            "schema_version": "market-structure-v1",
+            "status": "partial",
+            "market": "cn",
+            "market_theme_context": {
+                "schema_version": "market-theme-v1",
+                "status": "partial",
+                "market": "cn",
+            },
+            "stock_market_position": {
+                "schema_version": "stock-market-position-v1",
+                "status": "partial",
+                "stock_code": "300024",
+                "market": "cn",
+                "primary_theme": {"name": "机器人概念"},
+                "theme_phase": "accelerating",
+                "stock_role": "follower",
+                "risk_tags": [{"code": "theme_data_partial", "message": "partial"}],
+            },
+        }
+    }
+
+    payload = build_decision_signal_payload_from_report(
+        _result(code="300024", name="机器人"),
+        context_snapshot=context_snapshot,
+        source_report_id=91,
+        trace_id="trace-market-structure",
+        query_source="api",
+        report_type="full",
+        profile_source=BUILD_PROFILE_SOURCE,
+    )
+
+    assert payload is not None
+    metadata = payload["metadata"]
+    assert metadata["market_structure_version"] == "market-structure-v1"
+    assert metadata["market_theme_version"] == "market-theme-v1"
+    assert metadata["stock_market_position_version"] == "stock-market-position-v1"
+    assert metadata["market_structure_status"] == "partial"
+    assert metadata["primary_theme"] == "机器人概念"
+    assert metadata["theme_phase"] == "accelerating"
+    assert metadata["stock_role"] == "follower"
+    assert metadata["market_structure_risk_tags"] == ["theme_data_partial"]
 
 
 def test_build_payload_uses_result_fallbacks_and_optional_catalysts() -> None:
@@ -577,3 +624,69 @@ def test_extract_and_persist_missing_price_plan_does_not_fabricate_fields(isolat
     assert item["entry_high"] is None
     assert item["stop_loss"] is None
     assert item["target_price"] is None
+
+
+def test_build_payload_index_uses_market_override_cn() -> None:
+    """V9 — an index target whose canonical code would resolve to None market
+    (e.g. CSI) must persist with market=cn via the market_override."""
+    result = _result(code="csi930955", name="红利低波100")
+
+    payload = build_decision_signal_payload_from_report(
+        result,
+        context_snapshot=None,
+        portfolio_context=None,
+        source_report_id=955,
+        trace_id="trace-index-csi",
+        query_source="cli",
+        report_type="full",
+        profile_source=BUILD_PROFILE_SOURCE,
+        market_override="cn",
+    )
+
+    assert payload is not None
+    assert payload["stock_code"] == "csi930955"
+    assert payload["stock_name"] == "红利低波100"
+    assert payload["market"] == "cn"
+    assert payload["source_type"] == "analysis"
+    assert payload["source_report_id"] == 955
+
+
+def test_extract_and_persist_index_signal_with_market_override(isolated_db) -> None:
+    """V9 — end-to-end: an index signal persists with market=cn, source_type,
+    and source_report_id linkage (not skipped because CSI market was None)."""
+    service = DecisionSignalService(db_manager=isolated_db)
+    result = _result(code="csi930955", name="红利低波100")
+
+    created = extract_and_persist_from_analysis_result(
+        result,
+        context_snapshot={"market_phase_summary": {"phase": "intraday"}},
+        portfolio_context={"quantity": 0},
+        source_report_id=955,
+        trace_id="trace-index-csi",
+        query_source="cli",
+        report_type="full",
+        profile_source="auto_default",
+        service=service,
+        market_override="cn",
+    )
+
+    assert created is not None
+    assert created["created"] is True
+    item = created["item"]
+    assert item["stock_code"] == "csi930955"
+    assert item["market"] == "cn"
+    assert item["source_type"] == "analysis"
+    assert item["source_report_id"] == 955
+
+    listed = service.list_signals(source_report_id=955)
+    assert listed["total"] == 1
+    assert listed["items"][0]["stock_code"] == "csi930955"
+    assert listed["items"][0]["market"] == "cn"
+
+    by_alias = service.list_signals(stock_code="930955.CSI", market="cn")
+    assert by_alias["total"] == 1
+    assert by_alias["items"][0]["stock_code"] == "csi930955"
+
+    latest = service.get_latest_active(stock_code="csi930955", market="cn")
+    assert latest["total"] == 1
+    assert latest["items"][0]["source_report_id"] == 955

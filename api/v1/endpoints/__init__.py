@@ -15,6 +15,7 @@ from api.v1.endpoints import (
     stocks,
     backtest,
     signals,
+    data,
     system_config,
     auth,
     agent,
@@ -22,7 +23,7 @@ from api.v1.endpoints import (
     portfolio,
     alerts,
     decision_signals,
-    alphasift,
+    screening,
 )
 __all__ = [
     "health",
@@ -31,6 +32,7 @@ __all__ = [
     "stocks",
     "backtest",
     "signals",
+    "data",
     "system_config",
     "auth",
     "agent",
@@ -38,5 +40,5 @@ __all__ = [
     "portfolio",
     "alerts",
     "decision_signals",
-    "alphasift",
+    "screening",
 ]

@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 - [新功能] 新增 `scripts/backfill_history_cache.py`：BaoStock 全市场回填本地日线缓存（`data/cache/history/`，默认 400 天；已覆盖窗口自动跳过、与旧缓存按日期合并取新），选股产线优先读本地、只增量补尾巴。
 - [测试] 回填脚本离线用例 5 项：名单过滤（剔除北交所/去重）、覆盖判定、合并去重、跳过/更新/失败计数、空结果计数。
+- [改进] 回填脚本支持多进程并行（`--workers N`，每进程独立 BaoStock 会话）与抓取失败重试（×3）、覆盖判定 3 天尾差容忍；6 进程实测全市场 5222 只 33 分钟跑完（串行预计 1.5~2h），回填+补漏两轮后 5116/5245 完整覆盖（缺口=97 新股 + 32 停牌）。
 - [文档] 修复 `docs/CHANGELOG.md` [Unreleased] 段内遗留的 `### 新功能` 分类标题（上游合并带入，违反扁平格式）并扁平化，格式校验测试恢复通过。
 - [改进] 个人策略矩阵按市场环境（`config/local_strategy_profile.json` 的 `market_regime`，默认 defensive）收敛：默认只展示进攻线（百日新高/日线慢涨/长平台释放/趋势观察），业绩备用线在 balanced/offensive 恢复；8 条冻结策略移出页面与命中（登记见 `docs/个人策略文档/策略与脚本冻结登记.md`）。
 - [新功能] 新增短线观察（图形 ∩ 催化）：`scripts/run_short_term_watch.py` + `src/services/short_term_watch_service.py`，催化来源=内置产业催化注册表 + `config/catalyst_watchlist.json` 人工清单，产物写入 `data/short_term_watch/<日期>/`。

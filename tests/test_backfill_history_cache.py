@@ -74,6 +74,16 @@ def test_needs_backfill_detects_missing_window() -> None:
     assert backfill.needs_backfill(missing_head, start, end) is True
 
 
+def test_needs_backfill_tolerates_small_tail_lag() -> None:
+    start = date(2025, 1, 1)
+    end = date(2026, 9, 26)
+    small_lag = _frame(["2024-12-01", "2026-09-24"], [10.0, 12.0])
+    assert backfill.needs_backfill(small_lag, start, end) is False
+
+    stale_tail = _frame(["2024-12-01", "2026-08-01"], [10.0, 12.0])
+    assert backfill.needs_backfill(stale_tail, start, end) is True
+
+
 def test_merge_history_frames_prefers_new_rows() -> None:
     cached = _frame(["2026-09-01", "2026-09-02"], [10.0, 10.5])
     fetched = _frame(["2026-09-02", "2026-09-03"], [99.0, 11.0])

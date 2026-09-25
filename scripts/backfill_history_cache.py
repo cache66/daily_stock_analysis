@@ -19,11 +19,12 @@ from __future__ import annotations
 import argparse
 import csv
 import logging
+import multiprocessing
 import sys
 import time
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
@@ -79,13 +80,22 @@ def _frame_bounds(frame: Optional[pd.DataFrame]) -> Tuple[Optional[date], Option
     return dates.min().date(), dates.max().date()
 
 
-def needs_backfill(cached_frame: Optional[pd.DataFrame], start: date, end: date) -> bool:
-    """Return True when the cached frame misses part of the target window."""
+def needs_backfill(
+    cached_frame: Optional[pd.DataFrame],
+    start: date,
+    end: date,
+    max_lag_days: int = 3,
+) -> bool:
+    """Return True when the cached frame misses part of the target window.
+
+    尾声容忍：允许缓存末日落后 end 最多 ``max_lag_days`` 天（覆盖非交易/增量场景，
+    避免同日重跑时全量重抓）。
+    """
 
     first, last = _frame_bounds(cached_frame)
     if first is None or last is None:
         return True
-    return first > start or last < end
+    return first > start or last < end - timedelta(days=max(0, int(max_lag_days)))
 
 
 def merge_history_frames(cached_frame: Optional[pd.DataFrame], fetched_frame: Optional[pd.DataFrame]) -> pd.DataFrame:
@@ -148,22 +158,104 @@ def run_backfill(
     return stats
 
 
+_WORKER_STATE: Dict[str, Any] = {}
+
+
+def _worker_init() -> None:
+    """Per-process init: one manager + one BaoStock fetcher per worker."""
+
+    _WORKER_STATE["manager"] = DataFetcherManager()
+    _WORKER_STATE["fetch"] = build_baostock_fetch_fn()
+
+
+def _backfill_chunk(task: Tuple[List[str], int, bool, str]) -> Dict[str, int]:
+    codes, days, force, end_iso = task
+    manager: DataFetcherManager = _WORKER_STATE["manager"]
+    fetch_fn: FetchFn = _WORKER_STATE["fetch"]
+    end = date.fromisoformat(end_iso)
+    start = end - timedelta(days=max(1, int(days)))
+    stats = {"total": len(codes), "skipped": 0, "updated": 0, "empty": 0, "failed": 0}
+    for code in codes:
+        try:
+            cached_frame, _metadata = manager._read_history_cache(code)
+            if not force and not needs_backfill(cached_frame, start, end):
+                stats["skipped"] += 1
+                continue
+            fetched = fetch_fn(code, start, end)
+            if fetched is None or fetched.empty:
+                stats["empty"] += 1
+                continue
+            merged = merge_history_frames(cached_frame, fetched)
+            manager._write_history_cache(code, merged, "baostock_backfill")
+            stats["updated"] += 1
+        except Exception as exc:  # noqa: BLE001 - 单票失败继续
+            stats["failed"] += 1
+            logger.warning("backfill failed for %s: %s", code, exc)
+    return stats
+
+
+def run_backfill_parallel(
+    codes: Sequence[str],
+    *,
+    workers: int,
+    days: int = DEFAULT_DAYS,
+    force: bool = False,
+    progress_every: int = 200,
+    chunk_size: int = 20,
+    today: Optional[date] = None,
+) -> Dict[str, int]:
+    """Multi-process warm-up: each worker owns its BaoStock session (threads are unsafe)."""
+
+    end = today or date.today()
+    code_list = list(codes)
+    chunks = [code_list[i:i + chunk_size] for i in range(0, len(code_list), chunk_size)]
+    totals = {"total": len(code_list), "skipped": 0, "updated": 0, "empty": 0, "failed": 0}
+    processed = 0
+    last_report = 0
+    tasks = [(chunk, days, force, end.isoformat()) for chunk in chunks]
+    ctx = multiprocessing.get_context("fork")
+    with ctx.Pool(processes=max(2, int(workers)), initializer=_worker_init) as pool:
+        for stats in pool.imap_unordered(_backfill_chunk, tasks):
+            processed += stats["total"]
+            for key in ("skipped", "updated", "empty", "failed"):
+                totals[key] += stats[key]
+            if progress_every and processed - last_report >= int(progress_every):
+                last_report = processed
+                logger.info(
+                    "progress %s/%s updated=%s skipped=%s empty=%s failed=%s",
+                    processed,
+                    len(code_list),
+                    totals["updated"],
+                    totals["skipped"],
+                    totals["empty"],
+                    totals["failed"],
+                )
+    return totals
+
+
 def build_baostock_fetch_fn(fetcher: Optional[BaostockFetcher] = None) -> FetchFn:
     """Wrap a BaoStock fetcher into the ``(code, start, end) -> frame|None`` callable."""
 
     resolved = fetcher or BaostockFetcher()
 
     def _fetch(code: str, start: date, end: date) -> Optional[pd.DataFrame]:
-        try:
-            frame = resolved.get_daily_data(
-                stock_code=code,
-                start_date=start.isoformat(),
-                end_date=end.isoformat(),
-                days=0,
-            )
-        except DataFetchError:
-            return None
-        return frame
+        last_error: Optional[Exception] = None
+        for _attempt in range(3):
+            try:
+                frame = resolved.get_daily_data(
+                    stock_code=code,
+                    start_date=start.isoformat(),
+                    end_date=end.isoformat(),
+                    days=0,
+                )
+            except DataFetchError as exc:  # 并发下偶发会话冲突，重试即可
+                last_error = exc
+                time.sleep(0.3)
+                continue
+            return frame
+        if last_error is not None:
+            logger.debug("fetch failed after retries for %s: %s", code, last_error)
+        return None
 
     return _fetch
 
@@ -176,6 +268,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--universe-file", default=str(DEFAULT_UNIVERSE_FILE), help="全市场名单文件。")
     parser.add_argument("--force", action="store_true", help="已覆盖的代码也重抓。")
     parser.add_argument("--sleep", type=float, default=DEFAULT_SLEEP_SECONDS, help="每只间隔秒数，默认 0.05。")
+    parser.add_argument("--workers", type=int, default=1, help="并行进程数（>=2 启用多进程分片，默认 1 串行）。")
     parser.add_argument("--progress-every", type=int, default=200, help="进度打印间隔，默认 200。")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return parser.parse_args(argv)
@@ -198,16 +291,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         codes = load_universe_codes(universe_path, limit=args.limit or None)
     logger.info("回填目标: %s 只（窗口 %s 天，force=%s）", len(codes), args.days, args.force)
 
-    manager = DataFetcherManager()
-    stats = run_backfill(
-        codes,
-        fetch_fn=build_baostock_fetch_fn(),
-        manager=manager,
-        days=args.days,
-        force=args.force,
-        sleep_seconds=args.sleep,
-        progress_every=args.progress_every,
-    )
+    if int(args.workers) > 1:
+        stats = run_backfill_parallel(
+            codes,
+            workers=args.workers,
+            days=args.days,
+            force=args.force,
+            progress_every=args.progress_every,
+        )
+    else:
+        manager = DataFetcherManager()
+        stats = run_backfill(
+            codes,
+            fetch_fn=build_baostock_fetch_fn(),
+            manager=manager,
+            days=args.days,
+            force=args.force,
+            sleep_seconds=args.sleep,
+            progress_every=args.progress_every,
+        )
     logger.info("回填完成: %s", stats)
     print(stats)
     return 0

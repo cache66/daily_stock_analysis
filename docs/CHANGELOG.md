@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > Detailed internal change log and run evidence: [docs/AI_MODIFICATION_LOG.md](./AI_MODIFICATION_LOG.md)
 
 ## [Unreleased]
+- [修复] 同步上游 main（v3.32.0 线，127 个提交）：解决 14 处合并冲突，并恢复此前历史合并丢失的本地逻辑（分析器空响应回退分支、大盘复盘模板涨停块、AkShare 板块排行磁盘缓存与常量）；聚焦测试 636 项 623 通过，剩余为本地数据层定制与上游新增指数路由测试的已知差异（待专项对齐）。
 - [文档] 新增 `docs/个人策略文档/吃股息策略-实施与验证总结.md`：汇总股息线 MVP→v3 因子、平台对照、点时回测（合格池等权年化 +9.7% 含息；评分排序/趋势/低波因子未验证出增量）与行业结构分析，含运行手册、未决问题与恢复工作入口。
 - [测试] 股息线门槛敏感性对比（2026-09-24 快照）：股息率门槛 4%→3.5% 后合格池 236→320 只、覆盖行业 66→74 个，新增宁沪高速/上港集团/长江电力/海康威视等 84 只（原 Top10 全部保留），说明放宽门槛为「加宽」而非「替换」。
 - [新功能] 新增 `scripts/backtest_dividend_income.py`：吃股息策略点时回测（本地行情缓存 + 分红缓存重建历史股息率与基本面截点，月度调仓含除权现金流，基准中证红利 000922；Baostock 回测专用深历史缓存 `data/cache/backtest_history/cn/`，`--no-deep-fetch` 可关）。

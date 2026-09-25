@@ -3480,7 +3480,6 @@ class GeminiAnalyzer:
                         )
                         time.sleep(min(0.5 * attempt, 1.5))
                         continue
-                    raise empty_error
 
                 if _stream_text is not None:
                     last_response_text = _stream_text

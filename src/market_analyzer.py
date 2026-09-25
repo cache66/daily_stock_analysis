@@ -107,6 +107,7 @@ class MarketOverview:
     bottom_sectors: List[Dict] = field(default_factory=list)  # 跌幅前5板块
     top_concepts: List[Dict] = field(default_factory=list)    # 涨幅前5概念
     bottom_concepts: List[Dict] = field(default_factory=list) # 跌幅前5概念
+    limit_up_review_rows: List[Dict] = field(default_factory=list)  # 涨停复盘结构化行（本地扩展）
 
 
 @dataclass
@@ -1144,8 +1145,12 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         stats_block = self._build_stats_block(overview)
         indices_block = self._build_indices_block(overview)
         sector_block = self._build_sector_block(overview)
-        limit_up_review_block = self.limit_up_review_service.build_markdown_block(
-            overview.limit_up_review_rows
+        limit_up_review_service = getattr(self, "limit_up_review_service", None)
+        limit_up_review_rows = getattr(overview, "limit_up_review_rows", None)
+        limit_up_review_block = (
+            limit_up_review_service.build_markdown_block(limit_up_review_rows)
+            if limit_up_review_rows and limit_up_review_service is not None
+            else ""
         )
         patterns = (
             _ENGLISH_SECTION_PATTERNS
@@ -1904,6 +1909,13 @@ Output the report content directly, no extra commentary.
     
     def _generate_template_review(self, overview: MarketOverview, news: List) -> str:
         """使用模板生成复盘报告（无大模型时的备选方案）"""
+        limit_up_review_service = getattr(self, "limit_up_review_service", None)
+        limit_up_review_rows = getattr(overview, "limit_up_review_rows", None)
+        limit_up_review_block = (
+            limit_up_review_service.build_markdown_block(limit_up_review_rows)
+            if limit_up_review_rows and limit_up_review_service is not None
+            else ""
+        )
         template_language = self._get_template_review_language()
         mood_code = self.profile.mood_index_code
         # 根据 mood_index_code 查找对应指数

@@ -71,6 +71,8 @@ _AKSHARE_TIMEOUT_PROCESS_JOIN_GRACE = 1.0
 _AKSHARE_TIMEOUT_PROCESS_START_METHOD = "spawn"
 DEFAULT_SECTOR_RANK_EM_BACKOFF_SECONDS = int(os.getenv("AKSHARE_SECTOR_RANK_EM_BACKOFF_SECONDS", "1200"))
 DEFAULT_STOCK_HISTORY_EM_BACKOFF_SECONDS = int(os.getenv("AKSHARE_STOCK_HISTORY_EM_BACKOFF_SECONDS", "120"))
+DEFAULT_SECTOR_RANKINGS_CACHE_TTL_SECONDS = int(os.getenv("AKSHARE_SECTOR_RANKINGS_CACHE_TTL_SECONDS", "3600"))
+DEFAULT_SECTOR_RANKINGS_CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "cache" / "sector_rankings"
 DEFAULT_STOCK_HISTORY_SOURCE_PRIORITY: Tuple[str, ...] = ("em", "sina", "tencent")
 
 
@@ -454,6 +456,8 @@ class AkshareFetcher(BaseFetcher):
         self._market_stats_call_timeout = _AKSHARE_MARKET_STATS_CALL_TIMEOUT
         self._sector_rank_em_backoff_seconds = max(0, int(DEFAULT_SECTOR_RANK_EM_BACKOFF_SECONDS))
         self._sector_rank_em_backoff_until_ts: float = 0.0
+        self._sector_rankings_cache_dir: Path = DEFAULT_SECTOR_RANKINGS_CACHE_DIR
+        self._sector_rankings_cache_ttl_seconds: int = max(0, int(DEFAULT_SECTOR_RANKINGS_CACHE_TTL_SECONDS))
         self._stock_history_em_backoff_seconds = max(0, int(DEFAULT_STOCK_HISTORY_EM_BACKOFF_SECONDS))
         self._stock_history_em_backoff_until_ts: float = 0.0
         # 东财补丁开启才执行打补丁操作

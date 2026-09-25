@@ -40,7 +40,10 @@ CATALYST_TEXT_FIELDS = (
     "theme_label",
     "mainline_judgement",
     "cause_tags",
+    "cause_tags_zh",
+    "cycle_catalyst_label",
     "cycle_catalyst_reason",
+    "display_reason_summary",
 )
 
 CSV_COLUMNS = (
@@ -122,11 +125,44 @@ def load_catalyst_watchlist(
     return entries
 
 
+def _is_ascii_alnum(char: str) -> bool:
+    return bool(char) and char.isascii() and char.isalnum()
+
+
+def keyword_hits_text(keyword: str, text: str) -> bool:
+    """Case-insensitive keyword match with ASCII token boundaries.
+
+    Plain substring matching made short ASCII keywords like ``ai`` match
+    inside longer words (e.g. ``daily=steady_rise``). ASCII keywords now
+    require token boundaries, while CJK keywords keep substring matching.
+    """
+
+    needle = str(keyword or "").strip().lower()
+    haystack = str(text or "").lower()
+    if not needle or not haystack:
+        return False
+    start = 0
+    while True:
+        index = haystack.find(needle, start)
+        if index < 0:
+            return False
+        before_ok = True
+        after_ok = True
+        if _is_ascii_alnum(needle[0]):
+            before_ok = index == 0 or not _is_ascii_alnum(haystack[index - 1])
+        if _is_ascii_alnum(needle[-1]):
+            end = index + len(needle)
+            after_ok = end >= len(haystack) or not _is_ascii_alnum(haystack[end])
+        if before_ok and after_ok:
+            return True
+        start = index + 1
+
+
 def _match_watchlist_entry(item: Dict[str, Any], entry: Dict[str, Any]) -> bool:
     text = " ".join(_text(item.get(field)) for field in CATALYST_TEXT_FIELDS).lower()
     if not text:
         return False
-    return any(str(keyword) in text for keyword in entry.get("keywords") or [])
+    return any(keyword_hits_text(str(keyword), text) for keyword in entry.get("keywords") or [])
 
 
 def _graph_quality_score(item: Dict[str, Any]) -> float:

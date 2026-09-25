@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [新功能] 新增短线观察（图形 ∩ 催化）：`scripts/run_short_term_watch.py` + `src/services/short_term_watch_service.py`，催化来源=内置产业催化注册表 + `config/catalyst_watchlist.json` 人工清单，产物写入 `data/short_term_watch/<日期>/`。
 - [文档] 新增个人策略配套文档：`策略与脚本冻结登记.md`、`数据与验证统一约定.md`、`开源工具融合规划（investment_data-qlib-TradingAgents）.md`。
 - [文档] 《个人策略修改记录》滚动归档：2026-07 之前 214 段移入 `docs/个人策略文档/归档/`，主文件 901KB→102KB（保留近期记录）。
+- [修复] 读取层透传产业催化字段：`fast_review_focus_service` 补映射 `cycle_catalyst_type/label/reason`（此前被丢弃导致「图形∩催化」恒为空），API schema 同步补齐可选字段；短线圈催化命中字段清单同步修正。
+- [新功能] 新增「题材/催化聚合」日报与跨日跟踪：`scripts/run_catalyst_digest.py` + `src/services/catalyst_digest_service.py`（聚合当日候选的题材/催化分布、连续上榜与 Δ，产物 `data/catalyst_digest/<日期>/`）。
+- [新功能] 新增 `scripts/sync_investment_data.py`：investment_data 日更数据下载/校验/解压（P0 数据底座，`--check` 先看体积）。
+- [改进] 选股链路 Tushare 限速改为可配置：`TUSHARE_SELECTOR_RATE_LIMIT_PER_MINUTE`（默认 35 不变，账号档位允许可升 45），`kline_selector_service` 不再硬编码；本地 `.env` 设为 45 提速；相关测试同步适配（默认/覆盖两用例），并修正一处依赖退市代码导致的环境敏感用例。
+- [改进] 个人策略 profile 开启百日新高归因（`hundred_day_skip_cause_analysis=false`）：候选带 `cause_tags/theme_label`，供短线观察与催化聚合使用（今日补全实跑 16/16 有 cause_tags）。
+- [修复] 短线观察清单关键词匹配改为 ASCII 词边界（避免 `ai` 误命中 `daily=steady_rise` 等英文串；CJK 关键词仍按子串匹配），并新增回归测试。
+- [文档] 新增《进攻线每日运行手册》：全市场产线 → 短线观察 → 催化聚合 → 框架 LLM 分析 的四步日循环。
 - [修复] 同步上游 main（v3.32.0 线，127 个提交）：解决 14 处合并冲突，并恢复此前历史合并丢失的本地逻辑（分析器空响应回退分支、大盘复盘模板涨停块、AkShare 板块排行磁盘缓存与常量）；聚焦测试 636 项 623 通过，剩余为本地数据层定制与上游新增指数路由测试的已知差异（待专项对齐）。
 - [文档] 新增 `docs/个人策略文档/吃股息策略-实施与验证总结.md`：汇总股息线 MVP→v3 因子、平台对照、点时回测（合格池等权年化 +9.7% 含息；评分排序/趋势/低波因子未验证出增量）与行业结构分析，含运行手册、未决问题与恢复工作入口。
 - [测试] 股息线门槛敏感性对比（2026-09-24 快照）：股息率门槛 4%→3.5% 后合格池 236→320 只、覆盖行业 66→74 个，新增宁沪高速/上港集团/长江电力/海康威视等 84 只（原 Top10 全部保留），说明放宽门槛为「加宽」而非「替换」。

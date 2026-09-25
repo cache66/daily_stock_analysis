@@ -1,6 +1,6 @@
 {
+  "market_regime": "defensive",
   "defaults": {
-    "market_regime": "defensive",
     "include_signals": [
       "earnings",
       "hundred_day_high",
@@ -27,7 +27,7 @@
     "earnings_recent_event_scope": "latest_report_period",
     "earnings_recent_event_max_age_days": 7,
     "hundred_day_signal_type": "hundred_day_high",
-    "hundred_day_skip_cause_analysis": true,
+    "hundred_day_skip_cause_analysis": false,
     "trend_signal_type": "trend_leader_unified",
     "trend_disable_second_stage_enrichment": true,
     "trend_fallback_top_n": 20,

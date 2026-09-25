@@ -18,6 +18,7 @@
 8. [`策略与脚本冻结登记.md`](./策略与脚本冻结登记.md)
 9. [`数据与验证统一约定.md`](./数据与验证统一约定.md)
 10. [`开源工具融合规划（investment_data-qlib-TradingAgents）.md`](./开源工具融合规划（investment_data-qlib-TradingAgents）.md)
+11. [`进攻线每日运行手册.md`](./进攻线每日运行手册.md)
 
 补充说明：
 

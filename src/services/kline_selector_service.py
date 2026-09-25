@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import time
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1151,8 +1152,19 @@ class KlineSelectorService:
         try:
             # Keep a little headroom below the account-side 50/min limit because
             # the same process may also use Tushare for trade calendar, realtime,
-            # or board helpers during the same replay.
-            tushare_fetcher = TushareFetcher(rate_limit_per_minute=35)
+            # or board helpers during the same replay. Override via
+            # TUSHARE_SELECTOR_RATE_LIMIT_PER_MINUTE when the account tier allows.
+            selector_rate_limit = 35
+            raw_selector_rate_limit = os.getenv("TUSHARE_SELECTOR_RATE_LIMIT_PER_MINUTE", "").strip()
+            if raw_selector_rate_limit:
+                try:
+                    selector_rate_limit = max(1, int(raw_selector_rate_limit))
+                except ValueError:
+                    logger.warning(
+                        "invalid TUSHARE_SELECTOR_RATE_LIMIT_PER_MINUTE=%s, fallback to 35",
+                        raw_selector_rate_limit,
+                    )
+            tushare_fetcher = TushareFetcher(rate_limit_per_minute=selector_rate_limit)
             if tushare_fetcher.is_available():
                 tushare_fetcher.priority = -2
                 fetchers.append(tushare_fetcher)

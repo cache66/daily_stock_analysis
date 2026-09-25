@@ -5,6 +5,7 @@ Tests for the isolated K-line selector service.
 
 import math
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -144,7 +145,11 @@ class TestKlineSelectorService(unittest.TestCase):
             def is_available(self) -> bool:
                 return True
 
-        with patch("data_provider.akshare_fetcher.AkshareFetcher", _FakeAkshareFetcher), patch(
+        with patch.dict(
+            os.environ,
+            {"TUSHARE_SELECTOR_RATE_LIMIT_PER_MINUTE": "35"},
+            clear=False,
+        ), patch("data_provider.akshare_fetcher.AkshareFetcher", _FakeAkshareFetcher), patch(
             "data_provider.tushare_fetcher.TushareFetcher",
             _FakeTushareFetcher,
         ):
@@ -158,6 +163,40 @@ class TestKlineSelectorService(unittest.TestCase):
         self.assertFalse(getattr(manager, "_skip_tushare_history_fallback_for_fast_scan", True))
         self.assertFalse(getattr(manager, "_skip_redundant_history_fallback_for_fast_scan", True))
         self.assertEqual(getattr(tushare_fetcher, "rate_limit_per_minute", None), 35)
+
+    def test_build_fast_a_share_manager_respects_rate_limit_override(self):
+        class _FakeAkshareFetcher:
+            def __init__(self, *args, **kwargs) -> None:
+                self.name = "AkshareFetcher"
+                self.priority = 1
+
+        class _FakeTushareFetcher:
+            name = "TushareFetcher"
+            priority = -1
+
+            def __init__(self, rate_limit_per_minute=None) -> None:
+                self.priority = -1
+                self.rate_limit_per_minute = rate_limit_per_minute
+
+            def is_available(self) -> bool:
+                return True
+
+        with patch.dict(
+            os.environ,
+            {"TUSHARE_SELECTOR_RATE_LIMIT_PER_MINUTE": "50"},
+            clear=False,
+        ), patch("data_provider.akshare_fetcher.AkshareFetcher", _FakeAkshareFetcher), patch(
+            "data_provider.tushare_fetcher.TushareFetcher",
+            _FakeTushareFetcher,
+        ):
+            manager = KlineSelectorService.build_fast_a_share_manager()
+
+        tushare_fetcher = next(
+            fetcher
+            for fetcher in manager._get_fetchers_snapshot()
+            if getattr(fetcher, "name", "") == "TushareFetcher"
+        )
+        self.assertEqual(getattr(tushare_fetcher, "rate_limit_per_minute", None), 50)
 
     def test_get_a_share_universe_filters_bse_and_duplicates(self):
         service = KlineSelectorService(
@@ -409,8 +448,8 @@ class TestKlineSelectorService(unittest.TestCase):
         service = KlineSelectorService(manager=manager)
         universe = pd.DataFrame(
             [
-                {"code": "600001", "name": "alpha", "pct_change": 1.2, "turnover_rate": 1.1},
-                {"code": "600002", "name": "beta", "pct_change": None, "turnover_rate": 1.3},
+                {"code": "600519", "name": "alpha", "pct_change": 1.2, "turnover_rate": 1.1},
+                {"code": "000001", "name": "beta", "pct_change": None, "turnover_rate": 1.3},
             ]
         )
 
@@ -425,7 +464,10 @@ class TestKlineSelectorService(unittest.TestCase):
         self.assertEqual(manager.requested_codes, [])
         self.assertEqual(result.prefilter_stats["quote_requested_rows"], 0)
         self.assertEqual(result.prefilter_stats["quote_hydrated_rows"], 0)
-        self.assertEqual(result.prepared_universe["code"].tolist(), ["600001", "600002"])
+        self.assertEqual(
+            sorted(result.prepared_universe["code"].tolist()),
+            ["000001", "600519"],
+        )
 
     def test_get_spot_enriched_a_share_universe_retries_once_before_success(self):
         service = KlineSelectorService()

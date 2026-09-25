@@ -10,6 +10,7 @@ from pathlib import Path
 from src.services.short_term_watch_service import (
     ShortTermWatchService,
     build_short_term_watch,
+    keyword_hits_text,
     load_catalyst_watchlist,
     render_short_term_watch_markdown,
     write_short_term_watch_artifacts,
@@ -106,6 +107,57 @@ def test_load_catalyst_watchlist_skips_expired_and_invalid_entries(tmp_path) -> 
 
     assert [entry["label"] for entry in entries] == ["有效条目"]
     assert entries[0]["weight"] == 1.5
+
+
+def test_build_short_term_watch_matches_theme_and_cause_tags() -> None:
+    items = [
+        {
+            "code": "002463",
+            "name": "沪电股份",
+            "matched_strategy_ids": ["hundred_day_high"],
+            "priority_score": 88.0,
+            "theme_label": "AI算力链映射",
+            "cause_tags_zh": "业绩/涨价",
+        }
+    ]
+    watchlist = [{"label": "AI算力", "keywords": ["ai算力"], "weight": 1.2}]
+
+    result = build_short_term_watch(items, watchlist=watchlist, top_n=10)
+
+    assert result["graph_catalyst_total"] == 1
+    assert "清单:AI算力" in result["graph_catalyst"][0]["catalysts"]
+
+
+def test_keyword_hits_text_ascii_boundaries() -> None:
+    # "ai" 不应命中 daily=steady_rise 这类英文长词
+    assert keyword_hits_text("ai", "daily=steady_rise/advance=21.0%; long_base") is False
+    assert keyword_hits_text("ai", "AI算力链映射") is True
+    assert keyword_hits_text("ai", "ai 服务器") is True
+    assert keyword_hits_text("ai", "xai") is False
+    # 中文关键词仍按子串匹配
+    assert keyword_hits_text("算力", "AI算力链景气") is True
+    assert keyword_hits_text("存储", "存储涨价/复苏") is True
+    # 混合关键词：ASCII 开头需左边界
+    assert keyword_hits_text("ai算力", "daily算力") is False
+    assert keyword_hits_text("ai算力", "AI算力链景气") is True
+
+
+def test_watchlist_does_not_match_reason_summary_english_tokens() -> None:
+    items = [
+        {
+            "code": "002246",
+            "name": "北化股份",
+            "matched_strategy_ids": ["daily_slow_rise"],
+            "priority_score": 68.6,
+            "display_reason_summary": "daily=steady_rise/advance=21.0%/10d_dd=6.4%",
+        }
+    ]
+    watchlist = [{"label": "AI算力", "keywords": ["ai", "算力"], "weight": 1.2}]
+
+    result = build_short_term_watch(items, watchlist=watchlist, top_n=10)
+
+    assert result["graph_catalyst_total"] == 0
+    assert result["graph_only_total"] == 1
 
 
 def test_load_catalyst_watchlist_tolerates_missing_file(tmp_path) -> None:

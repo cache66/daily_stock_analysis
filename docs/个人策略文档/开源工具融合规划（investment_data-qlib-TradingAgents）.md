@@ -19,7 +19,7 @@
 **落地方式（建议）**
 - 目录：`data/external/investment_data/`（`/data/` 已在 .gitignore，不入库）；
 - 下载：`wget https://github.com/chenditc/investment_data/releases/latest/download/qlib_bin.tar.gz`（同一 release 取 `qlib_bin.manifest.json` 校验）；
-- 后续可加薄脚本 `scripts/sync_investment_data.py`（下载 + 校验 manifest + 解压，默认不覆盖已有数据）；
+- 已提供薄脚本 `scripts/sync_investment_data.py`：`--check` 先看 release 信息/体积，`--download` 下载 + 校验（清单/sha256）+ 解压，默认不覆盖已有数据；⚠️ 需要能直连 GitHub Release（2026-09-25 本机直连超时，可挂代理/镜像或手动下载归档后 `--extract-only`）；
 - 使用：回测脚本（如 `backtest_dividend_income.py`）改为优先读本地数据集，Baostock 仅作缺口兜底。
 
 **验收**：抽 3 只股息池股票（如 宁沪高速 / 长江电力 / 紫金矿业）的 2024–2026 行情与现有缓存对比，复权口径差异 < 0.5%。

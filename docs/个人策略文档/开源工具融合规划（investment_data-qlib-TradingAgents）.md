@@ -26,6 +26,10 @@
 
 **风险**：多源合并口径（wind/caihui/tushare/akshare/baostock）；个别历史字段需抽查；**不要**把它当实时源使用。
 
+**状态（2026-09-25）**：
+- GitHub Release 本机直连超时 → 先落地**等价路径**：`scripts/backfill_history_cache.py` 用 BaoStock 全市场回填共享缓存 `data/cache/history/`（400 天、无配额、合并去重），全市场回填已启动；选股产线优先读本地；investment_data 下载脚本（`sync_investment_data.py`）已备好，等网络可达或手动归档后再切换/对拍；
+- 网络恢复后按原验收执行：抽 3 只股息池股票对比 2024–2026 行情，复权口径差异 < 0.5% 再替换为首选数据源。
+
 ## 2. qlib（P1：因子检验，依赖 P0）
 
 **Phase 1 打通（半天~1 天）**

@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > Detailed internal change log and run evidence: [docs/AI_MODIFICATION_LOG.md](./AI_MODIFICATION_LOG.md)
 
 ## [Unreleased]
+- [新功能] 新增 `scripts/backfill_history_cache.py`：BaoStock 全市场回填本地日线缓存（`data/cache/history/`，默认 400 天；已覆盖窗口自动跳过、与旧缓存按日期合并取新），选股产线优先读本地、只增量补尾巴。
+- [测试] 回填脚本离线用例 5 项：名单过滤（剔除北交所/去重）、覆盖判定、合并去重、跳过/更新/失败计数、空结果计数。
+- [文档] 修复 `docs/CHANGELOG.md` [Unreleased] 段内遗留的 `### 新功能` 分类标题（上游合并带入，违反扁平格式）并扁平化，格式校验测试恢复通过。
 - [改进] 个人策略矩阵按市场环境（`config/local_strategy_profile.json` 的 `market_regime`，默认 defensive）收敛：默认只展示进攻线（百日新高/日线慢涨/长平台释放/趋势观察），业绩备用线在 balanced/offensive 恢复；8 条冻结策略移出页面与命中（登记见 `docs/个人策略文档/策略与脚本冻结登记.md`）。
 - [新功能] 新增短线观察（图形 ∩ 催化）：`scripts/run_short_term_watch.py` + `src/services/short_term_watch_service.py`，催化来源=内置产业催化注册表 + `config/catalyst_watchlist.json` 人工清单，产物写入 `data/short_term_watch/<日期>/`。
 - [文档] 新增个人策略配套文档：`策略与脚本冻结登记.md`、`数据与验证统一约定.md`、`开源工具融合规划（investment_data-qlib-TradingAgents）.md`。
@@ -593,9 +596,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - 📈 **百日新高策略新增独立入口** — 新增 `scripts/select_hundred_day_high_candidates.py`，可单独运行“最新 K 线 `high` 创近 N 日新高”的 A 股筛选，不再与当前“上涨占比 + 涨停 + 百日新高”的组合 K 线策略混用；底层同时为 `KlineSelectorCriteria` 增加了 `require_up_day_ratio` 开关，便于后续扩展更多独立规则入口。
 - 📈 **大盘复盘新增今日涨停股复盘表** — `MarketAnalyzer` 现已在 A 股大盘复盘中追加“今日涨停股复盘表”，按连板数与封板资金展示代表性涨停股，并补充涨停原因、涨停统计与近 250 个交易日历史涨停次数，保持现有 Markdown 报告输出链路不变，可直接复用于 `/market`、`--market-review` 与通知推送。
 
-### 新功能
-
-- 📈 **独立 K 线条件筛选器** — 新增 `src/services/kline_selector_service.py` 与 `scripts/select_kline_candidates.py`，可对全市场 A 股执行独立扫描并自动排除北交所；当前内置规则包括最近 10 个交易日上涨占比大于 70%、最近 10 日至少 1 次涨停、最新 K 线 `high` 创 100 日新高、总市值不超过 500 亿。脚本会输出 A 股样本列表以及候选结果的 `csv/txt/md` 文件，便于后续回看和扩展更多 K 线规则；同时新增保守并发参数 `--max-workers`、现货预过滤参数以及 checkpoint / `--resume` 断点续跑能力，并默认走更精简的 `Akshare` 单链路抓取。基于当前 Windows 环境的真实联网验证，组合筛选脚本现已默认使用 `--max-workers 1` 作为稳定基线；如需提速，更推荐使用分片而不是继续拉高 worker。使用说明见 `docs/KLINE_SELECTOR_GUIDE.md`。
+- [新功能] 📈 **独立 K 线条件筛选器** — 新增 `src/services/kline_selector_service.py` 与 `scripts/select_kline_candidates.py`，可对全市场 A 股执行独立扫描并自动排除北交所；当前内置规则包括最近 10 个交易日上涨占比大于 70%、最近 10 日至少 1 次涨停、最新 K 线 `high` 创 100 日新高、总市值不超过 500 亿。脚本会输出 A 股样本列表以及候选结果的 `csv/txt/md` 文件，便于后续回看和扩展更多 K 线规则；同时新增保守并发参数 `--max-workers`、现货预过滤参数以及 checkpoint / `--resume` 断点续跑能力，并默认走更精简的 `Akshare` 单链路抓取。基于当前 Windows 环境的真实联网验证，组合筛选脚本现已默认使用 `--max-workers 1` 作为稳定基线；如需提速，更推荐使用分片而不是继续拉高 worker。使用说明见 `docs/KLINE_SELECTOR_GUIDE.md`。
 - [修复] WebUI 启动时显式 `--host` / `--port` 不再被 `.env` 中的 `WEBUI_HOST` / `WEBUI_PORT` 覆盖，未传 CLI 参数时统一使用解析后的运行时配置。
 - [改进] GitHub Actions: 每日分析工作流（`00-daily-analysis.yml`）新增钉钉通知环境变量映射，支持在云端定时任务中直接使用钉钉机器人。
 - [修复] Web 持仓页首屏快照改用 `include_realtime=false` 快速估值，跳过逐票实时行情预取后先展示持仓列表，避免外部实时行情源变慢时长时间空白等待。

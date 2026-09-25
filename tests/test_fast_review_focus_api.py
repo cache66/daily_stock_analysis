@@ -459,15 +459,17 @@ class FastReviewFocusApiTestCase(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload["total"], 2)
-        self.assertIn("earnings_surprise", payload["strategy_summary"])
+        self.assertEqual(payload["market_regime"], "defensive")
+        self.assertNotIn("earnings_surprise", payload["strategy_summary"])
+        self.assertIn("hundred_day_high", payload["strategy_summary"])
         self.assertGreaterEqual(len(payload["strategies"]), 4)
         by_code = {item["code"]: item for item in payload["items"]}
         self.assertEqual(
             by_code["300475"]["matched_strategy_ids"],
-            ["earnings_surprise", "hundred_day_high", "daily_slow_rise"],
+            ["hundred_day_high", "daily_slow_rise"],
         )
         self.assertEqual(by_code["002463"]["matched_strategy_ids"], ["hundred_day_high", "long_base_release"])
-        self.assertEqual(by_code["300475"]["matched_strategy_count"], 3)
+        self.assertEqual(by_code["300475"]["matched_strategy_count"], 2)
         self.assertEqual(by_code["300475"]["quality_band"], "recommended")
         self.assertEqual(by_code["002463"]["quality_band"], "watch")
         self.assertGreater(by_code["300475"]["quality_score"], by_code["002463"]["quality_score"])

@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > Detailed internal change log and run evidence: [docs/AI_MODIFICATION_LOG.md](./AI_MODIFICATION_LOG.md)
 
 ## [Unreleased]
+- [改进] 个人策略矩阵按市场环境（`config/local_strategy_profile.json` 的 `market_regime`，默认 defensive）收敛：默认只展示进攻线（百日新高/日线慢涨/长平台释放/趋势观察），业绩备用线在 balanced/offensive 恢复；8 条冻结策略移出页面与命中（登记见 `docs/个人策略文档/策略与脚本冻结登记.md`）。
+- [新功能] 新增短线观察（图形 ∩ 催化）：`scripts/run_short_term_watch.py` + `src/services/short_term_watch_service.py`，催化来源=内置产业催化注册表 + `config/catalyst_watchlist.json` 人工清单，产物写入 `data/short_term_watch/<日期>/`。
+- [文档] 新增个人策略配套文档：`策略与脚本冻结登记.md`、`数据与验证统一约定.md`、`开源工具融合规划（investment_data-qlib-TradingAgents）.md`。
+- [文档] 《个人策略修改记录》滚动归档：2026-07 之前 214 段移入 `docs/个人策略文档/归档/`，主文件 901KB→102KB（保留近期记录）。
 - [修复] 同步上游 main（v3.32.0 线，127 个提交）：解决 14 处合并冲突，并恢复此前历史合并丢失的本地逻辑（分析器空响应回退分支、大盘复盘模板涨停块、AkShare 板块排行磁盘缓存与常量）；聚焦测试 636 项 623 通过，剩余为本地数据层定制与上游新增指数路由测试的已知差异（待专项对齐）。
 - [文档] 新增 `docs/个人策略文档/吃股息策略-实施与验证总结.md`：汇总股息线 MVP→v3 因子、平台对照、点时回测（合格池等权年化 +9.7% 含息；评分排序/趋势/低波因子未验证出增量）与行业结构分析，含运行手册、未决问题与恢复工作入口。
 - [测试] 股息线门槛敏感性对比（2026-09-24 快照）：股息率门槛 4%→3.5% 后合格池 236→320 只、覆盖行业 66→74 个，新增宁沪高速/上港集团/长江电力/海康威视等 84 只（原 Top10 全部保留），说明放宽门槛为「加宽」而非「替换」。

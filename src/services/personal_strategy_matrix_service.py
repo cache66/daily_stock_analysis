@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -12,9 +13,16 @@ from src.services.fast_review_focus_service import (
 )
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_STRATEGY_PROFILE_FILE = PROJECT_ROOT / "config" / "local_strategy_profile.json"
+DEFAULT_MARKET_REGIME = "defensive"
+SUPPORTED_MARKET_REGIMES = ("defensive", "balanced", "offensive")
+
 PERSONAL_STRATEGY_CATALOG: List[Dict[str, Any]] = [
     {
         "id": "earnings_surprise",
+        "line": "backup",
+        "line_label": "备用线",
         "name": "业绩强势 earnings_surprise",
         "short_name": "业绩",
         "group": "daily",
@@ -26,6 +34,8 @@ PERSONAL_STRATEGY_CATALOG: List[Dict[str, Any]] = [
     },
     {
         "id": "hundred_day_high",
+        "line": "offensive",
+        "line_label": "进攻线",
         "name": "百日新高 hundred_day_high",
         "short_name": "新高",
         "group": "daily",
@@ -37,6 +47,8 @@ PERSONAL_STRATEGY_CATALOG: List[Dict[str, Any]] = [
     },
     {
         "id": "daily_slow_rise",
+        "line": "offensive",
+        "line_label": "进攻线",
         "name": "日线慢涨 daily_slow_rise",
         "short_name": "慢涨",
         "group": "daily",
@@ -48,6 +60,8 @@ PERSONAL_STRATEGY_CATALOG: List[Dict[str, Any]] = [
     },
     {
         "id": "long_base_release",
+        "line": "offensive",
+        "line_label": "进攻线",
         "name": "长平台释放 long_base_release",
         "short_name": "平台",
         "group": "daily",
@@ -59,6 +73,8 @@ PERSONAL_STRATEGY_CATALOG: List[Dict[str, Any]] = [
     },
     {
         "id": "trend_leader_unified",
+        "line": "offensive",
+        "line_label": "进攻线",
         "name": "趋势龙头统一扫描 trend_leader_unified",
         "short_name": "趋势",
         "group": "chart",
@@ -70,6 +86,8 @@ PERSONAL_STRATEGY_CATALOG: List[Dict[str, Any]] = [
     },
     {
         "id": "monthly_slow_rise",
+        "line": "frozen",
+        "line_label": "冻结",
         "name": "月线慢涨 monthly_slow_rise",
         "short_name": "月慢",
         "group": "chart",
@@ -81,6 +99,8 @@ PERSONAL_STRATEGY_CATALOG: List[Dict[str, Any]] = [
     },
     {
         "id": "continuous_up_ratio",
+        "line": "frozen",
+        "line_label": "冻结",
         "name": "连续上涨占比 continuous_up_ratio",
         "short_name": "阳线",
         "group": "chart",
@@ -92,6 +112,8 @@ PERSONAL_STRATEGY_CATALOG: List[Dict[str, Any]] = [
     },
     {
         "id": "continuous_up_streak",
+        "line": "frozen",
+        "line_label": "冻结",
         "name": "连续上涨段 continuous_up_streak",
         "short_name": "连涨",
         "group": "chart",
@@ -103,6 +125,8 @@ PERSONAL_STRATEGY_CATALOG: List[Dict[str, Any]] = [
     },
     {
         "id": "earnings_observation",
+        "line": "backup",
+        "line_label": "备用线",
         "name": "业绩观察 earnings_observation",
         "short_name": "业观",
         "group": "earnings",
@@ -114,6 +138,8 @@ PERSONAL_STRATEGY_CATALOG: List[Dict[str, Any]] = [
     },
     {
         "id": "dragon_head_candidate",
+        "line": "frozen",
+        "line_label": "冻结",
         "name": "龙头候选 dragon_head_candidate",
         "short_name": "龙头",
         "group": "theme",
@@ -125,6 +151,8 @@ PERSONAL_STRATEGY_CATALOG: List[Dict[str, Any]] = [
     },
     {
         "id": "board_cycle_scan",
+        "line": "frozen",
+        "line_label": "冻结",
         "name": "板块周期 board_cycle_scan",
         "short_name": "板块",
         "group": "theme",
@@ -136,6 +164,8 @@ PERSONAL_STRATEGY_CATALOG: List[Dict[str, Any]] = [
     },
     {
         "id": "theme_core_mapper",
+        "line": "frozen",
+        "line_label": "冻结",
         "name": "题材核心映射 theme_core_mapper",
         "short_name": "题材",
         "group": "theme",
@@ -147,6 +177,8 @@ PERSONAL_STRATEGY_CATALOG: List[Dict[str, Any]] = [
     },
     {
         "id": "commodity_price_pass_through",
+        "line": "frozen",
+        "line_label": "冻结",
         "name": "涨价传导 commodity_price_pass_through",
         "short_name": "涨价",
         "group": "theme",
@@ -158,6 +190,8 @@ PERSONAL_STRATEGY_CATALOG: List[Dict[str, Any]] = [
     },
     {
         "id": "shortline_hub",
+        "line": "frozen",
+        "line_label": "冻结",
         "name": "短线中枢 shortline_hub",
         "short_name": "短线",
         "group": "tool",
@@ -210,6 +244,31 @@ VIEW_LANE_LABELS = {
     "watch": "其他观察",
 }
 
+# 市场环境开关：defensive 只展示进攻线（图形件），balanced/offensive 恢复备用业绩线；
+# frozen 策略（月慢/阳线/连涨/龙头/板块/题材/涨价/短线中枢）不再参与展示与命中。
+REGIME_VISIBLE_LINES: Dict[str, tuple] = {
+    "defensive": ("offensive",),
+    "balanced": ("offensive", "backup"),
+    "offensive": ("offensive", "backup"),
+}
+
+
+def resolve_market_regime(profile_path: Optional[Path] = None) -> str:
+    """Resolve the display-side market regime from the local strategy profile."""
+
+    path = Path(profile_path or DEFAULT_STRATEGY_PROFILE_FILE)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return DEFAULT_MARKET_REGIME
+    if not isinstance(payload, dict):
+        return DEFAULT_MARKET_REGIME
+    defaults = payload.get("defaults") if isinstance(payload.get("defaults"), dict) else {}
+    regime = str(
+        payload.get("market_regime") or defaults.get("market_regime") or ""
+    ).strip().lower()
+    return regime if regime in SUPPORTED_MARKET_REGIMES else DEFAULT_MARKET_REGIME
+
 
 def signal_matches_personal_strategy(signal: str, strategy: Dict[str, Any]) -> bool:
     normalized_signal = str(signal or "").strip()
@@ -231,12 +290,35 @@ def signal_matches_personal_strategy(signal: str, strategy: Dict[str, Any]) -> b
 class PersonalStrategyMatrixService:
     """Build a stock -> matched personal strategies matrix from review artifacts."""
 
-    def __init__(self, manual_runs_root: Optional[Path] = None) -> None:
+    def __init__(
+        self,
+        manual_runs_root: Optional[Path] = None,
+        *,
+        regime: Optional[str] = None,
+        profile_path: Optional[Path] = None,
+    ) -> None:
         self.manual_runs_root = Path(manual_runs_root or DEFAULT_MANUAL_RUNS_ROOT)
         self.fast_review_service = FastReviewFocusService(manual_runs_root=self.manual_runs_root)
+        self.profile_path = Path(profile_path or DEFAULT_STRATEGY_PROFILE_FILE)
+        self.market_regime = resolve_market_regime(self.profile_path)
+        if regime is not None:
+            normalized_regime = str(regime or "").strip().lower()
+            if normalized_regime in SUPPORTED_MARKET_REGIMES:
+                self.market_regime = normalized_regime
+        self.visible_catalog = self._build_visible_catalog()
+
+    def _build_visible_catalog(self) -> List[Dict[str, Any]]:
+        visible_lines = set(
+            REGIME_VISIBLE_LINES.get(self.market_regime) or REGIME_VISIBLE_LINES[DEFAULT_MARKET_REGIME]
+        )
+        return [
+            strategy
+            for strategy in PERSONAL_STRATEGY_CATALOG
+            if str(strategy.get("line") or "").strip() in visible_lines
+        ]
 
     def get_catalog(self) -> List[Dict[str, Any]]:
-        return [dict(strategy) for strategy in PERSONAL_STRATEGY_CATALOG]
+        return [dict(strategy) for strategy in self.visible_catalog]
 
     def get_matrix(
         self,
@@ -271,6 +353,7 @@ class PersonalStrategyMatrixService:
             "total": len(items),
             "source_run_dir": overview["source_run_dir"],
             "source_csv_path": overview["source_csv_path"],
+            "market_regime": self.market_regime,
             "lane_summary": self._build_lane_summary(items),
             "signal_summary": self._build_signal_summary(items),
             "strategy_summary": strategy_summary,
@@ -281,7 +364,7 @@ class PersonalStrategyMatrixService:
     def _attach_matches(self, item: Dict[str, Any]) -> Dict[str, Any]:
         signals = self._collect_signals(item)
         matched: List[Dict[str, Any]] = []
-        for strategy in PERSONAL_STRATEGY_CATALOG:
+        for strategy in self.visible_catalog:
             if any(signal_matches_personal_strategy(signal, strategy) for signal in signals):
                 matched.append(self._to_match(strategy))
 
@@ -511,13 +594,15 @@ class PersonalStrategyMatrixService:
             "short_name": strategy["short_name"],
             "group": strategy["group"],
             "group_label": strategy["group_label"],
+            "line": strategy.get("line") or "",
+            "line_label": strategy.get("line_label") or "",
             "mode": strategy["mode"],
             "role": strategy["role"],
             "logic": strategy["logic"],
         }
 
     def _build_strategy_summary(self, items: List[Dict[str, Any]]) -> Dict[str, int]:
-        summary = {strategy["id"]: 0 for strategy in PERSONAL_STRATEGY_CATALOG}
+        summary = {strategy["id"]: 0 for strategy in self.visible_catalog}
         for item in items:
             for strategy_id in item.get("matched_strategy_ids") or []:
                 if strategy_id in summary:

@@ -1,5 +1,6 @@
 {
   "defaults": {
+    "market_regime": "defensive",
     "include_signals": [
       "earnings",
       "hundred_day_high",

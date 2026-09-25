@@ -162,6 +162,7 @@ def get_personal_strategy_matrix(
             total=data["total"],
             source_run_dir=data["source_run_dir"],
             source_csv_path=data["source_csv_path"],
+            market_regime=data.get("market_regime"),
             lane_summary=data.get("lane_summary", {}),
             signal_summary=data.get("signal_summary", {}),
             strategy_summary=data.get("strategy_summary", {}),

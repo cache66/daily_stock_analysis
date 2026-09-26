@@ -5,9 +5,11 @@
       "earnings",
       "hundred_day_high",
       "daily_slow_rise",
+      "trend_leader"
+    ],
+    "exclude_signals": [
       "long_base_release"
     ],
-    "exclude_signals": [],
     "persist_snapshots": true,
     "max_workers": 1,
     "trend_max_workers": 2,

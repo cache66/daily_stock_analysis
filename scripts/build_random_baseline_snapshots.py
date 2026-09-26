@@ -13,6 +13,10 @@ tradability / window rules, giving a "random buy" control distribution.
 Sampling notes:
 - universe = codes with a close bar on that date (survivorship-free within the
   covered window), excluding KCB / BSE / B-share prefixes (688/689/4/8/9).
+- sampling is stratified by board: each day's random rows mirror the source
+  signal mix（创业板 30xxxx vs 主板），so the control carries the same board
+  composition as the signal set; quota overflow spills to the other board and
+  is reported via capped_days.
 - deterministic per (seed, source, day): rerunning with the same seed produces
   the same baseline rows.
 
@@ -71,6 +75,13 @@ def _load_names(session, codes: list[str]) -> dict[str, str]:
     return {str(code): str(name or "") for code, name in rows if str(code) in wanted}
 
 
+def _split_universe_by_board(universe: list[tuple[str, float]]) -> tuple[list[str], list[str]]:
+    """Split a day's universe into (创业板 30xxxx, 主板/其他) code lists (sorted)."""
+    cyb = sorted(str(code) for code, _ in universe if str(code).startswith("30"))
+    main = sorted(str(code) for code, _ in universe if not str(code).startswith("30"))
+    return cyb, main
+
+
 def build_random_baseline(
     *,
     db: DatabaseManager,
@@ -88,6 +99,7 @@ def build_random_baseline(
         end_date=end_date,
     )
     day_counts: Counter[str] = Counter()
+    day_codes: dict[str, list[str]] = {}
     for row in snapshots:
         signal_date = getattr(row, "signal_date", None)
         if signal_date is None:
@@ -99,7 +111,9 @@ def build_random_baseline(
                     continue
             except (TypeError, ValueError):
                 pass
-        day_counts[signal_date.isoformat()] += 1
+        day_text = signal_date.isoformat()
+        day_counts[day_text] += 1
+        day_codes.setdefault(day_text, []).append(str(getattr(row, "code", "") or ""))
     if not day_counts:
         return {
             "source": source_signal_type,
@@ -121,13 +135,27 @@ def build_random_baseline(
             if not universe:
                 logger.warning("random baseline: no universe for day=%s, skipped", day_text)
                 continue
-            sample_size = min(wanted, len(universe))
-            if sample_size < wanted:
-                capped_days.append(day_text)
+            universe_cyb, universe_main = _split_universe_by_board(universe)
+            day_signal_codes = day_codes.get(day_text, [])
+            wanted_cyb = sum(1 for code in day_signal_codes if str(code).startswith("30"))
+            quota_cyb = min(wanted_cyb, len(universe_cyb))
+            quota_main = min(int(wanted) - quota_cyb, len(universe_main))
             rng = random.Random(f"{int(seed)}:{source_signal_type}:{day_text}")
-            picked = rng.sample([code for code, _ in universe], sample_size)
+            picked = rng.sample(universe_cyb, quota_cyb) + rng.sample(universe_main, quota_main)
+            if len(picked) < int(wanted):
+                capped_days.append(day_text)
             close_by_code = dict(universe)
             names = _load_names(session, picked)
+            if not dry_run:
+                # 替换语义：重新生成（种子/算法变化）时先清掉当天旧行，避免旧选票累积。
+                with db.session_scope() as cleanup_session:
+                    cleanup_session.execute(
+                        text(
+                            "DELETE FROM kline_signal_snapshot "
+                            "WHERE signal_type = :t AND signal_date = :d"
+                        ),
+                        {"t": target, "d": day_text},
+                    )
             for code in sorted(picked):
                 if dry_run:
                     continue

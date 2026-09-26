@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Report year-to-date returns for persisted signal snapshots."""
+"""Report year-to-date returns for persisted signal snapshots.
+
+口径（T0.5）：信号日估值价 DB 优先（`stock_daily` 前复权，取 <= signal_date 最近一根），
+快照 `metrics.close` 仅在 DB 无可用 bar 时兜底；年内起点价同样来自 DB，缺失时走实时兜底。
+"""
 
 from __future__ import annotations
 
@@ -115,7 +119,39 @@ def _snapshot_matches_profile(snapshot_row: Any, profile_name: Optional[str]) ->
     return snapshot_profile == profile_name
 
 
+def _first_daily_of_year(
+    stock_repo: StockRepository,
+    *,
+    code: str,
+    year: int,
+    end_date: Any,
+) -> Optional[Any]:
+    """年内第一根 DB bar（<= end_date）；get_range 顺序不保证时取日期最小者。"""
+    try:
+        rows = stock_repo.get_range(code, date(int(year), 1, 1), end_date)
+    except Exception:
+        return None
+    if not rows:
+        return None
+    return min(rows, key=lambda row: row.date)
+
+
 def _coerce_signal_close(snapshot_row: Any, stock_repo: StockRepository) -> Optional[float]:
+    """信号日估值价：DB 优先（前复权，<= signal_date 最近一根），快照价兜底（T0.5 口径）。"""
+    signal_date = getattr(snapshot_row, "signal_date", None)
+    if signal_date is not None:
+        latest_daily = stock_repo.get_start_daily(
+            code=str(getattr(snapshot_row, "code", "") or "").strip(),
+            analysis_date=signal_date,
+        )
+        if latest_daily is not None and latest_daily.close is not None:
+            try:
+                close_numeric = float(latest_daily.close)
+            except (TypeError, ValueError):
+                close_numeric = None
+            if close_numeric is not None and close_numeric > 0:
+                return close_numeric
+
     metrics = _safe_json_loads(getattr(snapshot_row, "metrics_payload", None))
     close_value = metrics.get("close")
     try:
@@ -125,21 +161,7 @@ def _coerce_signal_close(snapshot_row: Any, stock_repo: StockRepository) -> Opti
                 return close_numeric
     except (TypeError, ValueError):
         pass
-
-    signal_date = getattr(snapshot_row, "signal_date", None)
-    if signal_date is None:
-        return None
-    latest_daily = stock_repo.get_latest_daily_on_or_before(
-        code=str(getattr(snapshot_row, "code", "") or "").strip(),
-        target_date=signal_date,
-    )
-    if latest_daily is None or latest_daily.close is None:
-        return None
-    try:
-        close_numeric = float(latest_daily.close)
-    except (TypeError, ValueError):
-        return None
-    return close_numeric if close_numeric > 0 else None
+    return None
 
 
 def _normalize_history_frame(history_df: Any) -> pd.DataFrame:
@@ -220,7 +242,8 @@ def evaluate_snapshot_ytd(
             "eval_status": "insufficient_data",
         }
 
-    start_daily = stock_repo.get_first_daily_of_year(
+    start_daily = _first_daily_of_year(
+        stock_repo,
         code=code,
         year=signal_date.year,
         end_date=signal_date,
@@ -330,14 +353,27 @@ def evaluate_snapshot_ytd_live(
     cause_payload = _safe_json_loads(getattr(snapshot_row, "cause_payload", None))
 
     signal_close = None
-    close_value = metrics.get("close")
-    try:
-        if close_value is not None:
-            signal_close = float(close_value)
-    except (TypeError, ValueError):
-        signal_close = None
+    latest_daily = stock_repo.get_start_daily(
+        code=code,
+        analysis_date=signal_date,
+    )
+    if latest_daily is not None and latest_daily.close is not None:
+        try:
+            db_close = float(latest_daily.close)
+        except (TypeError, ValueError):
+            db_close = None
+        if db_close is not None and db_close > 0:
+            signal_close = db_close
+    if signal_close is None:
+        close_value = metrics.get("close")
+        try:
+            if close_value is not None:
+                signal_close = float(close_value)
+        except (TypeError, ValueError):
+            signal_close = None
 
-    start_daily = stock_repo.get_first_daily_of_year(
+    start_daily = _first_daily_of_year(
+        stock_repo,
         code=code,
         year=signal_date.year,
         end_date=signal_date,

@@ -5,6 +5,7 @@ import os
 import tempfile
 import unittest
 from datetime import date
+from types import SimpleNamespace
 
 from scripts.report_signal_snapshot_ytd import build_report
 from src.config import Config
@@ -153,6 +154,64 @@ class SignalSnapshotYtdReportTestCase(unittest.TestCase):
         self.assertEqual(report["snapshot_count"], 1)
         self.assertEqual(report["rows"][0]["code"], "600002")
         self.assertAlmostEqual(report["rows"][0]["ytd_return_pct"], 50.0)
+
+    def test_db_close_preferred_over_snapshot_close(self) -> None:
+        self._seed_snapshot(signal_date="2026-04-07", code="600001", close=999.0)
+        self._seed_daily_bars(
+            code="600001",
+            rows=[(date(2026, 1, 2), 10.0), (date(2026, 4, 7), 12.0)],
+        )
+
+        report = build_report(
+            db=self.db,
+            signal_type="hundred_day_high",
+            profile_name=None,
+            signal_date="2026-04-07",
+            start_date=None,
+            end_date=None,
+            code=None,
+            codes=None,
+            limit=None,
+        )
+
+        rows = {item["code"]: item for item in report["rows"]}
+        self.assertAlmostEqual(rows["600001"]["signal_close"], 12.0)
+        self.assertAlmostEqual(rows["600001"]["ytd_return_pct"], 20.0)
+
+    def test_db_close_uses_latest_bar_on_or_before_signal_date(self) -> None:
+        self._seed_snapshot(signal_date="2026-04-07", code="600002", close=999.0)
+        self._seed_daily_bars(
+            code="600002",
+            rows=[(date(2026, 1, 2), 10.0), (date(2026, 4, 3), 11.0)],
+        )
+
+        report = build_report(
+            db=self.db,
+            signal_type="hundred_day_high",
+            profile_name=None,
+            signal_date="2026-04-07",
+            start_date=None,
+            end_date=None,
+            code=None,
+            codes=None,
+            limit=None,
+        )
+
+        rows = {item["code"]: item for item in report["rows"]}
+        self.assertAlmostEqual(rows["600002"]["signal_close"], 11.0)
+        self.assertAlmostEqual(rows["600002"]["ytd_return_pct"], 10.0)
+
+    def test_coerce_signal_close_falls_back_to_snapshot_when_db_empty(self) -> None:
+        from scripts.report_signal_snapshot_ytd import _coerce_signal_close
+        from src.repositories.stock_repo import StockRepository
+
+        row = SimpleNamespace(
+            code="600003",
+            signal_date=date(2026, 4, 7),
+            metrics_payload='{"close": 18.0}',
+        )
+        value = _coerce_signal_close(row, StockRepository(self.db))
+        self.assertAlmostEqual(value, 18.0)
 
 
 if __name__ == "__main__":

@@ -3,7 +3,9 @@
 """每日复盘导出：最近 N 天的选股结果 + 已兑现前向收益（1/3/5 日）。
 
 口径与 `scripts/evaluate_signal_snapshot_performance.py` 对齐：
-- 入场价 = 快照 `metrics_payload.close`（优先）→ signal_date 当日精确 bar → 最近一条日期 <= signal_date 的 bar（评估器同款回退）
+- 入场价（默认 `--entry-mode daily`，DB 优先）= `stock_daily` 中日期 <= signal_date 的最近一根收盘
+  （评估器 `--entry-mode daily` 同款；不回落快照价，避免过期尺度/高送转假亏损）
+- `--entry-mode snapshot`（兼容旧口径）= 快照 `metrics_payload.close` 优先 → 精确 bar → 最近 <= signal_date 的 bar
 - 出场价 = 信号日期后第 k 个交易日收盘（stock_daily 可用 bar）
 - 收益率 = (出场 - 入场) / 入场 * 100，保留 2 位
 - 输赢口径：|ret| <= 2%（中性带）记 neutral，其余 win/loss
@@ -30,6 +32,7 @@ import sqlite3
 from collections import defaultdict
 from datetime import date, timedelta
 from pathlib import Path
+from typing import Optional, Sequence
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DB = PROJECT_ROOT / "data" / "stock_analysis.db"
@@ -68,6 +71,25 @@ def _metrics_close(metrics_payload) -> float | None:
     return value if value > 0 else None
 
 
+def _latest_close_on_or_before(seq: list, sd: str) -> float | None:
+    """stock_daily 中日期 <= sd 的最近一根收盘（评估器 get_start_daily 同款语义）。"""
+    candidates = [b for b in seq if b[0] <= sd and b[1]]
+    if not candidates:
+        return None
+    value = float(candidates[-1][1])
+    return value if value > 0 else None
+
+
+def _resolve_entry(metrics_payload, seq: list, sd: str, *, entry_mode: str) -> float | None:
+    """入场价口径：daily=只用 stock_daily（DB 优先，评估器同款）；snapshot=快照价优先（旧口径）。"""
+    if entry_mode == "snapshot":
+        entry = _metrics_close(metrics_payload)
+        if entry is None:
+            entry = _latest_close_on_or_before(seq, sd)
+        return entry
+    return _latest_close_on_or_before(seq, sd)
+
+
 SIGNAL_ALIASES = {
     "earnings": "earnings_surprise",
     "trend_leader": "trend_leader_unified",
@@ -94,17 +116,23 @@ def _profile_signals() -> list[str]:
         return []
 
 
-def main() -> int:
+def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="最近 N 天选股结果 + 已兑现前向收益导出")
     parser.add_argument("--db", default=str(DEFAULT_DB), help="sqlite 数据库路径")
     parser.add_argument("--days", type=int, default=21, help="回看自然日数（相对库内最新信号日）")
     parser.add_argument("--signals", default="", help="逗号分隔信号类型过滤；默认全部")
+    parser.add_argument(
+        "--entry-mode",
+        choices=["daily", "snapshot"],
+        default="daily",
+        help="入场价口径：daily=DB 优先（默认，评估器同款）；snapshot=快照价优先（旧口径）",
+    )
     parser.add_argument("--output", default=str(DEFAULT_OUT), help="输出 CSV 路径")
     parser.add_argument("--quiet", action="store_true", help="只写文件，不打印摘要")
     parser.add_argument("--slippage-bps", type=float, default=10.0, help="单边滑点（bps），默认 10")
     parser.add_argument("--fee-bps", type=float, default=3.0, help="单边费用（bps），默认 3")
     parser.add_argument("--turnover-penalty-bps", type=float, default=5.0, help="一次买卖换手惩罚（bps），默认 5")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     total_trade_cost_bps = max(0.0, float(args.turnover_penalty_bps)) + max(
         0.0, 2.0 * (float(args.slippage_bps) + float(args.fee_bps))
@@ -168,13 +196,7 @@ def main() -> int:
             "name": name,
             "cost_bps": round(total_trade_cost_bps, 2),
         }
-        entry = _metrics_close(metrics_payload)
-        if entry is None:
-            entry = next((float(b[1]) for b in seq if b[0] == sd and b[1]), None)
-        if entry is None:
-            previous = [b for b in seq if b[0] <= sd and b[1]]
-            if previous:
-                entry = float(previous[-1][1])
+        entry = _resolve_entry(metrics_payload, seq, sd, entry_mode=str(args.entry_mode))
         fwd = [b for b in seq if b[0] > sd]
         if not entry:
             record.update({k: "" for k in FIELDS if k not in record})
@@ -216,6 +238,10 @@ def main() -> int:
     print(f"[daily-review] 区间: {window_start} ~ {latest}（共 {len(rows)} 条选股）")
     print(f"[daily-review] 明细: {out_path}")
     print(f"[daily-review] 成本口径: 一次买卖 {round(total_trade_cost_bps, 2)} bps（净列 = 成本后）")
+    print(
+        "[daily-review] 入场口径: "
+        + ("daily（DB 优先，评估器同款）" if str(args.entry_mode) == "daily" else "snapshot（快照价优先，旧口径）")
+    )
     if used_profile:
         print(f"[daily-review] 信号来源: profile include_signals -> {', '.join(signals)}")
     else:

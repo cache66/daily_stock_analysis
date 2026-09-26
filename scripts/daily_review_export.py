@@ -7,6 +7,7 @@
 - 出场价 = 信号日期后第 k 个交易日收盘（stock_daily 可用 bar）
 - 收益率 = (出场 - 入场) / 入场 * 100，保留 2 位
 - 输赢口径：|ret| <= 2%（中性带）记 neutral，其余 win/loss
+- 成本口径：默认滑点 10bps/边 + 费用 3bps/边 + 换手 5bps/次（一次买卖 ≈31bps），输出 ret{k}_net 列（可用 --slippage-bps 等覆盖）
 
 用法：
     ./.venv-linux/bin/python scripts/daily_review_export.py
@@ -17,7 +18,8 @@
     data/strategy_review/daily_review_latest.csv（可用 --output 覆盖）
 说明：
     - 最新一天的选股还没有前向数据，收益列为空属正常；
-    - 节假日标签日（无当日 K 线）同样不参与收益计算。
+    - 节假日标签日（无当日 K 线）同样不参与收益计算；
+    - 信号来源：默认读 `config/local_strategy_profile.json` 的 include_signals（earnings→earnings_surprise、trend_leader→trend_leader_unified）；`--signals` 可覆盖；无 profile 时回退全部并排除 random_baseline 对照。
 """
 from __future__ import annotations
 
@@ -36,8 +38,9 @@ DEFAULT_OUT = PROJECT_ROOT / "data" / "strategy_review" / "daily_review_latest.c
 NEUTRAL_BAND_PCT = 2.0
 WINDOWS = (1, 3, 5)
 FIELDS = (
-    ["signal_date", "signal_type", "code", "name", "entry_close"]
+    ["signal_date", "signal_type", "code", "name", "entry_close", "cost_bps"]
     + [f"ret{k}" for k in WINDOWS]
+    + [f"ret{k}_net" for k in WINDOWS]
     + [f"win{k}" for k in WINDOWS]
     + ["runup5_pct", "drawdown5_pct"]
 )
@@ -65,6 +68,32 @@ def _metrics_close(metrics_payload) -> float | None:
     return value if value > 0 else None
 
 
+SIGNAL_ALIASES = {
+    "earnings": "earnings_surprise",
+    "trend_leader": "trend_leader_unified",
+}
+
+
+def _profile_signals() -> list[str]:
+    """默认信号来源：profile 的 include_signals（映射别名、去掉 exclude）。"""
+    try:
+        profile_path = PROJECT_ROOT / "config" / "local_strategy_profile.json"
+        defaults = (json.loads(profile_path.read_text(encoding="utf-8")) or {}).get("defaults") or {}
+        tokens = defaults.get("include_signals") or []
+        excluded = {str(item).strip() for item in (defaults.get("exclude_signals") or [])}
+        result: list[str] = []
+        for token in tokens:
+            name = str(token).strip()
+            if not name or name in excluded:
+                continue
+            mapped = SIGNAL_ALIASES.get(name, name)
+            if mapped not in result:
+                result.append(mapped)
+        return result
+    except Exception:
+        return []
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="最近 N 天选股结果 + 已兑现前向收益导出")
     parser.add_argument("--db", default=str(DEFAULT_DB), help="sqlite 数据库路径")
@@ -72,7 +101,14 @@ def main() -> int:
     parser.add_argument("--signals", default="", help="逗号分隔信号类型过滤；默认全部")
     parser.add_argument("--output", default=str(DEFAULT_OUT), help="输出 CSV 路径")
     parser.add_argument("--quiet", action="store_true", help="只写文件，不打印摘要")
+    parser.add_argument("--slippage-bps", type=float, default=10.0, help="单边滑点（bps），默认 10")
+    parser.add_argument("--fee-bps", type=float, default=3.0, help="单边费用（bps），默认 3")
+    parser.add_argument("--turnover-penalty-bps", type=float, default=5.0, help="一次买卖换手惩罚（bps），默认 5")
     args = parser.parse_args()
+
+    total_trade_cost_bps = max(0.0, float(args.turnover_penalty_bps)) + max(
+        0.0, 2.0 * (float(args.slippage_bps) + float(args.fee_bps))
+    )
 
     con = sqlite3.connect(args.db)
     cur = con.cursor()
@@ -84,6 +120,10 @@ def main() -> int:
         return 1
     window_start = (date.fromisoformat(str(latest)) - timedelta(days=max(1, args.days))).isoformat()
     signals = [s.strip() for s in str(args.signals or "").split(",") if s.strip()]
+    used_profile = False
+    if not signals:
+        signals = _profile_signals()
+        used_profile = bool(signals)
 
     sql = (
         "SELECT signal_type, signal_date, code, COALESCE(name, ''), metrics_payload "
@@ -93,6 +133,8 @@ def main() -> int:
     if signals:
         sql += " AND signal_type IN (%s)" % ",".join("?" * len(signals))
         params += signals
+    else:
+        sql += " AND signal_type NOT LIKE 'random_baseline%'"
     sql += " ORDER BY signal_date DESC, signal_type, code"
     cur.execute(sql, params)
     snapshots = cur.fetchall()
@@ -119,7 +161,13 @@ def main() -> int:
     for signal_type, signal_date, code, name, metrics_payload in snapshots:
         sd = str(signal_date)
         seq = bars.get(code) or []
-        record = {"signal_date": sd, "signal_type": signal_type, "code": code, "name": name}
+        record = {
+            "signal_date": sd,
+            "signal_type": signal_type,
+            "code": code,
+            "name": name,
+            "cost_bps": round(total_trade_cost_bps, 2),
+        }
         entry = _metrics_close(metrics_payload)
         if entry is None:
             entry = next((float(b[1]) for b in seq if b[0] == sd and b[1]), None)
@@ -137,9 +185,11 @@ def main() -> int:
             if len(fwd) >= k and entry:
                 ret = round((float(fwd[k - 1][1]) - entry) / entry * 100.0, 2)
                 record[f"ret{k}"] = ret
+                record[f"ret{k}_net"] = round(ret - total_trade_cost_bps / 100.0, 2)
                 record[f"win{k}"] = classify(ret)
             else:
                 record[f"ret{k}"] = ""
+                record[f"ret{k}_net"] = ""
                 record[f"win{k}"] = ""
         n5 = min(5, len(fwd))
         if n5 and entry:
@@ -165,6 +215,11 @@ def main() -> int:
 
     print(f"[daily-review] 区间: {window_start} ~ {latest}（共 {len(rows)} 条选股）")
     print(f"[daily-review] 明细: {out_path}")
+    print(f"[daily-review] 成本口径: 一次买卖 {round(total_trade_cost_bps, 2)} bps（净列 = 成本后）")
+    if used_profile:
+        print(f"[daily-review] 信号来源: profile include_signals -> {', '.join(signals)}")
+    else:
+        print("[daily-review] 信号来源: 全部（已排除 random_baseline 对照）")
     by_signal: dict[str, list] = defaultdict(list)
     for row in rows:
         by_signal[row["signal_type"]].append(row)
@@ -179,7 +234,9 @@ def main() -> int:
             total_cls = wins + losses
             rate = f"{wins / total_cls * 100:.1f}%" if total_cls else "--"
             avg = f"{sum(done) / len(done):+.2f}%" if done else "--"
-            print(f"   T+{k}: 已兑现 {len(done):>4} 条 | 胜率(不含中性) {rate:>6} | 均值 {avg}")
+            done_net = [r[f"ret{k}_net"] for r in subset if r.get(f"ret{k}_net") not in ("", None)]
+            avg_net = f"{sum(done_net) / len(done_net):+.2f}%" if done_net else "--"
+            print(f"   T+{k}: 已兑现 {len(done):>4} 条 | 胜率(不含中性) {rate:>6} | 均值 {avg}（净 {avg_net}）")
         latest_date = dates[0]
         day_rows = [r for r in subset if r["signal_date"] == latest_date and r.get("ret1") not in ("", None)]
         if day_rows:

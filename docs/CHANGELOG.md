@@ -624,6 +624,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [新功能] 信号快照评估器新增 `--benchmark-code`：输出同窗口基准收益、超额收益（含/不含成本）与跑赢比例（窗口汇总 + 报告列）。
 - [测试] 基准超额补充 3 条用例（`tests/test_signal_snapshot_benchmark.py`）；4 条在跑线完成 000905 对照（趋势 +4.69% 超额 / 业绩 -0.73%）。
 - [新功能] 新增决策日志回看 `scripts/review_decision_log.py` + `data/decision_log/` 模板：按列填写决策后自动计算前向收益/胜负/可选基准超额，支持按来源线汇总。
+- [改进] 复盘导出 v2：`scripts/daily_review_export.py` 增加成本后净收益列（默认 31bps/次，可调）与默认信号源=profile include_signals（自动排除 random_baseline 对照）。
 
 <!-- 新条目格式：- [类型] 描述（类型取值：新功能/改进/修复/文档/测试/chore）-->
 <!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->

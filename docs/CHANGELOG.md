@@ -617,6 +617,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] 为 AkShare 大盘涨跌统计的东财与新浪降级调用增加可强制终止的子进程超时，避免外部接口无响应时长期占用分析线程（Fixes #2340）。
 - [改进] 进攻线收敛：恢复 `trend_leader`（趋势龙头）为默认每日信号、停用负期望的 `long_base_release`（长平台突破），并新增个股复盘导出 `scripts/daily_review_export.py`（与评估器同口径的 T+1/3/5 已兑现收益，产物 `data/strategy_review/daily_review_latest.csv`）。
 - [文档] 新增《策略收敛与回测路线图》（`docs/个人策略文档/策略收敛与回测路线图.md`）：统一口径 v2（成本/可成交性/基准/随机对照）→ 同窗口回测全部候选线 → 按预设标准收敛 → 工具完善（复盘导出 v2、决策日志、推送）的执行计划。
+- [改进] 信号快照评估器新增 `--tradability-filter entry`：入场日一字涨停/停牌样本标记 `untradable_entry`，从胜率/均值样本中剔除并单独计数（报告新增 `untradable` 列）；4 条在跑线按"成本 + 可成交性"双口径重跑（v2t，产物 `data/strategy_review/v2/*_trad.*`）。
+- [测试] 评估器可成交性过滤补充 10 条单元/集成用例（`tests/test_signal_snapshot_tradability_filter.py`）。
 
 <!-- 新条目格式：- [类型] 描述（类型取值：新功能/改进/修复/文档/测试/chore）-->
 <!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->

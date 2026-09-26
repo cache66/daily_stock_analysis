@@ -619,6 +619,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [文档] 新增《策略收敛与回测路线图》（`docs/个人策略文档/策略收敛与回测路线图.md`）：统一口径 v2（成本/可成交性/基准/随机对照）→ 同窗口回测全部候选线 → 按预设标准收敛 → 工具完善（复盘导出 v2、决策日志、推送）的执行计划。
 - [改进] 信号快照评估器新增 `--tradability-filter entry`：入场日一字涨停/停牌样本标记 `untradable_entry`，从胜率/均值样本中剔除并单独计数（报告新增 `untradable` 列）；4 条在跑线按"成本 + 可成交性"双口径重跑（v2t，产物 `data/strategy_review/v2/*_trad.*`）。
 - [测试] 评估器可成交性过滤补充 10 条单元/集成用例（`tests/test_signal_snapshot_tradability_filter.py`）。
+- [新功能] 新增 `scripts/build_random_baseline_snapshots.py`：逐日按信号数量生成随机买入对照快照（固定 seed、可复现、支持 dry-run），配合标准评估器得到随机基线；4 条在跑线对照已出（趋势 +4.7pp 超额 / 业绩 -0.8pp 跑输随机）。
+- [文档] 《策略收敛与回测路线图》更新随机对照结果与"跨策略必须对齐日期窗口"发现；新增 `scripts/pit_rebuild_offense_window.sh`（Aug-Sep 同窗口 PIT 重建，过夜批处理）。
 
 <!-- 新条目格式：- [类型] 描述（类型取值：新功能/改进/修复/文档/测试/chore）-->
 <!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->

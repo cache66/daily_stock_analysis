@@ -13,6 +13,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > Detailed internal change log and run evidence: [docs/AI_MODIFICATION_LOG.md](./AI_MODIFICATION_LOG.md)
 
 ## [Unreleased]
+- [新功能] 新增 `scripts/batch_supervise.py`（C1/C3）：批处理心跳守护与完成后自动收尾（多日志 glob 汇总、完成/失败标记、状态落盘、`--on-done` 步骤编排）；配套 7 条离线用例。
+- [改进] `scripts/rebuild_stock_daily_qfq.py` 新增 `--retry-failed`：读取失败清单多轮重跑（可换源、清零即删清单、剩余非零退出）；配套 4 条离线用例。
+- [改进] `scripts/daily_review_export.py` 入场口径默认改 DB 优先（`--entry-mode daily`，评估器同款；`snapshot` 可回退旧口径），输出摘要标注入场口径；配套 4 条离线用例。
+- [修复] `scripts/report_signal_snapshot_ytd.py`：信号日估值价改 DB 优先（T0.5 口径，快照价仅兜底），并修复上游合并后脚本引用已不存在数据层方法导致的不可用；配套 3 条用例。
+- [测试] T3.6 组合层工具真实数据实跑验收（trend +10.51% / hdh +2.70% / dsr +0.32%，含随机与基准对照；产物 `data/strategy_review/portfolio_*.{json,md}`）。
+- [文档] 新增《2026年9月优化总览》：一页看懂默认每日 4 条链路状态、数据口径修复、评估尺子升级与成绩单；同步更新《数据与验证统一约定》§3 直连豁免（新增 `backfill_stock_daily_volume`）与 §5 缓存污染状态收口、《路线图》先导数字终版注记。
+- [文档] 归档历史口径文档《个人策略界面策略清单》（移入 `归档/个人策略界面策略清单-归档-2026年7月.md`，基线引用与内部链接同步修正）。
+- [新功能] 新增 `scripts/collect_screening_snapshots.py`（T1.2）：screening 引擎严格 Top-N 落库为 `screening__<策略>` 快照（前向积累；空 seed 可复现、替换式幂等、审计 JSON、有效交易日默认）；已冒烟并完成首采（momentum_quality / shrink_pullback / dual_low）；配套 4 条离线用例。
+- [测试] 新增 `scripts/summarize_sensitivity_results.py`（§4-5 汇总）：基线 vs ±20% 变体的条目 1~4 方向核对（复用评估器 + leaderboard 分月口径），输出 JSON；配套 6 条离线用例。
+- [新功能] 新增 `scripts/check_overfitting_risk.py`（F2）：防过拟合旁证（Deflated Sharpe + PBO-CSCV，参考指标不改判定标准），支持多配置族、交易日历网格与单配置回退；配套 10 条离线用例。
+- [测试] 新增 `scripts/pit_rebuild_sensitivity_window.sh`（§4-5）：阈值 ±20% 敏感性 PIT 重建批次（hdh 新高窗口 / trend 扫描前置阈值，独立 `sens__` 前缀不覆盖正式快照）。
+- [新功能] 新增 `scripts/check_random_percentile.py`（§4-6）：随机对照 95 分位检验（日块 bootstrap 5000 轮、固定种子，口径先写死），输出 JSON + 结论表；配套 6 条离线用例。
+- [文档] 《策略收敛与回测路线图》§4 补「口径操作化（跑数前写死）」：随机 95 分位与 ±20% 敏感性的实现口径与执行脚本；T1.2 screening 桥接完成注记同步。
+- [新功能] 新增 `scripts/check_price_anomalies.py`：超板跳变巡检（复用 `scan_abnormal_jumps` 同口径，含 45 天前收回看避免窗口首日漏检），输出 CSV/JSON 并可 `--compare-baseline` 对比重建前指纹基线；重建前基线已固化 `data/verification/qfq_fingerprint_2026_before_rebuild_20260926.csv`（10,456 条/369 只）；配套 6 条离线用例。
+- [新功能] 新增 `scripts/backfill_index_daily.py`：基准指数日线补齐（Baostock → `stock_daily`，(code,date) UPSERT、canonical 按存储契约推导），000300（沪深300）已入库 663 根供 `--benchmark-code` 使用；配套 6 条离线用例。
+- [新功能] 新增 `scripts/analyze_signal_portfolio.py`：组合层等权滚动持仓净值分析（复用评估器口径：daily 入场 / entry 可成交性 / 31bps 成本），输出净值摘要、分月收益与同窗基准/随机对照；配套 7 条离线用例。
+- [文档] 新增《开源参考候选调研（第二轮）》：chan.py / hikyuu / zvt / Alpha101-191 / alphalens-reloaded / quantstats / ML4T / awesome-quant 的案头评估与排期建议（只读不引，未立项）。
+- [文档] 《开源参考候选调研（第二轮）》补写 §6「参考姿势与闸门」并把 §5 转为拍板结论（Alpha101/191 入 P1 素材、alphalens 借方法不引库、chan.py 缓做、ML4T 服务防过拟合、quantstats 试跑）；路线图 Phase 2 新增衍生候选 F1/F2。
+- [文档] 《开源参考候选调研（第二轮）》补 §6.4 F2 预热阅读清单（ML4T 免费 primer 5 页）与 §6.5 hikyuu / zvt 只读备忘（组件边界与三段式组织，只读不引）。
+- [新功能] 新增 `scripts/quantify_pit_contamination_impact.py`：PIT 污染影响量化（重建前指纹 ∩ 窗口信号，按线/总体给出重跑建议，支持 `--anomaly-csv` 前后对照，JSON 落盘）；结论：总体 3.65% < 5%，不触发 PIT 重跑（cache 抽查确认同源接缝 386/386、35/35 受影响信号回看窗含接缝；hdh 单线 9.41% 列定向复核）；配套 4 条离线用例。
+- [改进] 随机对照生成器改为按当日信号板块配比分层抽样（修复创业板占比偏差：dsr 对照 33.7% vs 信号 15.8%），并改为替换式重生成（同日旧行自动清理）；三条线全窗口对照已按新口径重建。
+- [修复] qfq 重建链路：守卫脚本改串行（Baostock 单会话并发互踢致 74% 失败）、重建脚本新增 `--source akshare` 备用通道（腾讯优先）与失败率守门（>5% 非零退出 + 失败清单落盘 `data/run_logs/rebuild_stock_daily_qfq_failed_codes.txt`）。
+- [修复] 修复重建引入的成交量缺失（评估样本误杀）：akshare（腾讯历史接口）不返回 volume，127,648 行 volume=0 被评估器判为“次日停牌”、错杀 ~70% 样本；新增 `scripts/backfill_stock_daily_volume.py`（Tushare `daily(trade_date=…)` 按日批量回补，vol×100=股，幂等）并完成全量修复；配套 4 条用例。
 - [文档] 《开源工具融合规划》更新现状标注（2026-09-26）：P0 等价路径第一轮全市场回填完成（覆盖 5,116/5,245，失败 0）；P2 决策日志工具就绪（日志表 + 回看脚本，空表待积累 ≥20 条启动验收）；时间线表同步。
 - [文档] 冻结口径对齐（2026-09-25 口径）：《个人策略基线》`monthly_slow_rise` 标注冻结（移出页面、脚本保留）、`continuous_up_*` 补冻结标记；《个人策略中英对照》刷新默认每日 4 条链路与停用/冻结标注；`core/monthly_slow_rise.md` 与《个人策略目录》补状态同步。
 - [文档] 《策略收敛与回测路线图》新增 Phase 1 收尾执行清单（2026-09-26 固定）：PIT/qfq 重建验收 → 污染量化决策点 → leaderboard v2 → 收敛判定与留痕。

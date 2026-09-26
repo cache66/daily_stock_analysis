@@ -10,6 +10,8 @@
 | [microsoft/qlib](https://github.com/microsoft/qlib) | 因子研究标准流程：数据集、Alpha 表达式、IC / 分层回测 | 不引入其模型做交易、不替换现有选股与流水线 |
 | [TauricResearch/TradingAgents](https://github.com/TauricResearch/TradingAgents) | **方法论**：决策日志 → 结果回看 → 反思注入；多角色投研组织方式参考 | 不集成其代码（依赖重、美股向、A 股靠 Yahoo 数据质量不足） |
 
+> 第二轮候选（chan.py / hikyuu / zvt / Alpha101-191 因子素材 / alphalens-reloaded / quantstats / ML4T 等）的案头调研见《[开源参考候选调研（第二轮）](./开源参考候选调研（第二轮）.md)》（2026-09-26）。
+
 ## 1. investment_data（P0：数据底座）
 
 **用途**

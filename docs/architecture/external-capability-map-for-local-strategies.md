@@ -571,7 +571,7 @@
 1. `RD-Agent`
    - 重点看：实验编排、因子发现、反馈闭环、研究任务拆解方式
    - 映射目标：`earnings_surprise / monthly_slow_rise` 的统一研究迭代框架，以及 4 条主策略共用的排序器实验能力
-   - 首轮深挖提纲：见 `docs/architecture/rd-agent-source-dive-outline.md`
+   - 首轮深挖提纲：已随 2026-09-26 清理移除（正式结论已包含全部内容，git 历史可查）
    - 首轮正式结论：见 `docs/architecture/rd-agent-source-dive.md`
 2. `Qlib`
    - 重点看：特征层、数据集组织、排序/训练/评估流程、因子研究接口
@@ -603,7 +603,7 @@
    - 映射目标：`signal_snapshot` 评估层与后续组合层
    - 下一步入口（2026-04-28）：在扫描壳收口后，后续应把重点从“怎么扫”切到“怎么评”，优先给 `monthly_slow_rise / earnings_surprise` 建标准化评估层原型，再逐步扩到 4 条主策略。
    - 首轮正式结论：见 `docs/architecture/rqalpha-source-dive.md`
-   - 落地入口草案：见 `docs/architecture/rqalpha-evaluation-layer-next-step.md`
+   - 落地入口草案：已随 2026-09-26 清理移除（评估层已按统一口径评估器落地，git 历史可查）
 9. `vn.py`
    - 重点看：模块边界、插件生态、`vnpy.alpha`、研究到执行桥接
    - 映射目标：研究层、评估层、运行层和工作台层的长期分层

@@ -1,6 +1,6 @@
 # 个人策略专题总览
 
-最后更新：2026-07-09
+最后更新：2026-09-26
 
 这套目录只服务我个人在当前代码里的本地策略体系，不属于原工程通用文档，也不再承担旧文档兼容说明。
 
@@ -13,7 +13,7 @@
 如果你只想快速进入“我们自己维护的策略文档”，阅读顺序固定为：
 
 1. 先看本文，确认目录结构和主入口。
-2. 再看四条主策略文档，理解当前默认口径。
+2. 再看 `core/` 里的各策略现行文档，理解当前默认口径。
 3. 需要补上下文时，再看 supporting 和 topics。
 4. 需要查默认参数、变更留痕、用户可见摘要时，再回到根目录治理文档。
 
@@ -30,14 +30,17 @@
 - `plans/`
   - 个人专题的历史实施归档，保留拆解步骤与验证口径，不代表当前默认实现。
 
-## 四条主策略
+## 主策略一览（2026-09-26）
 
 | 策略 | 是否默认每日 | 角色 | 文档 |
 | --- | --- | --- | --- |
-| `trend_leader_unified` | 是 | 龙头 + 趋势 + 资金 + 业绩兑现的统一主骨架 | [`core/trend_leader_unified.md`](./core/trend_leader_unified.md) |
+| `trend_leader_unified` | 是 | 龙头 + 趋势 + 资金 + 业绩兑现的统一主骨架（2026-09-26 恢复默认） | [`core/trend_leader_unified.md`](./core/trend_leader_unified.md) |
 | `earnings_surprise` | 是 | 财报事件驱动的业绩强势筛选 | [`core/earnings_surprise.md`](./core/earnings_surprise.md) |
 | `hundred_day_high` | 是 | 新高突破确认层 | [`core/hundred_day_high.md`](./core/hundred_day_high.md) |
-| `monthly_slow_rise` | 否 | 中期慢牛结构补充层 | [`core/monthly_slow_rise.md`](./core/monthly_slow_rise.md) |
+| `daily_slow_rise` | 是 | 日线 30-45 度慢涨、平台转趋势补充层 | 见 [`../个人策略文档/个人策略目录.md`](../个人策略文档/个人策略目录.md) |
+| `monthly_slow_rise` | 否（2026-09-25 冻结） | 中期慢牛结构补充层 | [`core/monthly_slow_rise.md`](./core/monthly_slow_rise.md) |
+
+冻结 / 停用状态以 [`../个人策略文档/策略与脚本冻结登记.md`](../个人策略文档/策略与脚本冻结登记.md) 为准。
 
 ## Supporting 文档
 
@@ -51,7 +54,7 @@
 
 ## Topics 文档
 
-这些文档属于专题扫描、研究映射或专题快照，不进入默认每日主链路：
+这些文档属于专题扫描、研究映射或专题快照，不进入默认每日主链路；龙头 / 板块 / 题材 / 涨价四组工具已于 2026-09-25 冻结（转为催化参考工具），文档保留备查：
 
 - [`topics/board_cycle_scan.md`](./topics/board_cycle_scan.md)
 - [`topics/board_recognizability_ranking.md`](./topics/board_recognizability_ranking.md)
@@ -70,6 +73,8 @@
 
 - [`designs/2026-05-01-board_cycle_scan_design.md`](./designs/2026-05-01-board_cycle_scan_design.md)
 - [`plans/2026-05-01-board_cycle_scan_implementation.md`](./plans/2026-05-01-board_cycle_scan_implementation.md)
+- [`designs/2026-05-02-board_concept_pool_refresh_design.md`](./designs/2026-05-02-board_concept_pool_refresh_design.md)
+- [`plans/2026-05-02-board_concept_pool_refresh_implementation.md`](./plans/2026-05-02-board_concept_pool_refresh_implementation.md)
 
 ## 当前默认每日链路
 
@@ -79,15 +84,14 @@
 python scripts/run_fast_review_bundle.py --strategy-profile-file config/local_strategy_profile.json
 ```
 
-当前默认每日首页主筛只跑四条：
+当前默认每日首页主筛只跑四条（2026-09-26 起）：
 
 - `earnings` -> `earnings_surprise`
 - `hundred_day_high`
 - `daily_slow_rise`
-- `long_base_release`
+- `trend_leader` -> `trend_leader_unified`（2026-09-26 恢复：统一口径评估为全库最强前向绩效）
 
-`trend_leader` -> `trend_leader_unified` 当前保留为可选补充观察，不再默认主导首页。
-`monthly_slow_rise` 仍是低频扩展层，需要时再显式纳入。
+`long_base_release` 已于 2026-09-26 停用（评估为稳定负期望，脚本保留可手动单跑）；`monthly_slow_rise` 于 2026-09-25 冻结。停用 / 冻结与恢复流程见《策略与脚本冻结登记》。
 
 ## 根目录治理文档
 

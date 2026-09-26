@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > Detailed internal change log and run evidence: [docs/AI_MODIFICATION_LOG.md](./AI_MODIFICATION_LOG.md)
 
 ## [Unreleased]
+- [文档] 《local_strategies 总览》同步 2026-09-26 现行口径：主策略表补 `daily_slow_rise`、标注 `monthly_slow_rise` 冻结与 `trend_leader_unified` 恢复默认；默认每日链路改为 earnings / hundred_day_high / daily_slow_rise / trend_leader；历史归档区补登记 board_concept_pool_refresh 设计/实施两份。
 - [文档] 精简 `docs/architecture/`：移除 2 篇被取代的脚手架（`rd-agent-source-dive-outline.md`、`rqalpha-evaluation-layer-next-step.md`），同步标注能力地图与《个人策略目录》中的对应链接；其余研究文档（总地图/集成决策/11 篇 source-dive）与 `api_spec.json` 保留。
 - [文档] 移除本地策略 3 个“兼容入口”桩（`docs/LOCAL_STRATEGY_CATALOG.md`、`docs/LOCAL_STRATEGY_BASELINE.md`、`docs/LOCAL_STRATEGY_CHINESE_MAP.md`），引用统一收敛到 `docs/个人策略文档/`：AGENTS.md 维护约定改指《个人策略目录》§7、留痕落点同步；修改记录导航与维护约定、supporting 文档相关列表、CHANGELOG 头部指针一并修正（顺带修复相对链接）。
 - [文档] 清理个人早期添加的过期文档：删除 `docs/superpowers/` 本地残留（23 个 5 月临时计划/设计稿）、`docs/KLINE_PROCESS_LOG.md`、`docs/KLINE_SELECTOR_GUIDE.md`、`docs/SIGNAL_SNAPSHOT_YTD.md`（4 月旧版说明，指向已冻结工具/过期 Windows 路径）及 6 篇 shortline 历史设计稿（已冻结线）；《个人策略目录》中对应引用同步标注移除。

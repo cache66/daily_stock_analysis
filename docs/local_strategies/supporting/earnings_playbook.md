@@ -424,4 +424,4 @@
 - `docs/local_strategies/supporting/earnings_strategy_breakdown.md`
 - `docs/local_strategies/core/earnings_surprise.md`
 - `docs/local_strategies/supporting/earnings_quality_signal.md`
-- `docs/LOCAL_STRATEGY_CATALOG.md`
+- `docs/个人策略文档/个人策略目录.md`

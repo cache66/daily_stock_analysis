@@ -134,7 +134,7 @@ gh run view <run_id> --log-failed
 4. 先判断是否命中高风险区域：配置语义、API / Schema、数据源 fallback、报告结构、认证、调度、发布流程、桌面端启动链路。
 5. 只做和当前任务直接相关的最小改动，不顺手夹带无关重构。
 6. 如果发现文档、脚本、工作流描述不一致，优先信任实际代码与工作流，再决定是否顺手修正文档。
-7. 若命中本地策略资产改动，按 `docs/LOCAL_STRATEGY_CATALOG.md` 顶部“维护约定”逐项补齐记录，再执行验证。
+7. 若命中本地策略资产改动，按 `docs/个人策略文档/个人策略目录.md` §7“维护约定”逐项补齐记录，再执行验证。
 8. 改完后按下面的验证矩阵执行检查。
 9. 最终交付默认要说明：
    - 改了什么
@@ -287,7 +287,7 @@ CI 通过只能说明自动检查通过，不能替代人工语义收敛，也�
   - `风险点`
   - `回滚方式`
 - 如果是 `docs` 任务，可直接写：`Docs only, tests not run`，但仍需说明是否核对了命令和文件名。
-- 涉及本地策略资产的任务，交付说明需明确本次留痕落点：`docs/LOCAL_STRATEGY_CATALOG.md`、`docs/AI_MODIFICATION_LOG.md`、`docs/CHANGELOG.md`。
+- 涉及本地策略资产的任务，交付说明需明确本次留痕落点：`docs/个人策略文档/个人策略目录.md`、`docs/AI_MODIFICATION_LOG.md`、`docs/CHANGELOG.md`。
 - 自动 tag 默认不触发，只有 commit title 包含 `#patch`、`#minor`、`#major` 才会触发版本号更新。
 - 手动打 tag 必须使用 annotated tag。
 - 用户可见变更优先通过 PR 合入，并补齐 label 与验证说明。

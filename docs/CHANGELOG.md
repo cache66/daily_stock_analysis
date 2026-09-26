@@ -8,11 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 > Use this file as the user-visible summary only.
-> Current default strategy baseline: [docs/LOCAL_STRATEGY_BASELINE.md](./LOCAL_STRATEGY_BASELINE.md)
-> Local strategy entry/catalog: [docs/LOCAL_STRATEGY_CATALOG.md](./LOCAL_STRATEGY_CATALOG.md)
+> Current default strategy baseline: [docs/个人策略文档/个人策略基线.md](./个人策略文档/个人策略基线.md)
+> Local strategy entry/catalog: [docs/个人策略文档/个人策略目录.md](./个人策略文档/个人策略目录.md)
 > Detailed internal change log and run evidence: [docs/AI_MODIFICATION_LOG.md](./AI_MODIFICATION_LOG.md)
 
 ## [Unreleased]
+- [文档] 移除本地策略 3 个“兼容入口”桩（`docs/LOCAL_STRATEGY_CATALOG.md`、`docs/LOCAL_STRATEGY_BASELINE.md`、`docs/LOCAL_STRATEGY_CHINESE_MAP.md`），引用统一收敛到 `docs/个人策略文档/`：AGENTS.md 维护约定改指《个人策略目录》§7、留痕落点同步；修改记录导航与维护约定、supporting 文档相关列表、CHANGELOG 头部指针一并修正（顺带修复相对链接）。
 - [文档] 清理个人早期添加的过期文档：删除 `docs/superpowers/` 本地残留（23 个 5 月临时计划/设计稿）、`docs/KLINE_PROCESS_LOG.md`、`docs/KLINE_SELECTOR_GUIDE.md`、`docs/SIGNAL_SNAPSHOT_YTD.md`（4 月旧版说明，指向已冻结工具/过期 Windows 路径）及 6 篇 shortline 历史设计稿（已冻结线）；《个人策略目录》中对应引用同步标注移除。
 - [文档] 个人策略文档滚动瘦身（2026-09-26）：`个人策略目录.md` 历史增补（2026-05~07）与 `个人策略修改记录.md` 2026 年 7 月段分别归档至 `归档/`（新增两个归档文件），主体分别 1694→304 行、1431→258 行；README 阅读顺序与《个人策略精简方案》状态（已收口）同步更新。
 - [文档] 《数据与验证统一约定》新增 §5 价格口径约定：评估价格真源 = `stock_daily` 前复权，快照价禁用，统一 daily 入场与 leaderboard 入口。

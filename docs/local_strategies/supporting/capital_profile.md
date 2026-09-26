@@ -278,6 +278,6 @@
 ## 9. 相关文档
 
 - `docs/local_strategies/supporting/main_strategy_blueprint.md`
-- `docs/LOCAL_STRATEGY_CATALOG.md`
+- `docs/个人策略文档/个人策略目录.md`
 - `docs/local_strategies/supporting/earnings_strategy_breakdown.md`
 - `docs/local_strategies/core/monthly_slow_rise.md`

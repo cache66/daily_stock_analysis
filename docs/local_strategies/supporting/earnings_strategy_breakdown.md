@@ -9,7 +9,7 @@
 
 如果你只想先看总表，请看：
 
-- `docs/LOCAL_STRATEGY_CATALOG.md`
+- `docs/个人策略文档/个人策略目录.md`
 
 如果你想看业绩线的使用方式、常用命令和回测入口，请看：
 
@@ -463,4 +463,4 @@
 
 - `docs/local_strategies/core/earnings_surprise.md`
 - `docs/local_strategies/supporting/earnings_quality_signal.md`
-- `docs/LOCAL_STRATEGY_CATALOG.md`
+- `docs/个人策略文档/个人策略目录.md`

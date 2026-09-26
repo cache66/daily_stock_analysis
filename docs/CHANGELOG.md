@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > Detailed internal change log and run evidence: [docs/AI_MODIFICATION_LOG.md](./AI_MODIFICATION_LOG.md)
 
 ## [Unreleased]
+- [文档] 《开源工具融合规划》更新现状标注（2026-09-26）：P0 等价路径第一轮全市场回填完成（覆盖 5,116/5,245，失败 0）；P2 决策日志工具就绪（日志表 + 回看脚本，空表待积累 ≥20 条启动验收）；时间线表同步。
+- [文档] 冻结口径对齐（2026-09-25 口径）：《个人策略基线》`monthly_slow_rise` 标注冻结（移出页面、脚本保留）、`continuous_up_*` 补冻结标记；《个人策略中英对照》刷新默认每日 4 条链路与停用/冻结标注；`core/monthly_slow_rise.md` 与《个人策略目录》补状态同步。
+- [文档] 《策略收敛与回测路线图》新增 Phase 1 收尾执行清单（2026-09-26 固定）：PIT/qfq 重建验收 → 污染量化决策点 → leaderboard v2 → 收敛判定与留痕。
 - [文档] 《local_strategies 总览》同步 2026-09-26 现行口径：主策略表补 `daily_slow_rise`、标注 `monthly_slow_rise` 冻结与 `trend_leader_unified` 恢复默认；默认每日链路改为 earnings / hundred_day_high / daily_slow_rise / trend_leader；历史归档区补登记 board_concept_pool_refresh 设计/实施两份。
 - [文档] 精简 `docs/architecture/`：移除 2 篇被取代的脚手架（`rd-agent-source-dive-outline.md`、`rqalpha-evaluation-layer-next-step.md`），同步标注能力地图与《个人策略目录》中的对应链接；其余研究文档（总地图/集成决策/11 篇 source-dive）与 `api_spec.json` 保留。
 - [文档] 移除本地策略 3 个“兼容入口”桩（`docs/LOCAL_STRATEGY_CATALOG.md`、`docs/LOCAL_STRATEGY_BASELINE.md`、`docs/LOCAL_STRATEGY_CHINESE_MAP.md`），引用统一收敛到 `docs/个人策略文档/`：AGENTS.md 维护约定改指《个人策略目录》§7、留痕落点同步；修改记录导航与维护约定、supporting 文档相关列表、CHANGELOG 头部指针一并修正（顺带修复相对链接）。

@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > Detailed internal change log and run evidence: [docs/AI_MODIFICATION_LOG.md](./AI_MODIFICATION_LOG.md)
 
 ## [Unreleased]
+- [新功能] 新增 `scripts/run_strategy_leaderboard.py`（T3.2）：一条命令重跑 profile 全部在跑线 + 随机对照，输出主表（成本后 w1/w3/w5、赢率、超额、跑赢率、对随机差）与分月明细（md + json）；薄编排直接复用 `evaluate_signal_snapshot_performance.build_report`。
+- [修复] 信号快照评估入场价口径实锤：近半样本的 `metrics.close` 与前复权 DB 收盘偏离 >2%（高送转/过期尺度券），leaderboard 默认改 `--entry-mode daily`；旧 v2t（快照入场）对高送转股票产生假亏损，修正后 hdh w3 0.44%→3.56%、eps 1.42%→3.85%。
 - [修复] 新增 `scripts/rebuild_stock_daily_qfq.py`：用 Baostock 前复权统一重建 `stock_daily` 评估窗口（默认 2026-01-01 起，覆盖式写回 + 前后异常扫描），修复历史缓存多来源合并导致的同一股票序列"不复权/前复权"价格口径混用。
 - [改进] 信号快照评估器新增 `--entry-mode`（snapshot/daily）：daily 模式入场价只取 `stock_daily` 收盘，与重建后的前复权口径保持一致；默认 snapshot 行为不变。
 - [新功能] 新增 `scripts/backfill_history_cache.py`：BaoStock 全市场回填本地日线缓存（`data/cache/history/`，默认 400 天；已覆盖窗口自动跳过、与旧缓存按日期合并取新），选股产线优先读本地、只增量补尾巴。

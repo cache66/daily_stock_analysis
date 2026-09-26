@@ -621,6 +621,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [测试] 评估器可成交性过滤补充 10 条单元/集成用例（`tests/test_signal_snapshot_tradability_filter.py`）。
 - [新功能] 新增 `scripts/build_random_baseline_snapshots.py`：逐日按信号数量生成随机买入对照快照（固定 seed、可复现、支持 dry-run），配合标准评估器得到随机基线；4 条在跑线对照已出（趋势 +4.7pp 超额 / 业绩 -0.8pp 跑输随机）。
 - [文档] 《策略收敛与回测路线图》更新随机对照结果与"跨策略必须对齐日期窗口"发现；新增 `scripts/pit_rebuild_offense_window.sh`（Aug-Sep 同窗口 PIT 重建，过夜批处理）。
+- [新功能] 信号快照评估器新增 `--benchmark-code`：输出同窗口基准收益、超额收益（含/不含成本）与跑赢比例（窗口汇总 + 报告列）。
+- [测试] 基准超额补充 3 条用例（`tests/test_signal_snapshot_benchmark.py`）；4 条在跑线完成 000905 对照（趋势 +4.69% 超额 / 业绩 -0.73%）。
 
 <!-- 新条目格式：- [类型] 描述（类型取值：新功能/改进/修复/文档/测试/chore）-->
 <!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->

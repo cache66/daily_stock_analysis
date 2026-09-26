@@ -134,6 +134,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--benchmark-code",
+        default=None,
+        help=(
+            "Optional benchmark code present in stock_daily (e.g. 000905); "
+            "adds benchmark return and excess return fields to the report."
+        ),
+    )
+    parser.add_argument(
         "--score-buckets",
         default=DEFAULT_SCORE_BUCKET_EDGES,
         help=f"Comma-separated score bucket edges, default {DEFAULT_SCORE_BUCKET_EDGES}.",
@@ -451,6 +459,38 @@ def _entry_untradable_reason(entry_daily: Any) -> Optional[str]:
     return None
 
 
+def _benchmark_return_pct(
+    stock_repo: StockRepository,
+    *,
+    benchmark_code: str,
+    signal_date: date,
+    eval_window_days: int,
+) -> Optional[float]:
+    """Return the benchmark return over the same forward window, or None."""
+    entry_daily = stock_repo.get_start_daily(code=benchmark_code, analysis_date=signal_date)
+    if entry_daily is None or entry_daily.close is None:
+        return None
+    try:
+        entry_close = float(entry_daily.close)
+    except (TypeError, ValueError):
+        return None
+    if entry_close <= 0:
+        return None
+    forward_bars = stock_repo.get_forward_bars(
+        code=benchmark_code,
+        analysis_date=signal_date,
+        eval_window_days=int(eval_window_days),
+    )
+    if len(forward_bars) < int(eval_window_days):
+        return None
+    exit_bar = forward_bars[int(eval_window_days) - 1]
+    try:
+        exit_close = float(exit_bar.close)
+    except (TypeError, ValueError):
+        return None
+    return round((exit_close - entry_close) / entry_close * 100.0, 4)
+
+
 def _compute_equity_metrics(returns_pct: List[float]) -> Dict[str, Optional[float]]:
     if not returns_pct:
         return {
@@ -557,6 +597,7 @@ def evaluate_snapshot_row(
     eval_window_days: int,
     neutral_band_pct: float,
     total_trade_cost_bps: float,
+    benchmark_code: Optional[str] = None,
     tradability_filter: str = "off",
     fill_missing_daily_data: bool = False,
     missing_daily_data_filler: Optional[MissingDailyDataFiller] = None,
@@ -704,6 +745,30 @@ def evaluate_snapshot_row(
         else:
             insufficient_reason = "insufficient_data"
 
+    after_cost_return_pct = _compute_trade_return_after_cost(
+        evaluation.get("stock_return_pct"),
+        total_trade_cost_bps=total_trade_cost_bps,
+    )
+    benchmark_return_pct: Optional[float] = None
+    if benchmark_code:
+        benchmark_return_pct = _benchmark_return_pct(
+            stock_repo,
+            benchmark_code=str(benchmark_code),
+            signal_date=signal_date,
+            eval_window_days=int(eval_window_days),
+        )
+    raw_return = evaluation.get("stock_return_pct")
+    excess_return_pct = (
+        round(float(raw_return) - benchmark_return_pct, 4)
+        if benchmark_return_pct is not None and raw_return is not None
+        else None
+    )
+    excess_return_after_cost_pct = (
+        round(float(after_cost_return_pct) - benchmark_return_pct, 4)
+        if benchmark_return_pct is not None and after_cost_return_pct is not None
+        else None
+    )
+
     return {
         "code": code,
         "name": name,
@@ -714,10 +779,10 @@ def evaluate_snapshot_row(
         "start_price": start_price,
         "end_close": evaluation.get("end_close"),
         "stock_return_pct": evaluation.get("stock_return_pct"),
-        "stock_return_after_cost_pct": _compute_trade_return_after_cost(
-            evaluation.get("stock_return_pct"),
-            total_trade_cost_bps=total_trade_cost_bps,
-        ),
+        "stock_return_after_cost_pct": after_cost_return_pct,
+        "benchmark_return_pct": benchmark_return_pct,
+        "excess_return_pct": excess_return_pct,
+        "excess_return_after_cost_pct": excess_return_after_cost_pct,
         "simulated_return_pct": evaluation.get("simulated_return_pct"),
         "position_recommendation": evaluation.get("position_recommendation"),
         "outcome": evaluation.get("outcome"),
@@ -762,6 +827,17 @@ def summarize_window(
     untradable_count = sum(
         1 for row in rows if str(row.get("eval_status") or "") == "untradable_entry"
     )
+    benchmark_returns = [
+        float(row["benchmark_return_pct"])
+        for row in completed
+        if row.get("benchmark_return_pct") is not None
+    ]
+    excess_after_cost = [
+        float(row["excess_return_after_cost_pct"])
+        for row in completed
+        if row.get("excess_return_after_cost_pct") is not None
+    ]
+    beat_benchmark_count = sum(1 for value in excess_after_cost if value > 0)
     returns = [
         float(row["stock_return_pct"])
         for row in completed
@@ -837,6 +913,13 @@ def summarize_window(
         ),
         "insufficient_reason_counts": insufficient_reason_counts,
         "untradable_count": untradable_count,
+        "avg_benchmark_return_pct": round(statistics.mean(benchmark_returns), 2) if benchmark_returns else None,
+        "avg_excess_return_after_cost_pct": round(statistics.mean(excess_after_cost), 2)
+        if excess_after_cost
+        else None,
+        "beat_benchmark_rate_pct": (
+            round(beat_benchmark_count / len(excess_after_cost) * 100.0, 2) if excess_after_cost else None
+        ),
         "best_cases": sorted_by_return[: max(detail_limit, 0)],
         "worst_cases": list(reversed(sorted_by_return[-max(detail_limit, 0) :])) if detail_limit > 0 else [],
     }
@@ -860,16 +943,17 @@ def build_markdown_report(report: Dict[str, Any]) -> str:
         f"- Neutral Band Pct: `{report.get('neutral_band_pct')}`",
         f"- Trade Cost Model (bps): `slippage={trade_cost_model.get('slippage_bps', 0.0)}, fee={trade_cost_model.get('fee_bps', 0.0)} turnover_penalty={trade_cost_model.get('turnover_penalty_bps', 0.0)} total={trade_cost_model.get('total_trade_cost_bps', 0.0)}`",
         f"- Tradability Filter: `{filters.get('tradability_filter') or 'off'}`",
+        f"- Benchmark Code: `{filters.get('benchmark_code') or '--'}`",
         f"- Fill Attempts: `{fill_stats.get('fill_attempted_count', 0)}` / `{fill_stats.get('fill_max_attempts', '--')}`",
         "",
         "## Window Summary",
         "",
-        "| window | total | completed | insufficient | untradable | win_rate_pct | win_rate_after_cost_pct | avg_return_pct | avg_return_after_cost_pct | median_return_pct | median_return_after_cost_pct | max_drawdown_after_cost_pct | calmar_after_cost |",
-        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| window | total | completed | insufficient | untradable | win_rate_pct | win_rate_after_cost_pct | avg_return_pct | avg_return_after_cost_pct | median_return_pct | median_return_after_cost_pct | max_drawdown_after_cost_pct | calmar_after_cost | benchmark_pct | excess_after_cost_pct | beat_benchmark_pct |",
+        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for item in report.get("window_summaries") or []:
         lines.append(
-            "| {window} | {total} | {completed} | {insufficient} | {untradable} | {win_rate} | {win_rate_after_cost} | {avg_return} | {avg_return_after_cost} | {median_return} | {median_return_after_cost} | {max_dd_after_cost} | {calmar_after_cost} |".format(
+            "| {window} | {total} | {completed} | {insufficient} | {untradable} | {win_rate} | {win_rate_after_cost} | {avg_return} | {avg_return_after_cost} | {median_return} | {median_return_after_cost} | {max_dd_after_cost} | {calmar_after_cost} | {benchmark} | {excess_after_cost} | {beat} |".format(
                 window=item.get("eval_window_days"),
                 total=item.get("total_evaluations", 0),
                 completed=item.get("completed_count", 0),
@@ -892,6 +976,15 @@ def build_markdown_report(report: Dict[str, Any]) -> str:
                 else "--",
                 calmar_after_cost=item.get("calmar_ratio_after_cost")
                 if item.get("calmar_ratio_after_cost") is not None
+                else "--",
+                benchmark=item.get("avg_benchmark_return_pct")
+                if item.get("avg_benchmark_return_pct") is not None
+                else "--",
+                excess_after_cost=item.get("avg_excess_return_after_cost_pct")
+                if item.get("avg_excess_return_after_cost_pct") is not None
+                else "--",
+                beat=item.get("beat_benchmark_rate_pct")
+                if item.get("beat_benchmark_rate_pct") is not None
                 else "--",
             )
         )
@@ -977,6 +1070,7 @@ def build_report(
     fee_bps: float = 0.0,
     turnover_penalty_bps: float = 0.0,
     tradability_filter: str = "off",
+    benchmark_code: Optional[str] = None,
     score_bucket_edges: Optional[List[float]] = None,
     fill_missing_daily_data: bool = False,
     missing_daily_data_filler: Optional[MissingDailyDataFiller] = None,
@@ -1048,6 +1142,7 @@ def build_report(
                 neutral_band_pct=neutral_band_pct,
                 total_trade_cost_bps=total_trade_cost_bps,
                 tradability_filter=str(tradability_filter),
+                benchmark_code=benchmark_code,
                 fill_missing_daily_data=bool(fill_missing_daily_data),
                 missing_daily_data_filler=_fill_once,
                 trading_days_elapsed_counter=trading_days_elapsed_counter,
@@ -1078,6 +1173,7 @@ def build_report(
             "fill_missing_daily_data": bool(fill_missing_daily_data),
             "fill_max_attempts": normalized_fill_max_attempts,
             "tradability_filter": str(tradability_filter),
+            "benchmark_code": benchmark_code,
         },
         "neutral_band_pct": neutral_band_pct,
         "trade_cost_model": {
@@ -1130,6 +1226,7 @@ def main() -> int:
         fee_bps=max(0.0, float(args.fee_bps)),
         turnover_penalty_bps=max(0.0, float(args.turnover_penalty_bps)),
         tradability_filter=str(args.tradability_filter),
+        benchmark_code=args.benchmark_code,
         score_bucket_edges=score_bucket_edges,
         fill_missing_daily_data=bool(args.fill_missing_daily_data),
         fill_max_attempts=args.fill_max_attempts,
@@ -1147,7 +1244,8 @@ def main() -> int:
         print(
             "window={window} completed={completed} untradable={untradable} win_rate_pct={win_rate} "
             "win_rate_after_cost_pct={win_rate_after_cost} avg_return_pct={avg_return} "
-            "avg_return_after_cost_pct={avg_return_after_cost}".format(
+            "avg_return_after_cost_pct={avg_return_after_cost} "
+            "avg_excess_after_cost_pct={excess_after_cost} beat_benchmark_pct={beat}".format(
                 window=item.get("eval_window_days"),
                 completed=item.get("completed_count", 0),
                 untradable=item.get("untradable_count", 0),
@@ -1158,6 +1256,12 @@ def main() -> int:
                 else "--",
                 avg_return_after_cost=item.get("avg_stock_return_after_cost_pct")
                 if item.get("avg_stock_return_after_cost_pct") is not None
+                else "--",
+                excess_after_cost=item.get("avg_excess_return_after_cost_pct")
+                if item.get("avg_excess_return_after_cost_pct") is not None
+                else "--",
+                beat=item.get("beat_benchmark_rate_pct")
+                if item.get("beat_benchmark_rate_pct") is not None
                 else "--",
             )
         )

@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > Detailed internal change log and run evidence: [docs/AI_MODIFICATION_LOG.md](./AI_MODIFICATION_LOG.md)
 
 ## [Unreleased]
+- [文档] 清理个人早期添加的过期文档：删除 `docs/superpowers/` 本地残留（23 个 5 月临时计划/设计稿）、`docs/KLINE_PROCESS_LOG.md`、`docs/KLINE_SELECTOR_GUIDE.md`、`docs/SIGNAL_SNAPSHOT_YTD.md`（4 月旧版说明，指向已冻结工具/过期 Windows 路径）及 6 篇 shortline 历史设计稿（已冻结线）；《个人策略目录》中对应引用同步标注移除。
 - [文档] 个人策略文档滚动瘦身（2026-09-26）：`个人策略目录.md` 历史增补（2026-05~07）与 `个人策略修改记录.md` 2026 年 7 月段分别归档至 `归档/`（新增两个归档文件），主体分别 1694→304 行、1431→258 行；README 阅读顺序与《个人策略精简方案》状态（已收口）同步更新。
 - [文档] 《数据与验证统一约定》新增 §5 价格口径约定：评估价格真源 = `stock_daily` 前复权，快照价禁用，统一 daily 入场与 leaderboard 入口。
 - [新功能] 新增 `scripts/run_strategy_leaderboard.py`（T3.2）：一条命令重跑 profile 全部在跑线 + 随机对照，输出主表（成本后 w1/w3/w5、赢率、超额、跑赢率、对随机差）与分月明细（md + json）；薄编排直接复用 `evaluate_signal_snapshot_performance.build_report`。

@@ -142,6 +142,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--entry-mode",
+        choices=["snapshot", "daily"],
+        default="snapshot",
+        help=(
+            "Entry price source: 'snapshot' prefers metrics.close recorded at signal time "
+            "(default); 'daily' always uses the stock_daily close, keeping the whole "
+            "entry/exit window on a single adjustment convention."
+        ),
+    )
+    parser.add_argument(
         "--score-buckets",
         default=DEFAULT_SCORE_BUCKET_EDGES,
         help=f"Comma-separated score bucket edges, default {DEFAULT_SCORE_BUCKET_EDGES}.",
@@ -236,16 +246,22 @@ def _is_run_summary_snapshot(snapshot_row: Any) -> bool:
     return bool(metrics.get("is_run_summary"))
 
 
-def _coerce_start_price(snapshot_row: Any, stock_repo: StockRepository) -> Optional[float]:
-    metrics = _safe_json_loads(getattr(snapshot_row, "metrics_payload", None))
-    close_value = metrics.get("close")
-    try:
-        if close_value is not None:
-            close_numeric = float(close_value)
-            if close_numeric > 0:
-                return close_numeric
-    except (TypeError, ValueError):
-        pass
+def _coerce_start_price(
+    snapshot_row: Any,
+    stock_repo: StockRepository,
+    *,
+    prefer_daily: bool = False,
+) -> Optional[float]:
+    if not prefer_daily:
+        metrics = _safe_json_loads(getattr(snapshot_row, "metrics_payload", None))
+        close_value = metrics.get("close")
+        try:
+            if close_value is not None:
+                close_numeric = float(close_value)
+                if close_numeric > 0:
+                    return close_numeric
+        except (TypeError, ValueError):
+            pass
 
     start_daily = stock_repo.get_start_daily(
         code=str(getattr(snapshot_row, "code", "") or "").strip(),
@@ -599,6 +615,7 @@ def evaluate_snapshot_row(
     total_trade_cost_bps: float,
     benchmark_code: Optional[str] = None,
     tradability_filter: str = "off",
+    entry_mode: str = "snapshot",
     fill_missing_daily_data: bool = False,
     missing_daily_data_filler: Optional[MissingDailyDataFiller] = None,
     trading_days_elapsed_counter: Optional[TradingDaysElapsedCounter] = None,
@@ -612,7 +629,8 @@ def evaluate_snapshot_row(
         int(eval_window_days),
         trading_days_elapsed_counter=trading_days_elapsed_counter,
     )
-    start_price = _coerce_start_price(snapshot_row, stock_repo)
+    prefer_daily_entry = str(entry_mode or "snapshot").strip().lower() == "daily"
+    start_price = _coerce_start_price(snapshot_row, stock_repo, prefer_daily=prefer_daily_entry)
     if start_price is None and signal_date is not None and filler is not None and code:
         try:
             filler(
@@ -623,7 +641,7 @@ def evaluate_snapshot_row(
             )
         except Exception as exc:
             logger.warning("missing daily-data filler callback failed: code=%s date=%s error=%s", code, signal_date, exc)
-        start_price = _coerce_start_price(snapshot_row, stock_repo)
+        start_price = _coerce_start_price(snapshot_row, stock_repo, prefer_daily=prefer_daily_entry)
 
     if start_price is None or signal_date is None:
         insufficient_reason = "missing_start_price" if signal_date is not None else "missing_signal_date"
@@ -1070,6 +1088,7 @@ def build_report(
     fee_bps: float = 0.0,
     turnover_penalty_bps: float = 0.0,
     tradability_filter: str = "off",
+    entry_mode: str = "snapshot",
     benchmark_code: Optional[str] = None,
     score_bucket_edges: Optional[List[float]] = None,
     fill_missing_daily_data: bool = False,
@@ -1142,6 +1161,7 @@ def build_report(
                 neutral_band_pct=neutral_band_pct,
                 total_trade_cost_bps=total_trade_cost_bps,
                 tradability_filter=str(tradability_filter),
+                entry_mode=str(entry_mode),
                 benchmark_code=benchmark_code,
                 fill_missing_daily_data=bool(fill_missing_daily_data),
                 missing_daily_data_filler=_fill_once,
@@ -1173,6 +1193,7 @@ def build_report(
             "fill_missing_daily_data": bool(fill_missing_daily_data),
             "fill_max_attempts": normalized_fill_max_attempts,
             "tradability_filter": str(tradability_filter),
+            "entry_mode": str(entry_mode),
             "benchmark_code": benchmark_code,
         },
         "neutral_band_pct": neutral_band_pct,
@@ -1226,6 +1247,7 @@ def main() -> int:
         fee_bps=max(0.0, float(args.fee_bps)),
         turnover_penalty_bps=max(0.0, float(args.turnover_penalty_bps)),
         tradability_filter=str(args.tradability_filter),
+        entry_mode=str(args.entry_mode),
         benchmark_code=args.benchmark_code,
         score_bucket_edges=score_bucket_edges,
         fill_missing_daily_data=bool(args.fill_missing_daily_data),

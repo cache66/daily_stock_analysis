@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > Detailed internal change log and run evidence: [docs/AI_MODIFICATION_LOG.md](./AI_MODIFICATION_LOG.md)
 
 ## [Unreleased]
+- [修复] 新增 `scripts/rebuild_stock_daily_qfq.py`：用 Baostock 前复权统一重建 `stock_daily` 评估窗口（默认 2026-01-01 起，覆盖式写回 + 前后异常扫描），修复历史缓存多来源合并导致的同一股票序列"不复权/前复权"价格口径混用。
+- [改进] 信号快照评估器新增 `--entry-mode`（snapshot/daily）：daily 模式入场价只取 `stock_daily` 收盘，与重建后的前复权口径保持一致；默认 snapshot 行为不变。
 - [新功能] 新增 `scripts/backfill_history_cache.py`：BaoStock 全市场回填本地日线缓存（`data/cache/history/`，默认 400 天；已覆盖窗口自动跳过、与旧缓存按日期合并取新），选股产线优先读本地、只增量补尾巴。
 - [测试] 回填脚本离线用例 5 项：名单过滤（剔除北交所/去重）、覆盖判定、合并去重、跳过/更新/失败计数、空结果计数。
 - [改进] 回填脚本支持多进程并行（`--workers N`，每进程独立 BaoStock 会话）与抓取失败重试（×3）、覆盖判定 3 天尾差容忍；6 进程实测全市场 5222 只 33 分钟跑完（串行预计 1.5~2h），回填+补漏两轮后 5116/5245 完整覆盖（缺口=97 新股 + 32 停牌）。

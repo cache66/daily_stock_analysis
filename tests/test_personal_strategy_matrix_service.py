@@ -38,9 +38,9 @@ def test_get_matrix_enriches_quality_and_strategy_view_lanes() -> None:
                 "stock_review_lane": "double_confirmation",
                 "stock_review_lane_label": "双确认",
                 "priority_score": 88.0,
-                "signal_keys": ["earnings", "daily_slow_rise"],
-                "signal_types": ["earnings_surprise", "daily_slow_rise"],
-                "triggered_strategies": ["earnings", "daily_slow_rise"],
+                "signal_keys": ["earnings", "long_base_release"],
+                "signal_types": ["earnings_surprise", "long_base_release"],
+                "triggered_strategies": ["earnings", "long_base_release"],
                 "today_change_pct": 3.21,
                 "earnings_strategy_score": 76.0,
                 "earnings_strategy_gate_status": "passed_strategy_score",
@@ -63,7 +63,7 @@ def test_get_matrix_enriches_quality_and_strategy_view_lanes() -> None:
     assert strong["view_lane_label"] == "长线发现"
     assert weak["view_lane"] == "short_term"
     assert weak["view_lane_label"] == "短线主升"
-    assert strong["matched_strategy_ids"] == ["daily_slow_rise"]
+    assert strong["matched_strategy_ids"] == ["long_base_release"]
     assert weak["matched_strategy_ids"] == ["hundred_day_high"]
     assert strong["quality_band"] == "recommended"
     assert strong["quality_label"] == "优先看"
@@ -105,10 +105,10 @@ def test_get_matrix_filters_by_selected_strategy_after_quality_enrichment() -> N
         ],
     }
 
-    payload = service.get_matrix(snapshot_date="2026-07-10", strategy_ids=["daily_slow_rise"])
+    payload = service.get_matrix(snapshot_date="2026-07-10", strategy_ids=["long_base_release"])
 
     assert payload["total"] == 1
-    assert payload["items"][0]["code"] == "300475"
+    assert payload["items"][0]["code"] == "002463"
     assert payload["strategy_summary"]["long_base_release"] == 1
 
 
@@ -117,10 +117,10 @@ def test_market_regime_switches_visible_strategy_lines() -> None:
     defensive_ids = {item["id"] for item in defensive.get_catalog()}
     assert defensive_ids == {
         "hundred_day_high",
-        "daily_slow_rise",
         "long_base_release",
         "trend_leader_unified",
     }
+    assert "daily_slow_rise" not in defensive_ids
 
     balanced = PersonalStrategyMatrixService(regime="balanced")
     balanced_ids = {item["id"] for item in balanced.get_catalog()}
@@ -141,9 +141,9 @@ def test_balanced_regime_restores_earnings_line_matching() -> None:
                 "name": "香农芯创",
                 "stock_review_lane": "double_confirmation",
                 "stock_review_lane_label": "双确认",
-                "triggered_strategies": ["earnings", "daily_slow_rise"],
-                "signal_keys": ["earnings", "daily_slow_rise"],
-                "signal_types": ["earnings_surprise", "daily_slow_rise"],
+                "triggered_strategies": ["earnings", "long_base_release"],
+                "signal_keys": ["earnings", "long_base_release"],
+                "signal_types": ["earnings_surprise", "long_base_release"],
             }
         ],
     }
@@ -151,8 +151,32 @@ def test_balanced_regime_restores_earnings_line_matching() -> None:
     payload = service.get_matrix(snapshot_date="2026-07-10")
 
     assert payload["market_regime"] == "balanced"
-    assert payload["items"][0]["matched_strategy_ids"] == ["earnings_surprise", "daily_slow_rise"]
+    assert payload["items"][0]["matched_strategy_ids"] == ["earnings_surprise", "long_base_release"]
     assert "earnings_surprise" in payload["strategy_summary"]
+
+
+def test_frozen_daily_slow_rise_not_listed_or_matched() -> None:
+    service = PersonalStrategyMatrixService(regime="balanced")
+    catalog_ids = {item["id"] for item in service.get_catalog()}
+    assert "daily_slow_rise" not in catalog_ids
+
+    service.fast_review_service.get_stock_overview = lambda snapshot_date, code=None: {
+        "snapshot_date": "2026-07-10",
+        "source_run_dir": "data/manual_runs/2026-07-10/review",
+        "source_csv_path": "data/manual_runs/2026-07-10/review/fast_review_stock_overview.csv",
+        "items": [
+            {
+                "code": "300475",
+                "name": "香农芯创",
+                "triggered_strategies": ["daily_slow_rise"],
+                "signal_keys": ["daily_slow_rise"],
+                "signal_types": ["daily_slow_rise"],
+            }
+        ],
+    }
+    payload = service.get_matrix(snapshot_date="2026-07-10")
+
+    assert payload["items"][0]["matched_strategy_ids"] == []
 
 
 def test_resolve_market_regime_reads_profile_json(tmp_path) -> None:

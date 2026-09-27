@@ -3728,7 +3728,7 @@ def test_parse_args_uses_fast_review_defaults_when_profile_missing(tmp_path: Pat
 def test_parse_args_uses_repo_strategy_profile_tighter_trend_prefilter_defaults() -> None:
     args = fast_bundle.parse_args([])
 
-    assert args.include_signals == "earnings,hundred_day_high,daily_slow_rise,long_base_release"
+    assert args.include_signals == "earnings,hundred_day_high,trend_leader"
     assert args.daily_profile == "review_balanced"
     assert args.daily_max_workers == 4
     assert args.long_base_release_profile == "loose"

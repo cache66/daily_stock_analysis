@@ -4,11 +4,11 @@
     "include_signals": [
       "earnings",
       "hundred_day_high",
-      "daily_slow_rise",
       "trend_leader"
     ],
     "exclude_signals": [
-      "long_base_release"
+      "long_base_release",
+      "daily_slow_rise"
     ],
     "persist_snapshots": true,
     "max_workers": 1,

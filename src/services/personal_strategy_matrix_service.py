@@ -47,8 +47,8 @@ PERSONAL_STRATEGY_CATALOG: List[Dict[str, Any]] = [
     },
     {
         "id": "daily_slow_rise",
-        "line": "offensive",
-        "line_label": "进攻线",
+        "line": "frozen",
+        "line_label": "冻结",
         "name": "日线慢涨 daily_slow_rise",
         "short_name": "慢涨",
         "group": "daily",
@@ -245,7 +245,7 @@ VIEW_LANE_LABELS = {
 }
 
 # 市场环境开关：defensive 只展示进攻线（图形件），balanced/offensive 恢复备用业绩线；
-# frozen 策略（月慢/阳线/连涨/龙头/板块/题材/涨价/短线中枢）不再参与展示与命中。
+# frozen 策略（月慢/日慢/阳线/连涨/龙头/板块/题材/涨价/短线中枢）不再参与展示与命中。
 REGIME_VISIBLE_LINES: Dict[str, tuple] = {
     "defensive": ("offensive",),
     "balanced": ("offensive", "backup"),

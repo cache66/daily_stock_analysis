@@ -26,6 +26,7 @@ from src.report_language import normalize_report_language
 from src.search_service import SearchService
 from src.core.market_profile import get_profile, MarketProfile
 from src.core.market_strategy import get_market_strategy_blueprint
+from src.services.limit_up_review_service import LimitUpReviewService
 from src.llm.backend_registry import (
     LOCAL_CLI_GENERATION_BACKEND_IDS,
     LITELLM_BACKEND_ID,

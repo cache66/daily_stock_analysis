@@ -68,7 +68,8 @@ class _RecordingFetcher(BaseFetcher):
 
     def _fetch_raw_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
         self.calls.append(stock_code)
-        return _sample_df()
+        business_days = pd.bdate_range(start_date, end_date)
+        return _history_rows(*[day.strftime("%Y-%m-%d") for day in business_days])
 
     def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
         return df
@@ -100,6 +101,83 @@ class _NoDataFetcher(BaseFetcher):
 
     def _fetch_raw_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
         return pd.DataFrame()
+
+    def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
+        return df
+
+
+def _history_rows(*dates: str) -> pd.DataFrame:
+    """构造历史行情行（列结构与 _sample_df 对齐；日期为给定交易日）。"""
+    rows = []
+    for idx, day in enumerate(dates):
+        base = 10.0 + idx * 0.1
+        rows.append(
+            {
+                "date": day,
+                "open": base,
+                "high": base + 0.3,
+                "low": base - 0.2,
+                "close": base + 0.2,
+                "volume": 1000.0 + idx * 100,
+                "amount": (1000.0 + idx * 100) * (base + 0.2),
+                "pct_chg": 0.5,
+            }
+        )
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["date"] = pd.to_datetime(df["date"])
+    return df
+
+
+class _HistoryCacheFetcher(BaseFetcher):
+    """历史缓存测试用抓取器：记录调用；可指定区间响应，未指定时按交易日生成。"""
+
+    name = "HistoryCacheFetcher"
+    priority = 1
+
+    def __init__(self, responses_by_range=None):
+        self.responses_by_range = responses_by_range or {}
+        self.calls = []
+
+    def _fetch_raw_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+        self.calls.append((stock_code, start_date, end_date))
+        key = (start_date, end_date)
+        if key in self.responses_by_range:
+            return self.responses_by_range[key].copy()
+        business_days = pd.bdate_range(start_date, end_date)
+        return _history_rows(*[day.strftime("%Y-%m-%d") for day in business_days])
+
+    def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
+        return df
+
+
+class _HangingFetcher(BaseFetcher):
+    """永远阻塞的抓取器（用于超时快速失败用例）。"""
+
+    name = "HangingFetcher"
+    priority = 1
+
+    def _fetch_raw_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+        time.sleep(5)
+        return pd.DataFrame()
+
+    def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
+        return df
+
+
+class _AlwaysFailHistoryFetcher(BaseFetcher):
+    """永远抛 DataFetchError 的抓取器（用于失败磁盘缓存用例）。"""
+
+    name = "AlwaysFailHistoryFetcher"
+    priority = 1
+
+    def __init__(self, message: str):
+        self.message = message
+        self.calls = []
+
+    def _fetch_raw_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+        self.calls.append((stock_code, start_date, end_date))
+        raise DataFetchError(self.message)
 
     def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
         return df
@@ -238,7 +316,15 @@ class TestFetcherLogging(unittest.TestCase):
         yfinance = _RecordingFetcher("YfinanceFetcher", 3)
 
         manager = DataFetcherManager(fetchers=[efinance, pytdx, akshare, yfinance])
-        df, source = manager.get_daily_data("1211.HK", start_date="2026-05-01", end_date="2026-05-08")
+        config = types.SimpleNamespace(
+            history_disk_cache_enabled=False,
+            history_disk_cache_dir=tempfile.mkdtemp(),
+            history_disk_cache_ttl_seconds=21600,
+            history_disk_cache_overlap_days=0,
+        )
+
+        with patch("src.config.get_config", return_value=config):
+            df, source = manager.get_daily_data("1211.HK", start_date="2026-05-01", end_date="2026-05-08")
 
         self.assertFalse(df.empty)
         self.assertEqual(source, "AkshareFetcher")
@@ -702,6 +788,10 @@ class TestFetcherLogging(unittest.TestCase):
             history_disk_cache_overlap_days=0,
         )
 
+        # 预热一次性懒加载的指数注册表，避免把 ~0.4s 冷启动计入超时耗时
+        from src.services.stock_list_parser import default_index_registry
+
+        default_index_registry()
         started_at = time.monotonic()
         with patch("src.config.get_config", return_value=config):
             with self.assertRaises(DataFetchError) as raised:

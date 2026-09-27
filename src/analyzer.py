@@ -3474,11 +3474,11 @@ class GeminiAnalyzer:
                     except Exception as exc:
                         safe_error = self._sanitize_litellm_exception_text(exc, config=config, model=model)
                         logger.warning(
-                            "[LiteLLM] %s returned empty response (attempt %s/%s), retrying same model",
+                            "[LiteLLM] %s empty response / stream unavailable, falling back to next model: %s",
                             model,
                             safe_error,
                         )
-                        time.sleep(min(0.5 * attempt, 1.5))
+                        time.sleep(0.5)
                         continue
 
                 if _stream_text is not None:
@@ -3494,57 +3494,69 @@ class GeminiAnalyzer:
                         response_validator(_stream_text)
                     return _stream_text, model, _stream_usage
 
-                response = call_litellm_with_param_recovery(
-                    lambda kwargs: self._dispatch_litellm_completion(
-                        model,
-                        kwargs,
-                        config=config,
-                        use_channel_router=use_channel_router,
-                        router_model_names=router_model_names,
-                    ),
-                    model=model,
-                    call_kwargs=call_kwargs,
-                    model_list=recovery_model_list,
-                    logger=logger,
-                )
-
-                response_model, response_provider = self._resolve_response_model_provider(
-                    response,
-                    fallback_provider=usage_provider,
-                    configured_model=model,
-                    model_list=recovery_model_list,
-                )
-                actual_model = response_model or model
-                if response_model:
-                    last_model = actual_model
-                if response_provider:
-                    last_provider = response_provider
-                content = self._extract_completion_text(response)
-                if content:
-                    usage_messages = None if audit_context is not None else call_kwargs["messages"]
-                    usage = self._normalize_usage(
-                        extract_usage_payload(response),
-                        model=response_model or usage_model or model,
-                        provider=response_provider or usage_provider,
-                        messages=usage_messages,
+                empty_attempt = 0
+                while True:
+                    response = call_litellm_with_param_recovery(
+                        lambda kwargs: self._dispatch_litellm_completion(
+                            model,
+                            kwargs,
+                            config=config,
+                            use_channel_router=use_channel_router,
+                            router_model_names=router_model_names,
+                        ),
+                        model=model,
+                        call_kwargs=call_kwargs,
+                        model_list=recovery_model_list,
+                        logger=logger,
                     )
-                    if response_provider or usage_provider:
-                        usage["provider"] = response_provider or usage_provider
-                    if audit_context is not None:
-                        usage = _attach_usage_audit(usage, call_kwargs["messages"])
+
+                    response_model, response_provider = self._resolve_response_model_provider(
+                        response,
+                        fallback_provider=usage_provider,
+                        configured_model=model,
+                        model_list=recovery_model_list,
+                    )
+                    actual_model = response_model or model
                     if response_model:
-                        usage.setdefault("response_model", response_model)
-                    if response_provider or usage_provider:
-                        usage.setdefault("provider", response_provider or usage_provider)
-                    last_response_text = content
-                    last_model = actual_model
+                        last_model = actual_model
                     if response_provider:
                         last_provider = response_provider
-                    last_usage = usage
-                    if response_validator is not None:
-                        response_validator(content)
-                    return (content, actual_model, usage)
-                raise ValueError("LLM returned empty response")
+                    content = self._extract_completion_text(response)
+                    if content:
+                        usage_messages = None if audit_context is not None else call_kwargs["messages"]
+                        usage = self._normalize_usage(
+                            extract_usage_payload(response),
+                            model=response_model or usage_model or model,
+                            provider=response_provider or usage_provider,
+                            messages=usage_messages,
+                        )
+                        if response_provider or usage_provider:
+                            usage["provider"] = response_provider or usage_provider
+                        if audit_context is not None:
+                            usage = _attach_usage_audit(usage, call_kwargs["messages"])
+                        if response_model:
+                            usage.setdefault("response_model", response_model)
+                        if response_provider or usage_provider:
+                            usage.setdefault("provider", response_provider or usage_provider)
+                        last_response_text = content
+                        last_model = actual_model
+                        if response_provider:
+                            last_provider = response_provider
+                        last_usage = usage
+                        if response_validator is not None:
+                            response_validator(content)
+                        return (content, actual_model, usage)
+
+                    empty_attempt += 1
+                    if empty_attempt >= EMPTY_LLM_RESPONSE_RETRY_ATTEMPTS:
+                        raise ValueError("LLM returned empty response")
+                    logger.warning(
+                        "[LiteLLM] %s returned empty response (attempt %s/%s), retrying same model",
+                        model,
+                        empty_attempt,
+                        EMPTY_LLM_RESPONSE_RETRY_ATTEMPTS,
+                    )
+                    time.sleep(min(0.5 * empty_attempt, 1.5))
 
             except Exception as e:
                 if uses_router:

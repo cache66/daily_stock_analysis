@@ -17,7 +17,7 @@ from sqlalchemy.sql import func
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.config import Config
-from src.storage import Base, CURRENT_SCHEMA_VERSION, DatabaseManager, DatabaseSchemaMigration, StockDaily
+from src.storage import Base, CURRENT_SCHEMA_VERSION, DatabaseManager, DatabaseSchemaMigration, SignalFundamentalSnapshot, StockDaily
 from src.services import stock_list_parser as stock_list_parser_module
 
 class TestStorage(unittest.TestCase):

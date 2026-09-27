@@ -5,13 +5,38 @@ from __future__ import annotations
 
 import json
 import subprocess
+from datetime import date
 from pathlib import Path
 
+import pytest
+
+import src.services.personal_strategy_run_service as run_service
 from src.services.personal_strategy_run_service import (
     DEFAULT_EXTENDED_INCLUDE_SIGNALS,
     PersonalStrategyMatrixRunOptions,
     PersonalStrategyMatrixRunService,
 )
+
+
+def test_normalize_snapshot_date_supports_latest(monkeypatch) -> None:
+    monkeypatch.setattr(
+        run_service.FastReviewFocusService,
+        "find_latest_snapshot_date",
+        lambda self: date(2026, 7, 10),
+    )
+    assert run_service.normalize_snapshot_date("latest") == "2026-07-10"
+    assert run_service.normalize_snapshot_date("auto") == "2026-07-10"
+    assert run_service.normalize_snapshot_date("2026-07-09") == "2026-07-09"
+
+
+def test_normalize_snapshot_date_latest_without_artifact_raises(monkeypatch) -> None:
+    monkeypatch.setattr(
+        run_service.FastReviewFocusService,
+        "find_latest_snapshot_date",
+        lambda self: None,
+    )
+    with pytest.raises(ValueError):
+        run_service.normalize_snapshot_date("latest")
 
 
 def test_build_plan_defaults_to_prewarm_then_bundle(tmp_path: Path) -> None:

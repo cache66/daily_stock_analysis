@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from src.services.fast_review_focus_service import (
     DEFAULT_MANUAL_RUNS_ROOT,
@@ -22,7 +22,7 @@ PERSONAL_STRATEGY_CATALOG: List[Dict[str, Any]] = [
     {
         "id": "earnings_surprise",
         "line": "backup",
-        "line_label": "备用线",
+        "line_label": "默认线",
         "name": "业绩强势 earnings_surprise",
         "short_name": "业绩",
         "group": "daily",
@@ -53,20 +53,20 @@ PERSONAL_STRATEGY_CATALOG: List[Dict[str, Any]] = [
         "short_name": "慢涨",
         "group": "daily",
         "group_label": "日复盘默认信号",
-        "mode": "默认日复盘",
+        "mode": "已冻结（不进默认每日）",
         "aliases": ["daily_slow_rise"],
         "role": "寻找近阶段阳线多、走势没有明显走差、缓慢抬升的图形。",
         "logic": "当前使用 accelerating 画像，关注近 20-30 个交易日上涨日占比、区间涨幅、回撤、均线结构、量能与最近走势是否破坏；这是纯图形观察的核心入口。",
     },
     {
         "id": "long_base_release",
-        "line": "offensive",
-        "line_label": "进攻线",
+        "line": "frozen",
+        "line_label": "冻结",
         "name": "长平台释放 long_base_release",
         "short_name": "平台",
         "group": "daily",
         "group_label": "日复盘默认信号",
-        "mode": "默认日复盘",
+        "mode": "已停用（不进默认每日，可手动单跑）",
         "aliases": ["long_base_release"],
         "role": "找长期横盘后开始放量/突破的结构，偏“底部平台被资金重新定价”。",
         "logic": "当前使用 loose 画像，关注长周期压缩、平台区间、近期放量与突破关系；命中后要继续看行业估值、板块风口和个股辨识度。",
@@ -79,10 +79,10 @@ PERSONAL_STRATEGY_CATALOG: List[Dict[str, Any]] = [
         "short_name": "趋势",
         "group": "chart",
         "group_label": "趋势与纯图形观察",
-        "mode": "非默认扫描",
+        "mode": "默认日复盘",
         "aliases": ["trend_leader", "trend_leader_unified", "trend_leader_unified_watchlist"],
         "role": "寻找阶段涨幅、强度和流动性都靠前的趋势股。",
-        "logic": "以 60 日涨幅、换手率、相对强度、行业共振和风险过滤做预筛；当前不在默认日复盘信号集合里，更多用于专题扫描或候选池补充。",
+        "logic": "以 60 日涨幅、换手率、相对强度、行业共振和风险过滤做预筛；当前为默认日复盘的主观察线。",
     },
     {
         "id": "monthly_slow_rise",
@@ -244,8 +244,9 @@ VIEW_LANE_LABELS = {
     "watch": "其他观察",
 }
 
-# 市场环境开关：defensive 只展示进攻线（图形件），balanced/offensive 恢复备用业绩线；
-# frozen 策略（月慢/日慢/阳线/连涨/龙头/板块/题材/涨价/短线中枢）不再参与展示与命中。
+# 市场环境开关：只对“未在 profile 的 include/exclude 中显式配置”的策略生效。
+# profile.include_signals 永远展示；exclude_signals 与 line=frozen 永远隐藏；
+# 其余策略按环境过滤：defensive 只看进攻线，balanced/offensive 恢复备用线。
 REGIME_VISIBLE_LINES: Dict[str, tuple] = {
     "defensive": ("offensive",),
     "balanced": ("offensive", "backup"),
@@ -307,15 +308,39 @@ class PersonalStrategyMatrixService:
                 self.market_regime = normalized_regime
         self.visible_catalog = self._build_visible_catalog()
 
+    def _profile_signal_keys(self) -> Tuple[set, set]:
+        """读取 profile 的 include/exclude 信号键（缺失时返回空集合，退回环境开关逻辑）。"""
+        try:
+            payload = json.loads(self.profile_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return set(), set()
+        defaults = payload.get("defaults") if isinstance(payload.get("defaults"), dict) else {}
+
+        def _tokens(value: Any) -> set:
+            if not isinstance(value, (list, tuple)):
+                return set()
+            return {str(item).strip() for item in value if str(item).strip()}
+
+        return _tokens(defaults.get("include_signals")), _tokens(defaults.get("exclude_signals"))
+
     def _build_visible_catalog(self) -> List[Dict[str, Any]]:
+        """可见策略 = profile（include 永远展示、exclude/冻结永远隐藏）+ 环境过滤其余条目。"""
+        include_keys, exclude_keys = self._profile_signal_keys()
         visible_lines = set(
             REGIME_VISIBLE_LINES.get(self.market_regime) or REGIME_VISIBLE_LINES[DEFAULT_MARKET_REGIME]
         )
-        return [
-            strategy
-            for strategy in PERSONAL_STRATEGY_CATALOG
-            if str(strategy.get("line") or "").strip() in visible_lines
-        ]
+        catalog: List[Dict[str, Any]] = []
+        for strategy in PERSONAL_STRATEGY_CATALOG:
+            line = str(strategy.get("line") or "").strip()
+            if line == "frozen":
+                continue
+            aliases = {str(alias).strip() for alias in strategy.get("aliases") or [] if str(alias).strip()}
+            aliases.add(str(strategy.get("id") or "").strip())
+            if aliases & exclude_keys:
+                continue
+            if aliases & include_keys or line in visible_lines:
+                catalog.append(strategy)
+        return catalog
 
     def get_catalog(self) -> List[Dict[str, Any]]:
         return [dict(strategy) for strategy in self.visible_catalog]

@@ -3699,7 +3699,8 @@ def test_parse_args_uses_fast_review_defaults_when_profile_missing(tmp_path: Pat
     missing_profile = tmp_path / "missing_profile.json"
     args = fast_bundle.parse_args(["--strategy-profile-file", str(missing_profile)])
 
-    assert args.include_signals == "earnings,hundred_day_high,daily_slow_rise,long_base_release"
+    # 2026-09-27 起缺省回退为三条线；冻结/停用线不再进默认集合
+    assert args.include_signals == "earnings,hundred_day_high,trend_leader"
     assert args.daily_profile == "review_balanced"
     assert args.external_parallelism == 3
     assert args.external_command_idle_timeout_sec == 1800

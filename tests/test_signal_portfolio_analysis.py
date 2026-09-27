@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from scripts.analyze_signal_portfolio import (
     _monthly_compounded,
     _select_daily_samples,
+    _select_random_samples,
     _total_cost_pct,
     build_markdown,
     run_line,
@@ -55,10 +56,11 @@ class _FakeRepo:
         ]
 
 
-def _row(code, day, *, overall_score=None, name=""):
+def _row(code, day, *, overall_score=None, name="", **extra_metrics):
     metrics = {"close": 1.0}
     if overall_score is not None:
         metrics["overall_score"] = overall_score
+    metrics.update(extra_metrics)
     return SimpleNamespace(
         code=code,
         name=name,
@@ -70,6 +72,21 @@ def _row(code, day, *, overall_score=None, name=""):
 D1 = date(2026, 8, 4)
 D2 = date(2026, 8, 5)
 D3 = date(2026, 8, 6)
+
+
+def test_select_random_samples_is_seeded_and_independent_of_scores():
+    rows = [
+        _row(f"{i:06d}", D1, overall_score=float(100 - i), breakout_quality_score=float(i))
+        for i in range(10)
+    ]
+    picked = _select_random_samples(rows, top_n=3)
+    assert len(picked) == 3
+    assert [r.code for r in picked] == [r.code for r in _select_random_samples(rows, top_n=3)]
+    # 种子不同 → 抽取结果不同
+    other = _select_random_samples(rows, top_n=3, seed=1)
+    assert {r.code for r in other} != {r.code for r in picked}
+    # top_n<=0 时保留全部且确定
+    assert len(_select_random_samples(rows, top_n=0)) == 10
 
 
 def _two_code_repo():
@@ -160,6 +177,17 @@ class SelectionTestCase(unittest.TestCase):
         ]
         selected = _select_daily_samples(samples, top_n=1)
         self.assertEqual([item.code for item in selected], ["AAA", "CCC"])
+
+    def test_rank_by_uses_custom_metric(self):
+        samples = [
+            _row("AAA", D1, breakout_quality_score=10.0),
+            _row("BBB", D1, breakout_quality_score=99.0),
+            _row("CCC", D1, overall_score=90.0),
+        ]
+        selected = _select_daily_samples(
+            samples, top_n=1, rank_by="breakout_quality_score"
+        )
+        self.assertEqual([item.code for item in selected], ["BBB"])
 
     def test_duplicate_rows_are_deduplicated(self):
         samples = [_row("AAA", D1), _row("AAA", D1), _row("BBB", D1)]

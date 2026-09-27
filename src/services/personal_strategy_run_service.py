@@ -13,15 +13,15 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from src.services.fast_review_focus_service import FastReviewFocusService
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_STRATEGY_PROFILE_FILE = PROJECT_ROOT / "config" / "local_strategy_profile.json"
 DEFAULT_MATRIX_OUTPUT_DIR = PROJECT_ROOT / "data" / "manual_runs" / "personal_strategy_matrix"
 DEFAULT_PREWARM_OUTPUT_ROOT = PROJECT_ROOT / "data" / "runtime" / "cache_prewarm"
-DEFAULT_EXTENDED_INCLUDE_SIGNALS = (
-    "earnings,hundred_day_high,daily_slow_rise,long_base_release,"
-    "trend_leader,monthly_slow_rise,continuous_up"
-)
+# 与 profile 默认口径同步：仅未冻结的三条线；冻结/停用线不进扩展集合。
+DEFAULT_EXTENDED_INCLUDE_SIGNALS = "earnings,hundred_day_high,trend_leader"
 
 
 @dataclass(frozen=True)
@@ -47,7 +47,7 @@ class PersonalStrategyMatrixRunOptions:
 
 
 def normalize_snapshot_date(value: Any) -> str:
-    """Normalize date-like input to YYYY-MM-DD text."""
+    """Normalize date-like input to YYYY-MM-DD text（latest/auto → 最新已有复盘产物日期）。"""
 
     if isinstance(value, datetime):
         return value.date().isoformat()
@@ -56,6 +56,13 @@ def normalize_snapshot_date(value: Any) -> str:
     text = str(value or "").strip()
     if not text:
         return date.today().isoformat()
+    if text.lower() in {"latest", "auto"}:
+        latest = FastReviewFocusService().find_latest_snapshot_date()
+        if latest is None:
+            raise ValueError(
+                "未找到 fast_review_stock_overview.csv 产物，无法解析 snapshot-date=latest"
+            )
+        return latest.isoformat()
     return datetime.strptime(text, "%Y-%m-%d").date().isoformat()
 
 

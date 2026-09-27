@@ -55,6 +55,8 @@ def test_main_registers_long_base_release_external_signal(monkeypatch, tmp_path:
             "2026-05-20",
             "--output-dir",
             str(tmp_path),
+            "--strategy-profile-file",
+            str(tmp_path / "missing_profile.json"),
             "--include-signals",
             "long_base_release",
             "--skip-persist-snapshots",

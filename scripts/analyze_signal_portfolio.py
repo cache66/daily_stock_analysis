@@ -13,7 +13,8 @@
 - 成本：默认 31bps（slip10 + fee3 双边 + turnover5），按每笔在入场日一次性扣减；
 - 持有：window 个交易日（默认 5），到期收盘轮出；
 - 组合日收益 = 当日所有在持仓样本的等权平均；空仓日收益记 0。
-- 随机对照：自动寻找同窗 ``random_baseline__<signal>`` 快照做同样计算；
+- 随机对照：自动寻找同窗 ``random_baseline__<signal>`` 快照，按“每日稳定哈希抽样 TopN”
+  （独立于主策略排序字段）生成同口径对照；
 - 基准：同窗 buy&hold（默认 000905）。
 
 用法：
@@ -23,6 +24,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import statistics
@@ -50,6 +52,7 @@ logger = logging.getLogger("signal_portfolio_analysis")
 DEFAULT_WINDOW = 5
 DEFAULT_BENCHMARK = "000905"
 RANDOM_PREFIX = "random_baseline__"
+DEFAULT_RANDOM_SAMPLE_SEED = 20260926
 REVIEW_DIR = PROJECT_ROOT / "data" / "strategy_review"
 
 
@@ -60,8 +63,25 @@ def _total_cost_pct(slippage_bps: float, fee_bps: float, turnover_penalty_bps: f
     return total_bps / 100.0
 
 
-def _select_daily_samples(snapshots: Sequence[Any], *, top_n: int) -> List[Any]:
-    """Dedupe by (signal_date, code) and keep per-day top-N by snapshot score."""
+def _snapshot_metric_value(snapshot_row: Any, metric_key: str) -> Optional[float]:
+    """读取快照 metrics_payload 中指定字段的数值（缺失或非法时返回 None）。"""
+    try:
+        metrics = json.loads(getattr(snapshot_row, "metrics_payload", None) or "{}")
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(metrics, dict):
+        return None
+    value = metrics.get(metric_key)
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _group_daily_snapshots(snapshots: Sequence[Any]) -> Dict[str, List[Any]]:
+    """按信号日分组（按 (signal_date, code) 去重、跳过 run summary）。"""
     grouped: Dict[str, List[Any]] = {}
     seen: set[Tuple[str, str]] = set()
     for row in snapshots:
@@ -76,13 +96,57 @@ def _select_daily_samples(snapshots: Sequence[Any], *, top_n: int) -> List[Any]:
             continue
         seen.add(key)
         grouped.setdefault(key[0], []).append(row)
+    return grouped
+
+
+def _random_pick_key(seed: int, day: str, code: str) -> str:
+    return hashlib.md5(f"{seed}|{day}|{code}".encode("utf-8")).hexdigest()
+
+
+def _select_random_samples(
+    snapshots: Sequence[Any],
+    *,
+    top_n: int,
+    seed: int = DEFAULT_RANDOM_SAMPLE_SEED,
+) -> List[Any]:
+    """随机基线专用选样：每日按稳定哈希（seed|date|code）排序取前 N。
+
+    与主策略的 ``rank_by`` 彻底解耦——随机基线快照没有主策略排序字段，
+    若沿用主策略排序键会退化为按代码序取前 N，不等价于随机对照。
+    """
+    grouped = _group_daily_snapshots(snapshots)
+    selected: List[Any] = []
+    for day in sorted(grouped):
+        ordered = sorted(
+            grouped[day],
+            key=lambda item: _random_pick_key(seed, day, str(getattr(item, "code", "") or "")),
+        )
+        if int(top_n) > 0:
+            ordered = ordered[: int(top_n)]
+        selected.extend(ordered)
+    return selected
+
+
+def _select_daily_samples(
+    snapshots: Sequence[Any], *, top_n: int, rank_by: Optional[str] = None
+) -> List[Any]:
+    """Dedupe by (signal_date, code) and keep per-day top-N by snapshot score.
+
+    ``rank_by`` 可指定 metrics_payload 中的排序字段（如 ``breakout_quality_score``），
+    默认沿用评估器的综合快照分数。
+    """
+    grouped = _group_daily_snapshots(snapshots)
 
     selected: List[Any] = []
     for day in sorted(grouped):
         rows = grouped[day]
 
         def _sort_key(item: Any) -> Tuple[bool, float, str]:
-            score = _extract_snapshot_score(item)
+            score = (
+                _snapshot_metric_value(item, str(rank_by))
+                if rank_by
+                else _extract_snapshot_score(item)
+            )
             return (
                 score is None,
                 -(float(score) if score is not None else 0.0),
@@ -280,6 +344,7 @@ def build_portfolio_analysis(
     end_date: Optional[str] = None,
     window: int = DEFAULT_WINDOW,
     top_n: int = 0,
+    rank_by: Optional[str] = None,
     tradability_filter: str = "entry",
     entry_mode: str = "daily",
     slippage_bps: float = 10.0,
@@ -295,7 +360,7 @@ def build_portfolio_analysis(
     snapshots = db.get_signal_snapshots(
         signal_type=signal_type, start_date=start_date, end_date=end_date
     )
-    samples = _select_daily_samples(snapshots, top_n=int(top_n))
+    samples = _select_daily_samples(snapshots, top_n=int(top_n), rank_by=rank_by)
     line = run_line(
         samples,
         stock_repo=repo,
@@ -312,7 +377,7 @@ def build_portfolio_analysis(
             start_date=start_date,
             end_date=end_date,
         )
-        random_samples = _select_daily_samples(random_snapshots, top_n=int(top_n))
+        random_samples = _select_random_samples(random_snapshots, top_n=int(top_n))
         if random_samples:
             random_line = run_line(
                 random_samples,
@@ -341,6 +406,7 @@ def build_portfolio_analysis(
             "end_date": end_date,
             "window": int(window),
             "top_n": int(top_n),
+            "rank_by": rank_by,
             "tradability_filter": str(tradability_filter),
             "entry_mode": str(entry_mode),
             "benchmark_code": benchmark_code,
@@ -349,6 +415,8 @@ def build_portfolio_analysis(
             "turnover_penalty_bps": float(turnover_penalty_bps),
             "total_trade_cost_bps": cost_pct * 100.0,
             "with_random": bool(with_random),
+            "random_rule": "seeded_hash_pick" if with_random else None,
+            "random_sample_seed": DEFAULT_RANDOM_SAMPLE_SEED if with_random else None,
         },
         "line": line,
         "random": random_line,
@@ -380,6 +448,11 @@ def build_markdown(result: Dict[str, Any]) -> str:
         f"不可成交 {skipped.get('untradable_entry', 0)} / "
         f"前向不足 {skipped.get('missing_forward_bars', 0)}"
     )
+    if filters.get("random_rule") == "seeded_hash_pick":
+        lines.append(
+            f"- 随机对照规则：每日按稳定哈希（种子 {filters.get('random_sample_seed')}）"
+            f"从同窗随机基线集合中取 TopN，独立于主策略排序字段。"
+        )
     lines.append("")
     lines.append("| 口径 | 总收益% | 最大回撤% | Calmar | 日胜率% | 平均持仓 | 交易天数 |")
     lines.append("| --- | --- | --- | --- | --- | --- | --- |")
@@ -440,6 +513,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window", type=int, default=DEFAULT_WINDOW, help=f"Holding days, default {DEFAULT_WINDOW}.")
     parser.add_argument("--top-n", type=int, default=0, help="Keep per-day top-N by snapshot score, 0 = all.")
     parser.add_argument(
+        "--rank-by",
+        default=None,
+        help="Per-day ranking metric key from snapshot metrics_payload (e.g. breakout_quality_score); default uses the evaluator composite snapshot score.",
+    )
+    parser.add_argument(
         "--tradability-filter",
         default="entry",
         choices=["entry", "off"],
@@ -478,6 +556,7 @@ def main() -> int:
         end_date=args.end_date,
         window=int(args.window),
         top_n=int(args.top_n),
+        rank_by=args.rank_by,
         tradability_filter=str(args.tradability_filter),
         entry_mode=str(args.entry_mode),
         slippage_bps=float(args.slippage_bps),

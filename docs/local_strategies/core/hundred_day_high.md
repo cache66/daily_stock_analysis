@@ -20,7 +20,7 @@ fast review 默认通过 `run_fast_review_bundle.py` 透传：
 - `hundred_day_signal_type=hundred_day_high`
 - `hundred_day_profile=breakout_loose`
 - `hundred_day_max_workers=2`
-- `hundred_day_skip_cause_analysis=true`
+- `hundred_day_skip_cause_analysis=false`（默认开启归因）
 
 当前也已接入共享扫描壳 `KlineSelectorService.prepare_scan_universe(...)`。
 入选后的 `breakout_quality` 180 日补强当前默认会复用 `max_workers` 并发抓历史，以降低后处理墙钟时间。

@@ -35,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--snapshot-date",
         default=date.today().isoformat(),
-        help="交易日日期，格式 YYYY-MM-DD，默认今天。",
+        help="交易日日期，格式 YYYY-MM-DD（支持 latest/auto：解析为最新已有复盘产物），默认今天。",
     )
     parser.add_argument(
         "--output-dir",

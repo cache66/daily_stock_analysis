@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import pandas as pd
 
@@ -60,18 +60,20 @@ SHORTLINE_SIGNAL_TYPES = [
     "shortline_high_risk_mover",
 ]
 
+# 与 config/local_strategy_profile.json 的默认口径保持一致（2026-09-27 起三条线）；
+# 冻结/停用线（daily_slow_rise / long_base_release 等）不再作为缺省回退。
 DEFAULT_INCLUDE_SIGNALS = [
     SIGNAL_EARNINGS,
     SIGNAL_HUNDRED_DAY_HIGH,
-    SIGNAL_DAILY_SLOW_RISE,
-    SIGNAL_LONG_BASE_RELEASE,
+    SIGNAL_TREND_LEADER,
 ]
 SIGNAL_ALIASES = {
     "continuous_up": [SIGNAL_CONTINUOUS_UP_RATIO, SIGNAL_CONTINUOUS_UP_STREAK],
 }
 KNOWN_SIGNALS = (
     set(DEFAULT_INCLUDE_SIGNALS)
-    | {SIGNAL_TREND_LEADER, SIGNAL_MONTHLY_SLOW_RISE, SIGNAL_DAILY_SLOW_RISE}
+    # 冻结线保留显式请求入口（不进缺省回退，受 profile/CLI exclude 约束）。
+    | {SIGNAL_TREND_LEADER, SIGNAL_MONTHLY_SLOW_RISE, SIGNAL_DAILY_SLOW_RISE, SIGNAL_LONG_BASE_RELEASE}
     | set(SIGNAL_ALIASES)
 )
 CAUSE_TAG_LABELS = {

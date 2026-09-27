@@ -13,6 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > Detailed internal change log and run evidence: [docs/AI_MODIFICATION_LOG.md](./AI_MODIFICATION_LOG.md)
 
 ## [Unreleased]
+- [修复] 恢复 LiteLLM 空响应“同一模型重试”逻辑（`EMPTY_LLM_RESPONSE_RETRY_ATTEMPTS=3`）：重试循环在重构中丢失、失败分支引用未定义变量会直接 NameError（流式分支同步修掉未定义引用）。
+- [修复] `src/market_analyzer.py` 补上 `LimitUpReviewService` 导入：此前 `MarketAnalyzer` 构造即 NameError，市场复盘链路不可用。
+- [测试] 重建 `test_fetcher_logging.py` 缺失的测试辅助（`_HistoryCacheFetcher`/`_history_rows`/`_HangingFetcher`/`_AlwaysFailHistoryFetcher`）并修复两处非 hermetic 用例（懒加载注册表计入计时、真实磁盘缓存污染）；补齐 `test_storage.py` 缺失导入（全仓 flake8 critical 恢复为 0）。
+- [修复] 个人策略矩阵页面可见性改为由 profile `include/exclude` 驱动：defensive 不再隐藏真正在跑的 `earnings_surprise`，`long_base_release`/`daily_slow_rise` 按冻结处理（页面移出 + 命中停用）；`market_regime` 仅影响未显式配置的条目。
+- [修复] `analyze_signal_portfolio.py` 随机对照改为独立的“每日稳定哈希抽样 TopN”规则（种子 20260926），不再受主策略 `--rank-by` 影响；hdh Top5 随机对照旧数字作废并按新规则重跑。
+- [修复] `run_fast_review_bundle.py` 与矩阵 runner 的缺省信号集合同步为三线（earnings/hundred_day_high/trend_leader），冻结/停用线不再作为回退；`--snapshot-date latest/auto` 现可解析为最新已有复盘产物日期。
+- [文档] 同步《个人策略目录》《个人策略基线》《策略与脚本冻结登记》《local_strategies/README》《core/hundred_day_high》：默认三线口径、`skip_cause_analysis=false`、趋势前筛 17.0/1.5。
 - [改进] 按 ⑤ 判定执行：`daily_slow_rise` 移出默认每日（`include_signals` → earnings/hundred_day_high/trend_leader）并在页面目录标记冻结（frozen，页面移出、命中停用）；脚本保留可按需单跑。
 - [测试] ⑤ 收敛判定数据齐备并发布：±20% 敏感性（trend 两档不翻转 / hdh 两档翻转）、随机 95 分位（trend 82.4 / hdh 90.5，未过线）、F2 终版（trend PBO 0.0 / hdh 0.571）落盘 → 四线判定：无晋级，`daily_slow_rise` 冻结候选、`trend_leader_unified`/`hundred_day_high`/`earnings_surprise` 观察。
 - [修复] `scripts/summarize_sensitivity_results.py` 打印标签修正（方向翻转 Y/N；此前翻转误打 F、未翻转误打 n/a，JSON 与判定不受影响）。

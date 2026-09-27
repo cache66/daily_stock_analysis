@@ -30,14 +30,14 @@
 - `plans/`
   - 个人专题的历史实施归档，保留拆解步骤与验证口径，不代表当前默认实现。
 
-## 主策略一览（2026-09-26）
+## 主策略一览（2026-09-27）
 
 | 策略 | 是否默认每日 | 角色 | 文档 |
 | --- | --- | --- | --- |
 | `trend_leader_unified` | 是 | 龙头 + 趋势 + 资金 + 业绩兑现的统一主骨架（2026-09-26 恢复默认） | [`core/trend_leader_unified.md`](./core/trend_leader_unified.md) |
 | `earnings_surprise` | 是 | 财报事件驱动的业绩强势筛选 | [`core/earnings_surprise.md`](./core/earnings_surprise.md) |
 | `hundred_day_high` | 是 | 新高突破确认层 | [`core/hundred_day_high.md`](./core/hundred_day_high.md) |
-| `daily_slow_rise` | 是 | 日线 30-45 度慢涨、平台转趋势补充层 | 见 [`../个人策略文档/个人策略目录.md`](../个人策略文档/个人策略目录.md) |
+| `daily_slow_rise` | 否（2026-09-27 冻结） | 日线 30-45 度慢涨、平台转趋势补充层 | 见 [`../个人策略文档/个人策略目录.md`](../个人策略文档/个人策略目录.md) |
 | `monthly_slow_rise` | 否（2026-09-25 冻结） | 中期慢牛结构补充层 | [`core/monthly_slow_rise.md`](./core/monthly_slow_rise.md) |
 
 冻结 / 停用状态以 [`../个人策略文档/策略与脚本冻结登记.md`](../个人策略文档/策略与脚本冻结登记.md) 为准。

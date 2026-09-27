@@ -460,18 +460,20 @@ class FastReviewFocusApiTestCase(unittest.TestCase):
         payload = response.json()
         self.assertEqual(payload["total"], 2)
         self.assertEqual(payload["market_regime"], "defensive")
-        self.assertNotIn("earnings_surprise", payload["strategy_summary"])
+        self.assertIn("earnings_surprise", payload["strategy_summary"])
         self.assertIn("hundred_day_high", payload["strategy_summary"])
+        self.assertNotIn("long_base_release", payload["strategy_summary"])
         self.assertGreaterEqual(len(payload["strategies"]), 3)
         by_code = {item["code"]: item for item in payload["items"]}
         self.assertEqual(
             by_code["300475"]["matched_strategy_ids"],
-            ["hundred_day_high"],
+            ["earnings_surprise", "hundred_day_high"],
         )
-        self.assertEqual(by_code["002463"]["matched_strategy_ids"], ["hundred_day_high", "long_base_release"])
-        self.assertEqual(by_code["300475"]["matched_strategy_count"], 1)
+        self.assertEqual(by_code["002463"]["matched_strategy_ids"], ["hundred_day_high"])
+        self.assertEqual(by_code["300475"]["matched_strategy_count"], 2)
         self.assertEqual(by_code["300475"]["quality_band"], "recommended")
-        self.assertEqual(by_code["002463"]["quality_band"], "watch")
+        # lbr 冻结后 002463 只命中 hdh 单线，触发“单策略孤证”降档（watch → weak）
+        self.assertEqual(by_code["002463"]["quality_band"], "weak")
         self.assertGreater(by_code["300475"]["quality_score"], by_code["002463"]["quality_score"])
         self.assertEqual(by_code["300475"]["view_lane"], "short_term")
         self.assertEqual(by_code["002463"]["view_lane"], "short_term")
@@ -500,14 +502,14 @@ class FastReviewFocusApiTestCase(unittest.TestCase):
             with patch("src.services.personal_strategy_matrix_service.DEFAULT_MANUAL_RUNS_ROOT", self.manual_runs_root):
                 response = self.client.get(
                     "/api/v1/signals/personal-strategy-matrix",
-                    params={"snapshot_date": "2026-07-10", "strategy_ids": "long_base_release"},
+                    params={"snapshot_date": "2026-07-10", "strategy_ids": "hundred_day_high"},
                 )
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
-        self.assertEqual(payload["total"], 1)
-        self.assertEqual(payload["items"][0]["code"], "002463")
-        self.assertEqual(payload["strategy_summary"]["long_base_release"], 1)
+        self.assertEqual(payload["total"], 2)
+        self.assertEqual({item["code"] for item in payload["items"]}, {"300475", "002463"})
+        self.assertEqual(payload["strategy_summary"]["hundred_day_high"], 2)
 
     def test_focus_service_builds_display_authority_from_strong_earnings_evidence_when_raw_authority_is_missing(self) -> None:
         service = FastReviewFocusService(manual_runs_root=self.manual_runs_root)

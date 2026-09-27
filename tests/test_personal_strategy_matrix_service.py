@@ -63,7 +63,7 @@ def test_get_matrix_enriches_quality_and_strategy_view_lanes() -> None:
     assert strong["view_lane_label"] == "长线发现"
     assert weak["view_lane"] == "short_term"
     assert weak["view_lane_label"] == "短线主升"
-    assert strong["matched_strategy_ids"] == ["long_base_release"]
+    assert strong["matched_strategy_ids"] == ["earnings_surprise"]
     assert weak["matched_strategy_ids"] == ["hundred_day_high"]
     assert strong["quality_band"] == "recommended"
     assert strong["quality_label"] == "优先看"
@@ -105,26 +105,29 @@ def test_get_matrix_filters_by_selected_strategy_after_quality_enrichment() -> N
         ],
     }
 
-    payload = service.get_matrix(snapshot_date="2026-07-10", strategy_ids=["long_base_release"])
+    payload = service.get_matrix(snapshot_date="2026-07-10", strategy_ids=["hundred_day_high"])
 
     assert payload["total"] == 1
     assert payload["items"][0]["code"] == "002463"
-    assert payload["strategy_summary"]["long_base_release"] == 1
+    assert payload["strategy_summary"]["hundred_day_high"] == 1
 
 
 def test_market_regime_switches_visible_strategy_lines() -> None:
+    """可见性由 profile include/exclude 驱动；regime 只影响未显式配置的条目。"""
     defensive = PersonalStrategyMatrixService(regime="defensive")
     defensive_ids = {item["id"] for item in defensive.get_catalog()}
     assert defensive_ids == {
+        "earnings_surprise",
         "hundred_day_high",
-        "long_base_release",
         "trend_leader_unified",
     }
+    assert "long_base_release" not in defensive_ids
     assert "daily_slow_rise" not in defensive_ids
 
     balanced = PersonalStrategyMatrixService(regime="balanced")
     balanced_ids = {item["id"] for item in balanced.get_catalog()}
-    assert balanced_ids == defensive_ids | {"earnings_surprise", "earnings_observation"}
+    assert balanced_ids == defensive_ids | {"earnings_observation"}
+    assert "long_base_release" not in balanced_ids
     assert "monthly_slow_rise" not in balanced_ids
     assert "shortline_hub" not in balanced_ids
 
@@ -151,7 +154,7 @@ def test_balanced_regime_restores_earnings_line_matching() -> None:
     payload = service.get_matrix(snapshot_date="2026-07-10")
 
     assert payload["market_regime"] == "balanced"
-    assert payload["items"][0]["matched_strategy_ids"] == ["earnings_surprise", "long_base_release"]
+    assert payload["items"][0]["matched_strategy_ids"] == ["earnings_surprise"]
     assert "earnings_surprise" in payload["strategy_summary"]
 
 
@@ -192,3 +195,29 @@ def test_resolve_market_regime_reads_profile_json(tmp_path) -> None:
 
     profile_path.write_text("not json", encoding="utf-8")
     assert resolve_market_regime(profile_path) == "defensive"
+
+
+def test_missing_profile_falls_back_to_regime_catalog(tmp_path) -> None:
+    """profile 缺失时退回环境开关逻辑：defensive 只展示未冻结的进攻线。"""
+    service = PersonalStrategyMatrixService(regime="defensive", profile_path=tmp_path / "missing.json")
+    ids = {item["id"] for item in service.get_catalog()}
+    assert ids == {"hundred_day_high", "trend_leader_unified"}
+
+
+def test_exclude_signals_wins_over_include(tmp_path) -> None:
+    """exclude 优先于 include：即使显式 include 也不展示被排除线。"""
+    profile_path = tmp_path / "local_strategy_profile.json"
+    profile_path.write_text(
+        json.dumps(
+            {
+                "defaults": {
+                    "include_signals": ["earnings"],
+                    "exclude_signals": ["earnings"],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    service = PersonalStrategyMatrixService(regime="balanced", profile_path=profile_path)
+    ids = {item["id"] for item in service.get_catalog()}
+    assert "earnings_surprise" not in ids

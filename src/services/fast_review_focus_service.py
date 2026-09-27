@@ -172,6 +172,14 @@ class FastReviewFocusService:
         )
         return matched[0]
 
+    def find_latest_snapshot_date(self) -> Optional[date]:
+        """返回 manual_runs 下最新一份 stock_overview 产物的快照日期（无产物时 None）。"""
+        latest_csv = self._find_latest_stock_overview_csv()
+        if latest_csv is None:
+            return None
+        date_obj = self._coerce_date(latest_csv.parent.parent.name)
+        return date_obj if isinstance(date_obj, date) else None
+
     def _resolve_stock_overview_csv(self, *, snapshot_date: Any) -> Tuple[Optional[date], Optional[Path]]:
         text = str(snapshot_date or "").strip().lower()
         if text in {"latest", "auto"}:

@@ -92,7 +92,7 @@ def try_refresh_stock_basic(cache_dir: Path) -> str:
 
 
 def fetch_quotes(symbols: list[str], *, batch_size: int = 60, workers: int = 6) -> dict[str, dict]:
-    """腾讯批量行情：code6 -> {close, pe_ttm, pb, mv_yi}。"""
+    """腾讯批量行情：code6 -> {close, pe_ttm, pb, mv_yi, float_mv_yi}。"""
     batches = [symbols[i : i + batch_size] for i in range(0, len(symbols), batch_size)]
     out: dict[str, dict] = {}
 
@@ -114,11 +114,18 @@ def fetch_quotes(symbols: list[str], *, batch_size: int = 60, workers: int = 6) 
                         pe = float(fields[39]) if fields[39] else None
                         pb = float(fields[46]) if fields[46] else None
                         mv_yi = float(fields[45]) if fields[45] else None
+                        float_mv_yi = float(fields[44]) if len(fields) > 44 and fields[44] else None
                     except ValueError:
                         continue
                     if close is None or close <= 0:
                         continue
-                    result[fields[2]] = {"close": close, "pe_ttm": pe, "pb": pb, "mv_yi": mv_yi}
+                    result[fields[2]] = {
+                        "close": close,
+                        "pe_ttm": pe,
+                        "pb": pb,
+                        "mv_yi": mv_yi,
+                        "float_mv_yi": float_mv_yi,
+                    }
                 return result
             except Exception:  # noqa: BLE001
                 continue

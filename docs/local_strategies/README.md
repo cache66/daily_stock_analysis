@@ -84,14 +84,13 @@
 python scripts/run_fast_review_bundle.py --strategy-profile-file config/local_strategy_profile.json
 ```
 
-当前默认每日首页主筛只跑四条（2026-09-26 起）：
+当前默认每日首页主筛只跑三条（2026-09-27 起）：
 
 - `earnings` -> `earnings_surprise`
 - `hundred_day_high`
-- `daily_slow_rise`
 - `trend_leader` -> `trend_leader_unified`（2026-09-26 恢复：统一口径评估为全库最强前向绩效）
 
-`long_base_release` 已于 2026-09-26 停用（评估为稳定负期望，脚本保留可手动单跑）；`monthly_slow_rise` 于 2026-09-25 冻结。停用 / 冻结与恢复流程见《策略与脚本冻结登记》。
+`long_base_release` 已于 2026-09-26 停用（评估为稳定负期望，脚本保留可手动单跑）；`daily_slow_rise` 于 2026-09-27 按 ⑤ 判定移出并冻结（脚本保留可按需单跑）；`monthly_slow_rise` 于 2026-09-25 冻结。停用 / 冻结与恢复流程见《策略与脚本冻结登记》。
 
 ## 根目录治理文档
 

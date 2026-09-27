@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > Detailed internal change log and run evidence: [docs/AI_MODIFICATION_LOG.md](./AI_MODIFICATION_LOG.md)
 
 ## [Unreleased]
+- [改进] 按 ⑤ 判定执行：`daily_slow_rise` 移出默认每日（`include_signals` → earnings/hundred_day_high/trend_leader）并在页面目录标记冻结（frozen，页面移出、命中停用）；脚本保留可按需单跑。
+- [测试] ⑤ 收敛判定数据齐备并发布：±20% 敏感性（trend 两档不翻转 / hdh 两档翻转）、随机 95 分位（trend 82.4 / hdh 90.5，未过线）、F2 终版（trend PBO 0.0 / hdh 0.571）落盘 → 四线判定：无晋级，`daily_slow_rise` 冻结候选、`trend_leader_unified`/`hundred_day_high`/`earnings_surprise` 观察。
+- [修复] `scripts/summarize_sensitivity_results.py` 打印标签修正（方向翻转 Y/N；此前翻转误打 F、未翻转误打 n/a，JSON 与判定不受影响）。
+- [新功能] 新增 `scripts/scan_sub_new_watchlist.py`（次新观察清单扫描）：上市 120~800 天 + 流通市值 ≤30 亿（≤20 亿标★）+ 距上市高点回撤 ≥45% + “跌不动”三项维度评分（20 日振幅/量比/未创新低），输出 md/csv 候选清单与解禁窗提示（只出候选不产生信号）；配套 5 条离线用例；`refresh_local_daily_basic_snapshot.fetch_quotes` 顺带补流通市值字段。
 - [新功能] 新增 `scripts/batch_supervise.py`（C1/C3）：批处理心跳守护与完成后自动收尾（多日志 glob 汇总、完成/失败标记、状态落盘、`--on-done` 步骤编排）；配套 7 条离线用例。
 - [改进] `scripts/rebuild_stock_daily_qfq.py` 新增 `--retry-failed`：读取失败清单多轮重跑（可换源、清零即删清单、剩余非零退出）；配套 4 条离线用例。
 - [改进] `scripts/daily_review_export.py` 入场口径默认改 DB 优先（`--entry-mode daily`，评估器同款；`snapshot` 可回退旧口径），输出摘要标注入场口径；配套 4 条离线用例。

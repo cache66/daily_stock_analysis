@@ -259,7 +259,7 @@ def main() -> int:
                     v2="O" if items["item2_w1_w3_positive"] else "X",
                     v3="O" if items["item3_months_over_half"] else "X",
                     v4="O" if items["item4_excess_positive"] else "X",
-                    flip="F" if flip else "n/a",
+                    flip="Y" if flip else "N",
                 )
             )
     return 0

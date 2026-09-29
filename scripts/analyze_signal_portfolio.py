@@ -15,7 +15,7 @@
 - 组合日收益 = 当日所有在持仓样本的等权平均；空仓日收益记 0。
 - 随机对照：自动寻找同窗 ``random_baseline__<signal>`` 快照，按“每日稳定哈希抽样 TopN”
   （独立于主策略排序字段）生成同口径对照；
-- 基准：同窗 buy&hold（默认 000905）。
+- 基准：同窗 buy&hold（默认 000300；注意 000905 在 stock_daily 中是个股「厦门港务」，不可作指数）。
 
 用法：
     ./.venv-linux/bin/python scripts/analyze_signal_portfolio.py \
@@ -50,7 +50,8 @@ from src.storage import DatabaseManager  # noqa: E402
 logger = logging.getLogger("signal_portfolio_analysis")
 
 DEFAULT_WINDOW = 5
-DEFAULT_BENCHMARK = "000905"
+# 000905 在 stock_daily 中是个股（厦门港务），与中证500指数代码冲突；默认基准用 000300（沪深300）。
+DEFAULT_BENCHMARK = "000300"
 RANDOM_PREFIX = "random_baseline__"
 DEFAULT_RANDOM_SAMPLE_SEED = 20260926
 REVIEW_DIR = PROJECT_ROOT / "data" / "strategy_review"

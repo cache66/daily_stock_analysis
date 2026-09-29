@@ -137,7 +137,7 @@ def parse_args() -> argparse.Namespace:
         "--benchmark-code",
         default=None,
         help=(
-            "Optional benchmark code present in stock_daily (e.g. 000905); "
+            "Optional benchmark code present in stock_daily (e.g. 000300 沪深300); "
             "adds benchmark return and excess return fields to the report."
         ),
     )

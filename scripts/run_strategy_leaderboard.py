@@ -35,7 +35,8 @@ from src.storage import DatabaseManager  # noqa: E402
 
 logger = logging.getLogger("strategy_leaderboard")
 
-DEFAULT_BENCHMARK = "000905"
+# 000905 在 stock_daily 中是个股（厦门港务），与中证500指数代码冲突；默认基准用 000300（沪深300）。
+DEFAULT_BENCHMARK = "000300"
 DEFAULT_WINDOWS = "1,3,5"
 DEFAULT_OUT_MD = PROJECT_ROOT / "data" / "strategy_review" / "leaderboard_v2.md"
 DEFAULT_OUT_JSON = PROJECT_ROOT / "data" / "strategy_review" / "leaderboard_v2.json"

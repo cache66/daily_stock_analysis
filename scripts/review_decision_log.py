@@ -13,7 +13,7 @@
 
 用法：
     ./.venv-linux/bin/python scripts/review_decision_log.py
-    ./.venv-linux/bin/python scripts/review_decision_log.py --benchmark-code 000905
+    ./.venv-linux/bin/python scripts/review_decision_log.py --benchmark-code 000300
     ./.venv-linux/bin/python scripts/review_decision_log.py --file data/decision_log/decisions.csv
 
 列（输入）：decision_date, code, name, source, reason, expected_window_days

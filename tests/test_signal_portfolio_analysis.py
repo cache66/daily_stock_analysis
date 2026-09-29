@@ -7,6 +7,7 @@ from datetime import date
 from types import SimpleNamespace
 
 from scripts.analyze_signal_portfolio import (
+    DEFAULT_BENCHMARK,
     _monthly_compounded,
     _select_daily_samples,
     _select_random_samples,
@@ -272,6 +273,13 @@ class MarkdownSmokeTestCase(unittest.TestCase):
         self.assertIn("| 随机对照 | — | — | — | — | — | — |", markdown)
         self.assertIn("| 基准买持（000905） |", markdown)
         self.assertIn("| 2026-08 | 1.5 | — | 0.5 |", markdown)
+
+
+class DefaultBenchmarkTestCase(unittest.TestCase):
+    def test_default_benchmark_avoids_index_stock_collision(self):
+        # 000905 在 stock_daily 中是个股「厦门港务」（与中证500指数代码冲突），
+        # 组合默认基准必须使用无冲突的指数代码（000300 沪深300）。
+        self.assertEqual(DEFAULT_BENCHMARK, "000300")
 
 
 if __name__ == "__main__":

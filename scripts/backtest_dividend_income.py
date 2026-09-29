@@ -106,6 +106,13 @@ def load_price_series(
             )
             deep_count += 1
         print(f"[回测] 深历史覆盖 {deep_count} 只")
+    from scripts.history_quality import detect_seam_codes
+
+    dirty = detect_seam_codes(series)
+    if dirty:
+        for code in dirty:
+            series.pop(code, None)
+        print(f"[回测] 接缝剔除 {len(dirty)} 只（|日跳变|>30%，统一模块 scripts/history_quality）")
     return series
 
 
@@ -420,6 +427,13 @@ def run_backtest(args: argparse.Namespace) -> int:
     if not prices:
         print("没有可用行情缓存，退出。")
         return 1
+    # 深历史优先合并：共享缓存可能被实盘链路回写截短（曾于 2026-09-27 发现中位仅剩
+    # 2026-01-12 起），而回测专用深历史（独立目录，不受实盘写盘影响）覆盖完整窗口；
+    # 合并后用于生成调仓日历，不再是「先按短缓存算日历、再换深历史」的顺序。
+    if DEEP_HISTORY_DIR.exists():
+        deep_prices = load_price_series(limit=args.limit, prefer_deep=True)
+        if deep_prices:
+            prices = deep_prices
     print(f"[回测] 股票数 {len(prices)}")
 
     service = DividendIncomeService(cache_dir=CACHE_DIR, output_dir=OUTPUT_DIR)
@@ -458,6 +472,7 @@ def run_backtest(args: argparse.Namespace) -> int:
     fund_cache: Dict[Tuple[str, int], Optional[Dict[str, Any]]] = {}
     monthly_rows: List[Dict[str, Any]] = []
     holdings_log: List[Dict[str, Any]] = []
+    panel_log: List[Dict[str, Any]] = []
 
     for pos in range(len(rebalance_dates) - 1):
         t = rebalance_dates[pos]
@@ -557,6 +572,9 @@ def run_backtest(args: argparse.Namespace) -> int:
         if not scored:
             print(f"[回测] {t_ts.date()} 无合格样本，跳过。")
             continue
+
+        for item in scored:
+            panel_log.append({"date": t_ts.date().isoformat(), **item})
 
         scored.sort(key=lambda item: item.get("dividend_score") or 0.0, reverse=True)
         top = scored[: args.top]
@@ -718,8 +736,10 @@ def run_backtest(args: argparse.Namespace) -> int:
     tag = f"{start.strftime('%Y%m%d')}_{end.strftime('%Y%m%d')}"
     monthly_path = OUTPUT_DIR / f"backtest_dividend_income_monthly_{tag}.csv"
     holdings_path = OUTPUT_DIR / f"backtest_dividend_income_holdings_{tag}.csv"
+    panel_path = OUTPUT_DIR / f"backtest_dividend_income_panel_{tag}.csv"
     frame.to_csv(monthly_path, index=False)
     pd.DataFrame(holdings_log).to_csv(holdings_path, index=False)
+    pd.DataFrame(panel_log).to_csv(panel_path, index=False)
 
     print("\n================ 回测汇总 ================")
     for key, label in (("top", f"策略 Top{args.top}"), ("pool", "池子等权"), ("benchmark", "中证红利 000922（价格）")):
@@ -762,6 +782,7 @@ def run_backtest(args: argparse.Namespace) -> int:
         )
     print(f"月度明细：{monthly_path}")
     print(f"持仓明细：{holdings_path}")
+    print(f"全池面板：{panel_path}")
     print("\n注意：幸存者偏差（池子取自 2026-07 缓存）、行情缓存接缝、业绩面仅覆盖部分标的；基准为价格指数未含分红。")
     return 0
 

@@ -13,6 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > Detailed internal change log and run evidence: [docs/AI_MODIFICATION_LOG.md](./AI_MODIFICATION_LOG.md)
 
 ## [Unreleased]
+- [新功能] 新增 `scripts/dividend_t_watch.py`（红利 T 提示器）：扫 ① 趋势红利回踩触发档（-3%/-5%/-7%）+ 均线护栏（MA200 闸门 / MA60 减半），输出状态表；接入 17:05 复盘后自动运行；配套 3 条离线用例。
+- [新功能] 新增 `scripts/screen_deep_recovery.py`（超跌企稳扫描）：年内回撤≥阈值 + 站上MA20 + 5日>+2% + 流动性过滤 + 接缝保护，输出 A/B/C 分档 md/csv；接入 17:05 复盘后自动运行；配套 4 条离线用例。
+- [修复] `data/cache/history` 共享缓存深度恢复：按日批量回补 2024-01-01 起全市场日线（此前被清混尺重建收敛到 2026-01-12 起 ~170 根，影响回测调仓日历与池子）；恢复后共享缓存为统一 Tushare 不复权单源、跨年度连续。
+- [新功能] 新增 `scripts/patch_history_cache_by_date.py`：按交易日批量补历史缓存（Tushare `daily(trade_date=…)` 一次取全市场，vol×100/amount×1000 对齐缓存口径，只补缺幂等）；支持 `--start-date/--end-date` 历史区间分块回补；日常“补数+预热”由 `data/runtime/warm_daily.sh`（16:40）串接、复盘由 `matrix_daily.sh`（17:05）接力，实测全链从小时级降到分钟级；配套 6 条离线用例。
+- [新功能] 新增 `scripts/etf_t_dashboard.py`：ETF 做T适配仪表盘（腾讯前复权口径 + 折算毛刺过滤 + 三闸门标签 + T+0 标记 + 沪深300开关状态）；配套 5 条离线用例。
+- [改进] `scripts/experiment_ma20_switch.py` 工程化：缓冲带状态机（默认 0.5%）+ 切换成本（默认 15.5bps/边、按 |Δ敞口| 计费），每个敞口保留「无缓冲·无成本」对照档；报告新增翻转次数与累计切换成本列；测试扩至 8 条。
+- [改进] 新增 `scripts/history_quality.py` 接缝检测统一模块（`detect_seam_codes`/`has_seam`，阈值 >30%）；`experiment_dividend_rerank` / `backtest_dividend_income` / `analyze_dividend_top100` / `screen_trend_candles` 四条链路接入接缝过滤；配套 4 条离线用例。
 - [修复] 恢复 LiteLLM 空响应“同一模型重试”逻辑（`EMPTY_LLM_RESPONSE_RETRY_ATTEMPTS=3`）：重试循环在重构中丢失、失败分支引用未定义变量会直接 NameError（流式分支同步修掉未定义引用）。
 - [修复] `src/market_analyzer.py` 补上 `LimitUpReviewService` 导入：此前 `MarketAnalyzer` 构造即 NameError，市场复盘链路不可用。
 - [测试] 重建 `test_fetcher_logging.py` 缺失的测试辅助（`_HistoryCacheFetcher`/`_history_rows`/`_HangingFetcher`/`_AlwaysFailHistoryFetcher`）并修复两处非 hermetic 用例（懒加载注册表计入计时、真实磁盘缓存污染）；补齐 `test_storage.py` 缺失导入（全仓 flake8 critical 恢复为 0）。

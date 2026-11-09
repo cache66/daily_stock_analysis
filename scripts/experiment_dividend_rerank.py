@@ -74,7 +74,9 @@ def build_factors(sub: pd.DataFrame) -> pd.DataFrame:
     f["vol"] = pd.to_numeric(sub["volatility_1y_pct"], errors="coerce")
     f["consec"] = pd.to_numeric(sub["consecutive_dividend_years"], errors="coerce")
     f["growth"] = pd.to_numeric(sub["dividend_growth_5y_pct"], errors="coerce").clip(-30.0, 30.0)
-    for col in ("roe", "vol", "consec", "growth"):
+    f["cf"] = pd.to_numeric(sub["cf_coverage"], errors="coerce").clip(-5.0, 10.0)  # 现金流覆盖（2026-10-06 精简实验）
+    f["payout"] = pd.to_numeric(sub["payout_ratio_pct"], errors="coerce").clip(0.0, 120.0)  # 派现率
+    for col in ("roe", "vol", "consec", "growth", "cf", "payout"):
         f[col] = f[col].fillna(f[col].median())
     return f
 
@@ -100,7 +102,23 @@ def variant_scores(f: pd.DataFrame, industries: pd.Series, name: str) -> Optiona
         return 0.20 * z["yield_c"] + 0.40 * z["roe"] + 0.20 * (-z["vol"]) + 0.20 * z["consec"]
     if name == "z_yield_vol":
         return 0.50 * z["yield_c"] + 0.50 * (-z["vol"])
+    if name == "trim_yvcp":
+        # 精简候选 A：股息+低波+现金流+派现（去掉质量/连续性块）
+        return 0.30 * z["yield_c"] + 0.30 * (-z["vol"]) + 0.20 * z["cf"] + 0.20 * z["payout"]
+    if name == "trim_yvc":
+        # 精简候选 B：股息+低波+现金流（更简）
+        return 0.40 * z["yield_c"] + 0.30 * (-z["vol"]) + 0.30 * z["cf"]
     raise ValueError(name)
+
+
+def apply_fall_filter(sub: pd.DataFrame, scores: pd.Series, *, max_fall_pct: float) -> pd.Series:
+    """选择前过滤（股息陷阱防线，2026-10-06 验证）：近一年含息回报 ≤ max_fall_pct 的
+    深跌票置为 -inf（排序末位；仍有名额时才补位，避免空仓）。
+
+    注：过滤会改变 RankIC 的语义（被剔行参与排名但置底），对比时以收益/回撤为主。
+    """
+    fall = pd.to_numeric(sub["total_return_1y_pct"], errors="coerce")
+    return scores.mask(fall <= max_fall_pct, other=float("-inf"))
 
 
 def select_with_cap(sub: pd.DataFrame, scores: pd.Series, *, top: int, cap: int) -> pd.DataFrame:
@@ -206,6 +224,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ("z_mix 中性+限额2", lambda s: variant_scores(build_factors(s), s["industry"], "z_mix_ind"), args.max_per_industry),
         ("低股息权重 20/40/20/20", lambda s: variant_scores(build_factors(s), s["industry"], "z_low_yield_weight"), None),
         ("股息+低波 50/50", lambda s: variant_scores(build_factors(s), s["industry"], "z_yield_vol"), None),
+        ("精简A 股息+低波+现金流+派现", lambda s: variant_scores(build_factors(s), s["industry"], "trim_yvcp"), None),
+        ("精简B 股息+低波+现金流", lambda s: variant_scores(build_factors(s), s["industry"], "trim_yvc"), None),
+        # 股息陷阱防线验证（2026-10-06）：精简B + 选择前剔除深跌票（含息≤-30% / ≤-15%）。
+        ("精简B+剔深跌30（含息≤-30%）", lambda s: apply_fall_filter(s, variant_scores(build_factors(s), s["industry"], "trim_yvc"), max_fall_pct=-30.0), None),
+        ("精简B+剔深跌15（含息≤-15%）", lambda s: apply_fall_filter(s, variant_scores(build_factors(s), s["industry"], "trim_yvc"), max_fall_pct=-15.0), None),
+        # 严格版（2026-10-06 追问验证）：只选"一年含息回报为正"的票（跌幅未超股息）。
+        ("精简B+只选含息为正（剔≤0%）", lambda s: apply_fall_filter(s, variant_scores(build_factors(s), s["industry"], "trim_yvc"), max_fall_pct=0.0), None),
     ]
 
     results = []

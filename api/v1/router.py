@@ -24,6 +24,7 @@ from api.v1.endpoints import (
     history,
     intelligence,
     portfolio,
+    research_tracking,
     signals,
     stocks,
     system_config,
@@ -104,6 +105,12 @@ router.include_router(
     decision_signals.router,
     prefix="/decision-signals",
     tags=["DecisionSignals"]
+)
+
+router.include_router(
+    research_tracking.router,
+    prefix="/research-tracks",
+    tags=["ResearchTracking"]
 )
 
 router.include_router(

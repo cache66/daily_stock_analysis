@@ -50,6 +50,17 @@ MARKET_TIMEZONE = {
     "tw": "Asia/Taipei",
 }
 
+
+def get_trading_sessions(market: str, start: date, end: date) -> List[date]:
+    """返回精确开市日；量化计量不可沿用应用分析的 fail-open。"""
+    if not _XCALS_AVAILABLE or market not in MARKET_EXCHANGE:
+        raise ValueError(f"交易日历不可用: {market}")
+    if end < start:
+        return []
+    cal = xcals.get_calendar(MARKET_EXCHANGE[market])
+    # 越界必须向上传递，不能将周末/节假日猜成交易日。
+    return [session.date() for session in cal.sessions_in_range(start.isoformat(), end.isoformat())]
+
 # P0 market phase baseline (Issue #1386). This is an intentionally small
 # regular-session inference layer; it does not change existing fail-open
 # trading-day filtering or effective-date behavior.

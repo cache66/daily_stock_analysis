@@ -13,6 +13,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > Detailed internal change log and run evidence: [docs/AI_MODIFICATION_LOG.md](./AI_MODIFICATION_LOG.md)
 
 ## [Unreleased]
+
+- [修复] 交易日判断改为本地日历优先：新增 `scripts/is_trading_day.py`（`exchange-calendars` 离线判定，tushare 仅兜底，取不到数据输出 `unknown` 而不是“休市”），`matrix_daily.sh` 改为只有明确休市才跳过。修复 2026-11-09 事故：tushare `trade_cal` 频率超限返回空表被当成休市，整条夜间链路被静默跳过（done exit=0）而当天实为交易日。
+- [新功能] 新增 `scripts/sync_cache_to_stock_daily.py`：把本地行情缓存回灌 `stock_daily`，支持增量写入、口径校验（与库内重叠日收盘差异 >0.5% 则跳过并告警）、幂等重跑；首次运行把 4,497 只补齐到最新交易日（+97,179 行），并正确跳过 000852/000905 两条口径不一致的缓存。此前 `stock_daily` 全市场自 2026-09 起停更，导致 10 月后横截面统计失真、选股与回填口径分叉。
+- [新功能] 建 track 增加三道闸门：`defensive/risk_off` 环境按 `config/daily_plan_tuning.json` 的 `defensive_demote_single` 不收趋势类信号、同票同来源 10 个交易日内只入池一条、距该批次首个信号涨幅 >30% 视为过热不再入池；提供 `--allow-defensive` 与 `--no-cooldown` 显式放行，输出打印三类跳过计数。
+- [新功能] 新增 `scripts/build_workbench_preview.py`：生成单页工作台预览（候选/跟踪/来源健康/数据完整性/信号 T+5 超额按月对比），输出到 `data/strategy_review/workbench_preview.html`（本地产物，不入库）。
+- [修复] 结构扫描包装器补齐完成证据：`structure_scan_daily.sh` 的 done 行改为 `done <时间> exit=<rc>`（取首个失败步骤，指数补数失败仍只告警），cron 按该值返回；总览健康不再因“缺退出码”把结构扫描判为降级，降级信息也按缺项细分。历史批次（≤2026-11-06）无退出码，继续保持降级显示，不回溯改写日志。
+- [修复] 行情跳变闸门补回“可解释阶段才放行”：相邻交易日出现 >2×板块阈值（主板 23%/创业板·科创板 43%/北交所 63%）的极端跳变判为口径混写并拒写，`--allow-extreme-jumps` 可显式放行；停牌/缺行情/新股前五个交易日仍只告警。可疑清单改为发现即原子落盘并留审计流水，新增 `src/services/quote_quality.py` 统一阈值与清单读写（重建/总览/回填共用一份），重建结束按扫描结果整体替换并输出新增/清除；“行情异常”不再占建 track 名额。
+- [修复] 批处理单条隔离：结果回填与建 track 入口对单票写入异常（并发冲突/数据库锁）计 `errors` 并继续，不再整批中断；`track_from_board` 失败返回非零但已建记录保留可重试。`outcome_tracks` 改按“最久未检查优先”轮转取样（`last_checked_at` 升序），避免 500 上限饿死旧样本；自动关闭前缀抽为 `AUTO_CLOSE_REASON_PREFIX`，读写两侧共用。
+- [修复] 投研工作台仅将匹配完整成功批次/审计版本的信号自动入池，未就绪行保留受限阅读；区分主任务与后处理完成，最终总览晚于导入/回填；来源引用/版本与限制贯通，未知公开可得时间留空，同日修订追加证据。
+- [修复] 研究收益按市场日历精确对齐 T+1/T+3/T+5，缺数不平移、截止不前视；按输入指纹识别行情修订，结果与自动关闭同事务，支持中断恢复及自动关闭样本修订，历史事件保留。
+- [修复] 前复权重建的收益跳变改作板块/日期相关复核线索，北交所合法30%不误拒写；未知 IPO/特殊阶段不以统一21.5%阈值断言错误，成交量/单位校验继续生效。
+- [修复] 回滚 tushare 回退污染：`TushareFetcher` 返回不复权 `daily`，不得写前复权库；已删除该选项并在文档里禁止，改用 `--source akshare`（adjust=qfq，sina/em 优先，自动 手→股）；1,758 行 `tushare_qfq_rebuild` 已用 akshare 重建为 0 残留（171 只，0 失败）。初版跳变硬闸门现已由本轮改为板块/日期复核线索；当时重建后扫描出 17 只待核代码写入 `rebuild_stock_daily_qfq_suspicious_codes.txt`，总览标注“行情异常”且不参与收益回填。
+- [修复] 回填前视与基准漂移：价格查询新增 `end_date` 硬截断（as_of 生效）；信号日无行情时判 `insufficient`，不再拿下一根 K 线当 D0；当前以规则/交易日/价格指纹识别测量版本，相同版本重跑不写，新增检查点或价格修订才追加。
+- [修复] 批次与缓存判定：日志健康改为“最后一次 start 晚于最后一次 done 即进行中”；`matrix_daily.sh` 把总览/建卡/回填/经验卡移到 `done` 之后；交易日历缓存必须覆盖当天才可信；生成时间不再对本地墙钟再加 8 小时；全部缺行情时逐条标“无本地行情”。
+- [新功能] A3-a 最小闭环：`scripts/evaluate_track_outcomes.py` 为到期 signal track 回填 T+1/T+3/T+5（D0 收盘为基准、`stock_daily` 前复权），D0及登记窗口数据完整时自动关闭；缺数据记 `insufficient_data`，检查点不平移，不推测不写假值。
+- [新功能] A1-b 经验卡：`config/experience_cards.json` 登记 12 张可核查卡片（机制/资格/数据/口径），带来源字段；`scripts/build_experience_cards.py` 渲染 `data/strategy_review/experience_cards.md`，缺字段/重复 ID/无来源直接报错。
+- [新功能] A2-b 后端：`/api/v1/stocks/{code}/profile` 增可选 `tracking` 块（该股研究记录列表，含状态/分支/到期）；不进入 `_BLOCK_NAMES`，不改变既有 evidence_quality 口径。
+- [改进] A0-b2：作战计划不再写死历史统计——T+1/T+3/T+5 与"单信号负期望"改为从 `daily_review_latest.csv` 实时计算（带窗口与 n，剔除兜底），无样本时显示"未计算"；成功度总览的自动链路时间改为实际 cron（18:10/18:40/19:00/19:05/+19:52），并新增统计口径公共模块 `src/services/signal_recent_stats.py`。
+- [新功能] 总览 ②“重要变化”接入 `news_intel` / `intelligence_items`（窗口 3 天，最多 10 条）；无记录时显示条数与“属采集未接入，不代表无变化”，不伪造结论。
+- [新功能] 研究跟踪新增只读 API：`GET /api/v1/research-tracks`（status/code/limit）、`GET /api/v1/research-tracks/due?as_of=`、`GET /api/v1/research-tracks/{track_id}`（含事件时间线）；不提供写入接口，避免双写入契约。
+- [新功能] 总览 ④“到期复核”接入研究跟踪：从 `research_tracks` 读 `next_review_at` 到期项（含逾期天数、分支、状态），无记录时明确写“无到期研究项”，表未建时显示不可用而不伪造；2026-11-09 实测 30 条到期项正常呈现。
+- [新功能] 新增 A2-a 每日建 track 入口 `scripts/track_from_board.py`：从当日总览候选按“匹配完整批次→剔除无行情→多来源优先”选 30 条（可 `--limit`），幂等可重跑；已接入 `matrix_daily.sh`。首跑 2026-11-06 建 30 条，重跑新建 0。
+- [修复] 筛选快照的交易日历改为**先读本地缓存再在线取**并回写 `data/cache/reference/tushare_trade_cal_sse.csv`；在线失败时回退旧缓存，消除三批审计重复出现的 `trade_cal 频率超限` 降级。
+- [修复] 行情重建保留 `amount/close` 与 `volume` 单位校验；此前试用的 Tushare 原始价格回退已移除，历史“0失败”不证明复权正确。当前仅支持 baostock/akshare 的前复权来源。
+- [改进] `data/runtime/matrix_daily.sh` 重建步骤使用 baostock→akshare 前复权回退链，并在每日任务末生成 A1-a 只读总览 `data/strategy_review/today_board.md`；不新增调度器。
+- [新功能] 新增 A2-a 研究跟踪数据层：`research_tracks` + `research_track_events` 两张表、`research_tracking_repo` 与 `research_tracking_service`；身份幂等（market+code+hypothesis_key）、事件只追加、`expected_revision` 乐观并发冲突。7 项合同测试覆盖同股多假设并存、幂等、冲突不写入、关闭需原因。
+- [新功能] 新增 A1-a 只读总览生成器（`src/services/daily_board_service.py` + `scripts/build_today_board.py`）：读已有信号快照、筛选审计与 `data/run_logs` 完成日志，输出 `data/strategy_review/today_board.md`；不建表、不接 API、不调模型、不启动生产者。含对象闸门（`TL_SUMMARY` 等摘要不得当证券）、UTC→北京时间换算、降级/重建失败/行情截至日标注、未接入分区显式缺口；18 项合同测试覆盖方案 §8.1 反例。
+- [文档] 投研工作台方案登记本机五条既有 cron 的生产者/产物/日志，核实 screening UTC 与北京时间转换，约束按订阅批次完成证据读取；记录 matrix 后处理补数失败及筛选降级，区分未完成、零候选与数据受限，限定首批扩展说明及后续迁移出口；未改代码、配置、数据或调度。
+- [文档] 投研工作台方案补新策略/数据/功能的原生接入边界、公共结果合同、版本与失败隔离及第二类接入验收；收敛分类轴、默认观察路由、执行频率、首版两类健康生产链与空分区展示，保留冻结/RE01及交易权限限制；仅文档，未改代码、配置、数据或调度。
+- [文档] 投研工作台方案按热点雷达/盘后复盘/长期研究重构，补个人策略、十个筛选预设及分析 skill 的归属、执行入口和主工程/开源能力复用；只读拆分最新信号与运行摘要，明确 ETF 接入、股息/反转分支、冻结和 RE01 边界，同步导航及目录过期标记；未改代码、配置、数据或调度。
+- [文档] 收敛投研工作台方案接入边界：RE01 生产者未就绪前排除自动跟踪验收，角色恢复总纲守/攻/观察及共用输入；A0-b1 对象闸门与 A0-b2 旧文案统计修复分开，A1-a 明确四项来源元数据责任与验收，人工记录入口后置，新增顶部三点摘要；仅文档，未改代码、数据、规则或调度。
+- [文档] 评审修订个人投研工作台重构方案：阶段改为总纲下的子工作包，先来源体检与零人工研究输入的 A1-a 总览、A2 再建跟踪存储/页面；补打法映射、计算/样本/建议/研究状态权威范围及冲突验收，保留 RE01 CSV 写入职责和回顾样本标签，未改代码、规则、数据或调度。
+- [文档] 新增个人投研工作台重构方案：复用现有报告、DecisionSignal、自选和个股聚合能力，规划跨日长短期假设、证据版本、变化总览、到期复核及经验回流；沿用 A0~A4 验收，保留全量失败样本与现行规则，未修改代码、数据库或调度。
+- [文档] 单票卡规则升至 r8：弱市判据简化为「000300 收盘<MA20」，R4b 两日净幅由 +2% 放宽到 ≥0；新增规格 §7 观察池约定（策略信号入池即固定、失败样本留档、D+3/D+10 固定检查点、仅事前入池计入统计）。11-06 复核仍为 2 只（湖南黄金、天赐材料），净幅放宽不改变结果。
+- [文档] 单票卡规则升至 r7：RE01 确认分市场——强/平市用 R4a 绝对确认，弱市（000300≤−1% 或<MA20）用 R4b 相对确认（不破 D0 低点、回吐≤2%、量≥50%、两日净≥+2%、站上 MA5、相对市场≥0），R4b 只记弱确认观察；新增 M01 市场状态登记。11-06 回顾扫描：41 只 D0 中 R4a 0、R4b 2（湖南黄金、天赐材料），无合力。未改代码或交易权限。
+- [文档] 单票卡规则升至 r6：新增超跌反弹分支 RE01（不看业绩，超跌三项 + 曾经行业龙头 + 底部阳线次日确认 + 消息催化 + 相对行业不弱；相对行业为负只做 ETF 且需龙头合力；D+3 不新高或破 D0 低点退出，最长 10 日）；资格由两种扩为三种，RE01 不走四象限。阈值均为候选，未改代码或交易权限。
+- [文档] 单票卡规则升至 r5：15 基准改按事件暴露映射（行业标签指数仅作代理、只能否证）、事件确认改 T+1/T+3/T+5 检查点、质量块收为 04~06 且估值降为约束不投票、新增案例选择日志；r4 卡保留不回填，B01/B02/V01 阈值仍待登记。未改代码、配置或交易权限。
+- [文档] 个人单票卡拆开配置与事件交易研究资格，状态限为描述性；新增人工规则登记、复权回退及能力/结论合同，完成阳光电源×美国中期选举纵向核验（两日落后光伏代理，暴露/财务/风险计划仍有缺口，无交易权限；未改运行配置或数据库）。
+- [文档] 单票卡公式拆至《单票卡规格 v0.1》，总纲收敛为 L0/L1/L2 独立任务准入、长期两来源族及分范围事件确认；明确预期差不可用/弱代理、已证实机构新进退出、20 只合同校验与全市场 PIT 长期验证边界。记录本机五票前复权补数（均至 11-06、新增 784 行）及首批 L0：生成 5 张、技术数据通过 4 张、工行复权事件受限 1 张，事件待核、无交易权限；未改代码、配置或自动化链路。
+- [文档] 单票卡升级 v0.1（22 槽位）：以四块合成长期状态，补业绩预期差/首日反应，区分个股持股数量与股本变化、基金组合权重；明确业务暴露、行业景气、分类催化复核及 ROE/收益口径，覆盖门槛逐指标登记。新增五只样票数据可行性矩阵：仅本地离线预检，完整卡通过 0 只、在线权限未复核；先数据闸门再 20 只人工校验，不改代码、参数或交易权限。
+- [文档] 个人策略协同总纲补充单票多周期卡 v0（20 指标、计算与时点/覆盖合同）、长短期四象限及事件交易候选，目标漏斗增加驱动一致性；登记机构趋势、催化生命周期、研究周期、维度准入和决策留痕，并规划先人工 20 只校验再做样本外增量/降级验证。仅文档，示例与候选阈值未验证，未改变代码、配置、CSV 或交易权限。
+- [文档] 新增并完善《个人策略协同总纲》：明确市场感知、双周期研究、历史经验、资金协同与量化验证的六层架构，分类现有国家队/基金/ETF/短期能力，补充经验卡、事件示例、四类验证和 A0~A4 验收计划；区分已有实现与规划、直接披露与代理推断，保留配方/漏斗/节奏及外部能力边界；同步个人策略目录、基线导航、文档说明与修改记录。仅文档，未改变代码、参数或策略权限。
+- [新功能] 新增国家队宽基 ETF 长期跟踪（`scripts/etf_flow_history.py` + `scripts/analyze_etf_national_team.py`）：固定 9 只老牌宽基 ETF 篮子（避免新发污染），周频回溯沪市份额并折算为净申赎金额（份额差 × 收盘价），输出三阶段复盘与信号统计；2025-01~2026-10 实测：2026 上半年净赎回 -10,631 亿元、7 月起回补 +3,092 亿元，份额谷底（7/3）比指数顶（5/29）晚 4 周，仅「周变动 ≤-5%」有大额流出预测力（未来 8 周 -4.57%，胜率 30%）。
+- [新功能] 新增 ETF 份额流双层信号（`scripts/etf_flow_weekly.py` + `scripts/run_etf_flow_weekly.sh`）：顶层用宽基 ETF 份额周变动判断大资金（国家队）进出与见顶风险，中层用行业 ETF 份额变动筛资金流入板块并给出对应可买 ETF；默认自动回溯最近有数据的交易日（周末/节假日安全），crontab 周五 17:30 运行；数据源沪市 `fund_etf_scale_sse(date)`（支持按日回溯）+ 深市 `fund_etf_scale_szse()`（仅当日快照，当前未纳入周变动）。
+- [新功能] 新增次新股「装死→放量」每日观察（`scripts/watch_newstock_deadwater.py` + `scripts/run_newstock_watch.sh`）：按今日换手/前20日均换手倍数、距发行价、5日均成交额给状态分级（★放量启动 / ⚠放量下跌 / 装死中），输出 `data/strategy_review/newstock_watch/<日期>.md|csv`；数据源 BaoStock（东财 push2his 本机不可用）。
+- [新功能] 新增股东户数筹码集中筛选方法（`docs/个人策略文档/股东户数筹码集中筛选方法.md`）：以近 4 年历史位置 `pos=(当前−最低)/(最高−最低)`、底部新鲜度、是否仍在下降三组口径判断筹码是否真集中，修正“只看从最高降幅”的误判；2026 三季报口径下有效样本 4,543 只，一档 73 只。
+- [改进] 吃股息执行约定 v1.0 定稿（4% 核心+3.5% 扩展层 / 30-50 只等权、单票 ≤4% / 季度检视+分红再投）；“精简评分”离线实验（`experiment_dividend_rerank.py` 新增精简A/B 变体）：精简B（股息+低波+现金流）合并年化 +19.1%、回撤 −10.6%，近两年 +12.3% 显著优于现有评分（+5.8%），列为切换候选；2026-10-06 已正式切换为默认排序（见下条）。
+- [改进] 股息线排序正式切换「精简B」：池产物新增 `trim_b_score` 列（0.40 股息率 + 0.30 低波 + 0.30 现金流覆盖，横截面 z 分；波动率覆盖 <50% 时自动回退评分），Top100 体检与三档清单同步优先新口径；9/30 池 236/236 生效，示例组合 v0.2 重出。
+- [改进] 吃股息“股息陷阱”过滤验证与执行层落地：精简B+剔深跌（含息≤-30%/-15%）回测均未增收益（合并 19.1%→18.4%/18.5%、回撤无改善）→ 不并入排序口径；示例组合 v0.3 按执行层约定剔除深跌票（五粮液/分众/欧派→中信银行/中远海控/周大生）。
+- [改进] 追加“只选含息为正”严格版验证：合并年化 +20.0% 但近两年熊市段 +7.9% < 裸 B +12.3%（动量倾斜、回撤 -11.3%）→ 不采纳为选股硬条件，保留 `含息≈` 展示列。
+- [新功能] 新增 `scripts/screen_updays_structure.py`（上涨结构扫描 + 伪强势自动检测：前涨后跌/高台跳水标注“剔除”、距高回落标注“观察”；默认上涨占比≥60%，支持 `--min-up-ratio`）；配套 `tests/test_screen_updays_structure.py`。
+- [新功能] 新增 `scripts/analyze_stock_profile.py`（个股五段式快照：新闻实锤/基本面/技术面/筹码/一句话；基本面含最新报告期+近三年年度双表、新闻含催化关键词命中；支持 `--codes/--from-csv` 批量与 `--offline`）；配套 `tests/test_analyze_stock_profile.py`。
+- [新功能] 新增 `scripts/screen_t_friendly.py`（温和阳线型“好看的图”/T 友好扫描：近 2 月阳线占比、振幅、回撤、摆动次数、单段最深回调约束 + 趋势质量层（净涨≥0、站上 MA20/MA60、距 60 日高 ≥-10%、近 10 日 ≥-3%，`--no-trend-filter` 可关）；输出名单 + 每只蜡烛图 + 总览图/INDEX）；配套 `tests/test_screen_t_friendly.py`。
+- [新功能] 新增 `scripts/strong_stocks_stats.py`（当日强势股统计与分类：涨幅≥5%+成交额≥1亿，按连板/首板/涨停后走强/未涨停放量大涨分类，附板块分布与连板清单）；配套 `tests/test_strong_stocks_stats.py`。
+- [新功能] 新增 `scripts/cap_bucket_stats.py`（市值分层热度：流通市值分桶的当日涨幅/上涨占比/换手/涨停/成交额占比/近5·20日动量 + 强势股市值分布；输出 `data/strategy_review/cap_buckets_<日期>.md`）。
+- [新功能] 新增 `scripts/screen_active_pool.py`（活性池：“有资金玩”=大波动日多（均振幅≥3%、3%+日≥10）+ 非单边阴跌（回撤≤35%、连跌≤6、20日≥-20%），核心 20 + 跟踪 30，位置标注低吸区/回踩中/强势；校准证据：阳线占比无区分度（芒果48.3%=通鼎48.3%，工行61.7%却振幅仅2%），通鼎因30日-29%/回撤-47%/连跌7被剔除）；配套 `tests/test_screen_active_pool.py`。
+- [文档] 新增根目录 `AI_INDEX.md`（给 AI 助手的一页式索引：项目定位/每日链路/策略清单/脚本速查/产物地图/文档导航），并在 OpenClaw 工作区 AGENTS.md 挂接指针。
+- [文档] 新增 `data/strategy_review/dividend_sample_portfolio_20260930.md`（吃股息示例组合：v0.1 评分序 → v0.2 精简B 序，40 只等权）。
+- [修复] `backtest_dividend_income.py` 深历史缓存分段截断修复：抓取前增加末日期校验、抓取结果与旧文件合并写入（防分段运行相互覆盖截断）；934 只深历史已统一补齐 2017-11 ~ 2026-06。
+- [新功能] 新增 `scripts/analyze_dividend_longrange.py`（吃股息长区间复核：分段+合并的 Top20/池子/股息+低波50-50 排序对比与单因子 RankIC 快检）；报告 `data/strategy_review/dividend_longrange_review.md`；配套 3 条离线用例。
+- [文档] 《吃股息策略-实施与验证总结》新增 §13 长区间复核与组合执行说明（草案）。
+- [文档] 新增《个人策略文档/基金定投候选与体检流程》：季度筛选逻辑（逐年为正+回撤受控）、49 只候选池（进攻/稳定两梯队）、定投回测口径（总收益 vs 年化、平均在场时间）、单只体检清单与大跌防慌手册。
+- [修复] 基金前十大持仓接口修复：东财 F10 加防盗链（缺 Referer 返回 404）致 akshare `fund_portfolio_hold_em` 失效（报 demjson 解码错）；新增 `scripts/fetch_fund_holdings.py`（Referer 直连 + 移动端兜底，支持 `--year/--quarters/--industry/--csv`），并完成定稿组合持仓体检（前十大合计 15.6%~50.9%）。
+- [新功能] 新增 `scripts/scan_earnings_lowbase_watch.py`（业绩爆发「低位预期票」观察清单）：大盘开关（000300 vs MA20）+ 低位启动（B）/ 刚转强（B-）/ 低位待动 / 破位 / 高位透支分组，纸面跟踪用（暂不并入快复盘，验证后拟并入 earnings_surprise 位置层）；位置分层回测证据 `data/strategy_review/position_split_study_2026.md`。
 - [新功能] 新增 `scripts/dividend_t_watch.py`（红利 T 提示器）：扫 ① 趋势红利回踩触发档（-3%/-5%/-7%）+ 均线护栏（MA200 闸门 / MA60 减半），输出状态表；接入 17:05 复盘后自动运行；配套 3 条离线用例。
 - [新功能] 新增 `scripts/screen_deep_recovery.py`（超跌企稳扫描）：年内回撤≥阈值 + 站上MA20 + 5日>+2% + 流动性过滤 + 接缝保护，输出 A/B/C 分档 md/csv；接入 17:05 复盘后自动运行；配套 4 条离线用例。
 - [修复] `data/cache/history` 共享缓存深度恢复：按日批量回补 2024-01-01 起全市场日线（此前被清混尺重建收敛到 2026-01-12 起 ~170 根，影响回测调仓日历与池子）；恢复后共享缓存为统一 Tushare 不复权单源、跨年度连续。
@@ -23,6 +87,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] 恢复 LiteLLM 空响应“同一模型重试”逻辑（`EMPTY_LLM_RESPONSE_RETRY_ATTEMPTS=3`）：重试循环在重构中丢失、失败分支引用未定义变量会直接 NameError（流式分支同步修掉未定义引用）。
 - [修复] `src/market_analyzer.py` 补上 `LimitUpReviewService` 导入：此前 `MarketAnalyzer` 构造即 NameError，市场复盘链路不可用。
 - [测试] 重建 `test_fetcher_logging.py` 缺失的测试辅助（`_HistoryCacheFetcher`/`_history_rows`/`_HangingFetcher`/`_AlwaysFailHistoryFetcher`）并修复两处非 hermetic 用例（懒加载注册表计入计时、真实磁盘缓存污染）；补齐 `test_storage.py` 缺失导入（全仓 flake8 critical 恢复为 0）。
+- [新功能] 快复盘新增「兑现风险」分层：业绩事件日（≤3 个自然日内）当日跌幅 ≤-5% 时自动从“业绩优先/双确认”移出并单列“兑现风险观察”（样本：兆易创新 2026-07-10 存储涨价中报事件日 -7.7%）；矩阵质量分同步 -12 与风险旗标。
+- [改进] 短线观察（图形 ∩ 催化）图形件池纳入趋势龙头线（此前仅 hdh/dsr/lbr），输出新增 `60日% / 距高% / 透支` 三列并按透支度罚分排序（高 -15 / 中 -5）；透支度口径与全市场分档证据：`data/strategy_review/extension_bucket_study_2026.md`。
 - [修复] 个人策略矩阵页面可见性改为由 profile `include/exclude` 驱动：defensive 不再隐藏真正在跑的 `earnings_surprise`，`long_base_release`/`daily_slow_rise` 按冻结处理（页面移出 + 命中停用）；`market_regime` 仅影响未显式配置的条目。
 - [修复] `analyze_signal_portfolio.py` 随机对照改为独立的“每日稳定哈希抽样 TopN”规则（种子 20260926），不再受主策略 `--rank-by` 影响；hdh Top5 随机对照旧数字作废并按新规则重跑。
 - [修复] `run_fast_review_bundle.py` 与矩阵 runner 的缺省信号集合同步为三线（earnings/hundred_day_high/trend_leader），冻结/停用线不再作为回退；`--snapshot-date latest/auto` 现可解析为最新已有复盘产物日期。
@@ -680,6 +746,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [新功能] 新增决策日志回看 `scripts/review_decision_log.py` + `data/decision_log/` 模板：按列填写决策后自动计算前向收益/胜负/可选基准超额，支持按来源线汇总。
 - [改进] 复盘导出 v2：`scripts/daily_review_export.py` 增加成本后净收益列（默认 31bps/次，可调）与默认信号源=profile include_signals（自动排除 random_baseline 对照）。
 
+- [新功能] 新增每日作战计划 `scripts/daily_action_plan.py`：市场开关（000300 收盘 vs MA20/MA60 → offensive/balanced/defensive，可 `--update-profile` 回写）、MA5 乖离追高纪律（<2% 可介入 / 2-5% 小仓 / >5% 严禁追高，双信号放宽 7%）、持有期纪律（T+5/T+10 评估、不做 T+1/T+3 兑现）、Agent AI 二次审核（本机 `/api/v1/agent/chat`）；产物 `data/strategy_review/daily_action_plan_latest.md`。
+- [新功能] 新增策略成功度总览 `scripts/strategy_scoreboard.py`：一页汇总默认每日/冻结停用/专题工具/独立支线的状态与绩效（全样本 + 近月扣费口径）；产物 `data/strategy_review/strategy_scoreboard.md`。
+- [改进] 每日 17:05 `matrix_daily.sh` 链路追加「成功度总览 + 作战计划」；AI 审核仅在本机 dsa-web 服务在线时启用（离线自动跳过）。
+- [改进] Web 工作台可用：前端构建产物就位（static/，本地生成未跟踪）；新增 systemd 用户服务 `dsa-web.service`（`main.py --webui-only`，http://127.0.0.1:8000，开机自启）。
+- [测试] 新增 `tests/test_daily_action_plan.py`：作战计划离线用例 5 条（MA5 追高阈值与双信号放宽、regime 三态判定、乖离回退计算、profile 回写、统计格式化）。
+- [改进] 个人策略每日链路调度从 16:10/16:40/17:05 调整为 18:10/18:40/19:05，对齐 DeepSeek 错峰半价时段（峰时=北京 09:00–12:00 / 14:00–18:00，其余时间及周末全天半价）。
+- [新功能] AI 审核扩量：审核池合并「最新快复盘 + 近 10 交易日信号」并**按股票去重**（默认最多 80 只、4 并发、技能 bull_trend）；全量审核文本单独输出 `data/strategy_review/daily_ai_reviews_latest.md`。
+- [改进] 新增 `config/daily_plan_tuning.json` 调参文件（指数代码/候选数/追高三档阈值/AI 审核参数），优先级 CLI > 调参文件 > 内置默认。
+- [改进] 每日作战计划新增「防守市降权」：defensive 下百日新高单信号候选移入观察区（不参与新开仓），与其它信号交叉的双确认样本保留主清单；名单可调参 `defensive_demote_single`。
+- [改进] `trend_leader_unified` 关闭弱市兜底凑数（`trend_fallback_top_n=0`）：严格 0 命中时不再从 tier4/tier5 补凑输出（此前 2026-09-28 曾补凑 20 只低质样本混入信号流）。
+- [改进] 评估分层：`daily_review` 导出新增 `selection_mode` 列；成功度总览与作战计划候选池剔除兜底样本，不再与 strict 信号混淆。
+- [修复] 每日作战计划：AI 审核存在失败项时不再渲染崩溃（内联解读区仅取成功项，缺内容时降级提示）。
 <!-- 新条目格式：- [类型] 描述（类型取值：新功能/改进/修复/文档/测试/chore）-->
 <!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->
 

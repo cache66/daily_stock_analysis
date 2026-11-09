@@ -28,6 +28,11 @@ logger = logging.getLogger(__name__)
 _SNAPSHOT_CACHE_VERSION = 1
 _DEFAULT_TUSHARE_HTTP_URL = "http://api.waditu.com"
 _EM_REQUEST_MIN_INTERVAL_SECONDS = 1.0
+# 本地交易日历缓存（与 TushareFetcher 共用同一文件，避免 trade_cal 1 次/小时限频）
+_TRADE_CAL_CACHE_PATH = (
+    Path(__file__).resolve().parents[3] / "data" / "cache" / "reference" / "tushare_trade_cal_sse.csv"
+)
+_TRADE_CAL_MAX_STALE_DAYS = 7
 _EM_REQUEST_JITTER_SECONDS = 0.3
 _SOURCE_HEALTH_FAILURE_THRESHOLD = 3
 _SOURCE_HEALTH_COOLDOWN_SECONDS = 5 * 60
@@ -634,23 +639,110 @@ def _configure_tushare_client(pro: object, *, token: str) -> None:
         pass
 
 
+def _read_cached_trade_dates(start: date, end: date) -> list[str]:
+    """读本地交易日历缓存，返回 [start, end] 内的开市日（升序）。"""
+    if not _TRADE_CAL_CACHE_PATH.exists():
+        return []
+    try:
+        frame = pd.read_csv(_TRADE_CAL_CACHE_PATH, dtype=str)
+    except Exception as exc:  # noqa: BLE001 - 读缓存失败不能阻断取数
+        logger.warning("trade_cal 缓存读取失败: %s", exc)
+        return []
+    if frame is None or frame.empty or "cal_date" not in frame.columns:
+        return []
+    work = frame.copy()
+    work["cal_date"] = work["cal_date"].astype(str).str.strip()
+    if "is_open" in work.columns:
+        opened = pd.to_numeric(work["is_open"], errors="coerce").fillna(0).astype(int) == 1
+        work = work[opened]
+    lo, hi = start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
+    work = work[(work["cal_date"] >= lo) & (work["cal_date"] <= hi)]
+    return sorted(set(work["cal_date"].tolist()))
+
+
+def _write_trade_cal_cache(calendar: pd.DataFrame) -> None:
+    """把在线取到的日历并入本地缓存（幂等，失败仅告警）。"""
+    try:
+        _TRADE_CAL_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        work = calendar.copy()
+        if "exchange" not in work.columns:
+            work["exchange"] = "SSE"
+        if "is_open" not in work.columns:
+            work["is_open"] = 1
+        work = work[["exchange", "cal_date", "is_open"]].astype(str)
+        if _TRADE_CAL_CACHE_PATH.exists():
+            try:
+                merged = pd.concat(
+                    [pd.read_csv(_TRADE_CAL_CACHE_PATH, dtype=str), work], ignore_index=True
+                )
+                work = merged
+            except Exception:  # noqa: BLE001 - 旧缓存损坏时直接覆写
+                pass
+        work = (
+            work.drop_duplicates(subset=["exchange", "cal_date"], keep="last")
+            .sort_values("cal_date")
+            .reset_index(drop=True)
+        )
+        work.to_csv(_TRADE_CAL_CACHE_PATH, index=False, encoding="utf-8-sig")
+    except Exception as exc:  # noqa: BLE001 - 缓存失败不影响主流程
+        logger.warning("trade_cal 缓存写入失败: %s", exc)
+
+
+def _cache_has_date(target: date) -> bool:
+    """缓存是否已覆盖指定日期（无论开市/体市），用于判断能否离线判定“最近交易日”。"""
+    if not _TRADE_CAL_CACHE_PATH.exists():
+        return False
+    try:
+        frame = pd.read_csv(_TRADE_CAL_CACHE_PATH, dtype=str)
+    except Exception:  # noqa: BLE001
+        return False
+    if frame is None or frame.empty or "cal_date" not in frame.columns:
+        return False
+    return target.strftime("%Y%m%d") in set(frame["cal_date"].astype(str).str.strip())
+
+
 def _resolve_tushare_trade_date(pro) -> str:
-    """Return the latest open trade date for Tushare requests."""
+    """Return the latest open trade date for Tushare requests.
+
+    只有缓存已覆盖今天（包含今天是否开市）才直接用；否则必须在线取。
+    在线失败时回退旧缓存，两者都没有才报错。
+    """
     explicit = os.getenv("TUSHARE_TRADE_DATE", "").strip()
     if explicit:
         return explicit
 
     end = date.today()
     start = end - timedelta(days=30)
-    calendar = pro.trade_cal(
-        exchange="",
-        start_date=start.strftime("%Y%m%d"),
-        end_date=end.strftime("%Y%m%d"),
-        is_open="1",
-        fields="cal_date,is_open",
-    )
+    cached = _read_cached_trade_dates(start, end)
+    if cached and _cache_has_date(end):
+        try:
+            newest = datetime.strptime(cached[-1], "%Y%m%d").date()
+            if (end - newest).days <= _TRADE_CAL_MAX_STALE_DAYS:
+                return cached[-1]
+        except ValueError:
+            pass
+
+    try:
+        calendar = pro.trade_cal(
+            exchange="",
+            start_date=start.strftime("%Y%m%d"),
+            end_date=end.strftime("%Y%m%d"),
+            is_open="1",
+            fields="cal_date,is_open",
+        )
+    except Exception as exc:  # noqa: BLE001 - 限频/网络失败时用旧缓存兜底
+        if cached:
+            logger.warning("trade_cal 在线获取失败，改用本地缓存（%s）: %s", cached[-1], exc)
+            return cached[-1]
+        raise RuntimeError(f"tushare trade_cal 失败且无本地缓存: {exc}") from exc
+
     if calendar is None or calendar.empty or "cal_date" not in calendar.columns:
+        if cached:
+            logger.warning("trade_cal 返回为空，改用本地缓存（%s）", cached[-1])
+            return cached[-1]
         raise RuntimeError("tushare trade_cal returned no open trading days")
+
+    _write_trade_cal_cache(calendar)
     return str(calendar["cal_date"].max())
 
 

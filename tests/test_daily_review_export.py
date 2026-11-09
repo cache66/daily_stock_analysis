@@ -106,3 +106,20 @@ def test_latest_close_on_or_before_helper():
     assert daily_review_export._latest_close_on_or_before(seq, "2026-09-20") == 5.0
     assert daily_review_export._latest_close_on_or_before(seq, "2026-09-21") == 6.0
     assert daily_review_export._latest_close_on_or_before(seq, "2026-09-17") is None
+
+
+def test_selection_mode_column(tmp_path):
+    db_path = _make_db(tmp_path)
+    con = sqlite3.connect(db_path)
+    con.execute(
+        "INSERT INTO kline_signal_snapshot VALUES (?,?,?,?,?)",
+        ("hundred_day_high", "2026-09-20", "600004", "测试兜底", '{"close": 3.0, "selection_mode": "fallback"}'),
+    )
+    con.commit()
+    con.close()
+    out_path = tmp_path / "review_fb.csv"
+    assert _run_main(db_path, out_path, "--quiet") == 0
+    rows = _read_rows(out_path)
+    # 兜底样本仍写入明细，但带 selection_mode 标记，供下游分层消费
+    assert rows["600004"]["selection_mode"] == "fallback"
+    assert rows["600001"]["selection_mode"] == ""

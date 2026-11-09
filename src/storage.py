@@ -1446,6 +1446,70 @@ class _DatabaseManagerMeta(type):
             return super().__call__(*args, **kwargs)
 
 
+class ResearchTrack(Base):
+    """研究跟踪记录（A2-a）：一条可跨日复用的研究假设。
+
+    与 ``DecisionSignalRecord`` 的分工：建议池记录"某次分析给了什么建议"，
+    这里记录"这条研究逻辑目前是否还成立"，一个 track 可引用多条历史建议。
+    """
+
+    __tablename__ = "research_tracks"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    track_id = Column(String(36), nullable=False, unique=True, index=True)
+    market = Column(String(12), nullable=False, default="cn")
+    code = Column(String(10), nullable=False, index=True)
+    hypothesis_key = Column(String(120), nullable=False)
+    title = Column(String(200), nullable=False, default="")
+    # 分类轴各自独立记录，不塞进单一 line 字段
+    business_layer = Column(String(16), nullable=False, default="review")  # hotspot/review/longterm
+    horizon = Column(String(16), nullable=False, default="short")  # short/long
+    branch = Column(String(16), nullable=False, default="")  # config/event/re01
+    capital_role = Column(String(16), nullable=False, default="watch")  # guard/attack/watch/shared
+    hypothesis = Column(Text)
+    invalidation = Column(Text)
+    status = Column(String(16), nullable=False, default="pending")  # pending/tracking/invalid/closed
+    revision = Column(Integer, nullable=False, default=1)
+    last_checked_at = Column(DateTime)
+    next_review_at = Column(DateTime, index=True)
+    closed_reason = Column(String(200))
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint("market", "code", "hypothesis_key", name="uix_research_tracks_identity"),
+        Index("ix_research_tracks_status_review", "status", "next_review_at"),
+    )
+
+
+class ResearchTrackEvent(Base):
+    """研究跟踪事件（只追加）：初始快照、证据变化、状态、复核与关闭。
+
+    历史事件不原地改写；错误通过新事件纠正。事件内引用外部 ID 与版本，
+    不复制整套报告/行情数据。
+    """
+
+    __tablename__ = "research_track_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    track_pk = Column(Integer, ForeignKey("research_tracks.id"), nullable=False, index=True)
+    event_type = Column(String(24), nullable=False, index=True)
+    source_type = Column(String(32))
+    source_ref = Column(String(200))
+    source_version = Column(String(120))
+    available_at = Column(DateTime)
+    observed_at = Column(DateTime)
+    quality = Column(String(24))
+    limitation = Column(String(400))
+    summary = Column(Text)
+    payload_json = Column(Text, nullable=False, default="{}")
+    created_at = Column(DateTime, default=datetime.now, index=True)
+
+    __table_args__ = (
+        Index("ix_research_track_events_track_type", "track_pk", "event_type"),
+    )
+
+
 class DatabaseManager(metaclass=_DatabaseManagerMeta):
     """
     数据库管理器 - 单例模式

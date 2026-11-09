@@ -185,9 +185,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     snap_path = SNAP_DIR / args.snapshot / "dividend_income_candidates.csv"
     snap = pd.read_csv(snap_path, dtype={"ts_code": str})
-    pool = snap[snap["qualified"] == True].sort_values("dividend_score", ascending=False).head(args.top).copy()
+    # 排序口径（2026-10-06 起）：优先「精简B」横截面综合分（池 CSV 自带），否则回退综合评分。
+    rank_col = "dividend_score"
+    if "trim_b_score" in snap.columns and pd.to_numeric(snap["trim_b_score"], errors="coerce").notna().any():
+        rank_col = "trim_b_score"
+    pool = snap[snap["qualified"] == True].sort_values(rank_col, ascending=False).head(args.top).copy()
     pool["code6"] = pool["ts_code"].str[:6]
-    print(f"[体检] 快照 {args.snapshot}，取评分前 {len(pool)} 只")
+    rank_label = "精简B" if rank_col == "trim_b_score" else "评分"
+    print(f"[体检] 快照 {args.snapshot}，按{rank_label}取前 {len(pool)} 只")
 
     with sqlite3.connect(DB_PATH) as con:
         bars_map = load_bars(con, pool["code6"].tolist())
@@ -202,6 +207,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "name": r["name"],
             "industry": r.get("industry"),
             "score": r["dividend_score"],
+            "trim_b_score": r.get("trim_b_score"),
             "dv_ttm": r["dv_ttm_pct"],
             "close": r["close"],
             "ma200_ratio": r.get("ma200_ratio_pct"),

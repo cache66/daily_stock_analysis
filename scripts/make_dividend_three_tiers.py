@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """从股息池体检 CSV 生成「股息三级清单」markdown（纯本地读取，不联网）。
 
+排序（2026-10-06 起）：优先「精简B」横截面综合分（体检表含 `trim_b_score` 列时），
+否则回退综合评分；依据见 `docs/个人策略文档/吃股息策略-实施与验证总结.md` §13.7。
+
 三层口径（与 `analyze_dividend_top100.py` 体检报告一致）：
 - ① 趋势红利：业绩平稳/稳增 + T 战术通过 + 三层月线闸门通过
 - ② 吃息+T：  业绩平稳/稳增 + T 战术通过（月线未过闸门，走平观察）
@@ -53,14 +56,26 @@ def load_checkup(path: Path) -> pd.DataFrame:
     return df
 
 
+def _rank_column(df: pd.DataFrame) -> str:
+    """排序口径（2026-10-06 起）：优先「精简B」横截面综合分，缺列/全空时回退综合评分。"""
+    if "trim_b_score" in df.columns and pd.to_numeric(df["trim_b_score"], errors="coerce").notna().any():
+        return "trim_b_score"
+    return "score"
+
+
 def build_tiers(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     biz_ok = df["biz_class"].isin(BIZ_OK)
     t_good = df["t_good"].fillna(False).astype(bool)
     trend = df["trend_ok"].fillna(False).astype(bool)
+    rank_col = _rank_column(df)
+
+    def _ranked(sub: pd.DataFrame) -> pd.DataFrame:
+        return sub.sort_values(rank_col, ascending=False, na_position="last")
+
     return {
-        "trend": df[biz_ok & t_good & trend].sort_values("score", ascending=False),
-        "t_watch": df[biz_ok & t_good & ~trend].sort_values("score", ascending=False),
-        "pure": df[biz_ok & (df["dv_ttm"] >= DIV_MIN)].sort_values("score", ascending=False),
+        "trend": _ranked(df[biz_ok & t_good & trend]),
+        "t_watch": _ranked(df[biz_ok & t_good & ~trend]),
+        "pure": _ranked(df[biz_ok & (df["dv_ttm"] >= DIV_MIN)]),
     }
 
 
@@ -106,6 +121,7 @@ def build_markdown(df: pd.DataFrame, checkup_name: str, run_day: str) -> str:
         "  - T 能打：S1 战术（回调买入 → 反弹止盈）样本内通过",
         "  - 月线闸门：距 MA200 ≥ -5% 且 MA200 60 日斜率 > 0 且近 6 月涨幅 ≥ -5%",
         "  - 股息率：滚动 12 个月股息率（dv_ttm）",
+        "  - 排序：精简B 横截面综合分（0.40 股息率 + 0.30 低波 + 0.30 现金流覆盖；体检表缺该列时回退综合评分）",
         "- 三层为并列视图，成员有重叠：① ⊂ ②；③ 按股息率独立选取",
         "- 样本内历史测试，不代表未来收益；仅作纪律与监控工具，不构成投资建议",
         "",

@@ -1,0 +1,17 @@
+{
+  "index_code": "000300",
+  "candidates_top": 12,
+  "bias_best": 2.0,
+  "bias_warn": 5.0,
+  "bias_strong": 7.0,
+  "defensive_demote_single": ["hundred_day_high"],
+  "ai_review": {
+    "enabled": true,
+    "top": 80,
+    "skill": "bull_trend",
+    "workers": 4,
+    "inline": 3,
+    "url": "http://127.0.0.1:8000",
+    "recent_signal_days": 10
+  }
+}

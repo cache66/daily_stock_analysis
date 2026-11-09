@@ -32,7 +32,7 @@
     "hundred_day_skip_cause_analysis": false,
     "trend_signal_type": "trend_leader_unified",
     "trend_disable_second_stage_enrichment": true,
-    "trend_fallback_top_n": 20,
+    "trend_fallback_top_n": 0,
     "trend_shard_count": 1,
     "trend_shard_index": 0,
     "trend_disable_scan_prefilter": false,

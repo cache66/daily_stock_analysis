@@ -9014,6 +9014,16 @@
           "monitors": {
             "$ref": "#/components/schemas/StockProfileMonitorBlock"
           },
+          "tracking": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StockProfileTrackingBlock"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "evidence_quality": {
             "$ref": "#/components/schemas/StockProfileEvidenceQuality"
           }
@@ -9068,6 +9078,92 @@
           "status"
         ],
         "title": "StockProfileQuoteBlock"
+      },
+      "StockProfileTrackingBlock": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "fresh",
+              "partial",
+              "unavailable"
+            ],
+            "title": "Status"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/StockProfileTrackingItem"
+            },
+            "type": "array",
+            "title": "Items"
+          },
+          "limitations": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Limitations"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "title": "StockProfileTrackingBlock"
+      },
+      "StockProfileTrackingItem": {
+        "properties": {
+          "track_id": {
+            "type": "string",
+            "title": "Track Id"
+          },
+          "hypothesis_key": {
+            "type": "string",
+            "title": "Hypothesis Key"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title",
+            "default": ""
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "branch": {
+            "type": "string",
+            "title": "Branch",
+            "default": ""
+          },
+          "horizon": {
+            "type": "string",
+            "title": "Horizon",
+            "default": "short"
+          },
+          "revision": {
+            "type": "integer",
+            "title": "Revision",
+            "default": 0
+          },
+          "next_review_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Review At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "track_id",
+          "hypothesis_key",
+          "status"
+        ],
+        "title": "StockProfileTrackingItem"
       }
     },
     "securitySchemes": {

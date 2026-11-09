@@ -174,6 +174,23 @@ class StockProfileEvidenceQuality(BaseModel):
     limitations: List[str] = Field(default_factory=list)
 
 
+class StockProfileTrackingItem(BaseModel):
+    track_id: str
+    hypothesis_key: str
+    title: str = ""
+    status: str
+    branch: str = ""
+    horizon: str = "short"
+    revision: int = 0
+    next_review_at: Optional[str] = None
+
+
+class StockProfileTrackingBlock(BaseModel):
+    status: StockProfileStatus
+    items: List[StockProfileTrackingItem] = Field(default_factory=list)
+    limitations: List[str] = Field(default_factory=list)
+
+
 class StockProfileResponse(BaseModel):
     requested_code: str
     canonical_code: str
@@ -185,4 +202,5 @@ class StockProfileResponse(BaseModel):
     intelligence: StockProfileIntelligenceBlock
     portfolio: StockProfilePortfolioBlock
     monitors: StockProfileMonitorBlock
+    tracking: Optional[StockProfileTrackingBlock] = None
     evidence_quality: StockProfileEvidenceQuality

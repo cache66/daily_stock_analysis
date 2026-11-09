@@ -56,6 +56,7 @@ class StockProfileService:
             "intelligence": self._intelligence_block(canonical_code, market=market),
             "portfolio": self._portfolio_block(canonical_code, market=market),
             "monitors": self._monitor_block(canonical_code, market=market),
+            "tracking": self._tracking_block(canonical_code),
         }
         return {
             "requested_code": str(requested_code).strip(),
@@ -453,6 +454,42 @@ class StockProfileService:
     @staticmethod
     def _unavailable(limitation: str, **payload: Any) -> Dict[str, Any]:
         return {"status": "unavailable", **payload, "limitations": [limitation]}
+
+    def _tracking_block(self, code: str) -> Dict[str, Any]:
+        """该股的研究跟踪记录（A2-b）。
+
+        不进入 `_BLOCK_NAMES`：研究记录是可选增强，不应对所有个股的
+        evidence_quality 总体状态造成降级。
+        """
+        try:
+            from src.repositories.research_tracking_repo import ResearchTrackingRepository
+
+            rows = ResearchTrackingRepository().list_tracks(code=code, limit=20)
+        except Exception as exc:  # noqa: BLE001 - 表未建/库不可读时降级
+            return {
+                "status": "unavailable",
+                "items": [],
+                "limitations": [f"研究跟踪表不可用：{type(exc).__name__}"],
+            }
+
+        items = [
+            {
+                "track_id": row.track_id,
+                "hypothesis_key": row.hypothesis_key,
+                "title": row.title or "",
+                "status": row.status,
+                "branch": row.branch or "",
+                "horizon": row.horizon,
+                "revision": int(row.revision or 0),
+                "next_review_at": row.next_review_at.isoformat() if row.next_review_at else None,
+            }
+            for row in rows
+        ]
+        return {
+            "status": "fresh" if items else "unavailable",
+            "items": items,
+            "limitations": [] if items else ["该股暂无研究跟踪记录"],
+        }
 
     @staticmethod
     def _evidence_quality(blocks: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:

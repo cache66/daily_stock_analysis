@@ -16,6 +16,7 @@ from warnings import warn
 import anyio.to_thread
 import fastapi.testclient
 import httpx
+import pytest
 import starlette.testclient
 from anyio._backends import _asyncio
 
@@ -249,3 +250,13 @@ class _ThreadlessTestClient:
 
 fastapi.testclient.TestClient = _ThreadlessTestClient
 starlette.testclient.TestClient = _ThreadlessTestClient
+
+
+@pytest.fixture(autouse=True)
+def _isolate_quote_quality_logs(tmp_path, monkeypatch):
+    """行情质量清单是有副作用的本地文件；测试一律写临时目录，不污染 data/run_logs。"""
+    from src.services import quote_quality
+
+    monkeypatch.setattr(quote_quality, "SUSPICIOUS_CODES_PATH", tmp_path / "suspicious_codes.txt")
+    monkeypatch.setattr(quote_quality, "SUSPICIOUS_EVENTS_PATH", tmp_path / "suspicious_events.jsonl")
+    yield

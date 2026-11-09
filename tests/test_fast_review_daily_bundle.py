@@ -1040,6 +1040,53 @@ def test_build_strategy_focus_rows_marks_storage_cycle_catalyst_without_enrichme
     assert overview_rows[0]["stock_review_lane"] == "earnings_first"
 
 
+def test_earnings_event_reversal_moves_row_to_payback_lane() -> None:
+    item = {
+        "code": "603986",
+        "name": "兆易创新",
+        "signal_keys": ["earnings"],
+        "earnings_strategy_score": 87.9,
+        "earnings_quality_score": 59.0,
+        "earnings_quality_cycle_phase": "reaccelerating",
+        "revenue_yoy": 177.0,
+        "net_profit_yoy": 1099.0,
+        "cycle_catalyst_type": "storage_price_recovery",
+        "cycle_catalyst_label": "存储涨价/复苏 + 业绩兑现",
+        "event_date": "2026-07-10",
+        "today_change_pct": -7.7,
+        "tier": "watch",
+    }
+    rows = fast_bundle._build_stock_overview_rows(
+        strategy_focus_rows=[item], snapshot_date=date(2026, 7, 10)
+    )
+    assert rows[0]["earnings_payback_risk"] is True
+    assert rows[0]["stock_review_lane"] == "earnings_payback_watch"
+    assert rows[0]["stock_review_lane_label"] == "兑现风险"
+    assert "earnings_payback_risk" in rows[0]["focus_reason"]
+
+    # 事件不再新鲜时回到原有分层
+    stale_rows = fast_bundle._build_stock_overview_rows(
+        strategy_focus_rows=[dict(item)], snapshot_date=date(2026, 8, 20)
+    )
+    assert stale_rows[0]["stock_review_lane"] == "earnings_first"
+
+    # 当日跌幅不够深也不触发
+    mild = dict(item, today_change_pct=-3.0)
+    mild_rows = fast_bundle._build_stock_overview_rows(
+        strategy_focus_rows=[mild], snapshot_date=date(2026, 7, 10)
+    )
+    assert mild_rows[0]["stock_review_lane"] == "earnings_first"
+
+    # 每日精选复盘分组同样生效
+    curated_lines: list = []
+    fast_bundle._append_daily_curated_review_markdown(
+        curated_lines, strategy_focus_rows=[dict(item)], snapshot_date=date(2026, 7, 10)
+    )
+    curated_text = "\n".join(curated_lines)
+    assert "兑现风险观察" in curated_text
+    assert "兑现风险`1`" in curated_text
+
+
 def test_build_strategy_focus_rows_uses_explicit_catalyst_registry_for_known_themes() -> None:
     signal_results = [
         fast_bundle.SignalResult(

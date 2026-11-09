@@ -78,6 +78,17 @@ def test_build_catalyst_digest_aggregates_and_sorts() -> None:
     assert themes["AI算力链"]["stocks"][0]["code"] == "002463"
 
 
+def test_digest_counts_trend_leader_as_graph() -> None:
+    items = [
+        _item("601872", "招商轮船", matched=("trend_leader_unified",), industry="航运", priority=60.0),
+    ]
+
+    result = build_catalyst_digest(items, history=[])
+
+    assert result["graph_candidates"] == 1
+    assert result["themes"][0]["graph_count"] == 1
+
+
 def test_build_catalyst_digest_computes_streak_and_delta() -> None:
     history = [
         {"date": "2026-09-23", "themes": {"AI算力链": 2}},

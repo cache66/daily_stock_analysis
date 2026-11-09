@@ -1,0 +1,126 @@
+{
+  "version": "2026-11-09",
+  "note": "经验卡登记表：只登记仓库内可核查的事实（文档/日志/产物），不写未发生的案例。新增卡片需填 source 字段。",
+  "cards": [
+    {
+      "id": "case_sungrow_us_election",
+      "date": "2026-11-06",
+      "type": "机制",
+      "title": "阳光电源 × 美国中期选举：相对市场正、相对行业负",
+      "facts": "11-05 开盘→11-06 收盘：个股 +2.2835%；沪深300 −0.2815%；光伏行业代理 +2.8994%；相对市场 +2.565pp；相对行业 −0.6159pp。事件研究资格未通过。",
+      "conclusion": "相对市场有超额、相对行业为负：代理只能否证不能证实，不据此授予事件资格。",
+      "boundary": "单案两日窗；行业代理为标签代理，非公司真实暴露；事件时点按可核查来源。",
+      "source": "docs/个人策略文档/单票卡数据可行性矩阵.md §7"
+    },
+    {
+      "id": "re01_scan_20261106",
+      "date": "2026-11-06",
+      "type": "资格",
+      "title": "RE01 弱市扫描：严格确认全灭、相对确认 2 只",
+      "facts": "缓存 3,950 只中 R1 超跌 637；D0=11-05 底部阳线 41 只；HS300 −1.44%；R4a 通过 0；R4b 通过 2（湖南黄金 002155、天赐材料 002709）；两者均无板块合力。",
+      "conclusion": "弱市用绝对确认会系统性失效；R4b 只记弱确认观察，无合力不做 ETF。",
+      "boundary": "回顾扫描，未事前入池，不计命中率；行情为缓存口径。",
+      "source": "docs/个人策略文档/单票卡数据可行性矩阵.md §8"
+    },
+    {
+      "id": "data_baostock_blacklist",
+      "date": "2026-11-06",
+      "type": "数据",
+      "title": "Baostock 黑名单导致 48.9% 行情重建失败",
+      "facts": "10-28~11-08 窗口 85/174 只重建失败（48.9%），根因 `Baostock 登录失败: 黑名单用户`；当日 72 条候选中 41 只落在失败清单；改用 tushare 后 171 只全成功，近 10 日 volume=0 记录由 18 条降为 0。",
+      "conclusion": "数据源失败必须显性标注并回退，不能在残缺数据上排序；写入前要用 amount/close 校验 volume 口径。",
+      "boundary": "本机账号环境；换数据源需核对 volume 单位（手 vs 股）与复权口径。",
+      "source": "data/run_logs/matrix_daily.log；scripts/rebuild_stock_daily_qfq.py"
+    },
+    {
+      "id": "screening_degradation_20261106",
+      "date": "2026-11-06",
+      "type": "数据",
+      "title": "筛选三批全部降级：LLM 排序回退 + 缓存快照",
+      "facts": "三批审计均 `LLM ranking failed: fell back to screen_score`；dual_low/momentum_quality 因 tushare trade_cal 限频回落 sina；shrink_pullback 使用 last_good_cache，日线 96/100 来自 disk_cache_best_effort_stale。",
+      "conclusion": "候选可用但必须带降级标签；tushare 日历应走本地缓存，避免限频触发整批回退。",
+      "boundary": "降级不等于无效，但改变可比性；跨日比较需同口径。",
+      "source": "data/screening_snapshots/2026-11-06/*.json"
+    },
+    {
+      "id": "dividend_backtest_20260924",
+      "date": "2026-09-24",
+      "type": "机制",
+      "title": "股息池有效、评分排序无效",
+      "facts": "24 期点时回测：合格池等权年化 +9.7%（含息），中证红利价格口径 −1.0%/年；评分 RankIC −0.010，Q5−Q1 −0.19%/月；Top20 年化 +5.6% 跑输池子；站上 200 日线 vs 深度跌破月均差 +0.05%，因子 IC≈0。",
+      "conclusion": "组合基座用池子等权/分散，Top20 降级为观察清单；趋势闸门与低波未验证出增量。",
+      "boundary": "回测含息口径、月度调仓；历史长度 24 期，样本有限。",
+      "source": "docs/个人策略文档/吃股息策略-实施与验证总结.md"
+    },
+    {
+      "id": "long_base_release_freeze",
+      "date": "2026-09-26",
+      "type": "资格",
+      "title": "long_base_release 稳定负期望，停用",
+      "facts": "全样本 w1 −0.73% / w5 −3.71% / w10 −18.4%；2026-09-26 停用，2026-09-27 从页面移出。",
+      "conclusion": "单一图形信号不足以支撑交易；冻结走既有登记流程，不因新框架复活。",
+      "boundary": "样本窗口为当时全样本；后续数据变化不自动解冻。",
+      "source": "docs/个人策略文档/策略与脚本冻结登记.md"
+    },
+    {
+      "id": "daily_slow_rise_freeze",
+      "date": "2026-09-27",
+      "type": "资格",
+      "title": "daily_slow_rise 触发淘汰线",
+      "facts": "成本后 w3 −1.23%（窗口 2026-08-04~09-24，492 完成样本，分月双月负）→ 触发 §4 淘汰线，页面移出 + 命中停用。",
+      "conclusion": "淘汰线按成本后指标判定，不用毛收益。",
+      "boundary": "淘汰线为事前登记规则，事后不因单月反弹改判。",
+      "source": "docs/个人策略文档/策略与脚本冻结登记.md"
+    },
+    {
+      "id": "tl_summary_object_gate",
+      "date": "2026-11-06",
+      "type": "口径",
+      "title": "运行摘要混入证券表：对象闸门必要",
+      "facts": "11-06 `trend_leader_unified` 仅 1 行，code=`TL_SUMMARY`、name=趋势龙头运行摘要、payload `is_run_summary=true`；最近证券记录在 11-05（2 只）。",
+      "conclusion": "摘要必须进诊断区，不得当股票；否则总览会把运行摘要当候选。",
+      "boundary": "闸门要在读侧执行，写入侧仍保留摘要用于诊断。",
+      "source": "data/stock_analysis.db kline_signal_snapshot；src/services/daily_board_service.py"
+    },
+    {
+      "id": "fallback_sample_pollution",
+      "date": "2026-10-05",
+      "type": "口径",
+      "title": "兜底样本污染近月统计",
+      "facts": "`selection_mode=fallback`（严格 0 命中时的凑数输出）曾进入近月净收益统计；2026-10-05 起 `trend_fallback_top_n=0` 关闭，统计侧剔除兜底样本。",
+      "conclusion": "统计分母必须剔除凑数输出，否则期望与胜率不可比。",
+      "boundary": "剔除只影响统计，不改变历史产物可读。",
+      "source": "scripts/strategy_scoreboard.py；config/local_strategy_profile.json"
+    },
+    {
+      "id": "multi_source_duplication",
+      "date": "2026-11-06",
+      "type": "口径",
+      "title": "样本数 ≠ 股票数：72 条原始 / 65 只证券",
+      "facts": "当日 72 条候选来自 4 个来源，去重后 65 只证券，13 条为多来源命中（同股被多个策略选中）。",
+      "conclusion": "统计与风险都要按证券去重；展示保留各来源样本，不合并计数。",
+      "boundary": "多来源命中可作为筛选优先级，但不能当独立样本量。",
+      "source": "data/strategy_review/today_board.md"
+    },
+    {
+      "id": "automation_timeline_20261106",
+      "date": "2026-11-06",
+      "type": "口径",
+      "title": "本机编排实际完成时间",
+      "facts": "screening 18:18:12（成功 3/失败 0，各 written=12）、warm 18:45:23、structure 19:00:39、matrix 19:52:08（主清单 0/观察 12）、ETF 17:30:03 rc=0。",
+      "conclusion": "总览/复盘类读取应晚于 19:55；19:00 读取会看到半成品。",
+      "boundary": "单日样本，完成时间随行情与网络波动。",
+      "source": "data/run_logs/*.log"
+    },
+    {
+      "id": "track_outcome_protocol",
+      "date": "2026-11-09",
+      "type": "口径",
+      "title": "研究跟踪结果回填口径",
+      "facts": "入场价 = 信号日 D0 收盘；收益 = 第 N 个交易日收盘 / D0 收盘 − 1；T+5 可用即关闭 track；缺数据记 insufficient_data，不推测。",
+      "conclusion": "结果回填只管计算与留痕，不授予资格、不改交易权限。",
+      "boundary": "本地 stock_daily 前复权口径；停牌导致的缺口记为不足，不补值。",
+      "source": "src/services/track_outcome_service.py"
+    }
+  ]
+}

@@ -428,6 +428,9 @@ class PersonalStrategyMatrixService:
         if lane.startswith("double_confirm") or "双确认" in lane:
             score += 10.0
             positives.append("双确认分层")
+        elif lane == "earnings_payback_watch" or "兑现风险" in lane:
+            score -= 12.0
+            flags.append("兑现风险（业绩事件反向）")
         elif lane == "earnings_first" or "业绩优先" in lane:
             score += 6.0
             positives.append("有业绩确认")

@@ -75,3 +75,18 @@ def test_missing_columns_rejected() -> None:
             raise AssertionError("缺字段应报 ValueError")
     finally:
         tmp.unlink(missing_ok=True)
+
+
+def test_tiers_sorted_by_trim_b_when_present() -> None:
+    """2026-10-06 起：体检表含 trim_b_score 时按「精简B」排序，而非综合评分。"""
+    df = _fake_checkup()
+    df["trim_b_score"] = [0.1, 0.9, 0.5, 0.7, 0.3]  # 600036=0.9 压过 600887=0.3（评分是 73.7 < 74.9，用于区分口径）
+    tiers = build_tiers(df)
+    assert list(tiers["t_watch"]["code"]) == ["600036", "600887"]
+    assert list(tiers["pure"]["code"]) == ["600036", "600750", "600887", "600919"]
+
+
+def test_tiers_fallback_sort_by_score_without_trim_b() -> None:
+    """无 trim_b_score 列时行为不变：按综合评分降序。"""
+    tiers = build_tiers(_fake_checkup())
+    assert list(tiers["t_watch"]["code"]) == ["600887", "600036"]  # 评分 74.9 > 73.7

@@ -2,17 +2,19 @@
 """Short-term watch line: graph setup ∩ catalyst intersection.
 
 The offensive line reuses the personal strategy matrix (graph strategies:
-hundred_day_high / daily_slow_rise / long_base_release) and requires an
-explicit catalyst before a row enters the daily watch output:
+hundred_day_high / trend_leader_unified / daily_slow_rise / long_base_release)
+and requires an explicit catalyst before a row enters the daily watch output:
 
 - builtin catalyst: ``cycle_catalyst_*`` fields already written by the
   fast-review bundle (``src/services/industry_catalyst_registry.py``);
 - watchlist catalyst: manually maintained entries in
   ``config/catalyst_watchlist.json`` (keywords + weight + optional expiry).
 
-Output is ranked by ``graph_quality + 30 * min(catalyst_weight, 2)`` so a
-strong catalyst can lift a decent chart, while a pure chart-only row stays in
-the optional fallback section.
+Output is ranked by ``graph_quality + 30 * min(catalyst_weight, 2)`` minus an
+extension-risk penalty (high -15 / mid -5, from 60d gain and distance to the
+250d high), so a strong catalyst can lift a decent chart while an overheated
+run-up gets demoted; a pure chart-only row stays in the optional fallback
+section.
 """
 
 from __future__ import annotations
@@ -28,7 +30,18 @@ from src.services.personal_strategy_matrix_service import (
     PersonalStrategyMatrixService,
 )
 
-GRAPH_STRATEGY_IDS = ("hundred_day_high", "daily_slow_rise", "long_base_release")
+GRAPH_STRATEGY_IDS = ("hundred_day_high", "trend_leader_unified", "daily_slow_rise", "long_base_release")
+
+# 透支度（extension risk）：60 日涨幅 + 距 250 日高点。阈值来自全市场分档统计
+# （data/strategy_review/extension_bucket_study_2026.md）：60 日涨幅 ≥40% 后追入为负期望。
+EXTENSION_LOOKBACK_BARS = 260
+EXTENSION_HOT_CHG60_PCT = 40.0
+EXTENSION_HOT_COMBO_CHG60_PCT = 20.0
+EXTENSION_HOT_COMBO_DIST_PCT = -5.0
+EXTENSION_MID_CHG60_PCT = 10.0
+EXTENSION_MID_DIST_PCT = -2.0
+_EXTENSION_LEVEL_PENALTY = {"高": 15.0, "中": 5.0}
+
 DEFAULT_CATALYST_WATCHLIST_PATH = PROJECT_ROOT / "config" / "catalyst_watchlist.json"
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "data" / "short_term_watch"
 
@@ -61,6 +74,10 @@ CSV_COLUMNS = (
     "breakout_quality_score",
     "pure_chart_quality_passed",
     "source_signals",
+    "chg_60d_pct",
+    "drawdown_from_250d_high_pct",
+    "extension_risk_level",
+    "extension_penalty",
 )
 
 
@@ -75,6 +92,10 @@ def _text(value: Any) -> str:
     if isinstance(value, (list, tuple, set)):
         return ",".join(str(item or "").strip() for item in value if str(item or "").strip())
     return str(value or "").strip()
+
+
+def _fmt_cell(value: Any) -> str:
+    return "" if value is None else str(value)
 
 
 def load_catalyst_watchlist(
@@ -177,6 +198,50 @@ def _graph_quality_score(item: Dict[str, Any]) -> float:
     )
 
 
+def _extension_metrics_from_closes(closes: Sequence[float]) -> Dict[str, Any]:
+    """计算 60 日涨幅 / 距 250 日高 / 透支度档（数据不足时返回空串）。"""
+
+    values = [float(value) for value in closes if value is not None and float(value) > 0]
+    if len(values) < 61:
+        return {"chg_60d_pct": "", "drawdown_from_250d_high_pct": "", "extension_risk_level": ""}
+    latest = values[-1]
+    chg_60d = (latest / values[-61] - 1.0) * 100.0
+    window = values[-EXTENSION_LOOKBACK_BARS:]
+    drawdown = (latest / max(window) - 1.0) * 100.0
+    if chg_60d >= EXTENSION_HOT_CHG60_PCT or (
+        chg_60d >= EXTENSION_HOT_COMBO_CHG60_PCT and drawdown >= EXTENSION_HOT_COMBO_DIST_PCT
+    ):
+        level = "高"
+    elif chg_60d >= EXTENSION_MID_CHG60_PCT or drawdown >= EXTENSION_MID_DIST_PCT:
+        level = "中"
+    else:
+        level = "低"
+    return {
+        "chg_60d_pct": round(chg_60d, 2),
+        "drawdown_from_250d_high_pct": round(drawdown, 2),
+        "extension_risk_level": level,
+    }
+
+
+def _load_daily_closes(code: str, *, snapshot_date: Optional[str] = None) -> List[float]:
+    """从 stock_daily（评估真源）读最近收盘（截止 snapshot_date，升序返回）。"""
+
+    from sqlalchemy import text
+
+    from src.storage import DatabaseManager
+
+    statement = "SELECT close FROM stock_daily WHERE code = :code"
+    params: Dict[str, Any] = {"code": code, "limit": EXTENSION_LOOKBACK_BARS}
+    if snapshot_date:
+        statement += " AND date <= :snapshot_date"
+        params["snapshot_date"] = snapshot_date
+    statement += " ORDER BY date DESC LIMIT :limit"
+    database = DatabaseManager.get_instance()
+    with database.session_scope() as session:
+        rows = session.execute(text(statement), params).fetchall()
+    return [float(row[0]) for row in rows if row[0] is not None][::-1]
+
+
 def build_short_term_watch(
     items: Sequence[Dict[str, Any]],
     *,
@@ -263,13 +328,13 @@ def render_short_term_watch_markdown(result: Dict[str, Any]) -> str:
         f"- 市场环境：{result.get('market_regime') or '-'}；催化清单条数：{result.get('watchlist_entry_count', 0)}",
         f"- 命中「图形 ∩ 催化」{result.get('graph_catalyst_total', 0)} 只，"
         f"仅图形 {result.get('graph_only_total', 0)} 只",
-        "- 排序：图形质量分 + 30×催化权重（权重上限 2.0）；命中条件=图形件命中 且 催化命中",
+        "- 排序：图形质量分 + 30×催化权重（上限 2.0）- 透支度罚分（高 -15 / 中 -5）；命中条件=图形件命中 且 催化命中",
         "",
         f"## 图形 ∩ 催化（{len(result.get('graph_catalyst') or [])}）",
         "",
     ]
-    header = "| # | 代码 | 名称 | 评分 | 图形分 | 催化 | 图形件 | 业务/主线 | 今日% |"
-    separator = "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+    header = "| # | 代码 | 名称 | 评分 | 图形分 | 催化 | 图形件 | 业务/主线 | 今日% | 60日% | 距高% | 透支 |"
+    separator = "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
     lines.extend([header, separator])
 
     rows = result.get("graph_catalyst") or []
@@ -280,7 +345,9 @@ def render_short_term_watch_markdown(result: Dict[str, Any]) -> str:
             f"| {index} | {row.get('code') or ''} | {row.get('name') or ''} "
             f"| {row.get('rank_score')} | {row.get('graph_quality_score')} "
             f"| {row.get('catalysts') or ''} | {row.get('graph_strategies') or ''} "
-            f"| {row.get('business_summary') or ''} | {row.get('today_change_pct')} |"
+            f"| {row.get('business_summary') or ''} | {row.get('today_change_pct')} "
+            f"| {_fmt_cell(row.get('chg_60d_pct'))} | {_fmt_cell(row.get('drawdown_from_250d_high_pct'))} "
+            f"| {_fmt_cell(row.get('extension_risk_level'))} |"
         )
 
     graph_only_rows = result.get("graph_only") or []
@@ -290,8 +357,8 @@ def render_short_term_watch_markdown(result: Dict[str, Any]) -> str:
                 "",
                 f"## 仅图形（备选观察，{len(graph_only_rows)}）",
                 "",
-                "| # | 代码 | 名称 | 评分 | 图形分 | 图形件 | 业务/主线 | 今日% |",
-                "| --- | --- | --- | --- | --- | --- | --- | --- |",
+                "| # | 代码 | 名称 | 评分 | 图形分 | 图形件 | 业务/主线 | 今日% | 60日% | 距高% | 透支 |",
+                "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
             ]
         )
         for index, row in enumerate(graph_only_rows, start=1):
@@ -299,7 +366,8 @@ def render_short_term_watch_markdown(result: Dict[str, Any]) -> str:
                 f"| {index} | {row.get('code') or ''} | {row.get('name') or ''} "
                 f"| {row.get('rank_score')} | {row.get('graph_quality_score')} "
                 f"| {row.get('graph_strategies') or ''} | {row.get('business_summary') or ''} "
-                f"| {row.get('today_change_pct')} |"
+                f"| {row.get('today_change_pct')} | {_fmt_cell(row.get('chg_60d_pct'))} "
+                f"| {_fmt_cell(row.get('drawdown_from_250d_high_pct'))} | {_fmt_cell(row.get('extension_risk_level'))} |"
             )
 
     lines.append("")
@@ -367,4 +435,37 @@ class ShortTermWatchService:
                 "market_regime": matrix_payload.get("market_regime"),
             }
         )
+        snapshot_date = str(matrix_payload.get("snapshot_date") or "").strip() or None
+        self._attach_extension_metrics(result.get("graph_catalyst") or [], snapshot_date=snapshot_date)
+        self._attach_extension_metrics(result.get("graph_only") or [], snapshot_date=snapshot_date)
         return result
+
+    @staticmethod
+    def _attach_extension_metrics(
+        rows: List[Dict[str, Any]],
+        *,
+        snapshot_date: Optional[str] = None,
+    ) -> None:
+        """给命中行附加 60 日涨幅 / 距 250 日高 / 透支度（fail-open，缺数不影响主流程）。"""
+
+        for row in rows:
+            code = str(row.get("code") or "").strip()
+            if not code:
+                continue
+            try:
+                closes = _load_daily_closes(code, snapshot_date=snapshot_date)
+            except Exception:
+                continue
+            metrics = _extension_metrics_from_closes(closes)
+            row.update(metrics)
+            penalty = _EXTENSION_LEVEL_PENALTY.get(str(metrics.get("extension_risk_level") or ""), 0.0)
+            if penalty:
+                row["rank_score"] = round(_to_float(row.get("rank_score")) - penalty, 1)
+            row["extension_penalty"] = penalty
+        rows.sort(
+            key=lambda row: (
+                -_to_float(row.get("rank_score")),
+                -_to_float(row.get("priority_score")),
+                str(row.get("code") or ""),
+            )
+        )

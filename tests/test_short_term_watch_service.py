@@ -8,7 +8,9 @@ from datetime import date
 from pathlib import Path
 
 from src.services.short_term_watch_service import (
+    GRAPH_STRATEGY_IDS,
     ShortTermWatchService,
+    _extension_metrics_from_closes,
     build_short_term_watch,
     keyword_hits_text,
     load_catalyst_watchlist,
@@ -42,6 +44,38 @@ def _item(
         "triggered_strategies": list(matched),
         "business_summary": business_summary,
     }
+
+
+def test_graph_pool_includes_trend_leader_unified() -> None:
+    assert "trend_leader_unified" in GRAPH_STRATEGY_IDS
+
+    items = [
+        _item(
+            "603986",
+            "兆易创新",
+            matched=("trend_leader_unified",),
+            builtin="存储涨价/复苏 + 业绩兑现",
+            priority=85.0,
+        ),
+    ]
+    result = build_short_term_watch(items, watchlist=[], top_n=10)
+
+    assert [row["code"] for row in result["graph_catalyst"]] == ["603986"]
+    assert result["graph_catalyst"][0]["graph_strategies"] == "trend_leader_unified"
+
+
+def test_extension_metrics_levels() -> None:
+    assert _extension_metrics_from_closes([100.0] * 10)["extension_risk_level"] == ""
+
+    hot = _extension_metrics_from_closes([100.0] * 250 + [150.0])
+    assert hot["extension_risk_level"] == "高"
+    assert hot["chg_60d_pct"] == 50.0
+
+    mid = _extension_metrics_from_closes([100.0] * 250 + [115.0])
+    assert mid["extension_risk_level"] == "中"
+
+    low = _extension_metrics_from_closes([100.0] * 200 + [110.0] * 30 + [105.0])
+    assert low["extension_risk_level"] == "低"
 
 
 def test_build_short_term_watch_requires_graph_and_ranks_by_score() -> None:

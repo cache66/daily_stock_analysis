@@ -116,7 +116,12 @@ def load_price_series(
     return series
 
 
-def _deep_ready(code: str, start: date) -> bool:
+def _deep_ready(code: str, start: date, end: Optional[date] = None) -> bool:
+    """深历史文件是否覆盖 [start, end] 窗口（45 天容差）。
+
+    只检查首日曾导致：早期分段运行把文件截断到当时的 end 后，
+    更晚区间的回测误判为“已就绪”（2026-10-06 排查修复）。
+    """
     path = DEEP_HISTORY_DIR / f"{code}.csv"
     if not path.exists():
         return False
@@ -126,8 +131,12 @@ def _deep_ready(code: str, start: date) -> bool:
         return False
     if df.empty:
         return False
-    first = pd.to_datetime(df["date"]).min().date()
-    return first <= start + timedelta(days=45)
+    dates = pd.to_datetime(df["date"])
+    if dates.min().date() > start + timedelta(days=45):
+        return False
+    if end is not None and dates.max().date() < end - timedelta(days=45):
+        return False
+    return True
 
 
 def ensure_deep_history(codes: List[str], start: date, end: date) -> int:
@@ -137,7 +146,7 @@ def ensure_deep_history(codes: List[str], start: date, end: date) -> int:
     except Exception:  # noqa: BLE001
         print("[回测] 未安装 baostock，跳过深历史抓取。")
         return 0
-    pending = [code for code in codes if not _deep_ready(code, start)]
+    pending = [code for code in codes if not _deep_ready(code, start, end)]
     if not pending:
         return 0
     DEEP_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
@@ -161,9 +170,21 @@ def ensure_deep_history(codes: List[str], start: date, end: date) -> int:
                 while rs.error_code == "0" and rs.next():
                     rows.append(rs.get_row_data())
                 if rows:
-                    pd.DataFrame(rows, columns=["date", "close"]).to_csv(
-                        DEEP_HISTORY_DIR / f"{code}.csv", index=False
-                    )
+                    new_df = pd.DataFrame(rows, columns=["date", "close"])
+                    path = DEEP_HISTORY_DIR / f"{code}.csv"
+                    if path.exists():
+                        # 合并旧文件：保留更早/更晚的已有区间，重叠日期以新抓取为准
+                        # （防止分段运行相互截断覆盖，2026-10-06 修复）
+                        try:
+                            old_df = pd.read_csv(path)
+                            new_df = (
+                                pd.concat([old_df, new_df])
+                                .drop_duplicates(subset=["date"], keep="last")
+                                .sort_values("date")
+                            )
+                        except Exception:  # noqa: BLE001 - 旧文件损坏则直接覆盖
+                            pass
+                    new_df.to_csv(path, index=False)
                     fetched += 1
             except Exception:  # noqa: BLE001 - 单票失败跳过
                 continue

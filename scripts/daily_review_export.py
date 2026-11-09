@@ -45,7 +45,7 @@ FIELDS = (
     + [f"ret{k}" for k in WINDOWS]
     + [f"ret{k}_net" for k in WINDOWS]
     + [f"win{k}" for k in WINDOWS]
-    + ["runup5_pct", "drawdown5_pct"]
+    + ["runup5_pct", "drawdown5_pct", "selection_mode"]
 )
 
 
@@ -57,6 +57,17 @@ def classify(ret: float | None) -> str:
     if ret < -NEUTRAL_BAND_PCT:
         return "loss"
     return "neutral"
+
+
+def _metrics_selection_mode(metrics_payload) -> str:
+    """读取快照 metrics_payload.selection_mode（strict / fallback；旧数据缺失时为空白）。"""
+    if not metrics_payload:
+        return ""
+    try:
+        value = json.loads(str(metrics_payload)).get("selection_mode")
+    except (TypeError, ValueError):
+        return ""
+    return str(value or "").strip()
 
 
 def _metrics_close(metrics_payload) -> float | None:
@@ -195,6 +206,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "code": code,
             "name": name,
             "cost_bps": round(total_trade_cost_bps, 2),
+            "selection_mode": _metrics_selection_mode(metrics_payload),
         }
         entry = _resolve_entry(metrics_payload, seq, sd, entry_mode=str(args.entry_mode))
         fwd = [b for b in seq if b[0] > sd]

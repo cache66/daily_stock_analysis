@@ -128,6 +128,19 @@ PRICE_TREND_FALL_SEVERE_ADJ = -12.0
 PRICE_TREND_FALL_6M_EXTRA_ADJ = -2.0
 PRICE_TREND_ADJ_FLOOR = -14.0
 
+# 排序口径（2026-10-06 切换「精简B」）：横截面综合分 = 0.40·z(股息率≤7%)
+# + 0.30·z(−年化波动) + 0.30·z(现金流覆盖)；去极值/中位数填充与
+# scripts/experiment_dividend_rerank.py 的 trim_yvc 变体一致（三段长区间复核见
+# docs/个人策略文档/吃股息策略-实施与验证总结.md §13.5/§13.7）。
+# 波动率覆盖率低于 TRIM_B_MIN_VOL_COVERAGE 时回退综合评分排序。
+TRIM_B_WEIGHT_YIELD = 0.40
+TRIM_B_WEIGHT_LOW_VOL = 0.30
+TRIM_B_WEIGHT_CF = 0.30
+TRIM_B_YIELD_CLIP_UPPER = 7.0
+TRIM_B_CF_CLIP_LOWER = -5.0
+TRIM_B_CF_CLIP_UPPER = 10.0
+TRIM_B_MIN_VOL_COVERAGE = 0.5
+
 
 @dataclass(frozen=True)
 class DividendIncomeOptions:
@@ -273,6 +286,70 @@ def _normalize_owner_type(raw: Any) -> str:
 
 def _code_prefix(ts_code: str) -> str:
     return _normalize_ts_code(ts_code).split(".")[0]
+
+
+def _zscore_component(
+    values: Sequence[Optional[float]],
+    *,
+    clip_lower: Optional[float] = None,
+    clip_upper: Optional[float] = None,
+    negate: bool = False,
+) -> List[float]:
+    """横截面 z 分（与 scripts/experiment_dividend_rerank.py 的口径一致）：
+    去极值 → 缺失打中位数 → ddof=0 标准化；全空或标准差为 0 时返回全 0。"""
+    series = pd.Series(list(values), dtype="float64")
+    if clip_lower is not None or clip_upper is not None:
+        series = series.clip(lower=clip_lower, upper=clip_upper)
+    median = series.median()
+    if pd.notna(median):
+        series = series.fillna(float(median))
+    std = float(series.std(ddof=0))
+    if not math.isfinite(std) or std <= 0:
+        return [0.0] * len(series)
+    z = (series - float(series.mean())) / std
+    out: List[float] = []
+    for value in z:
+        number = float(value)
+        if not math.isfinite(number):
+            number = 0.0
+        out.append(-number if negate else number)
+    return out
+
+
+def apply_trim_b_scores(
+    rows: Sequence[Dict[str, Any]], *, min_vol_coverage: float = TRIM_B_MIN_VOL_COVERAGE
+) -> Tuple[bool, float]:
+    """为合格候选追加「精简B」横截面综合分（排序口径，2026-10-06 切换）。
+
+    综合分 = 0.40·z(股息率≤7) + 0.30·z(−年化波动) + 0.30·z(现金流覆盖)；
+    非合格行 trim_b_score 置 None；波动率覆盖率低于 min_vol_coverage 时不生效。
+    返回 (是否生效, 波动率覆盖率)；未生效时调用方应回退综合评分排序。
+    """
+    for row in rows:
+        row["trim_b_score"] = None
+    qualified = [row for row in rows if row.get("qualified")]
+    if not qualified:
+        return False, 0.0
+    vol_values = [_to_float(row.get("volatility_1y_pct")) for row in qualified]
+    coverage = sum(1 for value in vol_values if value is not None) / len(qualified)
+    if coverage < min_vol_coverage:
+        return False, coverage
+    z_yield = _zscore_component(
+        [_to_float(row.get("dv_ttm_pct")) for row in qualified],
+        clip_upper=TRIM_B_YIELD_CLIP_UPPER,
+    )
+    z_low_vol = _zscore_component(vol_values, negate=True)
+    z_cf = _zscore_component(
+        [_to_float(row.get("cf_coverage")) for row in qualified],
+        clip_lower=TRIM_B_CF_CLIP_LOWER,
+        clip_upper=TRIM_B_CF_CLIP_UPPER,
+    )
+    for row, z_y, z_v, z_c in zip(qualified, z_yield, z_low_vol, z_cf):
+        row["trim_b_score"] = round(
+            TRIM_B_WEIGHT_YIELD * z_y + TRIM_B_WEIGHT_LOW_VOL * z_v + TRIM_B_WEIGHT_CF * z_c,
+            4,
+        )
+    return True, coverage
 
 
 class DividendIncomeService:
@@ -1297,7 +1374,28 @@ class DividendIncomeService:
         if self._fundamental_failures:
             self._warnings.append(f"fundamentals_fetch_failed:{self._fundamental_failures}")
 
-        rows.sort(key=lambda item: (item["qualified"], item["dividend_score"], item["dv_ttm_pct"]), reverse=True)
+        # 排序口径（2026-10-06 起）：精简B 横截面综合分；波动率覆盖不足时回退综合评分（apply_trim_b_scores）。
+        trim_b_applied, trim_b_coverage = apply_trim_b_scores(rows)
+        if not trim_b_applied and any(row.get("qualified") for row in rows):
+            self._warnings.append(f"trim_b_fallback_to_score:vol_coverage={trim_b_coverage:.2f}")
+            logger.warning(
+                "[股息线] 精简B 排序不可用（波动率覆盖率 %.0f%%），回退综合评分排序",
+                trim_b_coverage * 100.0,
+            )
+        elif trim_b_applied and trim_b_coverage < 1.0:
+            logger.info(
+                "[股息线] 精简B 排序：波动率覆盖率 %.0f%%（缺失打横截面中位数）",
+                trim_b_coverage * 100.0,
+            )
+        rows.sort(
+            key=lambda item: (
+                item["qualified"],
+                item.get("trim_b_score") if item.get("trim_b_score") is not None else float("-inf"),
+                item["dividend_score"],
+                item["dv_ttm_pct"],
+            ),
+            reverse=True,
+        )
 
         output_dir = self._output_dir / snapshot.isoformat()
         csv_path = output_dir / "dividend_income_candidates.csv"
@@ -1551,8 +1649,8 @@ class DividendIncomeService:
         lines.append("## 合格池（Top 30）")
         lines.append("")
         if qualified_top:
-            lines.append("| 代码 | 名称 | 类型 | 行业 | 股息率% | 近1年% | 含息1年% | 波动% | 距200日线% | 股息5年增速% | 连续年数 | 派现率% | 综合分 | 标注 |")
-            lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+            lines.append("| 代码 | 名称 | 类型 | 行业 | 股息率% | 近1年% | 含息1年% | 波动% | 距200日线% | 股息5年增速% | 连续年数 | 派现率% | 综合分 | 精简B | 标注 |")
+            lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
             for row in qualified_top:
                 year_return = row.get("year_return_pct")
                 total_return = row.get("total_return_1y_pct")
@@ -1568,6 +1666,7 @@ class DividendIncomeService:
                     f"{growth if growth is not None else '—'} | "
                     f"{row['consecutive_dividend_years']} | "
                     f"{row['payout_ratio_pct'] if row['payout_ratio_pct'] is not None else '—'} | {row['dividend_score']} | "
+                    f"{row['trim_b_score'] if row.get('trim_b_score') is not None else '—'} | "
                     f"{row['flags'] or '—'} |"
                 )
         else:
@@ -1580,6 +1679,7 @@ class DividendIncomeService:
         lines.append("- 合格口径：连续分红年数 ≥ 门槛，且最新分红年度不早于当前年度前 2 年（避免用历史高息的名义）。")
         lines.append("- 央国企偏好：`owner_type` 为央企/地方国企的候选加 3 分软偏好（`soe_bonus`），可用 `--no-prefer-soe` 关闭。")
         lines.append("- 评分体系 v2（基础满分 92）：股息率 ≤35 + 连续性 ≤20（4 分/年）+ 盈利质量 ≤25（EPS 基础 ≤10 + ROE ≤8 + 现金流覆盖 ≤7）+ 低波动 ≤12；调整项：央国企 +3、分红成长 -3/+2、价格走势 ≤0。")
+        lines.append("- 排序（2026-10-06 起切换）：合格池按「精简B」横截面综合分从高到低展示：0.40·z(股息率≤7%) + 0.30·z(−年化波动) + 0.30·z(现金流覆盖)，去极值、缺失打横截面中位数；波动率覆盖率不足 50% 时回退综合评分排序；`trim_b_score` 列记录该分值（池内均值 0，越高越优）。")
         lines.append("- 低波动（红利低波思路）：`volatility_1y_pct` 近一年年化波动率、`max_drawdown_1y_pct` 最大回撤；深度回撤（≤-30%）额外扣 3 分并标 `deep_drawdown_1y`。")
         lines.append("- 业绩面（AKShare 同花顺年度摘要，缓存 90 天，`--no-fundamentals` 关闭）：`roe_5y_mean`/`roe_5y_min`、现金流覆盖 `cf_coverage`（每股经营现金流/每股分红）；标注 `roe_weak`/`roe_negative_year`/`ocfps_negative`/`cf_below_dividend`。")
         lines.append("- 分红成长（DGI 思路）：`dividend_growth_5y_pct` 近 5 年每股分红年化增速、`dividend_decline_years` 下降年数；增速 ≥5% 且无下降记 `dividend_growing`（+2），下降年数 ≥2 或增速 ≤-10% 记 `dividend_shrinking`（-3）。")

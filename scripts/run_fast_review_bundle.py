@@ -210,22 +210,25 @@ STRATEGY_FOCUS_MARKDOWN_SECTIONS = [
 DAILY_REVIEW_LANE_PRIORITY = {
     "double_confirmation": 0,
     "earnings_first": 1,
-    "chart_first": 2,
-    "accumulation_watch": 3,
-    "trend_watch": 4,
-    "other": 5,
+    "earnings_payback_watch": 2,
+    "chart_first": 3,
+    "accumulation_watch": 4,
+    "trend_watch": 5,
+    "other": 6,
 }
 DAILY_REVIEW_LANE_LABELS = {
     "double_confirmation": "双确认",
     "chart_first": "图形优先",
     "accumulation_watch": "吸筹观察",
     "earnings_first": "业绩优先",
+    "earnings_payback_watch": "兑现风险",
     "trend_watch": "趋势补充",
     "other": "其他",
 }
 DAILY_REVIEW_MARKDOWN_SECTIONS = [
     ("double_confirmation", "双确认候选", 6),
     ("earnings_first", "业绩优先候选", 6),
+    ("earnings_payback_watch", "兑现风险观察", 6),
     ("chart_first", "图形优先候选", 8),
     ("accumulation_watch", "吸筹观察候选", 8),
     ("trend_watch", "趋势补充观察", 6),
@@ -5237,7 +5240,43 @@ def _classify_review_certainty(item: Dict[str, Any]) -> Dict[str, str]:
     }
 
 
+def _classify_earnings_event_reversal(
+    item: Dict[str, Any],
+    *,
+    snapshot_date: Optional[date],
+) -> Dict[str, Any]:
+    """业绩事件后价格反向（利好兑现/周期预判）检测。
+
+    条件：业绩信号且业绩分 ≥70；事件日在快照日 ≤3 个自然日内；当日跌幅 ≤ -5%。
+    样本：603986 兆易创新 2026-07-10（存储涨价中报事件当日 -7.7%，此后单边下行）。
+    """
+
+    signal_keys = set(_split_signal_keys(item.get("signal_keys")))
+    if SIGNAL_EARNINGS not in signal_keys:
+        return {}
+    if _to_float(item.get("earnings_strategy_score")) < 70.0:
+        return {}
+    event_date = _parse_iso_date_maybe(str(item.get("event_date") or ""))
+    if event_date is None or snapshot_date is None:
+        return {}
+    days_since_event = (snapshot_date - event_date).days
+    if days_since_event < 0 or days_since_event > 3:
+        return {}
+    today_change_pct = _to_optional_float(item.get("today_change_pct"))
+    if today_change_pct is None or today_change_pct > -5.0:
+        return {}
+    return {
+        "earnings_payback_risk": True,
+        "earnings_payback_reason": (
+            f"业绩事件（{event_date.isoformat()}）后第 {days_since_event} 日当日 {today_change_pct:.1f}%："
+            "利好兑现/反向风险（周期股防市场提前定价反转）"
+        ),
+    }
+
+
 def _classify_daily_review_lane(item: Dict[str, Any]) -> str:
+    if item.get("earnings_payback_risk"):
+        return "earnings_payback_watch"
     signal_keys = set(_split_signal_keys(item.get("signal_keys")))
     has_chart = _has_chart_signal(item)
     has_earnings = SIGNAL_EARNINGS in signal_keys
@@ -5328,6 +5367,10 @@ def _append_daily_curated_review_markdown(
         for item in (strategy_focus_rows or [])
         if _passes_stock_review_read_gate(dict(item), snapshot_date=snapshot_date)
     ]
+    for item in rows:
+        payback_payload = _classify_earnings_event_reversal(item, snapshot_date=snapshot_date)
+        if payback_payload:
+            item.update(payback_payload)
     rows = sorted(rows, key=_daily_review_sort_key)
     for item in rows:
         lane = _classify_daily_review_lane(item)
@@ -5349,11 +5392,12 @@ def _append_daily_curated_review_markdown(
     context_reason = str((rows[0].get("review_context_reason") or "")).strip()
     lines.append("- 这份文档按“今天先看什么票”组织，不再按策略文件逐个阅读。")
     lines.append(
-        "- 今日候选：`{total}`，双确认 ` {double_count} ` / 图形优先 ` {chart_count} ` / 业绩优先 ` {earnings_count} ` / 趋势补充 ` {trend_count} `。".format(
+        "- 今日候选：`{total}`，双确认 ` {double_count} ` / 图形优先 ` {chart_count} ` / 业绩优先 ` {earnings_count} ` / 兑现风险 ` {payback_count} ` / 趋势补充 ` {trend_count} `。".format(
             total=len(rows),
             double_count=lane_counts["double_confirmation"],
             chart_count=lane_counts["chart_first"],
             earnings_count=lane_counts["earnings_first"],
+            payback_count=lane_counts["earnings_payback_watch"],
             trend_count=lane_counts["trend_watch"],
         ).replace("` ", "`").replace(" `", "`")
     )
@@ -5422,6 +5466,14 @@ def _build_stock_overview_rows(
         if not _passes_stock_review_read_gate(item, snapshot_date=snapshot_date):
             continue
         signal_keys = _split_signal_keys(item.get("signal_keys"))
+        payback_payload = _classify_earnings_event_reversal(item, snapshot_date=snapshot_date)
+        if payback_payload:
+            item.update(payback_payload)
+            item["focus_reason"] = "; ".join(
+                part
+                for part in (str(item.get("focus_reason") or "").strip(), "earnings_payback_risk")
+                if part
+            )
         lane = _classify_daily_review_lane(item)
         item["stock_review_lane"] = lane
         item["stock_review_lane_label"] = DAILY_REVIEW_LANE_LABELS.get(lane, lane)
@@ -5467,6 +5519,7 @@ def _append_stock_overview_markdown(
     lines.append(f"- 双确认：`{lane_counts['double_confirmation']}`")
     lines.append(f"- 图形优先：`{lane_counts['chart_first']}`")
     lines.append(f"- 业绩优先：`{lane_counts['earnings_first']}`")
+    lines.append(f"- 兑现风险：`{lane_counts['earnings_payback_watch']}`")
     lines.append(f"- 趋势补充：`{lane_counts['trend_watch']}`")
     lines.append("")
 
@@ -5543,6 +5596,8 @@ def _write_stock_overview_outputs(
         "cycle_catalyst_type",
         "cycle_catalyst_label",
         "cycle_catalyst_reason",
+        "earnings_payback_risk",
+        "earnings_payback_reason",
         "theme_label",
         "mainline_judgement",
         "reason_summary",

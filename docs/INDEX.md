@@ -6,6 +6,8 @@
 
 | 我想要 | 先看 | 继续看 |
 | --- | --- | --- |
+| 从热点、盘后复盘与长期研究寻找机会 | [个人策略入口](个人策略文档/README.md) | [个人投研工作台重构方案](个人策略文档/个人投研工作台重构方案.md)（含策略归类、执行与开源复用；§7.2~§7.4 为新策略/数据/功能扩展合同及验收，规划，尚未实施） |
+| AI 助手快速了解本工程 | [AI_INDEX](../AI_INDEX.md)（一页式：策略/脚本/产物/命令） | [AGENTS.md](../AGENTS.md) |
 | 快速了解项目能做什么 | [README](../README.md) | [完整配置与部署指南](full-guide.md) |
 | 第一次把项目跑起来 | [小白客户端安装与配置](beginner-client-setup.md) | [完整配置与部署指南](full-guide.md) |
 | 在 Linux / WSL 本地开发运行 | [Linux 本地运行说明](local-linux-dev.md) | [贡献指南](CONTRIBUTING.md) |

@@ -22,7 +22,7 @@ from src.services.personal_strategy_matrix_service import (
     PersonalStrategyMatrixService,
 )
 
-GRAPH_STRATEGY_IDS = ("hundred_day_high", "daily_slow_rise", "long_base_release")
+GRAPH_STRATEGY_IDS = ("hundred_day_high", "trend_leader_unified", "daily_slow_rise", "long_base_release")
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "data" / "catalyst_digest"
 DEFAULT_HISTORY_PATH = DEFAULT_OUTPUT_ROOT / "history.jsonl"
 

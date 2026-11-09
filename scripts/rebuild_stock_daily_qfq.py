@@ -19,7 +19,19 @@
 
 注意：Baostock 为单会话服务，多进程并发（--workers>1）会互相踢登录，
 日志表现为“用户未登录”批量失败，必须保持串行（默认 workers=1）；
-若 Baostock 被封禁（“黑名单用户”），可切 `--source akshare`（同样前复权）。
+若 Baostock 被封禁（“黑名单用户”），只能用 `--source akshare`（adjust=qfq）。
+
+**不要用 tushare 重建本表**：TushareFetcher 走的是 `daily`（不复权），写进前复权库
+会制造假跳变（2026-11-08 实证：1,758 行被覆写成不复权口径，已回滚重建）。
+
+口径闸门（2026-11-08 新增）：写入前用 `amount/close` 估算股数并校验 `volume`，
+比例异常或缺 volume 的批次计为失败，不再覆盖已有日线；akshare 的“手”会自动 ×100。
+
+跳变闸门（2026-11-09 修订，见 `src/services/quote_quality.py`）：
+- 超复核阈值（主板 11.5%、创业板/科创板 21.5%、北交所 31.5%）→ 告警 + **立即**登记
+  可疑清单，不再等整批扫描结束才留痕；
+- 超极端阈值（阈值 ×2）且前一交易日紧邻、不在上市初期窗口 → 视为口径混写，拒写该票
+  （`--allow-extreme-jumps` 可显式放行）；停牌/缺行情/新股阶段仍只告警，不据跳变定罪。
 """
 from __future__ import annotations
 
@@ -27,9 +39,9 @@ import argparse
 import logging
 import multiprocessing
 import sys
-from datetime import date, timedelta
+from datetime import date
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -38,6 +50,20 @@ if str(PROJECT_ROOT) not in sys.path:
 import pandas as pd
 
 from data_provider.baostock_fetcher import BaostockFetcher
+from src.services.quote_quality import (  # noqa: F401 - 常量按旧名再导出，供外部引用
+    BSE_REVIEW_PCT,
+    GROWTH_BOARD_REVIEW_PCT,
+    LEVEL_EXTREME,
+    LEVEL_REVIEW,
+    MAIN_BOARD_REVIEW_PCT,
+    SUSPICIOUS_CODES_PATH,
+    classify_price_jumps,
+    load_suspicious_codes,
+    price_jump_extreme_threshold,
+    price_jump_review_threshold,
+    record_suspicious_codes,
+    replace_suspicious_codes,
+)
 from src.storage import DatabaseManager
 
 logger = logging.getLogger("rebuild_stock_daily_qfq")
@@ -47,6 +73,7 @@ DEFAULT_START = "2026-01-01"
 # 失败率阈值：超过则视为重建未完成（非零退出），并要求检查失败清单后重试。
 MAX_FAIL_RATE = 0.05
 DEFAULT_FAILED_CODES_PATH = PROJECT_ROOT / "data" / "run_logs" / "rebuild_stock_daily_qfq_failed_codes.txt"
+DEFAULT_SUSPICIOUS_CODES_PATH = SUSPICIOUS_CODES_PATH
 
 
 def load_universe_codes(db: DatabaseManager, *, start_date: str, end_date: str, limit: int = 0) -> List[str]:
@@ -85,7 +112,7 @@ def scan_abnormal_jumps(
     sample: int = 5,
     include_rows: bool = False,
 ) -> Dict[str, Any]:
-    """扫描超过 A 股涨跌板限制的单日收益（除权/送转/口径接缝嫌疑）。"""
+    """扫描需复核跳变；按板块包络排除合法北交所 30%，不是错误证明。"""
     from sqlalchemy import text
 
     query = text(
@@ -108,6 +135,11 @@ def scan_abnormal_jumps(
                 {"start": start_date, "end": end_date, "threshold": float(threshold_pct)},
             ).fetchall()
         )
+    rows = [
+        row for row in rows
+        if (limit := price_jump_review_threshold(str(row[0]), str(row[1])[:10])) is not None
+        and abs(float(row[4])) > max(float(threshold_pct), limit)
+    ]
     result: Dict[str, Any] = {
         "abnormal_count": len(rows),
         "codes_affected": len({str(row[0]) for row in rows}),
@@ -137,9 +169,10 @@ def _worker_init(source: str = "baostock") -> None:
     if str(source) == "akshare":
         from data_provider.akshare_fetcher import AkshareFetcher
 
-        # 本次环境验证：东财间歇性连接失败、新浪较慢；腾讯源当日最稳（同为前复权）。
+        # 2026-11-08 实测：tencent 返回 volume 全 0（被口径闸门拒绝），
+        # sina / em 为 adjust=qfq 且带成交量（单位为手，由闸门换算成股）。
         _WORKER["fetcher"] = AkshareFetcher(
-            stock_history_source_priority=("tencent", "sina", "em")
+            stock_history_source_priority=("sina", "em", "tencent")
         )
     else:
         _WORKER["fetcher"] = BaostockFetcher()
@@ -147,8 +180,86 @@ def _worker_init(source: str = "baostock") -> None:
     _WORKER["db"] = DatabaseManager.get_instance()
 
 
-def _rebuild_chunk(task: Tuple[List[str], str, str, bool]) -> Dict[str, Any]:
-    codes, start_date, end_date, dry_run = task
+# volume 估算容差：amount/close 得到股数，与之比较
+_VOLUME_RATIO_MIN = 0.5
+_VOLUME_RATIO_MAX = 2.0
+# 手 -> 股 的换算区间（volume 远小于估算股数时视为手）
+_VOLUME_LOT_RATIO = 0.2
+
+
+def normalize_and_validate_frame(
+    frame: pd.DataFrame,
+    code: str,
+    *,
+    allow_extreme_jumps: bool = False,
+    persist_suspicious: bool = True,
+    source: str = SOURCE_LABEL,
+) -> pd.DataFrame:
+    """校验并归一化成交量语义（股）；跳变分级处理。
+
+    规则：
+    1. 必须有 volume；全零视为缺失（腾讯源会回填空列）→ 报错。
+    2. 用 ``amount / close`` 估算股数；若 volume 明显偏小（<0.2 倍）按“手”处理 ×100。
+    3. 归一化后比例仍不在 [0.5, 2.0] 内 → 报错，宁可不写。
+    4. 跳变：超复核阈值→告警 + 立即登记可疑清单；超极端阈值且前一交易日紧邻、
+       不在上市初期窗口 → 拒写（除非 ``allow_extreme_jumps``）。停牌、缺行情、
+       新股阶段仍只告警，不据跳变定罪。
+    """
+    if frame is None or frame.empty:
+        raise ValueError("empty frame")
+    columns = {str(col).lower() for col in frame.columns}
+    if "volume" not in columns:
+        raise ValueError("missing volume column")
+
+    volume = pd.to_numeric(frame["volume"], errors="coerce")
+    close = pd.to_numeric(frame.get("close"), errors="coerce") if "close" in columns else None
+    amount = pd.to_numeric(frame.get("amount"), errors="coerce") if "amount" in columns else None
+    if volume is None or volume.fillna(0).abs().sum() <= 0:
+        raise ValueError("volume all zero")
+
+    if close is not None:
+        dates = frame["date"] if "date" in frame else pd.Series([""] * len(frame), index=frame.index)
+        jumps = classify_price_jumps(list(dates), list(close), code)
+        review_hits = jumps[LEVEL_REVIEW]
+        extreme_hits = jumps[LEVEL_EXTREME]
+        for hit in review_hits:
+            logger.warning(
+                "价格跳变需复核 code=%s %s；特殊交易阶段未核实，不据此拒写",
+                hit.code, hit.describe(),
+            )
+        if (review_hits or extreme_hits) and persist_suspicious:
+            # 立即留痕：整批中断、后续失败或重试都不会丢掉“这只票待复核”的事实
+            record_suspicious_codes(
+                [code],
+                reason="extreme_jump" if extreme_hits else "review_jump",
+                source=source,
+                as_of=str(dates.iloc[-1])[:10] if len(dates) else None,
+            )
+        if extreme_hits:
+            detail = "；".join(hit.describe() for hit in extreme_hits[:5])
+            if not allow_extreme_jumps:
+                raise ValueError(f"极端跳变（无缺失行情解释）拒写 {code}：{detail}")
+            logger.warning("极端跳变已显式放行 code=%s：%s", code, detail)
+
+    if close is not None and amount is not None:
+        valid = (close > 0) & (amount > 0) & (volume > 0)
+        if valid.any():
+            expected_shares = float(amount[valid].sum()) / float(close[valid].mean())
+            ratio = float(volume[valid].sum()) / expected_shares if expected_shares > 0 else 0.0
+            if 0 < ratio < _VOLUME_LOT_RATIO:
+                frame = frame.copy()
+                frame["volume"] = volume * 100.0
+                volume = frame["volume"]
+                ratio *= 100.0
+            if not (_VOLUME_RATIO_MIN <= ratio <= _VOLUME_RATIO_MAX):
+                raise ValueError(
+                    f"volume/amount 口径异常（ratio={ratio:.4f}），拒绝写入 {code}"
+                )
+    return frame
+
+
+def _rebuild_chunk(task: Tuple[List[str], str, str, bool, bool]) -> Dict[str, Any]:
+    codes, start_date, end_date, dry_run, allow_extreme_jumps = task
     fetcher: BaostockFetcher = _WORKER["fetcher"]
     db: DatabaseManager = _WORKER["db"]
     stats: Dict[str, Any] = {
@@ -157,6 +268,8 @@ def _rebuild_chunk(task: Tuple[List[str], str, str, bool]) -> Dict[str, Any]:
         "skipped": 0,
         "failed": 0,
         "failed_codes": [],
+        "quarantined": 0,
+        "quarantined_codes": [],
     }
     for code in codes:
         try:
@@ -169,12 +282,23 @@ def _rebuild_chunk(task: Tuple[List[str], str, str, bool]) -> Dict[str, Any]:
             if frame is None or frame.empty:
                 stats["skipped"] += 1
                 continue
+            frame = normalize_and_validate_frame(
+                frame,
+                code,
+                allow_extreme_jumps=allow_extreme_jumps,
+                persist_suspicious=not dry_run,
+                source=_WORKER.get("label") or SOURCE_LABEL,
+            )
             if not dry_run:
                 db.save_daily_data(frame, code, _WORKER.get("label") or SOURCE_LABEL)
             stats["updated"] += 1
         except Exception as exc:  # noqa: BLE001 - 单票失败继续
             stats["failed"] += 1
             stats["failed_codes"].append(code)
+            if "极端跳变" in str(exc):
+                # 口径混写嫌疑：已登记可疑清单，单独计数以便区分“取数失败”
+                stats["quarantined"] += 1
+                stats["quarantined_codes"].append(code)
             logger.warning("rebuild failed for %s: %s", code, exc)
     return stats
 
@@ -189,6 +313,7 @@ def run_rebuild(
     dry_run: bool = False,
     progress_every: int = 200,
     source: str = "baostock",
+    allow_extreme_jumps: bool = False,
 ) -> Dict[str, Any]:
     totals: Dict[str, Any] = {
         "total": len(codes),
@@ -196,21 +321,26 @@ def run_rebuild(
         "skipped": 0,
         "failed": 0,
         "failed_codes": [],
+        "quarantined": 0,
+        "quarantined_codes": [],
     }
     if not codes:
         return totals
     if workers and int(workers) > 1 and not dry_run:
         chunk_size = max(1, (len(codes) + int(workers) * 4 - 1) // (int(workers) * 4))
         chunks = [list(codes)[i : i + chunk_size] for i in range(0, len(codes), chunk_size)]
-        tasks = [(chunk, start_date, end_date, dry_run) for chunk in chunks]
+        tasks = [
+            (chunk, start_date, end_date, dry_run, allow_extreme_jumps) for chunk in chunks
+        ]
         ctx = multiprocessing.get_context("fork")
         processed = 0
         with ctx.Pool(processes=max(2, int(workers)), initializer=_worker_init, initargs=(source,)) as pool:
             for stats in pool.imap_unordered(_rebuild_chunk, tasks):
                 processed += stats["total"]
-                for key in ("updated", "skipped", "failed"):
+                for key in ("updated", "skipped", "failed", "quarantined"):
                     totals[key] += stats[key]
                 totals["failed_codes"].extend(stats.get("failed_codes") or [])
+                totals["quarantined_codes"].extend(stats.get("quarantined_codes") or [])
                 if progress_every and processed % max(1, int(progress_every)) < 50:
                     logger.info(
                         "progress %s/%s updated=%s skipped=%s failed=%s",
@@ -220,10 +350,11 @@ def run_rebuild(
 
     _worker_init(source)
     for index, code in enumerate(codes, start=1):
-        stats = _rebuild_chunk(([code], start_date, end_date, dry_run))
-        for key in ("updated", "skipped", "failed"):
+        stats = _rebuild_chunk(([code], start_date, end_date, dry_run, allow_extreme_jumps))
+        for key in ("updated", "skipped", "failed", "quarantined"):
             totals[key] += stats[key]
         totals["failed_codes"].extend(stats.get("failed_codes") or [])
+        totals["quarantined_codes"].extend(stats.get("quarantined_codes") or [])
         if progress_every and index % int(progress_every) == 0:
             logger.info(
                 "progress %s/%s updated=%s skipped=%s failed=%s",
@@ -264,6 +395,7 @@ def retry_failed_codes(
     max_attempts: int = 3,
     dry_run: bool = False,
     progress_every: int = 0,
+    allow_extreme_jumps: bool = False,
 ) -> Dict[str, Any]:
     """读取失败清单并多轮重试，直至清零或达到 max_attempts；每轮回写剩余清单。"""
     pending = _read_failed_codes(failed_path)
@@ -281,6 +413,7 @@ def retry_failed_codes(
             dry_run=dry_run,
             progress_every=progress_every,
             source=source,
+            allow_extreme_jumps=allow_extreme_jumps,
         )
         pending = sorted({str(code) for code in (stats.get("failed_codes") or [])})
         attempts.append(
@@ -309,10 +442,15 @@ def parse_args() -> argparse.Namespace:
         "--source",
         default="baostock",
         choices=["baostock", "akshare"],
-        help="数据源（默认 baostock；被封禁时可切 akshare，同样前复权）",
+        help="数据源（默认 baostock；被封禁时用 akshare，adjust=qfq，自动做 手→股 换算）",
     )
     parser.add_argument("--dry-run", action="store_true", help="只统计不写库")
     parser.add_argument("--no-scan", action="store_true", help="跳过重建前后的异常扫描")
+    parser.add_argument(
+        "--allow-extreme-jumps",
+        action="store_true",
+        help="显式放行极端跳变（仅用于已核实为复牌/重组等特殊阶段的场景）；默认拒写并记入可疑清单",
+    )
     parser.add_argument(
         "--retry-failed",
         action="store_true",
@@ -350,6 +488,7 @@ def main() -> int:
             source=str(args.source),
             max_attempts=int(args.max_attempts),
             dry_run=bool(args.dry_run),
+            allow_extreme_jumps=bool(args.allow_extreme_jumps),
         )
         for item in result["attempts"]:
             print(
@@ -365,6 +504,7 @@ def main() -> int:
         return 0
 
     before = None
+    suspicious_before = load_suspicious_codes()
     if not args.no_scan:
         before = scan_abnormal_jumps(db, start_date=args.start_date, end_date=args.end_date)
         print(f"[rebuild] 重建前超板异常: {before['abnormal_count']} 条 / 涉及 {before['codes_affected']} 只")
@@ -385,9 +525,11 @@ def main() -> int:
         workers=int(args.workers),
         dry_run=bool(args.dry_run),
         source=str(args.source),
+        allow_extreme_jumps=bool(args.allow_extreme_jumps),
     )
     print(
-        "[rebuild] 完成: total={total} updated={updated} skipped={skipped} failed={failed}".format(**stats)
+        "[rebuild] 完成: total={total} updated={updated} skipped={skipped} failed={failed} "
+        "quarantined={quarantined}".format(**stats)
     )
 
     failed_count = int(stats.get("failed") or 0)
@@ -408,10 +550,33 @@ def main() -> int:
         print(f"[rebuild] 警告: 存在失败票 {failed_count} 只（{fail_rate:.1%}），见上述失败清单")
 
     if not args.no_scan:
-        after = scan_abnormal_jumps(db, start_date=args.start_date, end_date=args.end_date)
+        after = scan_abnormal_jumps(
+            db, start_date=args.start_date, end_date=args.end_date, include_rows=True
+        )
         print(f"[rebuild] 重建后超板异常: {after['abnormal_count']} 条 / 涉及 {after['codes_affected']} 只")
         for item in after["samples"]:
             print(f"   - {item['code']} {item['date']}: {item['ret_pct']}%")
+        scanned = {str(row["code"]) for row in after.get("rows", [])}
+        # 本次运行中即时登记过的代码（= 当前清单 - 运行前快照）也要保留：
+        # 它们在窗口内可能已被重建覆盖，但仍是待复核事实。
+        flagged_during_run = load_suspicious_codes() - suspicious_before
+        final_codes = sorted(scanned | flagged_during_run)
+        if args.dry_run:
+            print(
+                f"[rebuild] 可疑行情清单（dry-run 未写入）将为 {len(final_codes)} 只："
+                f"{','.join(final_codes[:10])}{' ...' if len(final_codes) > 10 else ''}"
+            )
+        else:
+            change = replace_suspicious_codes(
+                final_codes,
+                reason="post_rebuild_scan",
+                source=str(args.source),
+                as_of=args.end_date,
+            )
+            print(
+                f"[rebuild] 可疑行情清单: {DEFAULT_SUSPICIOUS_CODES_PATH}（{len(final_codes)} 只；"
+                f"新增 {len(change['added'])}、清除 {len(change['removed'])}）"
+            )
     return 0
 
 

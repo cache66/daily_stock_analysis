@@ -21,7 +21,6 @@ import argparse
 import json
 import sqlite3
 import sys
-from collections import Counter
 from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -166,7 +165,6 @@ def render(board_date: str, checkup: Dict[str, Any], out_path: Path) -> Path:
     board, _ = build_board_for_date(board_date, output_path=None, db_manager=db)
     service = ResearchTrackingService(repo=ResearchTrackingRepository(db_manager=db))
     tracks = service.repo.list_tracks(limit=200)
-    by_source = Counter(track.hypothesis_key.split(":")[1] for track in tracks if ":" in track.hypothesis_key)
 
     con = sqlite3.connect(str(DEFAULT_DB))
     try:
@@ -175,8 +173,45 @@ def render(board_date: str, checkup: Dict[str, Any], out_path: Path) -> Path:
         ).fetchone()[0]
         news = con.execute("SELECT COUNT(*) FROM news_intel").fetchone()[0]
         intel = con.execute("SELECT COUNT(*) FROM intelligence_items").fetchone()[0]
+        outcome_rows = con.execute(
+            "SELECT t.code, t.hypothesis_key, e.payload_json, e.quality "
+            "FROM research_track_events e JOIN research_tracks t ON t.id = e.track_pk "
+            "WHERE e.source_type='stock_daily_qfq' ORDER BY e.id DESC"
+        ).fetchall()
+        timeline = con.execute(
+            "SELECT t.code, e.event_type, e.observed_at, COALESCE(e.summary,'') "
+            "FROM research_track_events e JOIN research_tracks t ON t.id = e.track_pk "
+            "ORDER BY e.id DESC LIMIT 400"
+        ).fetchall()
     finally:
         con.close()
+
+    seen = set()
+    outcomes: List[Dict[str, Any]] = []
+    for code, key, payload, quality in outcome_rows:
+        if code in seen:
+            continue
+        seen.add(code)
+        data = json.loads(payload or "{}")
+        outcomes.append({
+            "code": code,
+            "signal_date": str(key).rsplit(":", 1)[-1],
+            "source": str(key).split(":")[1] if ":" in str(key) else "",
+            "entry_date": data.get("entry_date"),
+            "ret1": data.get("ret1"),
+            "ret3": data.get("ret3"),
+            "ret5": data.get("ret5"),
+            "quality": quality,
+            "missing": data.get("missing_dates") or [],
+        })
+    rets = [o["ret1"] for o in outcomes if o.get("ret1") is not None]
+    outcome_stats = {
+        "n": len(rets),
+        "mean": (sum(rets) / len(rets) * 100) if rets else None,
+        "win": (sum(1 for x in rets if x > 0) / len(rets) * 100) if rets else None,
+        "best": max(rets) * 100 if rets else None,
+        "worst": min(rets) * 100 if rets else None,
+    }
 
     months = checkup["months"]
     head = "".join(f"<th>{m[5:]}月</th>" for m in months)
@@ -195,12 +230,6 @@ def render(board_date: str, checkup: Dict[str, Any], out_path: Path) -> Path:
         body += f"<tr><td><b>{row['label']}</b><div class='mut' style='font-size:11px'>{row['total']} 条</div></td>{cells}</tr>"
     signal_table = f"<table><tr><th>信号</th>{head}</tr>{body}</table>"
 
-    track_rows = "".join(
-        f"<tr><td>{source}</td><td>{count}</td><td class='mut'>{round(count / max(1, len(tracks)) * 100)}%</td></tr>"
-        for source, count in by_source.most_common()
-    )
-    track_table = f"<table><tr><th>来源</th><th>样本数</th><th>占比</th></tr>{track_rows}</table>"
-
     health_rows = "".join(
         f"<tr><td>{h.label}</td><td class='{_cls(1 if h.status == 'ok' else -1)}'>{h.status}</td>"
         f"<td>{h.last_done_local or '—'}</td><td>{'—' if h.exit_code is None else h.exit_code}</td>"
@@ -211,6 +240,47 @@ def render(board_date: str, checkup: Dict[str, Any], out_path: Path) -> Path:
 
     cov_text = "、".join(f"{ym}: {count} 只" for ym, count in checkup["coverage"] if ym >= "2026-08")
     healthy = [ym for ym, count in checkup["coverage"] if count > 3000]
+
+    def _pct(value):
+        if value is None:
+            return "—"
+        return f"{value * 100:+.2f}%"
+
+    outcome_rows_html = "".join(
+        f"<tr><td>{o['code']}</td><td>{o['source'].replace('screening__', '')}</td><td>{o['signal_date']}</td>"
+        f"<td class='{_cls(o['ret1'])}'>{_pct(o['ret1'])}</td>"
+        f"<td class='{_cls(o['ret3'])}'>{_pct(o['ret3'])}</td>"
+        f"<td class='{_cls(o['ret5'])}'>{_pct(o['ret5'])}</td>"
+        f"<td class='mut'>{'缺 ' + ','.join(o['missing'][:3]) if o['missing'] else '检查点完整'}</td></tr>"
+        for o in sorted(outcomes, key=lambda item: (item["ret1"] is None, -(item["ret1"] or 0)))
+    )
+    outcome_table = (
+        "<table><tr><th>代码</th><th>来源</th><th>信号日</th><th>T+1</th><th>T+3</th><th>T+5</th><th>缺失检查点</th></tr>"
+        + (outcome_rows_html or "<tr><td colspan='7' class='mut'>暂无回填结果</td></tr>")
+        + "</table>"
+    )
+    timeline_by_code: Dict[str, List[str]] = {}
+    for code, event_type, observed_at, summary in timeline:
+        label = f"{event_type}" + (f" · {str(observed_at)[:16]}" if observed_at else "") + (f" · {summary[:60]}" if summary else "")
+        timeline_by_code.setdefault(code, []).append(label)
+    track_detail_rows = "".join(
+        "<tr><td>{code}</td><td>{sig}</td><td>{src}</td><td>{status}</td><td>{due}</td><td><details><summary>{n} 条事件</summary>"
+        "<div class='ev' style='white-space:normal'>{events}</div></details></td></tr>".format(
+            code=track.code,
+            sig=str(track.hypothesis_key).rsplit(":", 1)[-1],
+            src=str(track.hypothesis_key).split(":")[1] if ":" in str(track.hypothesis_key) else "",
+            status=track.status,
+            due=str(track.next_review_at)[:10] if track.next_review_at else "—",
+            n=len(timeline_by_code.get(str(track.code), [])),
+            events="<br>".join(timeline_by_code.get(str(track.code), [])[:8]) or "（无事件）",
+        )
+        for track in tracks[:40]
+    )
+    track_table = (
+        "<table><tr><th>代码</th><th>信号日</th><th>来源</th><th>状态</th><th>到期</th><th>事件</th></tr>"
+        + track_detail_rows
+        + "</table>"
+    )
 
     # ---- 交互数据：候选详情（含近 30 日收盘序列，用于画迷你走势） ----
     def _closes(code: str, limit: int = 30):
@@ -399,16 +469,26 @@ def render(board_date: str, checkup: Dict[str, Any], out_path: Path) -> Path:
 </script>
 """ + f"""
 
-<h2>三、跟踪样本池</h2>
-<div class="two"><div>{track_table}</div>
-<div class="ok">每条样本带来源引用/内容版本/批次号/限制说明。入池前过三道闸门：
-<b>环境不适配</b>（defensive 时不收趋势类）、<b>同票冷却期</b>（10 个交易日内只一条）、
-<b>过热</b>（距首次信号涨幅 &gt;30% 不再入池）。</div></div>
+<h2>三、回填结果（真实 T+1，截至 {board_date}）</h2>
+<div class="cards">
+  <div class="card"><div class="k">已回填样本</div><div class="v">{outcome_stats['n']}</div><div class="n">共 {len(outcomes)} 条有结果</div></div>
+  <div class="card"><div class="k">T+1 均值</div><div class="v {_cls(outcome_stats['mean'])}">{('' if outcome_stats['mean'] is None else '%+.2f%%' % outcome_stats['mean'])}</div><div class="n">相对 D0 收盘</div></div>
+  <div class="card"><div class="k">T+1 胜率</div><div class="v">{('' if outcome_stats['win'] is None else '%.0f%%' % outcome_stats['win'])}</div><div class="n">收盘为正占比</div></div>
+  <div class="card"><div class="k">最好 / 最差</div><div class="v" style="font-size:18px">{('—' if outcome_stats['best'] is None else '%+.1f%% / %+.1f%%' % (outcome_stats['best'], outcome_stats['worst']))}</div><div class="n">单票 T+1</div></div>
+</div>
+{outcome_table}
+<div class="warn" style="margin-top:10px">T+3/T+5 需要更多交易日，目前按日历留空；quality=partial 表示窗口未走完，不是漏数。</div>
 
-<h2>四、来源健康</h2>
+<h2>四、跟踪样本池（点开事件列看时间线）</h2>
+{track_table}
+<div class="ok" style="margin-top:10px">每条样本带来源引用/内容版本/批次号/限制说明。入池前过三道闸门：
+<b>环境不适配</b>（defensive 时不收趋势类）、<b>同票冷却期</b>（10 个交易日内只一条）、
+<b>过热</b>（距首次信号涨幅 &gt;30% 不再入池）。</div>
+
+<h2>五、来源健康</h2>
 {health_table}
 
-<h2>五、数据完整性</h2>
+<h2>六、数据完整性</h2>
 <div class="bad">各股票“最后一根 K 线”所在月份：{cov_text}<br>
 本月已完成一次全市场缓存回灌（4,497 只补齐到最新交易日）；仍有约 700 只停在 9 月，多为已停牌/退市、缓存无更新，不计入统计。</div>
 <ul>
@@ -417,7 +497,7 @@ def render(board_date: str, checkup: Dict[str, Any], out_path: Path) -> Path:
 <li>夜间链路交易日判断：已改为本地日历优先，日历不可用时按交易日继续（原实现会把限流误判为休市并静默跳过）</li>
 </ul>
 
-<h2>六、下一步</h2>
+<h2>七、下一步</h2>
 <ul>
 <li><b>1</b> 观察今晚跑完后的首批真实回填结果（T+1/T+3/T+5）</li>
 <li><b>2</b> 新闻/概念层接入，让“冰雪”这类主题驱动能被看见</li>

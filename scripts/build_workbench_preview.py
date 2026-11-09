@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sqlite3
 import sys
 from collections import Counter
@@ -51,13 +52,14 @@ SIGNAL_LABELS = {
     "screening__shrink_pullback": "筛选·缩量回踩",
 }
 CSS = """
+*{box-sizing:border-box}
 body{font-family:-apple-system,"PingFang SC","Microsoft YaHei",system-ui,sans-serif;margin:0;background:#f5f6f8;color:#1f2328;line-height:1.6}
-.wrap{max-width:1180px;margin:0 auto;padding:26px 20px 60px}
-h1{font-size:23px;margin:0 0 4px} .sub{color:#6a737d;font-size:13px;margin-bottom:20px}
-h2{font-size:16px;margin:28px 0 10px;padding-left:9px;border-left:4px solid #2f6feb}
-.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:16px 0}
-.card{background:#fff;border:1px solid #e3e6ea;border-radius:10px;padding:14px 16px}
-.card .k{font-size:12px;color:#6a737d} .card .v{font-size:25px;font-weight:650;margin-top:2px}
+.wrap{max-width:1400px;margin:0 auto;padding:20px 18px 50px}
+h1{font-size:22px;margin:0 0 4px} .sub{color:#6a737d;font-size:13px;margin-bottom:16px}
+h2{font-size:16px;margin:24px 0 10px;padding-left:9px;border-left:4px solid #2f6feb}
+.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:14px 0}
+.card{background:#fff;border:1px solid #e3e6ea;border-radius:10px;padding:12px 14px}
+.card .k{font-size:12px;color:#6a737d} .card .v{font-size:24px;font-weight:650;margin-top:2px}
 .card .n{font-size:12px;color:#8b949e;margin-top:2px}
 table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #e3e6ea;border-radius:10px;overflow:hidden;font-size:13px}
 th,td{padding:7px 10px;border-bottom:1px solid #eef0f3;text-align:left;white-space:nowrap}
@@ -70,6 +72,26 @@ tr:last-child td{border-bottom:none}
 .two{display:grid;grid-template-columns:1fr 1fr;gap:14px}
 ul{margin:6px 0 0 18px;padding:0} li{margin:3px 0}
 code{background:#f1f3f5;padding:1px 5px;border-radius:4px;font-size:12px}
+/* ---- 交互区 ---- */
+.toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:10px 0}
+.chip{border:1px solid #d8dde3;background:#fff;border-radius:14px;padding:3px 11px;font-size:12px;cursor:pointer;color:#4a5158}
+.chip.on{background:#2f6feb;border-color:#2f6feb;color:#fff}
+input.search{border:1px solid #d8dde3;border-radius:8px;padding:5px 10px;font-size:13px;min-width:180px}
+.split{display:grid;grid-template-columns:minmax(320px,420px) 1fr;gap:14px;align-items:start}
+.list{background:#fff;border:1px solid #e3e6ea;border-radius:10px;max-height:620px;overflow:auto}
+.li{padding:9px 12px;border-bottom:1px solid #f0f2f4;cursor:pointer;font-size:13px}
+.li:hover{background:#f7f9fc}
+.li.on{background:#eaf1ff;border-left:3px solid #2f6feb;padding-left:9px}
+.li .code{font-weight:650;margin-right:6px}
+.li .meta{color:#8b949e;font-size:11px}
+.detail{background:#fff;border:1px solid #e3e6ea;border-radius:10px;padding:16px 18px;min-height:320px}
+.detail h3{margin:0 0 4px;font-size:17px}
+.kv{display:grid;grid-template-columns:88px 1fr;gap:4px 10px;font-size:13px;margin:10px 0}
+.kv .k{color:#6a737d}
+.ev{font-size:12px;color:#4a5158;background:#fafbfc;border:1px solid #eef0f3;border-radius:8px;padding:10px;margin-top:8px;word-break:break-all}
+.flag{display:inline-block;background:#fff2f0;color:#c0392b;border:1px solid #ffccc7;border-radius:10px;padding:0 7px;font-size:11px;margin-right:4px}
+.empty{color:#8b949e;font-size:13px;padding:26px 0;text-align:center}
+.spark{display:block;margin-top:6px}
 """
 
 
@@ -173,13 +195,6 @@ def render(board_date: str, checkup: Dict[str, Any], out_path: Path) -> Path:
         body += f"<tr><td><b>{row['label']}</b><div class='mut' style='font-size:11px'>{row['total']} 条</div></td>{cells}</tr>"
     signal_table = f"<table><tr><th>信号</th>{head}</tr>{body}</table>"
 
-    cand_rows = ""
-    for source, count in Counter(c.source for c in board.candidates).most_common():
-        picks = [c for c in board.candidates if c.source == source][:6]
-        codes = "、".join(f"{c.code} {c.name}" for c in picks)
-        cand_rows += f"<tr><td>{source}</td><td>{count}</td><td>{codes}</td></tr>"
-    cand_table = f"<table><tr><th>来源</th><th>条数</th><th>示例（前 6）</th></tr>{cand_rows}</table>"
-
     track_rows = "".join(
         f"<tr><td>{source}</td><td>{count}</td><td class='mut'>{round(count / max(1, len(tracks)) * 100)}%</td></tr>"
         for source, count in by_source.most_common()
@@ -196,6 +211,53 @@ def render(board_date: str, checkup: Dict[str, Any], out_path: Path) -> Path:
 
     cov_text = "、".join(f"{ym}: {count} 只" for ym, count in checkup["coverage"] if ym >= "2026-08")
     healthy = [ym for ym, count in checkup["coverage"] if count > 3000]
+
+    # ---- 交互数据：候选详情（含近 30 日收盘序列，用于画迷你走势） ----
+    def _closes(code: str, limit: int = 30):
+        path = CACHE_DIR / f"{code}.csv"
+        if not path.is_file():
+            return []
+        try:
+            frame = pd.read_csv(path).tail(limit)
+        except (OSError, pd.errors.ParserError):
+            return []
+        return [
+            {"d": str(row.date)[:10], "c": round(float(row.close), 3)}
+            for row in frame.itertuples() if pd.notna(row.close)
+        ]
+
+    track_by_code: Dict[str, List[Dict[str, Any]]] = {}
+    for track in tracks:
+        track_by_code.setdefault(str(track.code), []).append({
+            "signal_date": str(track.hypothesis_key).rsplit(":", 1)[-1],
+            "source": str(track.hypothesis_key).split(":")[1] if ":" in track.hypothesis_key else "",
+            "status": track.status,
+            "next_review_at": str(track.next_review_at)[:10] if track.next_review_at else "",
+        })
+
+    candidates_payload = []
+    for cand in board.candidates:
+        candidates_payload.append({
+            "code": cand.code,
+            "name": cand.name,
+            "source": cand.source,
+            "reason": cand.reason,
+            "flags": list(cand.flags),
+            "batch_ready": bool(cand.batch_ready),
+            "quality": cand.quality,
+            "limitation": cand.limitation,
+            "batch_ref": cand.batch_ref,
+            "source_ref": cand.source_ref,
+            "source_version": cand.source_version,
+            "observed_at": str(cand.observed_at or ""),
+            "metrics": cand.source_snapshot.get("metrics", {}) if cand.source_snapshot else {},
+            "closes": _closes(cand.code),
+            "tracks": track_by_code.get(cand.code, []),
+        })
+    payload_json = json.dumps(
+        {"date": board_date, "regime": board.market_regime, "candidates": candidates_payload},
+        ensure_ascii=False,
+    ).replace("</", "<\\/")
 
     html_doc = f"""<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>个人投研工作台 · 预览</title>
 <style>{CSS}</style><body><div class="wrap">
@@ -219,8 +281,123 @@ def render(board_date: str, checkup: Dict[str, Any], out_path: Path) -> Path:
 <div class="warn" style="margin-top:10px"><b>读法</b>：正值=跑赢同期大盘；样本数 n 太小的月份只能当线索。
 全市场覆盖完整的月份：{('、'.join(healthy) or '无')}。</div>
 
-<h2>二、今日候选（{board_date}）</h2>
-{cand_table}
+<h2>二、今日候选（{board_date}）—— 点击左侧查看详情</h2>
+<div class="toolbar">
+  <input class="search" id="q" placeholder="搜代码 / 名称 / 理由" autocomplete="off">
+  <span id="chips"></span>
+  <span class="mut" id="count"></span>
+</div>
+<div class="split">
+  <div class="list" id="list"></div>
+  <div class="detail" id="detail"><div class="empty">从左侧选一只看详情（打分依据 / 来源版本 / 近 30 日走势 / 关联跟踪）</div></div>
+</div>
+<div class="warn" style="margin-top:10px">小提醒：当前候选里 <b>dual_low（双低）</b> 天然偏向银行——它要求 PE 0~15 且 PB 0~2，银行最符合条件的行业。
+所以“怎么都是银行”不是 bug，是这条策略的定义；要分散就得靠其他来源或加行业上限。</div>
+<script type="application/json" id="wb-data">{payload_json}</script>
+""" + """
+<script>
+(function(){
+  var DATA = JSON.parse(document.getElementById('wb-data').textContent);
+  var cands = DATA.candidates || [];
+  var state = { source: '*', q: '', sel: null };
+
+  var chipsEl = document.getElementById('chips');
+  var listEl = document.getElementById('list');
+  var detailEl = document.getElementById('detail');
+  var countEl = document.getElementById('count');
+
+  var bySource = {};
+  cands.forEach(function(c){ bySource[c.source] = (bySource[c.source]||0)+1; });
+  var sources = Object.keys(bySource).sort(function(a,b){ return bySource[b]-bySource[a]; });
+
+  function chip(label, key, n){
+    var b = document.createElement('button');
+    b.className = 'chip' + (state.source === key ? ' on' : '');
+    b.textContent = label + (n ? ' ' + n : '');
+    b.onclick = function(){ state.source = key; renderChips(); renderList(); };
+    return b;
+  }
+  function renderChips(){
+    chipsEl.innerHTML = '';
+    chipsEl.appendChild(chip('全部', '*', cands.length));
+    sources.forEach(function(s){ chipsEl.appendChild(chip(s, s, bySource[s])); });
+  }
+  function filtered(){
+    var q = state.q.trim().toLowerCase();
+    return cands.filter(function(c){
+      if (state.source !== '*' && c.source !== state.source) return false;
+      if (!q) return true;
+      return (c.code + ' ' + c.name + ' ' + c.reason + ' ' + c.source).toLowerCase().indexOf(q) >= 0;
+    });
+  }
+  function row(c){
+    var d = document.createElement('div');
+    d.className = 'li' + (state.sel === c.code + '|' + c.source ? ' on' : '');
+    d.innerHTML = '<span class="code">' + c.code + '</span>' + (c.name||'') +
+      '<div class="meta">' + c.source + (c.flags && c.flags.length ? ' · ' + c.flags.join('、') : '') + '</div>';
+    d.onclick = function(){ state.sel = c.code + '|' + c.source; renderList(); renderDetail(c); };
+    return d;
+  }
+  function renderList(){
+    var rows = filtered();
+    listEl.innerHTML = '';
+    if (!rows.length) { listEl.innerHTML = '<div class="empty">没有匹配的候选</div>'; }
+    rows.forEach(function(c){ listEl.appendChild(row(c)); });
+    countEl.textContent = '显示 ' + rows.length + ' / ' + cands.length;
+  }
+  function spark(closes){
+    if (!closes || closes.length < 2) return '<div class="mut">（无本地行情序列）</div>';
+    var w = 380, h = 90, pad = 4;
+    var xs = closes.map(function(p){ return p.c; });
+    var min = Math.min.apply(null, xs), max = Math.max.apply(null, xs);
+    var span = (max - min) || 1;
+    var pts = xs.map(function(v,i){
+      var x = pad + i * (w - pad*2) / (xs.length - 1);
+      var y = h - pad - (v - min) / span * (h - pad*2);
+      return x.toFixed(1) + ',' + y.toFixed(1);
+    }).join(' ');
+    var up = xs[xs.length-1] >= xs[0];
+    var color = up ? '#0a7d33' : '#c0392b';
+    return '<svg class="spark" width="' + w + '" height="' + h + '" viewBox="0 0 ' + w + ' ' + h + '">' +
+      '<polyline fill="none" stroke="' + color + '" stroke-width="1.6" points="' + pts + '"/></svg>' +
+      '<div class="mut" style="font-size:11px">' + closes[0].d + ' → ' + closes[closes.length-1].d +
+      '（' + (((xs[xs.length-1]/xs[0])-1)*100).toFixed(1) + '%）</div>';
+  }
+  function kv(k, v){ return '<div class="k">' + k + '</div><div>' + (v === undefined || v === null || v === '' ? '—' : v) + '</div>'; }
+  function renderDetail(c){
+    var m = c.metrics || {};
+    var pick = ['close','window_high','new_high_window','rank','score','reason','industry','run_id','history_source','risk_level'];
+    var mrows = pick.filter(function(k){ return m[k] !== undefined && m[k] !== null; })
+      .map(function(k){ return kv(k, String(m[k]).slice(0,120)); }).join('');
+    var flags = (c.flags||[]).map(function(f){ return '<span class="flag">' + f + '</span>'; }).join('') || '<span class="mut">无</span>';
+    var tracks = (c.tracks||[]).length
+      ? (c.tracks||[]).map(function(t){
+          return '<li>' + t.signal_date + ' · ' + t.source + ' · <b>' + t.status + '</b>' +
+            (t.next_review_at ? ' · 到期 ' + t.next_review_at : '') + '</li>';
+        }).join('')
+      : '<li class="mut">该股暂无跟踪记录（未入池或已被闸门跳过）</li>';
+    detailEl.innerHTML =
+      '<h3>' + c.code + ' ' + (c.name||'') + '</h3>' +
+      '<div class="mut">' + c.source + ' · 批次证据 ' + (c.batch_ready ? '完整（可自动入池）' : '不足（仅供阅读）') + '</div>' +
+      '<div style="margin-top:8px">' + flags + '</div>' +
+      '<div class="kv" style="margin-top:12px">' + kv('入选理由', c.reason) + mrows + '</div>' +
+      '<div style="margin-top:12px"><b style="font-size:13px">近 30 日走势</b>' + spark(c.closes) + '</div>' +
+      '<div style="margin-top:12px"><b style="font-size:13px">关联跟踪</b><ul>' + tracks + '</ul></div>' +
+      '<div class="ev"><div><b>来源引用</b>：' + (c.source_ref || '—') + '</div>' +
+      '<div><b>内容版本</b>：' + (c.source_version || '—') + '</div>' +
+      '<div><b>批次号</b>：' + (c.batch_ref || '—') + '</div>' +
+      '<div><b>收录时点(UTC)</b>：' + (c.observed_at || '—') + '</div>' +
+      '<div><b>质量</b>：' + (c.quality || '—') + '</div>' +
+      '<div><b>限制</b>：' + (c.limitation || '—') + '</div></div>';
+  }
+  document.getElementById('q').addEventListener('input', function(e){
+    state.q = e.target.value; renderList();
+  });
+  renderChips(); renderList();
+  if (cands.length) { state.sel = cands[0].code + '|' + cands[0].source; renderList(); renderDetail(cands[0]); }
+})();
+</script>
+""" + f"""
 
 <h2>三、跟踪样本池</h2>
 <div class="two"><div>{track_table}</div>

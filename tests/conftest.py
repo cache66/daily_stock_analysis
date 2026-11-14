@@ -260,3 +260,12 @@ def _isolate_quote_quality_logs(tmp_path, monkeypatch):
     monkeypatch.setattr(quote_quality, "SUSPICIOUS_CODES_PATH", tmp_path / "suspicious_codes.txt")
     monkeypatch.setattr(quote_quality, "SUSPICIOUS_EVENTS_PATH", tmp_path / "suspicious_events.jsonl")
     yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_signal_regime_cache(tmp_path, monkeypatch):
+    """信号体检缓存默认指向仓库内的真实结果；测试用空缓存，避免真实 verdict 影响准入。"""
+    from src.services import signal_regime
+
+    monkeypatch.setattr(signal_regime, "DEFAULT_OUTPUT", tmp_path / "signal_regime.json")
+    yield

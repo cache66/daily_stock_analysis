@@ -33,7 +33,7 @@ import sys
 import time
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence
 
 import pandas as pd
 
@@ -142,8 +142,15 @@ def patch_from_day_frames(
     cache_root: Path,
     dry_run: bool = False,
     market_tag: str = MARKET_TAG,
+    create_missing: bool = False,
+    only_codes: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
-    """把按日全市场行情补进逐票缓存（仅补缺，幂等）。返回统计字典。"""
+    """把按日全市场行情补进逐票缓存（仅补缺，幂等）。返回统计字典。
+
+    ``create_missing=True`` 时，对没有缓存文件的代码也新建整份缓存（历史区间
+    模式可一次性把漏掉的票补全，无需逐票额外调用）；``only_codes`` 限定只处理
+    指定代码，用于精准补漏。
+    """
     per_code: Dict[str, List[Dict[str, Any]]] = {}
     for day_compact in sorted(frames_by_date):
         frame = frames_by_date[day_compact]
@@ -153,21 +160,64 @@ def patch_from_day_frames(
                 continue
             per_code.setdefault(parsed["code"], []).append(parsed["row"])
 
+    allowed = {str(item).strip() for item in only_codes} if only_codes else None
     stats: Dict[str, Any] = {
         "codes_in_frames": len(per_code),
         "updated_files": 0,
+        "created_files": 0,
         "rows_added": 0,
         "skipped_uptodate": 0,
         "skipped_no_file": 0,
+        "skipped_not_requested": 0,
         "failed": 0,
         "sample_updated": [],
     }
     market_dir = Path(cache_root) / market_tag
     for code, new_rows in sorted(per_code.items()):
+        if allowed is not None and code not in allowed:
+            stats["skipped_not_requested"] += 1
+            continue
         csv_path = market_dir / f"{code}.csv"
         json_path = market_dir / f"{code}.json"
         if not csv_path.exists():
-            stats["skipped_no_file"] += 1
+            if not create_missing:
+                stats["skipped_no_file"] += 1
+                continue
+            if dry_run:
+                stats["created_files"] += 1
+                stats["rows_added"] += len(new_rows)
+                if len(stats["sample_updated"]) < 8:
+                    stats["sample_updated"].append(
+                        {"code": code, "would_create_rows": len(new_rows)}
+                    )
+                continue
+            merged = pd.DataFrame(new_rows)
+            merged["date"] = merged["date"].astype(str)
+            merged = merged.sort_values("date").drop_duplicates(subset=["date"]).reset_index(drop=True)
+            keep = [col for col in COLUMNS if col in merged.columns]
+            market_dir.mkdir(parents=True, exist_ok=True)
+            merged[keep].to_csv(csv_path, index=False, encoding="utf-8")
+            json_path.write_text(
+                json.dumps(
+                    {
+                        "stock_code": code,
+                        "market": market_tag,
+                        "source": "TushareFetcher",
+                        # pro.daily 是**不复权**价：必须标清楚，否则会被当成前复权
+                        # 写进 stock_daily 并进入收益测量（现金分红会被误计为亏损）。
+                        "price_basis": "raw_unadjusted",
+                        "updated_at": time.time(),
+                        "rows": int(len(merged)),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            stats["created_files"] += 1
+            stats["rows_added"] += len(merged)
+            if len(stats["sample_updated"]) < 8:
+                stats["sample_updated"].append({"code": code, "created_rows": len(merged)})
             continue
         try:
             existing = pd.read_csv(csv_path, dtype={"date": str})
@@ -244,6 +294,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--cache-root", default="", help="缓存根目录，默认取配置 history_disk_cache_dir。")
     parser.add_argument("--sleep", type=float, default=1.0, help="每次 API 调用间隔秒数，默认 1.0。")
     parser.add_argument("--dry-run", action="store_true", help="只统计不写盘。")
+    parser.add_argument(
+        "--create-missing",
+        action="store_true",
+        help="对没有缓存文件的代码新建整份缓存（配合历史区间模式使用）。",
+    )
+    parser.add_argument(
+        "--only-codes",
+        default="",
+        help="逗号分隔的代码白名单，只处理这些代码（用于精准补漏）。",
+    )
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return parser.parse_args(argv)
 
@@ -285,12 +345,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     import tushare as ts
 
     pro = ts.pro_api()
+    only_codes = [item.strip() for item in str(args.only_codes or "").split(",") if item.strip()]
     totals: Dict[str, Any] = {
         "codes_in_frames": 0,
         "updated_files": 0,
+        "created_files": 0,
         "rows_added": 0,
         "skipped_uptodate": 0,
         "skipped_no_file": 0,
+        "skipped_not_requested": 0,
         "failed": 0,
         "sample_updated": [],
     }
@@ -298,15 +361,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for index, chunk in enumerate(chunks, start=1):
         frames = build_day_frames(pro, chunk, sleep_seconds=float(args.sleep))
         chunk_stats = patch_from_day_frames(
-            frames, cache_root=cache_root, dry_run=bool(args.dry_run)
+            frames,
+            cache_root=cache_root,
+            dry_run=bool(args.dry_run),
+            create_missing=bool(args.create_missing),
+            only_codes=only_codes or None,
         )
         trading_days.extend(sorted(frames))
         for key in (
             "codes_in_frames",
             "updated_files",
+            "created_files",
             "rows_added",
             "skipped_uptodate",
             "skipped_no_file",
+            "skipped_not_requested",
             "failed",
         ):
             totals[key] += int(chunk_stats.get(key, 0) or 0)
@@ -314,13 +383,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if len(totals["sample_updated"]) < 8:
                 totals["sample_updated"].append(item)
         logger.info(
-            "chunk %s/%s [%s ~ %s]: trading_days=%s updated=%s rows_added=%s",
+            "chunk %s/%s [%s ~ %s]: trading_days=%s updated=%s created=%s rows_added=%s",
             index,
             len(chunks),
             chunk[0],
             chunk[-1],
             len(frames),
             chunk_stats.get("updated_files"),
+            chunk_stats.get("created_files"),
             chunk_stats.get("rows_added"),
         )
     stats = totals

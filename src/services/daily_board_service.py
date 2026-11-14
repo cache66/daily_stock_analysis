@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from src.services.personal_strategy_matrix_service import PROJECT_ROOT
+from src.services.market_instruments import is_tradable_stock
 from src.services.quote_quality import load_suspicious_codes as _shared_load_suspicious_codes
 
 DEFAULT_OUTPUT_PATH = PROJECT_ROOT / "data" / "strategy_review" / "today_board.md"
@@ -559,6 +560,18 @@ def _candidate_evidence(
     if not ready:
         limits.append("未匹配该快照的完整成功批次，仅供阅读，不自动入池")
     batch_ref = status.batch_ref if status else ""
+    # 公开可得时间：筛选批次有审计生成时间，能证明“该时点已落库可读”；
+    # 矩阵信号没有同等证据，继续留空（不拿 15:00 之类固定值充数）。
+    available_at = None
+    if ready and source.startswith("screening__"):
+        audit_time = str(audit.get("generated_at") or "").strip()
+        if audit_time:
+            try:
+                available_at = datetime.fromisoformat(audit_time).replace(tzinfo=LOCAL_TZ).astimezone(timezone.utc).replace(tzinfo=None)
+            except ValueError:
+                available_at = None
+    if available_at is not None:
+        limits = [item for item in limits if "available_at 为空" not in item]
     content = {
         "source": source, "date": board_date, "code": str(row.code), "name": str(row.name or ""), "batch_ref": batch_ref,
         "metrics": metrics, "criteria": _parse_json(getattr(row, "criteria_payload", None)),
@@ -568,7 +581,7 @@ def _candidate_evidence(
     native_id = metrics.get("run_id") or getattr(row, "id", None) or source
     return {
         "source_ref": f"kline_signal_snapshot:{native_id}:{row.code}:{version}",
-        "source_version": version, "batch_ref": batch_ref, "available_at": None,
+        "source_version": version, "batch_ref": batch_ref, "available_at": available_at,
         "source_snapshot": content,
         "observed_at": (
             local_stamp.replace(tzinfo=LOCAL_TZ).astimezone(timezone.utc).replace(tzinfo=None)
@@ -661,6 +674,8 @@ def build_board(
                 flags.append("无本地行情")
             elif last_date < board_date:
                 flags.append(f"行情截至{last_date}")
+        else:
+            flags.append("行情状态未知")
         if source.startswith("screening__"):
             strategy = source.split("__", 1)[1]
             audit = audit_by_strategy.get(strategy, {})
@@ -723,6 +738,7 @@ def select_track_candidates(candidates: Sequence[Candidate], limit: int = 30) ->
         cand
         for cand in candidates
         if cand.batch_ready and "无本地行情" not in cand.flags and "行情异常" not in cand.flags
+        and is_tradable_stock(cand.code)
     ]
     usable.sort(key=lambda c: ("多来源命中" not in c.flags, c.source, c.code))
     return usable[: max(0, int(limit))]

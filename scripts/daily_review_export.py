@@ -2,12 +2,14 @@
 # -*- coding: utf-8 -*-
 """每日复盘导出：最近 N 天的选股结果 + 已兑现前向收益（1/3/5 日）。
 
-口径与 `scripts/evaluate_signal_snapshot_performance.py` 对齐：
-- 入场价（默认 `--entry-mode daily`，DB 优先）= `stock_daily` 中日期 <= signal_date 的最近一根收盘
-  （评估器 `--entry-mode daily` 同款；不回落快照价，避免过期尺度/高送转假亏损）
-- `--entry-mode snapshot`（兼容旧口径）= 快照 `metrics_payload.close` 优先 → 精确 bar → 最近 <= signal_date 的 bar
-- 出场价 = 信号日期后第 k 个交易日收盘（stock_daily 可用 bar）
+口径与 `src/services/track_outcome_service.py` 的 v2 前向口径对齐：
+- 入场价（默认 `--entry-mode next_open`）= **信号日之后第一根 K 线的开盘价**
+  （信号盘后才可得，当日收盘买不到；与 `evaluate_track_outcomes.py` 同口径）
+- 出场价 = 入场日之后第 k 个交易日收盘；缺某天留空，不平移到下一根
 - 收益率 = (出场 - 入场) / 入场 * 100，保留 2 位
+- `--entry-mode daily`（旧口径）= `stock_daily` 中日期 <= signal_date 的最近一根收盘
+- `--entry-mode snapshot`（最旧口径）= 快照 `metrics_payload.close` 优先 → 精确 bar → 最近 <= signal_date 的 bar
+- 最高/最低回撤区间：next_open 取入场日到 T+5（含入场日）；旧口径取信号日之后 5 根
 - 输赢口径：|ret| <= 2%（中性带）记 neutral，其余 win/loss
 - 成本口径：默认滑点 10bps/边 + 费用 3bps/边 + 换手 5bps/次（一次买卖 ≈31bps），输出 ret{k}_net 列（可用 --slippage-bps 等覆盖）
 
@@ -83,16 +85,16 @@ def _metrics_close(metrics_payload) -> float | None:
 
 
 def _latest_close_on_or_before(seq: list, sd: str) -> float | None:
-    """stock_daily 中日期 <= sd 的最近一根收盘（评估器 get_start_daily 同款语义）。"""
-    candidates = [b for b in seq if b[0] <= sd and b[1]]
+    """stock_daily 中日期 <= sd 的最近一根收盘（`--entry-mode daily` 口径）。"""
+    candidates = [b for b in seq if b[0] <= sd and b[2]]
     if not candidates:
         return None
-    value = float(candidates[-1][1])
+    value = float(candidates[-1][2])
     return value if value > 0 else None
 
 
 def _resolve_entry(metrics_payload, seq: list, sd: str, *, entry_mode: str) -> float | None:
-    """入场价口径：daily=只用 stock_daily（DB 优先，评估器同款）；snapshot=快照价优先（旧口径）。"""
+    """非 next_open 口径的入场价（next_open 直接用入场日开盘，不走这里）。"""
     if entry_mode == "snapshot":
         entry = _metrics_close(metrics_payload)
         if entry is None:
@@ -134,9 +136,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--signals", default="", help="逗号分隔信号类型过滤；默认全部")
     parser.add_argument(
         "--entry-mode",
-        choices=["daily", "snapshot"],
-        default="daily",
-        help="入场价口径：daily=DB 优先（默认，评估器同款）；snapshot=快照价优先（旧口径）",
+        choices=["next_open", "daily", "snapshot"],
+        default="next_open",
+        help=(
+            "入场价口径：next_open=次一交易日开盘（默认，与 evaluate_track_outcomes 的 v2 口径一致）；"
+            "daily=信号日及之前最近收盘（旧口径）；snapshot=快照价优先（最旧口径）"
+        ),
     )
     parser.add_argument("--output", default=str(DEFAULT_OUT), help="输出 CSV 路径")
     parser.add_argument("--quiet", action="store_true", help="只写文件，不打印摘要")
@@ -182,18 +187,42 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         con.close()
         return 1
 
+    # 可疑行情（跳变待复核）不参与收益统计；同口径的总览/回填已经排除，这里补齐导出链路
+    try:
+        from src.services.quote_quality import load_suspicious_codes
+
+        suspicious = load_suspicious_codes()
+    except Exception:  # noqa: BLE001 - 清单不可读时按“没有待核代码”处理，不阻断导出
+        suspicious = set()
+    if suspicious:
+        before = len(snapshots)
+        snapshots = [row for row in snapshots if str(row[2])[:6] not in suspicious]
+        dropped = before - len(snapshots)
+        if dropped:
+            print(f"[daily-review] 已剔除 {dropped} 条可疑行情样本（待复核清单 {len(suspicious)} 只）")
+
     codes = sorted({row[2] for row in snapshots})
     qmarks = ",".join("?" * len(codes))
     # 入场价回退需要信号日之前的 bar（评估器用“最近一条 <= signal_date”），比回看窗口多取 90 天。
     bars_start = (date.fromisoformat(window_start) - timedelta(days=90)).isoformat()
-    cur.execute(
-        f"SELECT code, date, close, high, low FROM stock_daily "
-        f"WHERE code IN ({qmarks}) AND date >= ? ORDER BY code, date",
-        codes + [bars_start],
-    )
+    try:
+        cur.execute(
+            f"SELECT code, date, open, close, high, low FROM stock_daily "
+            f"WHERE code IN ({qmarks}) AND date >= ? ORDER BY code, date",
+            codes + [bars_start],
+        )
+        raw_bars = cur.fetchall()
+    except sqlite3.OperationalError:
+        # 老库没有 open 列：退化为 open=close，next_open 口径会等于当根收盘
+        cur.execute(
+            f"SELECT code, date, close, close, high, low FROM stock_daily "
+            f"WHERE code IN ({qmarks}) AND date >= ? ORDER BY code, date",
+            codes + [bars_start],
+        )
+        raw_bars = cur.fetchall()
     bars: dict[str, list] = defaultdict(list)
-    for code, d, close, high, low in cur.fetchall():
-        bars[code].append((str(d), close, high, low))
+    for code, d, open_p, close, high, low in raw_bars:
+        bars[code].append((str(d), open_p, close, high, low))
     con.close()
 
     rows = []
@@ -208,16 +237,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "cost_bps": round(total_trade_cost_bps, 2),
             "selection_mode": _metrics_selection_mode(metrics_payload),
         }
-        entry = _resolve_entry(metrics_payload, seq, sd, entry_mode=str(args.entry_mode))
         fwd = [b for b in seq if b[0] > sd]
+        mode = str(args.entry_mode)
+        if mode == "next_open":
+            # 入场 = 信号日之后第一根 K 线的开盘价；T+k 取入场日之后第 k 根收盘
+            entry = float(fwd[0][1]) if fwd and fwd[0][1] else None
+            checkpoints = fwd  # fwd[k] 才是 T+k（fwd[0] 是入场日）
+            checkpoint_offset = 0
+            range_bars = fwd[: WINDOWS[-1] + 1]
+        else:
+            entry = _resolve_entry(metrics_payload, seq, sd, entry_mode=mode)
+            checkpoints = fwd
+            checkpoint_offset = -1
+            range_bars = fwd[: WINDOWS[-1]]
         if not entry:
             record.update({k: "" for k in FIELDS if k not in record})
             rows.append(record)
             continue
         record["entry_close"] = round(entry, 3)
         for k in WINDOWS:
-            if len(fwd) >= k and entry:
-                ret = round((float(fwd[k - 1][1]) - entry) / entry * 100.0, 2)
+            idx = k + checkpoint_offset
+            if 0 <= idx < len(checkpoints):
+                ret = round((float(checkpoints[idx][2]) - entry) / entry * 100.0, 2)
                 record[f"ret{k}"] = ret
                 record[f"ret{k}_net"] = round(ret - total_trade_cost_bps / 100.0, 2)
                 record[f"win{k}"] = classify(ret)
@@ -225,10 +266,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 record[f"ret{k}"] = ""
                 record[f"ret{k}_net"] = ""
                 record[f"win{k}"] = ""
-        n5 = min(5, len(fwd))
-        if n5 and entry:
-            hi = max(float(b[2]) for b in fwd[:n5])
-            lo = min(float(b[3]) for b in fwd[:n5])
+        if range_bars and entry:
+            hi = max(float(b[3]) for b in range_bars)
+            lo = min(float(b[4]) for b in range_bars)
             record["runup5_pct"] = round((hi - entry) / entry * 100.0, 2)
             record["drawdown5_pct"] = round((lo - entry) / entry * 100.0, 2)
         else:
@@ -252,7 +292,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"[daily-review] 成本口径: 一次买卖 {round(total_trade_cost_bps, 2)} bps（净列 = 成本后）")
     print(
         "[daily-review] 入场口径: "
-        + ("daily（DB 优先，评估器同款）" if str(args.entry_mode) == "daily" else "snapshot（快照价优先，旧口径）")
+        + {
+            "next_open": "next_open（次一交易日开盘，默认，与评估器 v2 同口径）",
+            "daily": "daily（DB 信号日及之前最近收盘，旧口径）",
+            "snapshot": "snapshot（快照价优先，最旧口径）",
+        }[str(args.entry_mode)]
     )
     if used_profile:
         print(f"[daily-review] 信号来源: profile include_signals -> {', '.join(signals)}")

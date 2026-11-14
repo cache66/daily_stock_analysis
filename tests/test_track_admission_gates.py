@@ -17,6 +17,7 @@ from scripts import track_from_board as importer
 from src.config import Config
 from src.repositories import research_tracking_repo as repo_module
 from src.services.daily_board_service import Candidate
+from src.services import signal_regime
 from src.services.research_tracking_service import ResearchTrackingService
 from src.storage import DatabaseManager
 
@@ -28,6 +29,10 @@ def workspace(tmp_path, monkeypatch):
     DatabaseManager.reset_instance()
     db = DatabaseManager.get_instance()
     service = ResearchTrackingService()
+    signal_regime.DEFAULT_OUTPUT.write_text(json.dumps({
+        "as_of": "2026-11-06", "schema_version": signal_regime.CACHE_SCHEMA_VERSION,
+        "families": {family: {"verdict": "caution"} for family in signal_regime.TRACKED_FAMILIES},
+    }), encoding="utf-8")
     try:
         yield db, service
     finally:

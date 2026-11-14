@@ -12,6 +12,7 @@ API v1 路由聚合
 from fastapi import APIRouter
 
 from api.v1.endpoints import (
+    workbench,
     agent,
     alerts,
     screening,
@@ -117,6 +118,12 @@ router.include_router(
     screening.router,
     prefix="/screening",
     tags=["Screening"]
+)
+
+router.include_router(
+    workbench.router,
+    prefix="/workbench",
+    tags=["Workbench"]
 )
 
 router.include_router(

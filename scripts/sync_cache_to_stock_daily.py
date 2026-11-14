@@ -11,7 +11,11 @@
 本脚本只做“缓存 -> 数据库”的搬运，不抓网络、不重算选股：
 - 增量：只写缓存里比库内更新的日期；
 - 口径校验：先比对库内最后一个交易日与缓存的收盘价，差异超阈值则跳过该票并报告
-  （防止把不复权/错复权数据写进前复权库）；
+  （防止把不复权/错复权数据写进前复权库）；缓存侧没有 ``price_basis`` 标记或标记
+  不是 qfq 时默认拒绝（``skipped_price_basis``），用 ``--allow-unknown-basis`` 才放行；
+- 历史遗留：早先由本脚本写入的 ``source='disk_cache_sync'`` 行（约 10.5 万行）保留，
+  2026-11-10 抽样核对跨接缝偏差中位 0.000%、无一只超 0.5%，与 qfq 口径一致；如需重
+  建走 ``scripts/rebuild_stock_daily_qfq.py``；
 - 幂等：重复运行不产生重复行（依赖 ``save_daily_data`` 的 (code,date) UPSERT）。
 
 用法：
@@ -23,6 +27,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from datetime import date
@@ -35,6 +40,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import pandas as pd
 
+from src.services.market_instruments import is_tradable_stock
 from src.storage import DatabaseManager
 
 logger = logging.getLogger("sync_cache_to_stock_daily")
@@ -43,7 +49,21 @@ DEFAULT_CACHE_DIR = PROJECT_ROOT / "data" / "cache" / "history" / "cn"
 SOURCE_LABEL = "disk_cache_sync"
 # 与库内重叠日收盘差异上限（%）：超过视为口径不一致，宁可不写
 PRICE_MISMATCH_TOLERANCE_PCT = 0.5
+# 少于这么多行的缓存视为测试残留，不写库
+MIN_CACHE_ROWS = 20
+# 唯一允许写库的价格口径；其他（如 raw_unadjusted）一律跳过
+ADJUSTED_PRICE_BASIS = "qfq"
 REQUIRED_COLUMNS = ("date", "open", "high", "low", "close", "volume", "amount")
+
+
+def _read_price_basis(csv_path: Path) -> str:
+    """读取同名 .json 元数据里的价格口径；没有该字段时返回空串（历史缓存）。"""
+    meta_path = csv_path.with_suffix(".json")
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    return str(meta.get("price_basis") or "")
 
 
 def _read_cache_frame(path: Path) -> Optional[pd.DataFrame]:
@@ -147,6 +167,7 @@ def run_sync(
     dry_run: bool = False,
     full: bool = False,
     verbose: bool = False,
+    allow_unknown_basis: bool = False,
 ) -> Dict[str, Any]:
     paths = sorted(Path(cache_dir).glob("*.csv"))
     if codes:
@@ -162,11 +183,26 @@ def run_sync(
     stats: Dict[str, Any] = {
         "files": len(paths), "updated": 0, "rows": 0,
         "up_to_date": 0, "mismatch": 0, "failed": 0,
+        "skipped_non_stock": 0, "skipped_thin": 0, "skipped_price_basis": 0,
     }
     for index, path in enumerate(paths, start=1):
+        if not is_tradable_stock(path.stem):
+            # 指数/基金序列不进股票表（000300/399001/ETF 等）
+            stats["skipped_non_stock"] += 1
+            continue
+        basis = _read_price_basis(path)
+        if basis != ADJUSTED_PRICE_BASIS and not allow_unknown_basis:
+            # 共享缓存实际是不复权价（pro.daily/行情接口），只有显式声明 qfq 才可信；
+            # 未知口径默认不写，避免把不复权价混进声称前复权的 stock_daily。
+            stats["skipped_price_basis"] += 1
+            continue
         frame = _read_cache_frame(path)
         if frame is None:
             stats["failed"] += 1
+            continue
+        if len(frame) < MIN_CACHE_ROWS:
+            # 只有几行的缓存是测试残留，写进去只会污染
+            stats["skipped_thin"] += 1
             continue
         try:
             outcome = sync_one(
@@ -195,6 +231,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--codes", default="", help="逗号分隔代码（默认=全部缓存文件）")
     parser.add_argument("--limit", type=int, default=0, help="只处理前 N 只（冒烟用）")
     parser.add_argument("--full", action="store_true", help="整段覆盖写（默认只写比库内更新的日期）")
+    parser.add_argument("--allow-unknown-basis", action="store_true",
+                        help="允许价格口径未知的缓存写库（默认拒绝）")
     parser.add_argument("--dry-run", action="store_true", help="只统计不写库")
     parser.add_argument("--verbose", action="store_true", help="逐票打印")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
@@ -218,11 +256,17 @@ def main() -> int:
         dry_run=bool(args.dry_run),
         full=bool(args.full),
         verbose=bool(args.verbose),
+        allow_unknown_basis=bool(args.allow_unknown_basis),
     )
     print(
         "[sync] 完成: files={files} updated={updated} rows={rows} "
-        "up_to_date={up_to_date} mismatch={mismatch} failed={failed}".format(**stats)
+        "up_to_date={up_to_date} mismatch={mismatch} failed={failed} "
+        "skipped_non_stock={skipped_non_stock} skipped_thin={skipped_thin} "
+        "skipped_price_basis={skipped_price_basis}".format(**stats)
     )
+    if stats.get("skipped_price_basis"):
+        print("[sync] 提示：共享缓存是不复权价，已按口径拒绝写库；"
+              "要补 stock_daily 请用 rebuild_stock_daily_qfq.py（--source akshare）")
     # 口径不一致必须人工看；失败率高同样非零退出
     if stats["mismatch"]:
         print(f"[sync] 警告: {stats['mismatch']} 只票口径与库内不一致，已跳过（见日志）")

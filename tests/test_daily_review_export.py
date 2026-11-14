@@ -20,7 +20,9 @@ def _make_db(tmp_path: Path) -> Path:
         "CREATE TABLE kline_signal_snapshot "
         "(signal_type TEXT, signal_date TEXT, code TEXT, name TEXT, metrics_payload TEXT)"
     )
-    con.execute("CREATE TABLE stock_daily (code TEXT, date TEXT, close REAL, high REAL, low REAL)")
+    con.execute(
+        "CREATE TABLE stock_daily (code TEXT, date TEXT, open REAL, close REAL, high REAL, low REAL)"
+    )
     con.executemany(
         "INSERT INTO kline_signal_snapshot VALUES (?,?,?,?,?)",
         [
@@ -30,19 +32,20 @@ def _make_db(tmp_path: Path) -> Path:
         ],
     )
     con.executemany(
-        "INSERT INTO stock_daily VALUES (?,?,?,?,?)",
+        "INSERT INTO stock_daily VALUES (?,?,?,?,?,?)",
         [
-            ("600001", "2026-09-19", 10.0, 10.2, 9.8),
-            ("600001", "2026-09-20", 10.5, 10.8, 10.2),
-            ("600001", "2026-09-21", 11.0, 11.5, 10.9),
-            ("600001", "2026-09-22", 12.0, 12.2, 11.6),
-            ("600001", "2026-09-23", 13.0, 13.5, 12.8),
-            ("600001", "2026-09-24", 14.0, 14.2, 13.9),
-            ("600002", "2026-09-18", 5.0, 5.1, 4.9),
-            ("600002", "2026-09-21", 6.0, 6.2, 5.9),
-            ("600002", "2026-09-22", 6.6, 6.7, 6.5),
-            ("600002", "2026-09-23", 7.2, 7.3, 7.1),
-            ("600002", "2026-09-24", 8.0, 8.1, 7.9),
+            ("600001", "2026-09-19", 10.0, 10.0, 10.2, 9.8),
+            ("600001", "2026-09-20", 10.4, 10.5, 10.8, 10.2),
+            # 信号 09-20 的次日开盘 = 10.0（next_open 口径的入场价）
+            ("600001", "2026-09-21", 10.0, 11.0, 11.5, 9.9),
+            ("600001", "2026-09-22", 11.0, 12.0, 12.2, 11.6),
+            ("600001", "2026-09-23", 12.0, 13.0, 13.5, 12.8),
+            ("600001", "2026-09-24", 13.0, 14.0, 14.2, 13.9),
+            ("600002", "2026-09-18", 5.0, 5.0, 5.1, 4.9),
+            ("600002", "2026-09-21", 5.9, 6.0, 6.2, 5.9),
+            ("600002", "2026-09-22", 6.0, 6.6, 6.7, 6.5),
+            ("600002", "2026-09-23", 6.6, 7.2, 7.3, 7.1),
+            ("600002", "2026-09-24", 7.2, 8.0, 8.1, 7.9),
         ],
     )
     con.commit()
@@ -64,7 +67,7 @@ def _run_main(db_path: Path, out_path: Path, *extra: str) -> int:
 def test_daily_mode_prefers_stock_daily(tmp_path):
     db_path = _make_db(tmp_path)
     out_path = tmp_path / "review.csv"
-    assert _run_main(db_path, out_path, "--quiet") == 0
+    assert _run_main(db_path, out_path, "--quiet", "--entry-mode", "daily") == 0
     rows = _read_rows(out_path)
     # 600001：忽略快照的 999.0，取 signal_date 当日 DB 收盘
     assert float(rows["600001"]["entry_close"]) == 10.5
@@ -82,6 +85,24 @@ def test_daily_mode_prefers_stock_daily(tmp_path):
     assert rows["600003"]["ret1"] == ""
 
 
+def test_default_mode_enters_at_next_open(tmp_path):
+    db_path = _make_db(tmp_path)
+    out_path = tmp_path / "review_next_open.csv"
+    assert _run_main(db_path, out_path, "--quiet") == 0
+    rows = _read_rows(out_path)
+    # 600001：信号 09-20，入场=09-21 开盘 10.0；T+1=09-22 收盘 12.0
+    assert float(rows["600001"]["entry_close"]) == 10.0
+    assert float(rows["600001"]["ret1"]) == 20.0
+    assert float(rows["600001"]["ret3"]) == 40.0
+    assert rows["600001"]["ret5"] == ""
+    # 600002：信号 09-20，入场=09-21 开盘 5.9；T+1=09-22 收盘 6.6
+    assert float(rows["600002"]["entry_close"]) == 5.9
+    assert float(rows["600002"]["ret1"]) == 11.86
+    assert float(rows["600002"]["ret3"]) == 35.59
+    # 600003：没有任何 bar → 入场留空
+    assert rows["600003"]["entry_close"] == ""
+
+
 def test_snapshot_mode_keeps_legacy_priority(tmp_path):
     db_path = _make_db(tmp_path)
     out_path = tmp_path / "review_snapshot.csv"
@@ -97,12 +118,12 @@ def test_summary_prints_entry_mode(tmp_path, capsys):
     out_path = tmp_path / "review2.csv"
     assert _run_main(db_path, out_path) == 0
     out = capsys.readouterr().out
-    assert "入场口径: daily" in out
+    assert "入场口径: next_open" in out
 
 
 def test_latest_close_on_or_before_helper():
     assert daily_review_export._latest_close_on_or_before([], "2026-09-20") is None
-    seq = [("2026-09-18", 5.0, 1, 1), ("2026-09-21", 6.0, 1, 1)]
+    seq = [("2026-09-18", 5.0, 5.0, 1, 1), ("2026-09-21", 6.0, 6.0, 1, 1)]
     assert daily_review_export._latest_close_on_or_before(seq, "2026-09-20") == 5.0
     assert daily_review_export._latest_close_on_or_before(seq, "2026-09-21") == 6.0
     assert daily_review_export._latest_close_on_or_before(seq, "2026-09-17") is None

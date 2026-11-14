@@ -138,7 +138,7 @@ def test_normal_disk_cache_is_not_flagged() -> None:
     rows = [_row("hundred_day_high", "000635", "英力特",
                  {"close": 9.5, "window_high": 9.58,
                   "history_source": "disk_cache:TushareFetcher"})]
-    board = _build(rows)
+    board = _build(rows, last_dates={"000635": "2026-11-06"})
     assert board.candidates[0].flags == ()
 
 

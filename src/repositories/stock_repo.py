@@ -160,6 +160,26 @@ class StockRepository:
             ).scalar_one_or_none()
             return row
 
+    def get_first_daily_of_year(
+        self, *, code: str, year: int, end_date: Optional[date] = None
+    ) -> Optional[StockDaily]:
+        """Return the first local bar of ``year`` for ``code`` (not later than end_date).
+
+        用于 YTD 起点：只在本地库里找该年第一根真实行情，不退回网络历史，
+        也不假设 1 月 1 日一定开市（2026-01-01/02 均休市，首个交易日是 01-05）。
+        """
+        start = date(int(year), 1, 1)
+        with self.db.get_session() as session:
+            stmt = select(StockDaily).where(
+                and_(StockDaily.code == code, StockDaily.date >= start)
+            )
+            if end_date is not None:
+                stmt = stmt.where(StockDaily.date <= end_date)
+            row = session.execute(
+                stmt.order_by(StockDaily.date).limit(1)
+            ).scalar_one_or_none()
+            return row
+
     def get_forward_bars(self, *, code: str, analysis_date: date, eval_window_days: int) -> List[StockDaily]:
         """Return forward daily bars after analysis_date, up to eval_window_days."""
         with self.db.get_session() as session:

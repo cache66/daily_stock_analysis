@@ -24,23 +24,39 @@ from src.storage import DatabaseManager
 
 
 def test_compute_forward_outcome_complete() -> None:
-    bars = [("2026-11-06", 10.0), ("2026-11-09", 10.2), ("2026-11-10", 9.9),
-            ("2026-11-11", 10.5), ("2026-11-12", 10.4), ("2026-11-13", 11.0)]
+    # 次日开盘入场：entry = 11-09 开盘 10.0（信号日 11-06 只用来定位日历）
+    # T+N = 入场日之后第 N 个交易日：11-10 / 11-12 / 11-16
+    bars = [
+        ("2026-11-06", 10.0, 10.0),
+        ("2026-11-09", 10.0, 10.2),
+        ("2026-11-10", 10.2, 9.9),
+        ("2026-11-11", 9.9, 10.5),
+        ("2026-11-12", 10.5, 10.4),
+        ("2026-11-13", 10.4, 11.0),
+        ("2026-11-16", 11.0, 11.5),
+    ]
     outcome = compute_forward_outcome(bars)
 
     assert outcome is not None and outcome.complete
-    assert outcome.entry_date == "2026-11-06"
-    assert round(outcome.ret1, 6) == 0.02
-    assert round(outcome.ret5, 6) == 0.1
-    assert outcome.available_days == 5
+    assert outcome.entry_date == "2026-11-09"
+    assert round(outcome.ret1, 6) == -0.01     # 9.9 / 10.0 - 1
+    assert round(outcome.ret3, 6) == 0.04      # 10.4 / 10.0 - 1
+    assert round(outcome.ret5, 6) == 0.15      # 11.5 / 10.0 - 1
+    assert outcome.available_days == 6
 
 
 def test_compute_forward_outcome_partial_and_insufficient() -> None:
-    partial = compute_forward_outcome([("2026-11-06", 10.0), ("2026-11-09", 10.5)])
+    partial = compute_forward_outcome([
+        ("2026-11-06", 10.0, 10.0),
+        ("2026-11-09", 10.0, 10.5),
+    ])
     assert partial is not None and not partial.complete
-    assert partial.ret1 is not None and partial.ret3 is None
+    # 入场日之后还没有任何检查点，三个窗口都留空而不是 0
+    assert partial.ret1 is None and partial.ret3 is None and partial.ret5 is None
+    assert partial.entry_date == "2026-11-09"
+    assert partial.last_date == "2026-11-09"
 
-    assert compute_forward_outcome([("2026-11-06", 10.0)]) is None
+    assert compute_forward_outcome([("2026-11-06", 10.0, 10.0)]) is None
     assert compute_forward_outcome([]) is None
 
 
@@ -81,10 +97,12 @@ def _make_track(service, key: str = "signal:hundred_day_high:2026-11-06"):
 
 def test_evaluate_closes_track_and_is_idempotent(service) -> None:
     _make_track(service)
+    # 次日开盘入场后还需要 5 个检查点：11-10 / 11-12 / 11-16
     bars = [("2026-11-06", 10.0), ("2026-11-09", 10.2), ("2026-11-10", 9.9),
-            ("2026-11-11", 10.5), ("2026-11-12", 10.4), ("2026-11-13", 11.0)]
+            ("2026-11-11", 10.5), ("2026-11-12", 10.4), ("2026-11-13", 11.0),
+            ("2026-11-16", 11.2)]
 
-    first = evaluate_track_outcomes(as_of=date(2026, 11, 13), bars_loader=lambda *a, **k: bars)
+    first = evaluate_track_outcomes(as_of=date(2026, 11, 16), bars_loader=lambda *a, **k: bars)
     assert first["written"] == 1 and first["closed"] == 1
 
     track = service.repo.list_tracks(limit=5)[0]
@@ -92,7 +110,7 @@ def test_evaluate_closes_track_and_is_idempotent(service) -> None:
     events = [event.event_type for event in service.repo.list_events(track.id)]
     assert events == ["created", "tracking", "evidence", "closed"]
 
-    second = evaluate_track_outcomes(as_of=date(2026, 11, 13), bars_loader=lambda *a, **k: bars)
+    second = evaluate_track_outcomes(as_of=date(2026, 11, 16), bars_loader=lambda *a, **k: bars)
     assert second["written"] == 0 and second["closed"] == 0
 
 

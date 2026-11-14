@@ -13,13 +13,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import sys
 from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, List, Optional, Sequence, Tuple
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -33,141 +33,13 @@ from src.services.daily_board_service import (  # noqa: E402
 from src.services.research_tracking_service import ResearchTrackingService  # noqa: E402
 from src.storage import utc_naive_now  # noqa: E402
 
-DEFAULT_LIMIT = 30
-REVIEW_AFTER_DAYS = 3
-RULE_TAG = "a2a_completed_batch_v1"
-# 环境不适配时不收的趋势类来源；名单沿用 config/daily_plan_tuning.json 的
-# defensive_demote_single（与作战计划同一份配置，避免两处维护两份口径）。
-DEFAULT_DEMOTE_ON_DEFENSIVE: Tuple[str, ...] = ("hundred_day_high",)
-DEFENSIVE_REGIMES = frozenset({"defensive", "risk_off"})
-# 同一只票在同一来源上多少交易日内只允许一条样本（避免反复计样本）
-COOLDOWN_TRADING_DAYS = 10
-# 距该批次首个信号涨幅超过此值视为过热，不再入池（实测：同一票连触 7 次时，后 3 次 T+5 为 −13%~−17%）
-OVERHEAT_RETURN_PCT = 30.0
-TUNING_PATH = PROJECT_ROOT / "config" / "daily_plan_tuning.json"
+from src.services.track_admission_service import (  # noqa: E402,F401
+    DEFAULT_LIMIT, REVIEW_AFTER_DAYS, RULE_TAG, TUNING_PATH,
+    _read_regime, blocked_families, gate_candidates,
+)
+from src.services.research_sample import FORWARD_ADMISSION_RULE  # noqa: E402
 
 logger = logging.getLogger("track_from_board")
-
-
-def _read_regime() -> str:
-    """运行配置里的市场环境（与总览同源）。"""
-    profile = PROJECT_ROOT / "config" / "local_strategy_profile.json"
-    try:
-        data = json.loads(profile.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return "unknown"
-    return str(data.get("market_regime") or "unknown")
-
-
-def blocked_families(regime: str, tuning_path: Optional[Path] = None) -> Tuple[str, ...]:
-    """该环境不适合自动跟踪的来源；非防守环境返回空。"""
-    if str(regime) not in DEFENSIVE_REGIMES:
-        return ()
-    path = Path(tuning_path) if tuning_path else TUNING_PATH
-    try:
-        tuning = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return DEFAULT_DEMOTE_ON_DEFENSIVE
-    families = tuning.get("defensive_demote_single")
-    if not isinstance(families, list) or not families:
-        return DEFAULT_DEMOTE_ON_DEFENSIVE
-    return tuple(str(item) for item in families if str(item).strip())
-
-
-def _signal_date_of(track: Any, family: str) -> Optional[date]:
-    """从 hypothesis_key (signal:<family>:<YYYY-MM-DD>) 取出信号日。"""
-    key = str(getattr(track, "hypothesis_key", "") or "")
-    prefix = f"signal:{family}:"
-    if not key.startswith(prefix):
-        return None
-    try:
-        return date.fromisoformat(key[len(prefix):][:10])
-    except ValueError:
-        return None
-
-
-def _recent_family_tracks(service: ResearchTrackingService, code: str, family: str) -> List[Tuple[Any, date]]:
-    """该票在同一来源上已有的样本（含信号日）。"""
-    out: List[Tuple[Any, date]] = []
-    for track in service.repo.list_tracks(code=code, limit=50):
-        day = _signal_date_of(track, family)
-        if day is not None:
-            out.append((track, day))
-    return out
-
-
-def _trading_days_between(start: date, end: date) -> Optional[int]:
-    """两个日期之间的交易日数（end 不计入）；日历不可用时返回 None。"""
-    if end <= start:
-        return 0
-    try:
-        sessions = get_trading_sessions("cn", start, end)
-    except (ValueError, RuntimeError, ImportError):
-        return None
-    return max(0, len(sessions) - 1)
-
-
-def _return_since(code: str, start: str, end: str) -> Optional[float]:
-    """从 start 收盘到 end 收盘的涨幅；任一端缺价返回 None（不推测）。"""
-    from sqlalchemy import text
-
-    from src.storage import DatabaseManager
-
-    try:
-        with DatabaseManager.get_instance().session_scope() as session:
-            rows = session.execute(
-                text(
-                    "SELECT date, close FROM stock_daily "
-                    "WHERE code=:code AND date IN (:a, :b)"
-                ),
-                {"code": code, "a": start, "b": end},
-            ).fetchall()
-    except Exception:  # noqa: BLE001 - 取价失败只影响过热判断，不应阻断入池
-        return None
-    prices = {str(row[0])[:10]: float(row[1]) for row in rows if row[1]}
-    if start not in prices or end not in prices or prices[start] <= 0:
-        return None
-    return (prices[end] / prices[start] - 1.0) * 100.0
-
-
-def gate_candidates(
-    service: ResearchTrackingService,
-    candidates: Sequence[Any],
-    board_date: str,
-    *,
-    regime: str,
-    cooldown_days: int = COOLDOWN_TRADING_DAYS,
-    overheat_pct: float = OVERHEAT_RETURN_PCT,
-    tuning_path: Optional[Path] = None,
-) -> Tuple[List[Any], Counter]:
-    """在写库前做环境/冷却/过热三道闸门；返回（可入池, 跳过统计）。"""
-    blocked = blocked_families(regime, tuning_path)
-    kept: List[Any] = []
-    skipped: Counter = Counter()
-    for cand in candidates:
-        family = str(getattr(cand, "source", "") or "")
-        if family in blocked:
-            skipped[f"环境不适配({regime})"] += 1
-            continue
-        history = _recent_family_tracks(service, str(cand.code), family)
-        if history:
-            earliest = min(day for _, day in history)
-            days = _trading_days_between(earliest, date.fromisoformat(board_date))
-            change = _return_since(str(cand.code), earliest.isoformat(), board_date)
-            if change is not None and change > overheat_pct:
-                skipped["过热"] += 1
-                logger.info(
-                    "跳过 %s %s：距首次信号 %s 已涨 %.1f%%",
-                    cand.code, family, earliest.isoformat(), change,
-                )
-                continue
-            if days is not None and days <= int(cooldown_days):
-                skipped["冷却期"] += 1
-                logger.info("跳过 %s %s：%s 已有样本（间隔 %s 个交易日）", cand.code, family, earliest.isoformat(), days)
-                continue
-        kept.append(cand)
-    return kept, skipped
-
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="按当日总览批量建立研究跟踪记录")
@@ -192,21 +64,41 @@ def main() -> int:
     except ValueError:
         raise SystemExit(f"日期格式错误：{board_date}")
 
+    sessions = get_trading_sessions("cn", base, base + timedelta(days=30))
+    if base not in sessions or len(sessions) <= REVIEW_AFTER_DAYS:
+        raise SystemExit("信号日不是开市日或复核日历不可用")
+    review_at = datetime.combine(sessions[REVIEW_AFTER_DAYS], datetime.min.time())
     board, _ = build_board_for_date(board_date, output_path=None)
     # 先过闸门再截断，避免被环境/冷却过滤掉的名单占满 limit 名额
     pool = select_track_candidates(board.candidates, limit=10 ** 6)
 
     service = ResearchTrackingService()
     regime = "bypass" if args.allow_defensive else _read_regime()
+    from src.services.signal_regime import load_cached
+
+    regime_snapshot = load_cached(as_of=board_date)
+    signal_verdicts = {} if regime_snapshot.get("error") else {
+        family: str(item.get("verdict") or "unknown")
+        for family, item in (regime_snapshot.get("families") or {}).items()
+    }
+    regime_ref = hashlib.sha256(json.dumps(regime_snapshot, sort_keys=True).encode()).hexdigest()
     gate_skips: Counter = Counter()
-    if args.no_cooldown:
-        picks = pool[: max(0, int(args.limit))]
-    else:
-        picks, gate_skips = gate_candidates(service, pool, board_date, regime=regime)
-        picks = picks[: max(0, int(args.limit))]
+    picks, gate_skips = gate_candidates(
+        service, pool, board_date, regime=regime, apply_cooldown=not args.no_cooldown,
+        signal_verdicts=signal_verdicts,
+    )
+    updates, new = [], []
+    for cand in picks:
+        existing = service.repo.get_by_identity("cn", cand.code, f"signal:{cand.source}:{board_date}")
+        (updates if existing else new).append(cand)
+    # 每日额度要扣掉当天已建的记录，否则同日重跑会突破上限（30 → 31 …）
+    already_today = service.repo.count_signal_tracks_for_date(board_date)
+    quota = max(0, int(args.limit) - already_today)
+    picks = updates + new[:quota]
     gate_text = " ".join(f"{key}={value}" for key, value in gate_skips.items())
     print(
-        f"[track_from_board] 闸门: 环境={regime} 可入池={len(pool)} 跳过={dict(gate_skips) or '无'}"
+        f"[track_from_board] 闸门: 环境={regime} 可入池={len(pool)} 跳过={dict(gate_skips) or '无'} "
+        f"当日已建={already_today} 剩余额度={quota}"
     )
 
     created = 0
@@ -224,6 +116,9 @@ def main() -> int:
             observed_at=utc_naive_now(), quality=cand.quality, limitation=cand.limitation,
             payload={
                 "batch_ref": cand.batch_ref, "import_rule": RULE_TAG,
+                "admission_rule": FORWARD_ADMISSION_RULE,
+                "signal_regime_ref": regime_ref, "signal_regime_as_of": regime_snapshot.get("as_of"),
+                "signal_regime_verdict": signal_verdicts.get(cand.source, "unknown"),
                 "source_observed_at": cand.observed_at.isoformat() if cand.observed_at else None,
                 "source": cand.source, "reason": cand.reason,
                 "source_snapshot": cand.source_snapshot,
@@ -241,7 +136,7 @@ def main() -> int:
                 capital_role="watch",
                 hypothesis=cand.reason,
                 invalidation="",
-                next_review_at=datetime.combine(base + timedelta(days=REVIEW_AFTER_DAYS), datetime.min.time()),
+                next_review_at=review_at,
                 **evidence,
             )
             if not was_created:

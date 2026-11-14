@@ -178,6 +178,13 @@ def parse_args() -> argparse.Namespace:
         action="store_false",
         help="Disable missing StockDaily fill attempt.",
     )
+    parser.add_argument(
+        "--keep-suspicious",
+        dest="exclude_suspicious",
+        action="store_false",
+        default=True,
+        help="Include codes on the suspicious-price list (default: excluded).",
+    )
     return parser.parse_args()
 
 
@@ -1094,6 +1101,7 @@ def build_report(
     fill_missing_daily_data: bool = False,
     missing_daily_data_filler: Optional[MissingDailyDataFiller] = None,
     fill_max_attempts: Optional[int] = DEFAULT_FILL_MAX_ATTEMPTS,
+    exclude_suspicious: bool = True,
 ) -> Dict[str, Any]:
     bucket_edges = score_bucket_edges or parse_score_bucket_edges(DEFAULT_SCORE_BUCKET_EDGES)
     total_trade_cost_bps = max(0.0, float(turnover_penalty_bps)) + max(0.0, 2.0 * (float(slippage_bps) + float(fee_bps)))
@@ -1108,6 +1116,23 @@ def build_report(
     )
     snapshots = [row for row in snapshots if _snapshot_matches_profile(row, profile_name)]
     snapshots = [row for row in snapshots if not _is_run_summary_snapshot(row)]
+    # 行情待核代码不进统计：与工作台“行情异常”同口径，避免可疑价格抬高/拉低收益
+    excluded_suspicious = 0
+    if exclude_suspicious:
+        try:
+            from src.services.quote_quality import load_suspicious_codes
+
+            suspicious_codes = load_suspicious_codes()
+        except Exception:  # noqa: BLE001 - 清单不可读时不拦统计
+            suspicious_codes = set()
+        if suspicious_codes:
+            kept_rows = []
+            for row in snapshots:
+                if str(getattr(row, "code", "") or "").strip() in suspicious_codes:
+                    excluded_suspicious += 1
+                    continue
+                kept_rows.append(row)
+            snapshots = kept_rows
     if limit is not None and limit > 0:
         snapshots = snapshots[:limit]
     stock_repo = StockRepository(db)
@@ -1195,7 +1220,9 @@ def build_report(
             "tradability_filter": str(tradability_filter),
             "entry_mode": str(entry_mode),
             "benchmark_code": benchmark_code,
+            "exclude_suspicious": bool(exclude_suspicious),
         },
+        "excluded_suspicious": excluded_suspicious,
         "neutral_band_pct": neutral_band_pct,
         "trade_cost_model": {
             "slippage_bps": float(slippage_bps),
@@ -1252,6 +1279,7 @@ def main() -> int:
         score_bucket_edges=score_bucket_edges,
         fill_missing_daily_data=bool(args.fill_missing_daily_data),
         fill_max_attempts=args.fill_max_attempts,
+        exclude_suspicious=bool(getattr(args, "exclude_suspicious", True)),
     )
 
     output_json = Path(args.output_json)
@@ -1262,6 +1290,8 @@ def main() -> int:
     output_md.write_text(build_markdown_report(report), encoding="utf-8")
 
     print(f"snapshot_count={report['snapshot_count']}")
+    if report.get("excluded_suspicious"):
+        print(f"excluded_suspicious={report['excluded_suspicious']}")
     for item in report["window_summaries"]:
         print(
             "window={window} completed={completed} untradable={untradable} win_rate_pct={win_rate} "

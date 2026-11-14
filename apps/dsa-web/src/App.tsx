@@ -21,6 +21,9 @@ const ChatPage = lazy(() => import('./pages/ChatPage'));
 const PortfolioPage = lazy(() => import('./pages/PortfolioPage'));
 const DecisionSignalsPage = lazy(() => import('./pages/DecisionSignalsPage'));
 const PersonalStrategiesPage = lazy(() => import('./pages/PersonalStrategiesPage'));
+const WorkbenchPage = lazy(() => import('./pages/WorkbenchPage'));
+const ShortlinePage = lazy(() => import('./pages/ShortlinePage'));
+const StockProfilePage = lazy(() => import('./pages/StockProfilePage'));
 const AlertsPage = lazy(() => import('./pages/AlertsPage'));
 const TokenUsagePage = lazy(() => import('./pages/TokenUsagePage'));
 const StockScreeningPage = lazy(() => import('./pages/StockScreeningPage'));
@@ -85,6 +88,9 @@ const AppContent: React.FC = () => {
         <Route path="/portfolio" element={<PortfolioPage />} />
         <Route path="/decision-signals" element={<DecisionSignalsPage />} />
         <Route path="/personal-strategies" element={<PersonalStrategiesPage />} />
+        <Route path="/workbench" element={<WorkbenchPage />} />
+        <Route path="/workbench/shortline" element={<ShortlinePage />} />
+        <Route path="/workbench/stock/:code" element={<StockProfilePage />} />
         <Route path="/screening" element={<StockScreeningPage />} />
         <Route path="/backtest" element={<BacktestPage />} />
         <Route path="/alerts" element={<AlertsPage />} />

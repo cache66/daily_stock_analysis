@@ -11,7 +11,7 @@ import json
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 
 from src.storage import DatabaseManager, ResearchTrack, ResearchTrackEvent
 
@@ -45,6 +45,19 @@ class ResearchTrackingRepository:
                 .limit(1)
             ).scalar_one_or_none()
 
+    def count_signal_tracks_for_date(self, board_date: str) -> int:
+        """统计某个信号日已经建了多少条前向研究记录（`signal:*:<date>`）。
+
+        用于“每日最多 N 条”的额度扣减：重跑时只补剩余额度，不会因为上次已建的
+        记录不占额度而超出上限。回放记录（`research:signal:*`）不计入。
+        """
+        with self.db.get_session() as session:
+            return int(session.execute(
+                select(func.count())
+                .select_from(ResearchTrack)
+                .where(ResearchTrack.hypothesis_key.like(f"signal:%:{board_date}"))
+            ).scalar_one())
+
     def list_tracks(
         self,
         *,
@@ -60,6 +73,20 @@ class ResearchTrackingRepository:
         stmt = stmt.order_by(ResearchTrack.updated_at.desc(), ResearchTrack.id.desc()).limit(limit)
         with self.db.get_session() as session:
             return list(session.execute(stmt).scalars().all())
+
+    def signal_history(self, code: str, family: str) -> List[ResearchTrack]:
+        """同票同源完整身份历史，避免其他来源/回放挤占分页后漏掉冷却记录。"""
+        with self.db.get_session() as session:
+            return list(session.execute(select(ResearchTrack).where(
+                ResearchTrack.market == "cn", ResearchTrack.code == code,
+                ResearchTrack.hypothesis_key.startswith(f"signal:{family}:", autoescape=True),
+            )).scalars().all())
+
+    def initial_event(self, track_pk: int) -> Optional[ResearchTrackEvent]:
+        with self.db.get_session() as session:
+            return session.execute(select(ResearchTrackEvent).where(
+                ResearchTrackEvent.track_pk == track_pk, ResearchTrackEvent.event_type == "created",
+            ).order_by(ResearchTrackEvent.id).limit(1)).scalar_one_or_none()
 
     def due_for_review(self, as_of: Optional[datetime] = None, limit: int = 100) -> List[ResearchTrack]:
         moment = as_of or datetime.now()
@@ -104,21 +131,28 @@ class ResearchTrackingRepository:
             ).first() is not None
 
     def outcome_tracks(
-        self, limit: int = 500, *, closed_reason_prefix: str = AUTO_CLOSE_REASON_PREFIX
+        self, limit: int = 500, *, closed_reason_prefix: str = AUTO_CLOSE_REASON_PREFIX,
+        hypothesis_prefix: str = "signal:",
+        include_pending: bool = False,
     ) -> List[ResearchTrack]:
         """自动关闭样本仍可追加行情修订；不重算人工关闭/失效的假设。
 
         排序：先按“上次测量/检查时间”升序（最久未看的先算，避免新样本永远压住旧样本），
         再按 id 升序保证稳定；``limit`` 只截断本批，不回绕。
+        ``hypothesis_prefix`` 默认只取前向样本（``signal:``）；回放样本用
+        ``research:signal:``，需显式传入。
         """
         from sqlalchemy import or_
 
+        statuses = [ResearchTrack.status == "tracking"]
+        if include_pending:
+            statuses.append(ResearchTrack.status == "pending")
         with self.db.get_session() as session:
             return list(session.execute(
                 select(ResearchTrack).where(
-                    ResearchTrack.hypothesis_key.like("signal:%"),
+                    ResearchTrack.hypothesis_key.like(f"{hypothesis_prefix}%"),
                     or_(
-                        ResearchTrack.status == "tracking",
+                        *statuses,
                         (ResearchTrack.status == "closed") & (
                             ResearchTrack.closed_reason.like(f"{closed_reason_prefix}%")
                         ),

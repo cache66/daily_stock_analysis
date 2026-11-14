@@ -448,6 +448,45 @@ class KlineSignalStreakSnapshot(Base):
     )
 
 
+class LimitTouchEvent(Base):
+    """触板事件（涨停封板 / 炸板），长期累积用于计算「试盘次数」与资金态度。
+
+    每个交易日每只票一条：kind='seal' 表示收盘涨停封板，kind='break' 表示触及涨停后炸板。
+    只保留主板/创业板/科创板，排除 ST 与北交所。
+    """
+
+    __tablename__ = 'limit_touch_event'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(10), nullable=False, index=True)
+    name = Column(String(32))
+    trade_date = Column(Date, nullable=False, index=True)
+    kind = Column(String(8), nullable=False)  # seal / break
+    industry = Column(String(32), index=True)
+
+    change_pct = Column(Float)
+    close_price = Column(Float)
+    limit_price = Column(Float)
+    dist_limit = Column(Float)  # 收盘距涨停价（小数，0 = 收盘即涨停价）
+    break_count = Column(Integer)
+    first_seal = Column(String(12))
+    boards = Column(Integer)
+    limit_stat = Column(String(16))
+
+    amount = Column(Float)
+    turnover = Column(Float)
+    amplitude = Column(Float)
+    seal_amount = Column(Float)
+    float_mv = Column(Float)
+    source = Column(String(24))
+    created_at = Column(DateTime, default=datetime.now, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint('code', 'trade_date', name='uq_limit_touch_code_date'),
+        Index('idx_limit_touch_date_kind', 'trade_date', 'kind'),
+    )
+
+
 class ScreeningRun(Base):
     """A completed built-in screening run persisted by DSA."""
 

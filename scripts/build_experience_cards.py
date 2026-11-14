@@ -28,9 +28,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="生成经验卡 Markdown")
     parser.add_argument("--registry", default=str(DEFAULT_REGISTRY))
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT))
+    parser.add_argument("--as-of", help="自动观察使用的体检日期 YYYY-MM-DD（默认今天）")
     args = parser.parse_args()
 
-    result = build_cards_file(Path(args.registry), Path(args.output))
+    result = build_cards_file(Path(args.registry), Path(args.output), as_of=args.as_of)
     print(f"[experience_cards] cards={result['count']} -> {result['output']}")
     return 0
 

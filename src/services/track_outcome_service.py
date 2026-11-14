@@ -5,7 +5,9 @@
 T+5 可用时关闭 track。只读价格，不重算选股、不改资格。
 
 口径：
-- 入场价 = 信号日（D0）收盘；收益 = 第 N 个交易日收盘 / D0 收盘 − 1；
+- 入场价 = 信号日**次一交易日开盘价**（信号盘后才可得，当日收盘买不到）；
+  收益 = 第 N 个交易日收盘 / 次日开盘 − 1；
+- 检查点按市场交易日历取，缺某天就留空（`missing_dates`），不平移到下一根；
 - 只用本地 `stock_daily`（前复权），缺数据就记 `insufficient_data`，不推测；
 - 同一测量版本重跑幂等；行情修订追加新证据，完整结果与自动关闭同事务。
 """
@@ -24,12 +26,15 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from src.core.trading_calendar import get_trading_sessions
 from src.repositories.research_tracking_repo import AUTO_CLOSE_REASON_PREFIX
 from src.services.quote_quality import load_suspicious_codes as _shared_load_suspicious_codes
+from src.services.research_sample import sample_kind as classify_sample
 from src.storage import utc_naive_now
 
 logger = logging.getLogger(__name__)
 
 HORIZONS = (1, 3, 5)
-OUTCOME_RULE_VERSION = "track-market-sessions-v1"
+OUTCOME_RULE_VERSION = "track-market-sessions-v2-next-open"
+# 只测量不结束的研究标记：价格窗口完成≠研究结论，方法自己推进生命周期
+MEASUREMENT_ONLY_BRANCH = "measurement_only"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SUSPICIOUS_CODES_PATH = (
     PROJECT_ROOT / "data" / "run_logs" / "rebuild_stock_daily_qfq_suspicious_codes.txt"
@@ -63,43 +68,87 @@ class ForwardOutcome:
 
 
 def compute_forward_outcome(
-    bars: Sequence[Tuple[str, float]], *, sessions: Optional[Sequence[str]] = None, market: str = "cn",
+    bars: Sequence[Any],
+    *,
+    sessions: Optional[Sequence[str]] = None,
+    market: str = "cn",
 ) -> Optional[ForwardOutcome]:
-    """按市场日历检查点取价，缺失保留空，不平移到下一条行情。"""
-    clean = [(str(day)[:10], float(close)) for day, close in bars if close and math.isfinite(float(close)) and float(close) > 0]
+    """次日开盘入场的前向结果（按市场日历检查点取价，缺失保留空，不平移）。
+
+    口径（2026-11-10 起，`OUTCOME_RULE_VERSION` 已升级）：
+
+    - 信号日 = bars 的第一天，只用来定位日历，**不作为入场价**；
+    - 入场价 = 次一交易日**开盘价**（信号盘后才可得，当日收盘买不到）；
+    - `ret{k}` = 入场日之后第 k 个交易日收盘 / 入场开盘 − 1（k=1/3/5），
+      即 k 为真实持有交易日数，T+5 需要 signal + 入场 + 5 个检查点共 7 个交易日。
+
+    bars 允许两种形态：`(date, open, close)` 或 `(date, close)`；后者按
+    open=close 处理（只用于没有开盘价的旧数据/单测，会因口径退化被标 partial）。
+    """
+    clean: List[Tuple[str, float, float]] = []
+    for row in bars:
+        if len(row) >= 3:
+            day, open_price, close = row[0], row[1], row[2]
+        else:
+            day, close = row[0], row[1]
+            open_price = close
+        try:
+            close_f = float(close)
+        except (TypeError, ValueError):
+            continue
+        if not close_f or not math.isfinite(close_f) or close_f <= 0:
+            continue
+        try:
+            open_f = float(open_price) if open_price is not None else close_f
+        except (TypeError, ValueError):
+            open_f = close_f
+        if not math.isfinite(open_f) or open_f <= 0:
+            open_f = close_f
+        clean.append((str(day)[:10], open_f, close_f))
     clean.sort()
     if len(clean) < 2:
         return None
-    entry_date, entry_close = clean[0]
-    if entry_close <= 0:
-        return None
+
+    signal_date = clean[0][0]
+    opens = {day: open_price for day, open_price, _ in clean}
+    closes = {day: close for day, _, close in clean}
     expected = tuple(sessions) if sessions is not None else tuple(
-        d.isoformat() for d in get_trading_sessions(market, date.fromisoformat(entry_date), date.fromisoformat(clean[-1][0]))
+        d.isoformat() for d in get_trading_sessions(
+            market, date.fromisoformat(signal_date), date.fromisoformat(clean[-1][0]),
+        )
     )
-    expected = expected[:max(HORIZONS) + 1]
-    if not expected or expected[0] != entry_date:
+    # 需要 signal + 入场日 + 5 个检查点
+    expected = expected[: max(HORIZONS) + 2]
+    if not expected or expected[0] != signal_date or len(expected) < 2:
         return None
-    prices = dict(clean)
-    present = [day for day in expected if day in prices]
-    if len(present) < 2:
+
+    entry_date = expected[1]
+    entry_price = opens.get(entry_date)
+    if not entry_price or entry_price <= 0:
+        return None
+
+    prices = closes
+    present = [day for day in expected[1:] if day in prices]
+    if not present:
         return None
     values: Dict[str, Optional[float]] = {}
     for horizon in HORIZONS:
-        if len(expected) > horizon and expected[horizon] in prices:
-            values[f"ret{horizon}"] = prices[expected[horizon]] / entry_close - 1.0
-        else:
-            values[f"ret{horizon}"] = None
+        # +1：跳过信号日与入场日之间那一段，T+k 从入场日之后算起
+        target = expected[horizon + 1] if len(expected) > horizon + 1 else None
+        values[f"ret{horizon}"] = (
+            prices[target] / entry_price - 1.0 if target and target in prices else None
+        )
     return ForwardOutcome(
         entry_date=entry_date,
-        entry_close=entry_close,
+        entry_close=entry_price,
         last_date=present[-1],
         last_close=prices[present[-1]],
         ret1=values["ret1"],
         ret3=values["ret3"],
         ret5=values["ret5"],
-        available_days=len(present) - 1,
+        available_days=len(present),
         expected_dates=expected,
-        missing_dates=tuple(day for day in expected if day not in prices),
+        missing_dates=tuple(day for day in expected[1:] if day not in prices),
     )
 
 
@@ -121,16 +170,21 @@ def load_bars(
 
     db = db_manager or DatabaseManager.get_instance()
     sql = (
-        "SELECT date, close FROM stock_daily WHERE code = :code AND date >= :start "
+        "SELECT date, open, close FROM stock_daily WHERE code = :code AND date >= :start "
         + ("AND date <= :end " if end_date else "")
         + "ORDER BY date ASC " + ("" if end_date else "LIMIT :lim")
     )
-    params: Dict[str, Any] = {"code": code, "start": signal_date, "lim": max(2, int(horizon) + 1)}
+    params: Dict[str, Any] = {"code": code, "start": signal_date, "lim": max(3, int(horizon) + 2)}
     if end_date:
         params["end"] = end_date
     with db.session_scope() as session:
         rows = session.execute(text(sql), params).fetchall()
-    return [(str(row[0])[:10], float(row[1])) for row in rows]
+    return [
+        (str(row[0])[:10],
+         float(row[1]) if row[1] is not None else float(row[2]),
+         float(row[2]))
+        for row in rows
+    ]
 
 
 def evaluate_track_outcomes(
@@ -139,10 +193,17 @@ def evaluate_track_outcomes(
     limit: int = 500,
     dry_run: bool = False,
     bars_loader=load_bars,
+    hypothesis_prefix: str = "signal:",
 ) -> Dict[str, Any]:
-    """为到期的 signal track 回填结果；返回统计摘要（可 dry-run）。"""
+    """为到期的 track 回填结果；返回统计摘要（可 dry-run）。
+
+    ``hypothesis_prefix`` 默认只算前向样本（``signal:``）；传
+    ``research:signal:`` 则回放历史信号，结果事件带 ``sample_kind=replay``，
+    不与前向成绩混算。
+    """
     from src.services.research_tracking_service import ResearchTrackingService
 
+    sample_kind = "replay" if hypothesis_prefix.startswith("research:") else "forward"
     service = ResearchTrackingService()
     cutoff = as_of or date.today()
     summary: Dict[str, Any] = {
@@ -156,11 +217,18 @@ def evaluate_track_outcomes(
         "errors": 0,
         "calendar_unavailable": 0,
         "newer_measurement": 0,
+        "not_due": 0,
+        "measured_only": 0,
+        "sample_kind": sample_kind,
     }
     suspicious = load_suspicious_codes()
 
-    for track in service.repo.outcome_tracks(limit=limit):
-        if not str(track.hypothesis_key).startswith("signal:"):
+    for track in service.repo.outcome_tracks(
+        limit=limit,
+        hypothesis_prefix=hypothesis_prefix,
+        include_pending=sample_kind == "replay",
+    ):
+        if not str(track.hypothesis_key).startswith(hypothesis_prefix):
             continue
         signal_date = str(track.hypothesis_key).rsplit(":", 1)[-1]
         try:
@@ -168,8 +236,9 @@ def evaluate_track_outcomes(
         except ValueError:
             summary["skipped_no_signal"] += 1
             continue
-        if track.next_review_at and track.next_review_at.date() > cutoff:
-            continue
+        # 说明：next_review_at 只是人工复核提醒（建档时按信号日+N 个交易日生成），
+        # 不是行情可用性合同。测量是否到期由“入场日（D+1）是否已过”决定，见下方
+        # sessions 长度判断；否则 T+1/T+3 的中间观测会被复核日推后。
 
         summary["checked"] += 1
 
@@ -182,21 +251,35 @@ def evaluate_track_outcomes(
         except (ValueError, RuntimeError, ImportError):
             summary["calendar_unavailable"] += 1
             continue
-        sessions = sessions[:max(HORIZONS) + 1]
+        # 次日开盘入场：需要 signal + 入场日 + 5 个检查点
+        sessions = sessions[:max(HORIZONS) + 2]
         if not sessions or sessions[0] != signal_date:
             summary["insufficient"] += 1
+            continue
+        if len(sessions) < 2:
+            # 入场日还没到（截止日仍是信号日）：不是缺数据，只是未到期
+            summary["not_due"] += 1
             continue
 
         try:
             bars = bars_loader(
-                track.code, signal_date, horizon=max(HORIZONS), end_date=sessions[-1]
+                track.code, signal_date, horizon=max(HORIZONS) + 1, end_date=sessions[-1]
             )
         except Exception:  # noqa: BLE001 - 单票价格失败不阻断整批
             summary["errors"] += 1
             continue
 
         # 最终计算也截断，防止外部/自定义 loader 忽略截止合同。
-        bars = [(str(day)[:10], close) for day, close in bars if str(day)[:10] in sessions]
+        filtered = []
+        for row in bars:
+            day = str(row[0])[:10]
+            if day not in sessions:
+                continue
+            if len(row) >= 3:
+                filtered.append((day, row[1], row[2]))
+            else:
+                filtered.append((day, row[1], row[1]))
+        bars = filtered
         bars.sort()
         if not bars or str(bars[0][0])[:10] != signal_date:
             summary["insufficient"] += 1
@@ -207,13 +290,19 @@ def evaluate_track_outcomes(
             summary["insufficient"] += 1
             continue
 
-        prices = dict(bars)
+        # 指纹覆盖入场价与检查点收盘：只修订开盘价也必须产出新版本。
+        prices = {row[0]: row[-1] for row in bars}
         measurement = {
             "rule_version": OUTCOME_RULE_VERSION, "market": track.market,
+            "entry": [outcome.entry_date, outcome.entry_close],
             "prices": [(day, prices.get(day)) for day in outcome.expected_dates],
         }
         version = hashlib.sha256(json.dumps(measurement, sort_keys=True).encode()).hexdigest()
         outcome_ref = f"outcome:{track.code}:{signal_date}:{version}"
+        # 方法类研究（branch=measurement_only）只接价格测量，生命周期由方法确认/失效规则推进；
+        # 价格窗口走完不等于研究结束，不能在这里关闭。
+        measurement_only = str(getattr(track, "branch", "") or "") == MEASUREMENT_ONLY_BRANCH
+
         previous = service.repo.latest_source_event(track.id, "stock_daily_qfq")
         if previous:
             previous_payload = json.loads(previous.payload_json or "{}")
@@ -224,7 +313,7 @@ def evaluate_track_outcomes(
                 continue
         if previous and previous.source_ref == outcome_ref:
             # 兼容旧版“结果已提交、关闭未提交”的中断记录。
-            if outcome.complete and track.status == "tracking":
+            if outcome.complete and track.status == "tracking" and not measurement_only:
                 if not dry_run:
                     try:
                         service.change_status(track.track_id, "closed", reason=f"{AUTO_CLOSE_REASON_PREFIX}；T+5 {_pct(outcome.ret5)}", expected_revision=track.revision)
@@ -235,7 +324,14 @@ def evaluate_track_outcomes(
                 summary["closed"] += 1
             continue
 
-        payload = {**asdict(outcome), **measurement, "as_of": cutoff.isoformat(), "supersedes_event_id": previous.id if previous else None}
+        initial = service.repo.initial_event(track.id)
+        track_kind = classify_sample(
+            track.hypothesis_key, initial.observed_at if initial else None,
+            json.loads(initial.payload_json or "{}") if initial else {},
+        )
+        payload = {**asdict(outcome), **measurement, "as_of": cutoff.isoformat(),
+                   "supersedes_event_id": previous.id if previous else None,
+                   "sample_kind": track_kind, "measurement_only": measurement_only}
         if not dry_run:
             try:
                 service.append_evidence(
@@ -253,6 +349,7 @@ def evaluate_track_outcomes(
                     payload=payload,
                     expected_revision=track.revision,
                     close_reason=(
+                        "" if measurement_only else
                         f"{AUTO_CLOSE_REASON_PREFIX}；T+5 {_pct(outcome.ret5)}" if outcome.complete else
                         f"{AUTO_CLOSE_REASON_PREFIX}；最新测量受限，查看修订证据" if track.status == "closed" else ""
                     ),
@@ -265,7 +362,10 @@ def evaluate_track_outcomes(
         if dry_run:
             continue
         if outcome.complete:
-            summary["closed"] += int(track.status == "tracking")
+            if measurement_only:
+                summary["measured_only"] += 1
+            else:
+                summary["closed"] += int(track.status == "tracking")
         else:
             summary["pending"] += 1
     return summary

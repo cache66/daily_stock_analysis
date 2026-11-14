@@ -1,0 +1,112 @@
+{
+  "version": "shortline_methods_v1",
+  "_comment": "短线方法注册表。每个方法只有一条研究问题与一套确认/失效条件；新增方法只加定义与 adapter，不改共用跟踪模型。",
+  "defaults": {
+    "market": "cn",
+    "exclude_industries": [
+      "银行",
+      "保险",
+      "证券",
+      "多元金融",
+      "建筑工程",
+      "建筑装饰",
+      "装修装饰",
+      "水泥",
+      "钢铁",
+      "公用事业"
+    ],
+    "min_avg_amount_wan": 8000,
+    "stop_max_pct": 0.09,
+    "evaluation_window": "T+5（主）T+1/T+3（旁证）"
+  },
+  "methods": [
+    {
+      "id": "hotspot",
+      "name": "热点与板块",
+      "enabled": true,
+      "producer": "industry_strength(daily)",
+      "adapter": "hotspot",
+      "question": "哪些板块在走强，板块内哪只最强？",
+      "horizon": "1-10 个交易日",
+      "confirm_rule": "行业 20 日中位跑赢全市场中位 ≥3pp；个股 20 日超额 ≥5pp；收盘站上 MA20",
+      "invalid_rule": "收盘跌破 MA20，或所属行业 20 日中位回落到全市场分位 <50%",
+      "params": {
+        "top_industries": 6,
+        "industry_min_excess_pp": 3.0,
+        "stock_min_excess_pp": 5.0,
+        "max_dist_above_ma20": 0.1,
+        "max_ret5": 0.12,
+        "vol_ratio_min": 1.0,
+        "max_picks": 8,
+        "max_per_industry": 2
+      }
+    },
+    {
+      "id": "deep_recovery",
+      "name": "超跌与修复",
+      "enabled": true,
+      "producer": "screen_deep_recovery(thresholds mirrored)",
+      "adapter": "deep_recovery",
+      "question": "跌下来之后是否已经企稳并出现承接？",
+      "horizon": "3-15 个交易日",
+      "confirm_rule": "距 120 日高回撤 ≥35%；收盘站上 MA20；近 5 日涨幅 >2%；20 日均额 ≥1 亿",
+      "invalid_rule": "收盘重新跌破 MA20，或距 120 日高继续扩大 10pp 以上",
+      "params": {
+        "min_drawdown": -0.35,
+        "min_ret5": 0.02,
+        "min_avg_amount_wan": 10000,
+        "max_picks": 8
+      }
+    },
+    {
+      "id": "holders",
+      "name": "股东户数（披露后跟踪）",
+      "enabled": true,
+      "producer": "gdhs disclosure (akshare fwds)",
+      "adapter": "holders",
+      "question": "连续披露户数下降之后，价格是否开始启动？",
+      "horizon": "5-20 个交易日（披露低频）",
+      "confirm_rule": "最近披露户数连续下降 ≥2 期，且当前收盘站上 MA20、20 日跑赢市场中位",
+      "invalid_rule": "新一期披露户数转增，或收盘跌破 MA20 且 20 日超额为负",
+      "params": {
+        "min_drop_periods": 2,
+        "max_picks": 8,
+        "max_ret20": 0.35
+      }
+    },
+    {
+      "id": "legacy_signals",
+      "name": "旧五信号（非默认每日）",
+      "enabled": true,
+      "producer": "kline_signal_snapshot",
+      "adapter": "legacy",
+      "question": "原有五个信号今天还出了哪些票？（只作参考，不默认入池）",
+      "horizon": "按原信号定义",
+      "confirm_rule": "沿用原信号定义；本方法只做归集展示，不新增确认规则",
+      "invalid_rule": "沿用原信号定义",
+      "params": {
+        "signal_types": [
+          "hundred_day_high",
+          "trend_leader_unified",
+          "earnings_surprise",
+          "daily_slow_rise",
+          "long_base_release"
+        ],
+        "default_daily": false,
+        "max_picks": 20
+      }
+    }
+  ],
+  "intersections": [
+    {
+      "id": "hotspot_x_recovery",
+      "name": "热点 × 超跌共振",
+      "enabled": false,
+      "methods": [
+        "hotspot",
+        "deep_recovery"
+      ],
+      "rule": "同一代码同时出现在两个方法的当日发现中；单独登记版本、单独分母，不默认生效"
+    }
+  ]
+}

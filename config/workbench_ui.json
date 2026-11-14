@@ -1,0 +1,19 @@
+{
+  "note": "工作台页面的默认试算参数；页面可临时改，改完可存到浏览器本地。这里只给默认值，不参与建 track / 回填。",
+  "excluded_groups": ["银行保险券商", "基建地产"],
+  "max_per_industry": 3,
+  "min_avg_amount_yi": 0.5,
+  "max_pct_from_high10": 3.0,
+  "max_pct_from_ma20": 8.0,
+  "exclude_st": true,
+  "enabled_signals": [
+    "hundred_day_high",
+    "trend_leader_unified",
+    "earnings_surprise",
+    "daily_slow_rise",
+    "screening__dual_low",
+    "screening__momentum_quality",
+    "screening__shrink_pullback",
+    "long_base_release"
+  ]
+}

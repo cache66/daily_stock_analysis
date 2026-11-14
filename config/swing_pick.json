@@ -1,0 +1,57 @@
+{
+  "_comment": "波段选股口径（熊市版本）：先做结构与相对强度，再补基本面。改参数后重跑 scripts/swing_pick.py 即可。",
+  "as_of_hint": "使用 stock_daily 的最新交易日",
+  "exclude_industries": [
+    "银行",
+    "保险",
+    "证券",
+    "多元金融",
+    "建筑工程",
+    "建筑装饰",
+    "装修装饰",
+    "水泥",
+    "钢铁",
+    "公用事业"
+  ],
+  "exclude_name_keywords": [
+    "ST",
+    "退",
+    "N",
+    "C"
+  ],
+  "universe": {
+    "min_listed_days": 250,
+    "min_avg_amount_wan": 8000,
+    "min_market_cap_yi": 30,
+    "max_market_cap_yi": 800
+  },
+  "structure": {
+    "max_drawdown_from_high_120": -0.12,
+    "min_off_low_60": 0.08,
+    "max_off_low_60": 0.4,
+    "require_ma20_above_ma60": true,
+    "require_close_above_ma20": true,
+    "max_dist_above_ma20": 0.08,
+    "max_ret5": 0.12,
+    "max_ret20": 0.3,
+    "vol_ratio_min": 0.9,
+    "vol_ratio_max": 2.2
+  },
+  "relative_strength": {
+    "window": 20,
+    "min_excess_vs_market_pp": 5.0
+  },
+  "volatility": {
+    "atr_pct_min": 0.02,
+    "atr_pct_max": 0.09
+  },
+  "output": {
+    "top_n": 10,
+    "holding_days": "3-10",
+    "stop_from_low_days": 10
+  },
+  "risk": {
+    "stop_max_pct": 0.09,
+    "_comment": "止损 = max(近10日低, 收盘×(1-9%))；两者都更远则放弃该票"
+  }
+}
